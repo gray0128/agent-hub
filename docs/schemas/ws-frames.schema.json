@@ -1,0 +1,151 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ahub.bobocai.win/schemas/ws-frames.schema.json",
+  "title": "WebSocketFrame",
+  "description": "Discriminated union of all JSON frames exchanged over /ws/node and /ws/stream.",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "conn_nonce", "version", "os", "arch", "max_concurrency", "capabilities", "workspaces"],
+      "properties": {
+        "type": { "const": "node.hello" },
+        "conn_nonce": { "type": "string", "minLength": 8 },
+        "version": { "type": "string" },
+        "os": { "type": "string" },
+        "arch": { "type": "string" },
+        "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 16 },
+        "capabilities": { "type": "object" },
+        "workspaces": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["key", "path"],
+            "properties": {
+              "key": { "type": "string" },
+              "path": { "type": "string" },
+              "default_branch": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "active_run_ids", "ts"],
+      "properties": {
+        "type": { "const": "node.ping" },
+        "active_run_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "ts": { "type": "string", "format": "date-time" }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "run_id", "seq", "kind", "payload", "ts"],
+      "properties": {
+        "type": { "const": "run.event" },
+        "run_id": { "type": "string", "pattern": "^run_[A-Za-z0-9]+$" },
+        "seq": { "type": "integer", "minimum": 1 },
+        "kind": {
+          "type": "string",
+          "enum": ["status", "tool_use", "turn_end", "approval_needed", "stderr_warn", "system"]
+        },
+        "payload": { "type": "object" },
+        "ts": { "type": "string", "format": "date-time" }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "run_id", "lease_owner", "status", "ts"],
+      "properties": {
+        "type": { "const": "run.state" },
+        "run_id": { "type": "string", "pattern": "^run_[A-Za-z0-9]+$" },
+        "lease_owner": { "type": "string" },
+        "status": {
+          "type": "string",
+          "enum": ["running", "needs_approval", "done", "failed", "cancelled"]
+        },
+        "remote_control_url": { "type": "string" },
+        "resolved_model": { "type": "string" },
+        "resolved_effort": { "type": "string" },
+        "ts": { "type": "string", "format": "date-time" }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "node_id", "heartbeat_interval_ms", "has_pending_runs"],
+      "properties": {
+        "type": { "const": "hub.welcome" },
+        "node_id": { "type": "string" },
+        "heartbeat_interval_ms": { "type": "integer", "minimum": 5000 },
+        "has_pending_runs": { "type": "boolean" }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "reason"],
+      "properties": {
+        "type": { "const": "hub.wake" },
+        "reason": { "type": "string", "enum": ["run_queued", "reconcile"] },
+        "run_id": { "type": "string" }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "run_id", "reason"],
+      "properties": {
+        "type": { "const": "hub.abort" },
+        "run_id": { "type": "string", "pattern": "^run_[A-Za-z0-9]+$" },
+        "reason": { "type": "string" }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "nodes", "ts"],
+      "properties": {
+        "type": { "const": "snapshot" },
+        "nodes": { "type": "array", "items": { "type": "object" } },
+        "runs": { "type": "array", "items": { "type": "object" } },
+        "ts": { "type": "string", "format": "date-time" }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "node"],
+      "properties": {
+        "type": { "const": "node.status" },
+        "node": { "type": "object" }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "run"],
+      "properties": {
+        "type": { "const": "run.updated" },
+        "run": { "type": "object" }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "code", "message"],
+      "properties": {
+        "type": { "const": "error" },
+        "code": { "type": "string" },
+        "message": { "type": "string" }
+      }
+    }
+  ]
+}

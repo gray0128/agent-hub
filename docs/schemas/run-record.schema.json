@@ -1,0 +1,155 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ahub.bobocai.win/schemas/run-record.schema.json",
+  "title": "RunRecordEnvelope",
+  "description": "Standard run object returned by REST API and ahub --json CLI commands.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "thread_id",
+    "root_run_id",
+    "depth",
+    "max_depth",
+    "node_id",
+    "workdir",
+    "agent",
+    "status",
+    "created_at",
+    "updated_at"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^run_[A-Za-z0-9]+$"
+    },
+    "thread_id": {
+      "type": "string",
+      "pattern": "^thr_[A-Za-z0-9]+$"
+    },
+    "root_run_id": {
+      "type": "string",
+      "pattern": "^run_[A-Za-z0-9]+$"
+    },
+    "parent_run_id": {
+      "type": ["string", "null"],
+      "pattern": "^run_[A-Za-z0-9]+$"
+    },
+    "depth": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "max_depth": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 3
+    },
+    "node_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "workdir": {
+      "type": "string",
+      "minLength": 1
+    },
+    "agent": {
+      "type": "string",
+      "enum": ["agy", "pi", "omp", "codex", "claude"]
+    },
+    "model": {
+      "type": "string"
+    },
+    "effort": {
+      "type": "string",
+      "enum": ["", "off", "minimal", "low", "medium", "high", "xhigh", "max"]
+    },
+    "sandbox": {
+      "type": "boolean"
+    },
+    "timeout_sec": {
+      "type": "integer",
+      "minimum": 10,
+      "maximum": 7200
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "claimed",
+        "running",
+        "needs_approval",
+        "done",
+        "failed",
+        "cancelled"
+      ]
+    },
+    "priority_order": {
+      "type": "number"
+    },
+    "resolved_model": {
+      "type": "string"
+    },
+    "resolved_effort": {
+      "type": "string"
+    },
+    "native_session_id": {
+      "type": ["string", "null"]
+    },
+    "remote_control_url": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "output_preview": {
+      "type": "string"
+    },
+    "output_md": {
+      "type": "string"
+    },
+    "output_bytes": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "truncated": {
+      "type": "boolean"
+    },
+    "webhook_armed": {
+      "type": "boolean"
+    },
+    "error_code": {
+      "type": "string"
+    },
+    "error_message": {
+      "type": "string"
+    },
+    "notify_status": {
+      "type": "string",
+      "enum": ["none", "queued", "sent", "failed"]
+    },
+    "lease_expires_at": {
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "started_at": {
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "finished_at": {
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

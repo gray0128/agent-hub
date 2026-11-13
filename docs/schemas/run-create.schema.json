@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ahub.bobocai.win/schemas/run-create.schema.json",
+  "title": "CreateRunRequest",
+  "description": "Request payload for POST /api/v1/runs.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["prompt"],
+  "properties": {
+    "thread_id": {
+      "type": "string",
+      "pattern": "^thr_[A-Za-z0-9]+$",
+      "description": "Existing thread ID to continue. When set, node_id, workdir, and agent default to the thread's bound target."
+    },
+    "node_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z0-9][a-z0-9_-]*$",
+      "description": "Target execution node identifier. Required when thread_id is omitted."
+    },
+    "workdir": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "description": "Project short key (e.g. dds) or absolute path on the target node. Required when thread_id is omitted."
+    },
+    "agent": {
+      "type": "string",
+      "enum": ["agy", "pi", "omp", "codex", "claude"],
+      "description": "Local agent adapter to execute the prompt."
+    },
+    "model": {
+      "type": "string",
+      "maxLength": 128,
+      "description": "Model alias (e.g. carbon, ds-pro) or provider/model identifier."
+    },
+    "effort": {
+      "type": "string",
+      "enum": ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+      "description": "Reasoning or thinking effort level."
+    },
+    "sandbox": {
+      "type": "boolean",
+      "default": true,
+      "description": "Whether sandbox mode is enabled when supported by the target agent."
+    },
+    "timeout_sec": {
+      "type": "integer",
+      "minimum": 10,
+      "maximum": 7200,
+      "default": 900,
+      "description": "Execution timeout in seconds."
+    },
+    "prompt": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200000,
+      "description": "Task instructions passed to the target agent."
+    },
+    "title": {
+      "type": "string",
+      "maxLength": 160,
+      "description": "Optional thread title when creating a new thread."
+    },
+    "parent_run_id": {
+      "type": "string",
+      "pattern": "^run_[A-Za-z0-9]+$",
+      "description": "Parent run ID injected from AHUB_RUN_ID for lineage and recursion checks."
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 128,
+      "description": "Client-provided deduplication key."
+    },
+    "notify": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "target": {
+          "type": "string",
+          "enum": ["none", "grok", "webhook"],
+          "default": "none"
+        },
+        "events": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["done", "failed", "cancelled", "needs_approval"]
+          },
+          "uniqueItems": true
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "not": {
+          "required": ["thread_id"]
+        }
+      },
+      "then": {
+        "required": ["node_id", "workdir", "agent"]
+      }
+    }
+  ]
+}

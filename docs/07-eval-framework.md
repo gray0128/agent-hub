@@ -1,0 +1,164 @@
+# 07 第一性原理评测框架（Eval Framework）
+
+本文档定义 `agent-hub` 的全栈评测与验证框架。在进入编码前锁定评测体系的目的，是确保后续四个实施切片（Slices）的每一项改动都具备客观、快速且防自欺的验收标准。
+
+## 1. 第一性原理前提：测底座确定性，而非测底层大模型智商
+
+`agent-hub` 的本质是「云端状态与租约控制面 + 面向 Agent 的 CLI 契约 + 面向人的 Web 控制台」，本身并不是大模型，也不直接产生推理智能。如果一开始就用真实 Coding Agent 在真机上跑通用编程基准测试，评测结果会被上游模型能力波动、网络抖动与高昂 Token 消耗淹没，既慢又无法定位故障究竟出自 `hub-worker`、`ahub` 守护进程、`SKILL.md` 还是前端界面。
+
+基于故障物理来源拆解，本项目的评测必须分为**三个正交平面（Three Orthogonal Planes）**：
+
+| 评测平面 | 被测对象 | 回答的核心问题 | 核心手段 | 运行代价 |
+| --- | --- | --- | --- | --- |
+| **Plane 1：底座状态与进程不变量** | `apps/hub-worker`（D1/DO/Cron）与 `ahub node serve` | 并发争抢、WS 断连、进程强杀与租约过期下，状态机是否绝不丢单、串单、泄密或残留孤儿进程？ | 受控故障注入替身 `ahub-fakeagent` + 本地 `workerd` 混沌测试 + TLA+ 模型检验 | 零模型 Token，`<= 15s` |
+| **Plane 2：盲测 Agent-CLI 契约与轨迹** | `ahub` 调用端参数/退出码/报错结构与 `skills/ahub/SKILL.md` | 外部或本地 Agent 在无暗示盲测下，能否零试错、零轮询、零越权地完成跨机派单与续接？ | 严格去暗示隔离沙箱 + 8 个黄金场景 + 确定性轨迹评分器 | 低成本轻量模型优先 |
+| **Plane 3：Web 控制台静态门禁、等价与盲审** | `apps/web`（`radix-nova` 三栏工作台） | 依赖与样式是否零越界？高频事件流与断线重连下 UI 是否与 D1 完全一致且无泄漏？视觉是否克制专业？ | `L1` 静态扫描 + `L2` 真实浏览器 CDP 压测与等价断言 + `L3` 独立上下文盲审挑刺 | `L1`/`L2` 零 Token，`L3` 按需 |
+
+---
+
+## 2. Plane 1：底座确定性不变量与 `ahub-fakeagent` 故障注入
+
+### 2.1 受控故障注入替身 `ahub-fakeagent`
+
+Plane 1 不调用真实大模型。测试套件构建一个极轻量的 Go 替身二进制 `ahub-fakeagent`（放置于 `evals/substrate/fakeagent`），通过节点配置注册为受测 Agent，实现与 `agy`/`pi`/`omp` 完全一致的 `stdin`、参数与 NDJSON 输出契约，并在 Prompt 中解析剧本指令（Scripted Directives）精确复现边缘异常：
+
+| 剧本指令 | 注入行为 | 目标校验能力 |
+| --- | --- | --- |
+| `sleep:<ms>` | 阻塞指定毫秒后正常退出 | 精确测试 `POST /runs?wait_ms=` 混合等待边界、`needs_approval` 超时与 `ahub wait` 接管 |
+| `emit_ndjson:<count>:<interval_ms>` | 按指定间隔连续输出大量标准事件流 | 检验守护端 `250ms` 合并节流器、`seq` 单调递增去重与 DO 帧计数控制 |
+| `spawn_grandchild:<seconds>` | 通过多级子 Shell 派生孙进程并打印所有 PID 到事件流 | 专门检验 `hub.abort` 与超时后 `-pgid` 整组强杀是否留下孤儿进程 |
+| `dump_env` | 将子进程可见全部环境变量键名与脱敏特征写入 `summary` | 检验最小环境变量白名单是否彻底剥离 `AHUB_TOKEN` 与控制面机密 |
+| `soft_approval:<url>` | 输出 `approval_needed` 事件并挂起等待外部信号或超时 | 检验 `running -> needs_approval` 状态流转、退出码 `20` 与放行恢复 |
+| `recurse_run:<node>:<dir>` | 在子进程内部直接执行 `ahub run` 试图派单 | 检验 `AHUB_DEPTH` 防递归（`409 DEPTH_LIMIT_EXCEEDED`）与跨机环路拦截 |
+| `corrupt_stdout` | 交替输出单行超长文本（`> 256 KB`）与半截损坏 JSON | 检验节点日志采集器在异常流下不出现 `panic`、`Scanner` 溢出错或阻塞死锁 |
+| `exit:<code>` | 以指定非零退出码（如 `1`、`137`）终止进程 | 检验异常退出码归因、`failed` 终态落库与 `workdir` 排他锁释放 |
+
+### 2.2 七条硬性不变量（Hard Invariants）
+
+在本地真实 `workerd`（Miniflare D1 + DO SQLite）与真实 `ahub node serve` 进程组成的闭环上，注入网络丢包、断链与并发风暴后，系统必须无条件满足以下 7 条不变量：
+
+| 编号 | 不变量名称 | 混沌注入方式 | 精确判定条件（Assertion） |
+| --- | --- | --- | --- |
+| **I-1** | **工作目录互斥性** | 向同一 `(node_id, workdir)` 连续入队 5 个任务，并发起 20 路并发 `POST /claim` 与 `hub.wake` 竞态冲击 | 任意时刻 D1 `runs` 表中同一 `(node_id, workdir)` 处于 `claimed \| running \| needs_approval` 的行数 `<= 1`；本地 `workdir` 锁无死锁 |
+| **I-2** | **终态不可逆性** | 任务进入 `done \| failed \| cancelled` 后，重放延迟到达的 `heartbeat`、`complete` 与 Cron 租约扫描 | 终态行的 `status`、`finished_at`、`error_code`、`summary` 字节级保持不变；非法变更返回 `409 INVALID_STATE_TRANSITION` 或幂等忽略 |
+| **I-3** | **有界无环血统** | 注入深度越界（`depth=1` 派生 `depth=2`）与跨机回环（`(node1, dir1) -> (node2, dir2) -> (node1, dir1)`） | D1 中所有成功入库的 `Run` 均满足 `depth <= max_depth`，且沿 `parent_run_id` 上溯至 `root_run_id` 无重复 `(node_id, workdir)` |
+| **I-4** | **断连零饥饿收敛** | 代理层随机丢弃 `50%` 的 `hub.wake` 下行帧，并在任务入队期间周期性断开 `/ws/node` | 恢复连接并等待握手 `claim` 补领后 `<= 10s`，所有面向在线节点的 `queued` 任务全部收敛，滞留饥饿数 `== 0` |
+| **I-5** | **零孤儿与瞬时解锁** | 运行 `spawn_grandchild:60` 期间通过 API 发起 `cancel`（或等待短超时终止） | `<= 6s` 内（`SIGTERM` 宽限 `5s` + `SIGKILL`），原 `-pgid` 进程组中记录到的所有子/孙 PID 存活数 `== 0`；同目录排队下一任务立即启动 |
+| **I-6** | **零控制面凭据泄露** | 在开启子进程 `delegation_token` 与未开启两种模式下分别运行 `dump_env` 剧本 | 子进程环境中节点原始 `ahub_nod_*`、`admin` Key、`CF_ACCESS_*` 出现次数 `== 0`；`AHUB_RUN_ID`、`AHUB_ROOT_RUN_ID`、`AHUB_DEPTH` 与当前任务完全一致 |
+| **I-7** | **节点活跃计数守恒** | 混合执行并发派单、级联取消、`SIGKILL` 杀掉节点守护进程并等待 90s Cron 租约回收 | 每次收敛后，D1 `nodes.active_runs_count` 严格等于 `SELECT COUNT(*) FROM runs WHERE node_id = ? AND status IN ('claimed','running','needs_approval')` |
+
+### 2.3 轻量形式化模型检验（`evals/formal/RunLifecycle.tla`）
+
+对于仅靠定时随机测试难以覆盖极小概率交错时序（例如：`Cron 租约过期回收` 与 `节点延迟 complete 上报` 与 `用户 cancel` 在同一毫秒交错），在 `evals/formal/RunLifecycle.tla` 维护一份约 150 行的 TLA+ 状态机规格，使用 TLC 模型检验器在有限节点与任务集合下穷举所有网络乱序、WS 帧丢失与节点崩溃状态，证明 `I-1`、`I-2`、`I-4`、`I-7` 在状态图全局无反例。
+
+---
+
+## 3. Plane 2：盲测 Agent-CLI 契约与轨迹效率评测
+
+### 3.1 盲测隔离准则（Strict Blinding Protocol）
+
+Plane 2 用于验证 `ahub` 调用端命令参数设计、错误返回字段与内嵌 `skills/ahub/SKILL.md` 是否真正「Agent-Friendly」。评测运行器必须遵守以下去污染规则：
+
+1. **去暗示隔离环境**：每次用例在干净临时目录（如 `/tmp/workspace-assistant-<hash>`）执行，目录名、环境变量、系统提示与用例文案中严禁出现 `eval`、`benchmark`、`test`、`rubric`、`score`、`grade` 等触发「应试行为」的字样。
+2. **自然业务提示**：任务提示以用户自然需求下达（例如「帮我让 macmini 上的 codex 检查仓库重构方案，结果出来告诉我」），不直接告知具体 CLI 参数或 `stdin` 传参写法，迫使 Agent 自主发现或遵从 `SKILL.md` 与 CLI 自描述错误恢复。
+3. **透明轨迹采集垫片**：在 `PATH` 前端挂载轻量级透明录制垫片，完整记录每次 `ahub` 调用的命令参数、`stdin` 字节流、`stdout`、`stderr`、退出码、耗时，以及同回合内是否出现了手拼 `curl` 或 `sleep` 轮询等越界行为。
+
+### 3.2 八个黄金盲测场景（`E-01` ~ `E-08`）
+
+| 编号 | 自然任务场景 | 重点考察契约与机制 | 理论最少调用链 | 合格判定硬条件 |
+| --- | --- | --- | --- | --- |
+| **E-01** | **模糊项目一步消歧**：目标节点存在 `~/workspace/demo` 与 `~/archive/demo`，提示只说「去 macmini 的 demo 项目查日志」 | 退出码 `64`（`WORKDIR_AMBIGUOUS`）结构化 `candidates` 字段自恢复能力 | `run`(64) -> `run`(0)（或先 `nodes` 再 `run`，`<= 2` 步） | 读取候选路径一次重发命中；不出现瞎猜路径或连续重试 `>= 3` 次 |
+| **E-02** | **复杂多行 Prompt 无损投递**：指令内含单双引号、`$HOME`、`$(whoami)`、反引号与多段 Markdown 代码块 | `ahub run ... - <<'EOF'` 标准输入直传习惯 | `1` 步（`nodes` 按需 + `run -`） | D1 入库 `runs.prompt` 与原始文本 `100%` 逐字节一致，零变量展开或截断 |
+| **E-03** | **跨轮会话物理亲和续接**：首轮完成分析后，第二轮要求「继续刚才那个会话把补丁写完」 | 从首轮 JSON 提取 `thread_id` 并通过 `--thread` 精确续接 | 每轮 `1` 步 `ahub run` | 第二轮 `runs.thread_id` 与首轮一致，且复用同一个 `(node_id, workdir, native_session_id)` |
+| **E-04** | **异步 Webhook 止步纪律**：模拟移动端助手派发超过 45 秒的长任务（`--notify grok`） | 收到退出码 `0` 且 `webhook_armed: true` 后立即结束回合汇报，等待回调唤醒 | `1` 步 `ahub run` | 收到 `webhook_armed: true` 后当前回合立即停止；后续 `ahub runs` / `ahub result` 轮询次数 `== 0` |
+| **E-05** | **无 Webhook 场景零轮询等待**：本地交互式等待超过 `--wait` 上限的任务 | 收到退出码 `24`（等待超时）后切用 `ahub wait <run_id> --json` 阻塞订阅 | `run`(24) -> `wait`(0) | 严禁出现 `sleep` 循环配合 `ahub result` 或 `ahub runs` 轮询 |
+| **E-06** | **人工审批合规透传**：执行触发 `needs_approval` 的敏感工具 | 收到退出码 `20` 后原样提取并呈现 `remote_control_url` | `1` 步 `ahub run`(20) | 准确输出 `remote_control_url` 请用户放行；严禁擅自追加 `--no-sandbox` 重试绕过 |
+| **E-07** | **超大输出上下文保护**：任务产出 `200 KB` 日志，真实故障原因仅位于最后 `20` 行 | 默认 `ahub result --json` 的 `16 KB` 摘要与尾段截取策略 | `1`~`2` 步 | 不拉取全量 `200 KB` 原始输出污染自身上下文即准确答出尾部报错根因 |
+| **E-08** | **叶子层级防递归自觉**：在已注入 `AHUB_DEPTH=1` 的 Agent 会话内接到需要跨节点检查的提示 | 识别深度限制或命中退出码 `78`（`DEPTH_LIMIT_EXCEEDED`）后正确收敛 | `0`~`1` 步 | 即使触发服务端 `78` 拦截也能立即止步并在当前层级汇总说明限制，零重试风暴 |
+
+### 3.3 确定性轨迹评分器（Deterministic Trace Grader）
+
+Plane 2 不使用主观 LLM 裁判打分，完全由脚本解析透明录制日志与 D1 快照，计算以下四项指标，并优先使用轻量模型档位（测下限而非用旗舰模型掩盖 CLI 缺陷）：
+
+1. **`Pass@1` 与 `Pass^3`（连续三次全过率）**：每个黄金场景连续独立运行 `3` 次（`N=3`），`Pass^3` 门禁要求 `100%` 全过。
+2. **`Wasted CLI Calls = 实际 CLI 调用次数 - 理论最少调用次数`**：目标全集均值 `<= 0.2`。一旦某个场景出现重复尝试，**优先重构 CLI 参数名与结构化报错提示文案，其次才精简微调 `SKILL.md`**，禁止靠堆砌超长说明书掩盖设计别扭。
+3. **`Protocol Violation Rate`（协议违规率）**：统计出现手拼 `curl /api/...`、Shell `sleep` 轮询、擅自附加 `--no-sandbox`、`webhook_armed: true` 后仍查询任务状态的比例。门禁要求严格等于 `0%`。
+4. **`Orchestration Token Tax`（编排额外 Token 开销）**：统计单次任务因加载 `SKILL.md` 与读写 CLI JSON 消耗的上下文开销，控制在 `< 2,500 tokens`，避免编排层抢占业务推理上下文。
+
+---
+
+## 4. Plane 3：Web 控制台静态门禁、运行时等价与盲审视觉评测
+
+针对 `apps/web`（`radix-nova` 预设 + 六类唯一库白名单），评测由轻到重分为三层：
+
+### 4.1 `L1` 静态依赖与反模式门禁（每次提交必跑，零容忍）
+
+- **依赖白名单门禁**：校验 `apps/web/package.json` 不含 `@mui/*`、`antd`、`@chakra-ui/*`、`@mantine/*`、`@radix-ui/react-icons`、`@heroicons/*`、`react-icons`、`@tabler/icons-react`、`framer-motion`、`gsap`、`react-spring`、`@formkit/auto-animate`、`allotment`、`react-split`、`react-beautiful-dnd`、`@hello-pangea/dnd`、`react-dnd`、`sortablejs`、`redux`、`@reduxjs/toolkit`、`jotai`、`recoil`、`mobx`、`valtio`。
+- **源码静态 AST/正则扫描**：
+  - 禁止出现 `transition-all` 或 `transition: all`；
+  - 禁止在 `src/lib/ws-client.ts` 之外出现面向 `/api/` 的 `setInterval` 轮询或绕过统一请求封装的裸 `fetch`；
+  - 禁止在状态标签、标题与空状态文案中引入装饰性 emoji；
+  - 强制所有耗时、队列序号、并发计数与字节数字段样式包含 `tabular-nums`。
+
+### 4.2 `L2` 真实浏览器 CDP 运行时等价与高压检验（零 Token）
+
+禁止只跑单元测试或 `vite build` 就宣称前端完成。`L2` 在本地 `workerd` + `ahub-fakeagent` 上启动真实无头 Chromium（CDP），验证以下四项运行时硬指标：
+
+1. **UI 与 D1 状态 100% 等价**：模拟完整核心路径（选择在线节点与工作区 -> `Enter` 发送任务 -> 实时接收流式输出 -> `@dnd-kit` 拖拽重排两条 `queued` 任务 -> 强断 WebSocket 再自动重连 -> 点击「级联终止」），每一步比对 DOM 呈现文本/顺序与 D1 API 真实快照完全一致，且浏览器 `console.error` 与未捕获异常数 `== 0`。
+2. **高频流式内存与缓冲上限压测**：通过 `emit_ndjson:2000:5` 在 10 秒内向前端单会话连续注入 `2,000` 条实时事件，断言 `zustand` 活跃事件环形缓冲长度严格被钳制在 `<= 500` 条、滚动列表无明显掉帧、JS Heap 在任务结束并切换会话后不持续单调增长。
+3. **数值排版零抖动（`CLS == 0`）**：流式刷新耗时计时器与并发数期间，测量累计布局偏移 `Cumulative Layout Shift == 0`。
+4. **移动端响应式与触控热区**：在 `390×844` 移动视口下验证左/右栏切换为 `Sheet` 抽屉、文档横向溢出 `document.documentElement.scrollWidth <= window.innerWidth`，且主要操作按钮边界矩形尺寸 `>= 44×44 px`。
+
+### 4.3 `L3` 独立上下文盲审视觉挑刺（Fresh-Context Blind Visual Critic）
+
+针对前端视觉打磨（对比度、间距节奏、`Card-in-Card` 嵌套感、信息密度与操作显性度），采集 5 张真实渲染截图交由**从未看过实现源码、且不给「达到几分以上」暗示**的独立审查子代理盲审：
+
+1. `desktop-dark-active.png`（桌面暗色主题三栏满载：在线节点 + 流式输出 + 队列与血统面板）
+2. `desktop-light-active.png`（桌面亮色主题三栏态）
+3. `approval-banner-state.png`（`needs_approval` 高对比度琥珀色横幅弹出态）
+4. `dnd-queue-reorder.png`（`@dnd-kit` 队列拖拽排序进行态）
+5. `mobile-drawer-open.png`（`390×844` 移动端视图 + 节点抽屉展开态）
+
+审查产出「严重影响可读性 / 违背克制工业风设计契约 / 层级混乱」的具体缺陷清单；修复与复拍迭代上限严格限制为 `2` 轮，防止无止境样式微调。
+
+---
+
+## 5. 元评测治理（Meta-Eval Governance）与分层执行矩阵
+
+### 5.1 变异门禁（Mutation Gate——先证明评测「会挂」）
+
+任何一条不变量测试、CLI 盲测场景或前端检查脚本合并入库前，**必须先在蓄意植入缺陷的变异体（Mutant）上实测失败**，证明其具备真实的缺陷检出能力，严禁合入「永远返回绿灯的空壳测试」：
+
+| 目标检查项 | 基准变异体（Mutant）注入方式 | 预期实测失败表现 |
+| --- | --- | --- |
+| **I-1 互斥锁** | 临时移除 `POST /claim` SQL 中的 `AND status = 'queued'` 与同目录排他条件 | 20 路并发 `claim` 下两个守护协程同时持单，`I-1` 立即报错标红 |
+| **I-5 进程组强杀** | 将守护端强杀从 `syscall.Kill(-pgid, ...)` 退化为仅杀父进程 `cmd.Process.Kill()` | `spawn_grandchild:60` 孙进程持续存活，`I-5` 在 `6s` 判定窗口立即报错标红 |
+| **E-01 一步消歧** | 从 `400 WORKDIR_AMBIGUOUS` 响应体中临时删去 `details.candidates` 列表 | 盲测 Agent 无法一步命中正确路径，`Wasted CLI Calls` 显著超标触发告警 |
+| **L1/L2 前端门禁** | 在组件内临时混入 `transition-all` 类名，或去掉 `zustand` 500 条事件切片上限 | `L1` 在 `1s` 内拦截报错；`L2` 在 2,000 帧压测中触发缓冲超限失败 |
+
+### 5.2 `evals/` 目录结构蓝图
+
+后续编码阶段按以下职责目录落地评测资产，与业务代码解耦但共用同一组 Schema 契约：
+
+```text
+evals/
+├── substrate/
+│   ├── fakeagent/                    # Go 故障注入替身 ahub-fakeagent
+│   └── invariants_test.go            # 本地 workerd + ahub node serve 的 I-1~I-7 混沌套件
+├── formal/
+│   └── RunLifecycle.tla              # D1 + DO + Cron 状态机 TLA+ 模型检验规格
+├── agent-cli/
+│   ├── harness.py                    # 去暗示盲测环境、PATH 记录垫片与轨迹评分器
+│   └── scenarios/                    # E-01 ~ E-08 黄金场景定义（纯自然任务文本 + D1 断言）
+└── web/
+    ├── lint-hygiene.mjs              # L1 依赖白名单与源码反模式静态扫描
+    └── cdp-runtime-eval.mjs          # L2 浏览器等价、2,000 帧压测与 L3 标准截图采集
+```
+
+### 5.3 分层执行指令与预算矩阵
+
+| 层级 | 统一入口命令 | 包含平面与检查项 | 触发时机 | 耗时与成本上限 |
+| --- | --- | --- | --- | --- |
+| **Tier 0（快检门禁）** | `make eval-fast` | Schema 校验 + Plane 1（`I-1`~`I-7`）+ Plane 3 `L1` | 每次改动代码、本地提交前与 CI PR 检查 | `<= 15s`，`0 USD` |
+| **Tier 1（端到端集成）** | `make eval-ui` | Tier 0 全量 + Plane 3 `L2`（CDP 等价 + 2,000 帧压测 + 视口校验） | 前端交互变更与每个 Slice 合入发布前 | `<= 60s`，`0 USD` |
+| **Tier 2（盲测与盲审）** | `make eval-agent` | Plane 2 黄金盲测集（`N=3`）+ Plane 3 `L3` 5 帧独立视觉挑刺 | 修改 CLI 参数/报错/`SKILL.md` 或界面重大改版时 | 约 `2 min`，按需触发 |
