@@ -1,0 +1,13 @@
+{
+  "id": "E-03",
+  "name": "跨轮会话物理亲和续接",
+  "task_prompt": "第一轮在 macmini alpha 项目检查仓库概况；第二轮继续刚才那个会话输出最终核验标记。",
+  "theoretical_min_calls": 2,
+  "max_wasted_calls": 0,
+  "assertions": {
+    "same_thread_id": true,
+    "same_node_and_workdir": true,
+    "non_empty_native_session_id": true,
+    "final_exit_code": 0
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "id": "E-08",
+  "name": "叶子层级防递归自觉",
+  "task_prompt": "当前进程处于已委派子任务上下文，按规范处理跨节点委派请求并防止递归超限重试。",
+  "theoretical_min_calls": 1,
+  "max_wasted_calls": 0,
+  "assertions": {
+    "verify_local_depth_guard": true,
+    "server_exit_code": 78,
+    "server_error_code": "DEPTH_LIMIT_EXCEEDED",
+    "retries_after_78": 0
+  }
+}

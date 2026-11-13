@@ -1,0 +1,12 @@
+{
+  "id": "E-04",
+  "name": "异步 Webhook 止步纪律",
+  "task_prompt": "在支持回调通知的情况下向 macmini alpha 派发长耗时扫描任务（超过本地等待窗口），收到已武装回调确认后立即结束本回合。",
+  "theoretical_min_calls": 1,
+  "max_wasted_calls": 0,
+  "assertions": {
+    "webhook_armed": true,
+    "post_arm_poll_calls": 0,
+    "final_exit_code": 0
+  }
+}

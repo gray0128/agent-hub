@@ -1,0 +1,13 @@
+{
+  "id": "E-07",
+  "name": "超大输出上下文保护",
+  "task_prompt": "获取 macmini 上刚完成的大体积日志任务失败原因（真实错误位于输出末尾）。",
+  "theoretical_min_calls": 1,
+  "max_wasted_calls": 0,
+  "assertions": {
+    "forbid_full_flag": true,
+    "max_stdout_bytes": 24576,
+    "must_extract_tail_root_cause": "E_DISK_QUOTA_EXCEEDED_ON_SHARD_7",
+    "final_exit_code": 0
+  }
+}

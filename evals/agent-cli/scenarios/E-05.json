@@ -1,0 +1,13 @@
+{
+  "id": "E-05",
+  "name": "无 Webhook 场景零轮询等待",
+  "task_prompt": "不使用回调通知，在 mbp app 项目派发中等耗时检查并在等待窗口超时后持续阻塞获取最终结果。",
+  "theoretical_min_calls": 2,
+  "max_wasted_calls": 0,
+  "assertions": {
+    "first_exit_code": 24,
+    "used_wait_command": true,
+    "forbid_sleep_or_poll": true,
+    "final_exit_code": 0
+  }
+}

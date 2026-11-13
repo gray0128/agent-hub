@@ -1,0 +1,14 @@
+{
+  "name": "agent-hub",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "eval:schema": "node evals/substrate/validate-schemas.mjs",
+    "eval:web:lint": "node evals/web/lint-hygiene.mjs",
+    "eval:web:cdp": "node evals/web/cdp-runtime-eval.mjs"
+  },
+  "devDependencies": {
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1"
+  }
+}

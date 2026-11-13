@@ -1,0 +1,266 @@
+import { type ApiScope, type AuthPrincipal, type Env, HubError } from "./types";
+import { constantTimeEqual, nowIso, sha256Hex } from "./ulid";
+
+interface JwkWithKid extends JsonWebKey {
+  kid?: string;
+}
+
+interface JwksResponse {
+  keys: JwkWithKid[];
+}
+
+interface AccessJwtPayload {
+  aud?: string | string[];
+  exp?: number;
+  nbf?: number;
+  iss?: string;
+  email?: string;
+  sub?: string;
+}
+
+const jwksCache = new Map<string, { fetchedAt: number; keys: JwkWithKid[] }>();
+
+function decodeBase64Url(input: string): Uint8Array {
+  const padded = input.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (input.length % 4)) % 4);
+  const bin = atob(padded);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) {
+    out[i] = bin.charCodeAt(i);
+  }
+  return out;
+}
+
+async function getAccessCerts(teamDomain: string): Promise<JwkWithKid[]> {
+  const cached = jwksCache.get(teamDomain);
+  if (cached && Date.now() - cached.fetchedAt < 300_000) {
+    return cached.keys;
+  }
+  const base = teamDomain.startsWith("https://") ? teamDomain : `https://${teamDomain}`;
+  const resp = await fetch(`${base.replace(/\/+$/, "")}/cdn-cgi/access/certs`);
+  if (!resp.ok) {
+    throw new HubError(401, "UNAUTHORIZED", "Failed to fetch Cloudflare Access JWKS.");
+  }
+  const data = (await resp.json()) as JwksResponse;
+  const keys = Array.isArray(data.keys) ? data.keys : [];
+  jwksCache.set(teamDomain, { fetchedAt: Date.now(), keys });
+  return keys;
+}
+
+async function verifyAccessJwt(token: string, env: Env): Promise<AuthPrincipal> {
+  const teamDomain = env.CF_ACCESS_TEAM_DOMAIN?.trim();
+  const expectedAud = env.CF_ACCESS_AUD?.trim();
+  if (!teamDomain || !expectedAud) {
+    throw new HubError(401, "UNAUTHORIZED", "Cloudflare Access JWT verification is not configured.");
+  }
+  const parts = token.split(".");
+  if (parts.length !== 3) {
+    throw new HubError(401, "UNAUTHORIZED", "Malformed Cloudflare Access JWT.");
+  }
+  const [headerB64, payloadB64, sigB64] = parts as [string, string, string];
+  let header: { kid?: string; alg?: string };
+  let payload: AccessJwtPayload;
+  try {
+    header = JSON.parse(new TextDecoder().decode(decodeBase64Url(headerB64))) as {
+      kid?: string;
+      alg?: string;
+    };
+    payload = JSON.parse(new TextDecoder().decode(decodeBase64Url(payloadB64))) as AccessJwtPayload;
+  } catch {
+    throw new HubError(401, "UNAUTHORIZED", "Invalid Cloudflare Access JWT encoding.");
+  }
+  if (header.alg !== "RS256" || !header.kid) {
+    throw new HubError(401, "UNAUTHORIZED", "Unsupported Cloudflare Access JWT algorithm.");
+  }
+
+  const keys = await getAccessCerts(teamDomain);
+  const jwk = keys.find((k) => k.kid === header.kid);
+  if (!jwk) {
+    throw new HubError(401, "UNAUTHORIZED", "Matching Access signing key not found.");
+  }
+
+  const cryptoKey = await crypto.subtle.importKey(
+    "jwk",
+    jwk,
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["verify"]
+  );
+  const verified = await crypto.subtle.verify(
+    "RSASSA-PKCS1-v1_5",
+    cryptoKey,
+    decodeBase64Url(sigB64),
+    new TextEncoder().encode(`${headerB64}.${payloadB64}`)
+  );
+  if (!verified) {
+    throw new HubError(401, "UNAUTHORIZED", "Cloudflare Access JWT signature invalid.");
+  }
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (typeof payload.exp !== "number" || payload.exp <= nowSec) {
+    throw new HubError(401, "UNAUTHORIZED", "Cloudflare Access JWT expired.");
+  }
+  if (typeof payload.nbf === "number" && payload.nbf > nowSec + 60) {
+    throw new HubError(401, "UNAUTHORIZED", "Cloudflare Access JWT not yet valid.");
+  }
+  const audList = Array.isArray(payload.aud)
+    ? payload.aud
+    : typeof payload.aud === "string"
+      ? [payload.aud]
+      : [];
+  if (!audList.includes(expectedAud)) {
+    throw new HubError(401, "UNAUTHORIZED", "Cloudflare Access JWT audience mismatch.");
+  }
+
+  return {
+    kind: "access_jwt",
+    keyId: null,
+    scope: "admin",
+    boundNodeId: null,
+    allowedNodes: [],
+    allowUnsandboxed: true,
+    maxDepthLimit: 3
+  };
+}
+
+function extractBearerToken(request: Request, allowWsProtocolToken: boolean): string | null {
+  const authHeader = request.headers.get("Authorization");
+  if (authHeader) {
+    const match = /^Bearer\s+(.+)$/i.exec(authHeader.trim());
+    if (match?.[1]) {
+      return match[1].trim();
+    }
+  }
+  if (allowWsProtocolToken) {
+    const protoHeader = request.headers.get("Sec-WebSocket-Protocol");
+    if (protoHeader) {
+      const parts = protoHeader.split(",").map((p) => p.trim());
+      for (let i = 0; i < parts.length - 1; i++) {
+        if (parts[i]?.toLowerCase() === "bearer" && parts[i + 1]) {
+          return parts[i + 1]!;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+export async function authenticateRequest(
+  request: Request,
+  env: Env,
+  ctx?: ExecutionContext,
+  allowWsProtocolToken = false
+): Promise<AuthPrincipal> {
+  const accessJwt = request.headers.get("Cf-Access-Jwt-Assertion");
+  if (accessJwt) {
+    return verifyAccessJwt(accessJwt.trim(), env);
+  }
+
+  const token = extractBearerToken(request, allowWsProtocolToken);
+  if (!token) {
+    throw new HubError(401, "UNAUTHORIZED", "Missing authentication token.");
+  }
+
+  const digest = await sha256Hex(token);
+  const bootstrapHash = env.BOOTSTRAP_ADMIN_TOKEN_SHA256?.trim().toLowerCase();
+  if (bootstrapHash && constantTimeEqual(digest, bootstrapHash)) {
+    return {
+      kind: "bootstrap_admin",
+      keyId: null,
+      scope: "admin",
+      boundNodeId: null,
+      allowedNodes: [],
+      allowUnsandboxed: true,
+      maxDepthLimit: 3
+    };
+  }
+
+  const row = await env.DB.prepare(
+    `SELECT id, scope, bound_node_id, allowed_nodes_json, allow_unsandboxed, max_depth_limit, revoked_at
+     FROM api_keys
+     WHERE key_sha256 = ?1
+     LIMIT 1`
+  )
+    .bind(digest)
+    .first<{
+      id: string;
+      scope: ApiScope;
+      bound_node_id: string | null;
+      allowed_nodes_json: string;
+      allow_unsandboxed: number;
+      max_depth_limit: number;
+      revoked_at: string | null;
+    }>();
+
+  if (!row || row.revoked_at !== null) {
+    throw new HubError(401, "UNAUTHORIZED", "Invalid or revoked API token.");
+  }
+
+  let allowedNodes: string[] = [];
+  try {
+    const parsed = JSON.parse(row.allowed_nodes_json);
+    if (Array.isArray(parsed)) {
+      allowedNodes = parsed.filter((x): x is string => typeof x === "string");
+    }
+  } catch {
+    allowedNodes = [];
+  }
+
+  const updateTouch = env.DB.prepare(`UPDATE api_keys SET last_used_at = ?1 WHERE id = ?2`)
+    .bind(nowIso(), row.id)
+    .run()
+    .catch(() => undefined);
+  if (ctx) {
+    ctx.waitUntil(updateTouch);
+  }
+
+  return {
+    kind: "api_key",
+    keyId: row.id,
+    scope: row.scope,
+    boundNodeId: row.bound_node_id,
+    allowedNodes,
+    allowUnsandboxed: row.allow_unsandboxed === 1,
+    maxDepthLimit: row.max_depth_limit
+  };
+}
+
+export function requireScope(principal: AuthPrincipal, allowed: readonly ApiScope[]): void {
+  if (!allowed.includes(principal.scope)) {
+    throw new HubError(
+      403,
+      "FORBIDDEN_SCOPE",
+      `Scope '${principal.scope}' is not permitted for this operation.`
+    );
+  }
+}
+
+export function ensureNodeAllowedForClient(principal: AuthPrincipal, nodeId: string): void {
+  if (principal.scope === "admin") return;
+  if (principal.scope !== "client") {
+    throw new HubError(403, "FORBIDDEN_SCOPE", "Node token cannot perform client operations.");
+  }
+  if (principal.allowedNodes.length > 0 && !principal.allowedNodes.includes(nodeId)) {
+    throw new HubError(
+      403,
+      "FORBIDDEN_SCOPE",
+      `Client key is not permitted to target node '${nodeId}'.`
+    );
+  }
+}
+
+export function ensureRunAccessible(
+  principal: AuthPrincipal,
+  run: { created_by_key_id: string | null; node_id: string }
+): void {
+  if (principal.scope === "admin") return;
+  if (principal.scope === "node") {
+    if (principal.boundNodeId !== run.node_id) {
+      throw new HubError(403, "FORBIDDEN_SCOPE", "Node key cannot access another node's run.");
+    }
+    return;
+  }
+  ensureNodeAllowedForClient(principal, run.node_id);
+  if (run.created_by_key_id !== principal.keyId) {
+    throw new HubError(403, "FORBIDDEN_SCOPE", "Client key cannot access runs created by another key.");
+  }
+}

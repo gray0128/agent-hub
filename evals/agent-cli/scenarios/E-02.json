@@ -1,0 +1,12 @@
+{
+  "id": "E-02",
+  "name": "复杂多行 Prompt 无损投递",
+  "task_prompt": "请在 macmini 的 alpha 项目检查以下环境变量与代码片段（保持字面文本原样传入）：\n'single quotes' \"double quotes\" $HOME $(whoami) `uname -a`\n```sh\necho \"$AHUB_TOKEN\" && ls -la /tmp\n```",
+  "theoretical_min_calls": 1,
+  "max_wasted_calls": 0,
+  "assertions": {
+    "must_use_stdin_dash": true,
+    "byte_exact_d1_prompt": true,
+    "final_exit_code": 0
+  }
+}

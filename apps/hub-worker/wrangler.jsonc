@@ -1,0 +1,75 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "agent-hub",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-11-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "routes": [
+    {
+      "pattern": "ahub.bobocai.win",
+      "zone_name": "bobocai.win",
+      "custom_domain": true
+    }
+  ],
+  "assets": {
+    "directory": "../web/dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/ws/*", "/dl/*", "/skill/*"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "agent-hub-db",
+      "database_id": "f97822b3-559a-4675-8118-edc3cbb388c2",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "NODE_HUB",
+        "class_name": "NodeHub"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["NodeHub"]
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "NOTIFY_QUEUE",
+        "queue": "ahub-outbound-notify"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "ahub-outbound-notify",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5,
+        "max_retries": 5,
+        "dead_letter_queue": "ahub-outbound-notify-dlq"
+      }
+    ]
+  },
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
+  "rules": [
+    {
+      "type": "Text",
+      "globs": ["**/*.md", "**/*.sh"],
+      "fallthrough": false
+    }
+  ],
+  "vars": {
+    "HUB_PUBLIC_URL": "https://ahub.bobocai.win",
+    "DEFAULT_MAX_DEPTH": "1",
+    "LEASE_TTL_SECONDS": "90",
+    "RELEASE_BASE_URL": "https://github.com/gray0128/agent-hub/releases/latest/download"
+  }
+}

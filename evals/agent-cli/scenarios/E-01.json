@@ -1,0 +1,14 @@
+{
+  "id": "E-01",
+  "name": "模糊项目一步消歧",
+  "task_prompt": "去 macmini 节点的 demo 项目排查构建日志，只汇报最终状态。",
+  "theoretical_min_calls": 2,
+  "max_wasted_calls": 0,
+  "assertions": {
+    "first_exit_code": 64,
+    "first_error_code": "WORKDIR_AMBIGUOUS",
+    "requires_candidates": true,
+    "final_exit_code": 0,
+    "must_reach_d1_status": "done"
+  }
+}

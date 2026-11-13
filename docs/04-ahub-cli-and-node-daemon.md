@@ -123,7 +123,7 @@ skills/ahub/SKILL.md             # 通过 go:embed 内嵌于二进制中
 | `agy` | `agy -p --output-format json [--sandbox] [--model <m>] [--effort <e>] [--print-timeout <t>] <prompt>` | `--conversation <native_session_id>` | 解析单对象 JSON 提取 `status`、`conversation_id`、`response`、`error`；**严禁采信返回的累计耗时，必须由 Go 守护端 `time.Since(startedAt)` 单调计时**；当 `status == "NEEDS_HUMAN_APPROVAL"` 时自动巡检/拉起远控守护并回填 `remote_control_url` |
 | `pi` | `pi --mode json -p --approve [--model <m>] [--thinking <e>] <prompt>` | `--session <native_session_id>` | 逐行解析 v3 NDJSON 事件流：从 `session` 帧提取会话 ID，从 `turn_end` 提取实际命中 `provider/model` 与思考等级，从 `agent_end` 提取最终文本输出，并将关键工具事件实时映射为 `run.event` 推往云端 |
 | `omp` | `omp --mode=json -p --auto-approve --max-time=<t> [--model=<m>] [--thinking=<e>] <prompt>` | `--resume=<native_session_id>` | 同上，逐行解析 v3 NDJSON 事件流并实时推送 `run.event` |
-| `codex` / `claude` | 各自非交互 JSON 模式（`codex exec --json` / `claude -p --output-format json`） | `--resume <id>` / `--session-id <id>` | 提取标准输出文本与会话 ID，实现多引擎统一抽象 |
+| `codex` / `claude` | 各自非交互 JSON 模式（`codex exec --json` / `claude -p --output-format json`） | `codex exec resume --json <native_session_id> -` / `--session-id <id>` | 提取标准输出文本与会话 ID，实现多引擎统一抽象 |
 
 #### 模型简称与思考强度映射表
 
@@ -190,5 +190,6 @@ Use the `ahub` CLI as the sole interface to `agent-hub`. Do not hand-craft HTTP 
    - Exit `24` (local wait timed out without `--notify`): Call `ahub wait <run_id> --timeout 15m --json` to keep waiting over WebSocket.
    - Exit `20` (`status: "needs_approval"`): Immediately surface `remote_control_url` to the user for human approval.
    - Exit `64` (`WORKDIR_AMBIGUOUS`): Re-run using one of the exact paths returned in `error.details.candidates`.
-   - Exit `10` or `78`: Report `error.code` and `error.message`; do not blindly retry on `DEPTH_LIMIT_EXCEEDED` or `DELEGATION_CYCLE_DETECTED`.
+   - Exit `10` (`status: "failed"`): Read `error_code` and `error_message` on the run record.
+   - Exit `78`: Read `error.code` and `error.message`; do not blindly retry on `DEPTH_LIMIT_EXCEEDED`, `DELEGATION_CYCLE_DETECTED`, or `FORBIDDEN_SCOPE`.
 ```

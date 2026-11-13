@@ -1,0 +1,728 @@
+#!/usr/bin/env node
+import { execFileSync, spawn } from "node:child_process";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import net from "node:net";
+import os from "node:os";
+import path from "node:path";
+
+const repoRoot = path.resolve(import.meta.dirname, "../..");
+const workerDir = path.join(repoRoot, "apps", "hub-worker");
+const ahubBin = path.join(repoRoot, "bin", "ahub");
+const fakeAgentBin = path.join(repoRoot, "bin", "ahub-fakeagent");
+const screenshotDir = path.join(repoRoot, "evals", "artifacts", "screenshots");
+
+const chromeCandidates = [
+  process.env.AHUB_CHROME_BIN,
+  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+  "/usr/bin/google-chrome",
+  "/usr/bin/chromium"
+].filter(Boolean);
+
+const chromeBin = chromeCandidates.find((p) => fs.existsSync(p));
+if (!chromeBin) {
+  console.error("Chrome binary not found for CDP runtime eval");
+  process.exit(1);
+}
+if (!fs.existsSync(ahubBin) || !fs.existsSync(fakeAgentBin)) {
+  console.error("Missing bin/ahub or bin/ahub-fakeagent (run make build-go build-fakeagent)");
+  process.exit(1);
+}
+
+function getFreePort() {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.listen(0, "127.0.0.1", () => {
+      const addr = srv.address();
+      srv.close((err) => (err ? reject(err) : resolve(addr.port)));
+    });
+  });
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function killGroup(child) {
+  if (!child || child.exitCode !== null) return;
+  try {
+    process.kill(-child.pid, "SIGKILL");
+  } catch {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // already gone
+    }
+  }
+}
+
+async function waitForHttp(url, headers = {}, timeoutMs = 20000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(url, { headers });
+      if (res.ok) return res;
+    } catch {
+      // retry
+    }
+    await sleep(200);
+  }
+  throw new Error(`Timeout waiting for ${url}`);
+}
+
+class CDPClient {
+  constructor(wsUrl) {
+    this.ws = new WebSocket(wsUrl);
+    this.nextId = 1;
+    this.pending = new Map();
+    this.consoleErrors = [];
+    this.exceptions = [];
+    this.opened = new Promise((resolve, reject) => {
+      this.ws.addEventListener("open", () => resolve());
+      this.ws.addEventListener("error", (e) => reject(e));
+    });
+    this.ws.addEventListener("message", (evt) => {
+      const msg = JSON.parse(String(evt.data));
+      if (msg.id && this.pending.has(msg.id)) {
+        const { resolve, reject } = this.pending.get(msg.id);
+        this.pending.delete(msg.id);
+        if (msg.error) reject(new Error(`${msg.error.code}: ${msg.error.message}`));
+        else resolve(msg.result);
+        return;
+      }
+      if (msg.method === "Runtime.consoleAPICalled") {
+        const type = msg.params?.type;
+        if (type === "error") {
+          const text = (msg.params.args ?? []).map((a) => a.value ?? a.description ?? "").join(" ");
+          this.consoleErrors.push(text);
+        }
+      } else if (msg.method === "Runtime.exceptionThrown") {
+        const details = msg.params?.exceptionDetails;
+        this.exceptions.push(details?.exception?.description ?? details?.text ?? "Unknown exception");
+      }
+    });
+  }
+
+  async connect() {
+    await this.opened;
+    await this.send("Page.enable");
+    await this.send("Runtime.enable");
+    await this.send("DOM.enable");
+  }
+
+  send(method, params = {}) {
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject });
+      this.ws.send(JSON.stringify({ id, method, params }));
+    });
+  }
+
+  async evalJS(expression) {
+    const res = await this.send("Runtime.evaluate", {
+      expression,
+      awaitPromise: true,
+      returnByValue: true
+    });
+    if (res.exceptionDetails) {
+      throw new Error(
+        res.exceptionDetails.exception?.description ?? res.exceptionDetails.text ?? "Eval error"
+      );
+    }
+    return res.result?.value;
+  }
+
+  async getCenter(selector) {
+    const box = await this.evalJS(`
+      (() => {
+        const el = document.querySelector(${JSON.stringify(selector)});
+        if (!el) return null;
+        el.scrollIntoView({ block: "center", inline: "nearest" });
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) return null;
+        return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+      })()
+    `);
+    if (!box) throw new Error(`Element not clickable or invisible: ${selector}`);
+    return box;
+  }
+
+  async clickSelector(selector) {
+    const { x, y } = await this.getCenter(selector);
+    await this.send("Input.dispatchMouseEvent", {
+      type: "mouseMoved",
+      x,
+      y,
+      button: "none",
+      clickCount: 0
+    });
+    await this.send("Input.dispatchMouseEvent", {
+      type: "mousePressed",
+      x,
+      y,
+      button: "left",
+      clickCount: 1
+    });
+    await this.send("Input.dispatchMouseEvent", {
+      type: "mouseReleased",
+      x,
+      y,
+      button: "left",
+      clickCount: 1
+    });
+  }
+
+  async dragBetween(fromSelector, toSelector) {
+    const from = await this.getCenter(fromSelector);
+    const to = await this.getCenter(toSelector);
+    await this.send("Input.dispatchMouseEvent", {
+      type: "mouseMoved",
+      x: from.x,
+      y: from.y,
+      button: "none"
+    });
+    await this.send("Input.dispatchMouseEvent", {
+      type: "mousePressed",
+      x: from.x,
+      y: from.y,
+      button: "left",
+      clickCount: 1
+    });
+    const steps = 12;
+    for (let i = 1; i <= steps; i++) {
+      const x = from.x + ((to.x - from.x) * i) / steps;
+      const y = from.y + ((to.y - from.y) * i) / steps;
+      await this.send("Input.dispatchMouseEvent", {
+        type: "mouseMoved",
+        x,
+        y,
+        button: "left",
+        buttons: 1
+      });
+      await sleep(25);
+    }
+    await this.send("Input.dispatchMouseEvent", {
+      type: "mouseReleased",
+      x: to.x,
+      y: to.y,
+      button: "left",
+      clickCount: 1
+    });
+  }
+
+  async typeAndPressEnter(selector, text) {
+    await this.clickSelector(selector);
+    await this.evalJS(`document.querySelector(${JSON.stringify(selector)})?.focus()`);
+    await this.send("Input.insertText", { text });
+    await sleep(150);
+    await this.send("Input.dispatchKeyEvent", {
+      type: "keyDown",
+      key: "Enter",
+      code: "Enter",
+      windowsVirtualKeyCode: 13,
+      nativeVirtualKeyCode: 13
+    });
+    await this.send("Input.dispatchKeyEvent", {
+      type: "keyUp",
+      key: "Enter",
+      code: "Enter",
+      windowsVirtualKeyCode: 13,
+      nativeVirtualKeyCode: 13
+    });
+  }
+
+  async setViewport(width, height, mobile = false) {
+    await this.send("Emulation.setDeviceMetricsOverride", {
+      width,
+      height,
+      deviceScaleFactor: 2,
+      mobile
+    });
+  }
+
+  async screenshot(outPath) {
+    const res = await this.send("Page.captureScreenshot", { format: "png" });
+    fs.writeFileSync(outPath, Buffer.from(res.data, "base64"));
+  }
+
+  close() {
+    try {
+      this.ws.close();
+    } catch {
+      // ignore
+    }
+  }
+}
+
+async function apiJson(hubUrl, token, reqPath, init = {}) {
+  const res = await fetch(`${hubUrl}${reqPath}`, {
+    ...init,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      ...(init.body ? { "Content-Type": "application/json" } : {}),
+      ...(init.headers ?? {})
+    }
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(`${reqPath} -> ${res.status}: ${JSON.stringify(data)}`);
+  }
+  return data;
+}
+
+const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ahub-cdp-eval-"));
+const children = [];
+let cdpClient = null;
+
+try {
+  fs.mkdirSync(screenshotDir, { recursive: true });
+  // Remove any legacy 01-*..05-* filenames so screenshot dir matches spec cleanly
+  for (const name of fs.readdirSync(screenshotDir)) {
+    if (/^0\d-.*\.png$/.test(name)) {
+      fs.unlinkSync(path.join(screenshotDir, name));
+    }
+  }
+
+  const d1Dir = path.join(tmpDir, "d1");
+  const cfgDir = path.join(tmpDir, "ahub-cfg");
+  const chromeProfileDir = path.join(tmpDir, "chrome-profile");
+  const wsAlpha = path.join(tmpDir, "workspaces", "repo-alpha");
+  const wsBeta = path.join(tmpDir, "workspaces", "repo-beta");
+  const wsMbp = path.join(tmpDir, "workspaces-mbp", "repo-web");
+  for (const dir of [d1Dir, cfgDir, chromeProfileDir, wsAlpha, wsBeta, wsMbp]) {
+    fs.mkdirSync(path.join(dir, ".git"), { recursive: true });
+    if (dir.includes("workspaces")) {
+      fs.writeFileSync(path.join(dir, ".git", "HEAD"), "ref: refs/heads/main\n");
+    }
+  }
+
+  const adminToken = "ahub_adm_cdp_eval_bootstrap_token_9988";
+  const adminSha = crypto.createHash("sha256").update(adminToken).digest("hex");
+
+  execFileSync(
+    "pnpm",
+    ["exec", "wrangler", "d1", "migrations", "apply", "DB", "--local", "--persist-to", d1Dir],
+    { cwd: workerDir, env: { ...process.env, CI: "1" }, stdio: "pipe" }
+  );
+
+  const hubPort = await getFreePort();
+  const cdpPort = await getFreePort();
+  const hubUrl = `http://127.0.0.1:${hubPort}`;
+
+  const wranglerProc = spawn(
+    "pnpm",
+    [
+      "exec",
+      "wrangler",
+      "dev",
+      "--local",
+      "--port",
+      String(hubPort),
+      "--inspector-port",
+      "0",
+      "--persist-to",
+      d1Dir,
+      "--show-interactive-dev-session=false",
+      "--var",
+      `BOOTSTRAP_ADMIN_TOKEN_SHA256:${adminSha}`,
+      "--var",
+      `HUB_PUBLIC_URL:${hubUrl}`,
+      "--var",
+      "LEASE_TTL_SECONDS:30"
+    ],
+    {
+      cwd: workerDir,
+      env: { ...process.env, CI: "1" },
+      detached: true,
+      stdio: ["ignore", "pipe", "pipe"]
+    }
+  );
+  children.push(wranglerProc);
+
+  await waitForHttp(`${hubUrl}/api/v1/nodes`, { Authorization: `Bearer ${adminToken}` }, 25000);
+
+  const macKey = await apiJson(hubUrl, adminToken, "/api/v1/keys", {
+    method: "POST",
+    body: JSON.stringify({ name: "node-macmini", scope: "node", bound_node_id: "macmini" })
+  });
+  const mbpKey = await apiJson(hubUrl, adminToken, "/api/v1/keys", {
+    method: "POST",
+    body: JSON.stringify({ name: "node-mbp", scope: "node", bound_node_id: "mbp" })
+  });
+
+  function startNodeDaemon(nodeId, token, rootPath, maxConcurrency) {
+    const cfgPath = path.join(tmpDir, `node-${nodeId}.json`);
+    fs.writeFileSync(
+      cfgPath,
+      JSON.stringify({
+        node_id: nodeId,
+        display_name: nodeId,
+        hub_url: hubUrl,
+        token,
+        max_concurrency: maxConcurrency,
+        heartbeat_interval_sec: 1,
+        project_roots: [rootPath],
+        skip_dirs: ["node_modules", ".git"],
+        agents: {
+          agy: { enabled: true, command: fakeAgentBin },
+          pi: { enabled: true, command: fakeAgentBin }
+        }
+      })
+    );
+    const proc = spawn(ahubBin, ["node", "serve", "--config", cfgPath], {
+      env: { ...process.env, AHUB_CONFIG_DIR: cfgDir },
+      detached: true,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    children.push(proc);
+  }
+
+  startNodeDaemon("macmini", macKey.token, path.join(tmpDir, "workspaces"), 1);
+  startNodeDaemon("mbp", mbpKey.token, path.join(tmpDir, "workspaces-mbp"), 2);
+
+  for (let i = 0; i < 40; i++) {
+    const res = await apiJson(hubUrl, adminToken, "/api/v1/nodes");
+    const online = res.nodes.filter((n) => n.status === "online").map((n) => n.id);
+    if (online.includes("macmini") && online.includes("mbp")) break;
+    if (i === 39) throw new Error(`Nodes failed to come online: ${JSON.stringify(res.nodes)}`);
+    await sleep(250);
+  }
+
+  // Seed thread 1 on macmini (events + Markdown output)
+  const doneRunRes = await apiJson(hubUrl, adminToken, "/api/v1/runs?wait_ms=0", {
+    method: "POST",
+    body: JSON.stringify({
+      node_id: "macmini",
+      workdir: wsAlpha,
+      agent: "agy",
+      title: "D1 与 WebSocket 压测线程",
+      prompt: JSON.stringify({
+        summary: "已完成 40 条基线事件与契约校验",
+        response: "## 巡检结论\n\n- 工作区索引与分支状态一致\n- 环形事件缓冲限制生效 (`<= 500`)\n- REST 补水与流式增量同步完整",
+        directives: [{ op: "emit_ndjson", count: 40, kind: "tool_use" }]
+      })
+    })
+  });
+  const doneRunId = doneRunRes.run.id;
+  for (let i = 0; i < 40; i++) {
+    const r = await apiJson(hubUrl, adminToken, `/api/v1/runs/${doneRunId}`);
+    if (r.run.status === "done") break;
+    if (i === 39) throw new Error("Seeded done run did not finish");
+    await sleep(200);
+  }
+
+  // Seed thread 2 on mbp
+  await apiJson(hubUrl, adminToken, "/api/v1/runs?wait_ms=0", {
+    method: "POST",
+    body: JSON.stringify({
+      node_id: "mbp",
+      workdir: wsMbp,
+      agent: "pi",
+      title: "前端视觉与主题基准",
+      prompt: JSON.stringify({
+        summary: "完成 radix-nova 浅色/深色 Token 校验",
+        response: "前端构建产物已就绪，WebSocket 实时流在线。",
+        directives: [{ op: "emit_ndjson", count: 3, kind: "status" }]
+      })
+    })
+  });
+
+  const chromeProc = spawn(
+    chromeBin,
+    [
+      "--headless=new",
+      "--disable-gpu",
+      "--no-first-run",
+      "--no-default-browser-check",
+      `--user-data-dir=${chromeProfileDir}`,
+      `--remote-debugging-port=${cdpPort}`,
+      "--window-size=1440,900",
+      "about:blank"
+    ],
+    { detached: true, stdio: ["ignore", "pipe", "pipe"] }
+  );
+  children.push(chromeProc);
+
+  await waitForHttp(`http://127.0.0.1:${cdpPort}/json/version`, {}, 15000);
+  const targets = await (await fetch(`http://127.0.0.1:${cdpPort}/json/list`)).json();
+  const pageTarget = targets.find((t) => t.type === "page") ?? targets[0];
+  cdpClient = new CDPClient(pageTarget.webSocketDebuggerUrl);
+  await cdpClient.connect();
+  await cdpClient.setViewport(1440, 900, false);
+
+  await cdpClient.send("Page.addScriptToEvaluateOnNewDocument", {
+    source: `
+      window.__AHUB_CLS__ = 0;
+      window.__AHUB_CLS_SOURCES__ = [];
+      new PerformanceObserver((list) => {
+        for (const entry of list.getEntries()) {
+          if (!entry.hadRecentInput) {
+            window.__AHUB_CLS__ += entry.value;
+            window.__AHUB_CLS_SOURCES__.push({
+              value: entry.value,
+              nodes: (entry.sources || []).map(s => s.node ? (s.node.tagName + '#' + s.node.id + '.' + (s.node.className || '')) : 'null')
+            });
+          }
+        }
+      }).observe({ type: "layout-shift", buffered: true });
+    `
+  });
+
+  await cdpClient.send("Page.navigate", { url: `${hubUrl}/?token=${adminToken}` });
+
+  let state = null;
+  for (let i = 0; i < 40; i++) {
+    state = await cdpClient.evalJS(`
+      (() => {
+        const s = window.__AHUB_EVAL__?.getState();
+        if (!s || s.nodes.length < 2 || s.threads.length < 2 || s.streamStatus !== "connected") return null;
+        return s;
+      })()
+    `);
+    if (state) break;
+    await sleep(250);
+  }
+  if (!state) throw new Error("UI did not hydrate and connect WebSocket in time");
+
+  // Select doneRunRes thread via real user mouse click
+  await cdpClient.clickSelector(`[data-testid="thread-item-${doneRunRes.run.thread_id}"] button:nth-of-type(2)`);
+  await sleep(300);
+
+  // Also test real Composer Enter submit with natural Chinese prompt
+  await cdpClient.typeAndPressEnter(
+    'textarea[placeholder*="输入任务指令"]',
+    "请核查 macmini repo-alpha 最近构建记录"
+  );
+  for (let i = 0; i < 40; i++) {
+    const runsNow = await cdpClient.evalJS(`window.__AHUB_EVAL__.getState().runs`);
+    const latestForThread = runsNow.find((r) => r.thread_id === doneRunRes.run.thread_id && r.id !== doneRunId);
+    if (latestForThread && latestForThread.status === "done") {
+      break;
+    }
+    if (i === 39) {
+      const dbg = await cdpClient.evalJS(`({ s: window.__AHUB_EVAL__.getState().selectedThreadId, v: document.querySelector('textarea')?.value })`);
+      throw new Error(`Composer Enter-submitted run did not complete via WS: dbg=${JSON.stringify(dbg)} runs=${JSON.stringify(runsNow.map(r => [r.id, r.thread_id, r.status]))}`);
+    }
+    await sleep(200);
+  }
+  await sleep(250);
+
+  // Verify UI == D1 parity
+  state = await cdpClient.evalJS(`window.__AHUB_EVAL__.getState()`);
+  const d1Nodes = (await apiJson(hubUrl, adminToken, "/api/v1/nodes")).nodes;
+  const d1Threads = (await apiJson(hubUrl, adminToken, "/api/v1/threads")).threads;
+  const d1Runs = (await apiJson(hubUrl, adminToken, "/api/v1/runs?limit=200")).runs;
+  if (
+    state.nodes.length !== d1Nodes.length ||
+    state.threads.length !== d1Threads.length ||
+    state.runs.length !== d1Runs.length
+  ) {
+    throw new Error(
+      `UI!=D1 parity mismatch: nodes(${state.nodes.length}/${d1Nodes.length}) threads(${state.threads.length}/${d1Threads.length}) runs(${state.runs.length}/${d1Runs.length})`
+    );
+  }
+
+  // Screenshot 1: desktop-dark-active.png
+  await cdpClient.screenshot(path.join(screenshotDir, "desktop-dark-active.png"));
+
+  // Flood 2000 events and measure streaming CLS (must equal 0) + ring buffer cap (== 500)
+  await cdpClient.evalJS(`window.__AHUB_CLS__ = 0; window.__AHUB_CLS_SOURCES__ = [];`);
+  const floodRes = await apiJson(hubUrl, adminToken, "/api/v1/runs?wait_ms=0", {
+    method: "POST",
+    body: JSON.stringify({
+      thread_id: doneRunRes.run.thread_id,
+      node_id: "macmini",
+      workdir: wsAlpha,
+      agent: "agy",
+      prompt: JSON.stringify({
+        summary: "2000 条流式事件压测完成",
+        response: "2000 条实时事件已推送并由前端环形缓冲截断保留最新 500 条。",
+        directives: [{ op: "emit_ndjson", count: 2000, kind: "tool_use" }]
+      })
+    })
+  });
+  const floodRunId = floodRes.run.id;
+
+  let floodCount = 0;
+  for (let i = 0; i < 60; i++) {
+    const r = await apiJson(hubUrl, adminToken, `/api/v1/runs/${floodRunId}`);
+    if (r.run.status === "done") {
+      await sleep(350);
+      floodCount = await cdpClient.evalJS(`window.__AHUB_EVAL__.getState().eventsByRunId["${floodRunId}"]?.length ?? 0`);
+      break;
+    }
+    await sleep(250);
+  }
+  if (floodCount !== 500) {
+    throw new Error(`Expected ring buffer capped strictly at 500 after 2000 events, got ${floodCount}`);
+  }
+  const domEventRows = await cdpClient.evalJS(`document.querySelectorAll('[data-testid="event-row"]').length`);
+  if (domEventRows > 500 || domEventRows === 0) {
+    throw new Error(`Unexpected rendered event-row DOM count: ${domEventRows}`);
+  }
+  const floodCls = await cdpClient.evalJS(`window.__AHUB_CLS__ ?? 0`);
+  const floodSources = await cdpClient.evalJS(`window.__AHUB_CLS_SOURCES__ ?? []`);
+  if (floodCls > 0.001) {
+    throw new Error(`Expected zero CLS during 2000-event stream & counter updates, got ${floodCls}; sources=${JSON.stringify(floodSources)}`);
+  }
+
+  // Screenshot 2: desktop-light-active.png (via real user click on theme toggle)
+  await cdpClient.clickSelector('[data-testid="theme-toggle-btn"]');
+  await sleep(250);
+  await cdpClient.screenshot(path.join(screenshotDir, "desktop-light-active.png"));
+
+  // Switch back to Dark theme for approval + DnD queue screenshots
+  await cdpClient.clickSelector('[data-testid="theme-toggle-btn"]');
+  await sleep(200);
+
+  // Seed blocking soft_approval run + 2 queued runs for approval & DnD reorder tests
+  const approvalRes = await apiJson(hubUrl, adminToken, "/api/v1/runs?wait_ms=0", {
+    method: "POST",
+    body: JSON.stringify({
+      node_id: "macmini",
+      workdir: wsBeta,
+      agent: "agy",
+      title: "生产配置人工审批验证",
+      prompt: JSON.stringify({
+        summary: "等待网页审批",
+        directives: [
+          {
+            op: "soft_approval",
+            hold_ms: 12000,
+            url: "https://claude.ai/code/session_eval_approval",
+            then: "resume"
+          }
+        ]
+      })
+    })
+  });
+  const approvalRunId = approvalRes.run.id;
+
+  const q1Res = await apiJson(hubUrl, adminToken, "/api/v1/runs?wait_ms=0", {
+    method: "POST",
+    body: JSON.stringify({
+      node_id: "macmini",
+      workdir: wsAlpha,
+      agent: "agy",
+      title: "排队任务 Alpha",
+      prompt: "echo queued alpha"
+    })
+  });
+  const q2Res = await apiJson(hubUrl, adminToken, "/api/v1/runs?wait_ms=0", {
+    method: "POST",
+    body: JSON.stringify({
+      node_id: "macmini",
+      workdir: wsAlpha,
+      agent: "agy",
+      title: "排队任务 Beta",
+      prompt: "echo queued beta"
+    })
+  });
+
+  for (let i = 0; i < 40; i++) {
+    const r = await apiJson(hubUrl, adminToken, `/api/v1/runs/${approvalRunId}`);
+    if (r.run.status === "needs_approval") break;
+    await sleep(200);
+  }
+  await sleep(250);
+  await cdpClient.clickSelector(`[data-testid="thread-item-${approvalRes.run.thread_id}"] button:nth-of-type(2)`);
+  await sleep(300);
+
+  const hasBanner = await cdpClient.evalJS(`Boolean(document.querySelector('[data-testid="needs-approval-banner"]'))`);
+  if (!hasBanner) {
+    throw new Error("Expected [data-testid='needs-approval-banner'] to be visible for needs_approval run");
+  }
+
+  // Screenshot 3: approval-banner-state.png
+  await cdpClient.screenshot(path.join(screenshotDir, "approval-banner-state.png"));
+
+  // Switch Inspector tab to 待跑队列 -> perform real CDP mouse drag-reorder of queued items!
+  await cdpClient.clickSelector('[role="tab"]:nth-of-type(2)');
+  await sleep(300);
+
+  const beforeOrder = await cdpClient.evalJS(
+    `Array.from(document.querySelectorAll('[data-testid^="queued-item-"]')).map(el => el.getAttribute("data-testid"))`
+  );
+  if (beforeOrder.length < 2) {
+    throw new Error(`Expected >= 2 queued items in queue tab, got ${JSON.stringify(beforeOrder)}`);
+  }
+
+  // Drag second queued item above first queued item using CDP pointer steps
+  await cdpClient.dragBetween(
+    `[data-testid="queued-item-${q2Res.run.id}"] button[aria-label="拖拽调整队列优先级"]`,
+    `[data-testid="queued-item-${q1Res.run.id}"] button[aria-label="拖拽调整队列优先级"]`
+  );
+  await sleep(450);
+
+  const afterOrder = await cdpClient.evalJS(
+    `Array.from(document.querySelectorAll('[data-testid^="queued-item-"]')).map(el => el.getAttribute("data-testid"))`
+  );
+  if (afterOrder[0] !== `queued-item-${q2Res.run.id}`) {
+    throw new Error(`Expected DnD reorder to place ${q2Res.run.id} first, got ${JSON.stringify(afterOrder)}`);
+  }
+
+  // Verify priority_order persisted in D1 API as well!
+  const apiQ1 = (await apiJson(hubUrl, adminToken, `/api/v1/runs/${q1Res.run.id}`)).run;
+  const apiQ2 = (await apiJson(hubUrl, adminToken, `/api/v1/runs/${q2Res.run.id}`)).run;
+  if (!(apiQ2.priority_order < apiQ1.priority_order)) {
+    throw new Error(`D1 priority_order mismatch after DnD: q2=${apiQ2.priority_order} q1=${apiQ1.priority_order}`);
+  }
+
+  // Screenshot 4: dnd-queue-reorder.png
+  await cdpClient.screenshot(path.join(screenshotDir, "dnd-queue-reorder.png"));
+
+  // Cancel seeded approval + queued runs cleanly
+  for (const rid of [q1Res.run.id, q2Res.run.id, approvalRunId]) {
+    await apiJson(hubUrl, adminToken, `/api/v1/runs/${rid}/cancel`, {
+      method: "POST",
+      body: JSON.stringify({ cascade: false, reason: "eval done" })
+    });
+  }
+
+  // Mobile 390x844 responsiveness + tap target check + drawer screenshot 5
+  await cdpClient.setViewport(390, 844, true);
+  await sleep(300);
+  const mobileMetrics = await cdpClient.evalJS(`
+    (() => {
+      const overflow = document.documentElement.scrollWidth - document.documentElement.clientWidth;
+      const headerBtns = Array.from(document.querySelectorAll("header button"));
+      const undersized = [];
+      for (const el of headerBtns) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        if (rect.width < 44 || rect.height < 44) {
+          undersized.push({ label: el.getAttribute("aria-label") || el.textContent?.trim(), w: rect.width, h: rect.height });
+        }
+      }
+      return { overflow, undersized };
+    })()
+  `);
+  if (mobileMetrics.overflow > 0) {
+    throw new Error(`Mobile 390x844 horizontal overflow detected: ${mobileMetrics.overflow}px`);
+  }
+  if (mobileMetrics.undersized.length > 0) {
+    throw new Error(`Mobile tap targets < 44x44px: ${JSON.stringify(mobileMetrics.undersized)}`);
+  }
+
+  await cdpClient.clickSelector('[data-testid="mobile-left-trigger"]');
+  await sleep(300);
+
+  // Screenshot 5: mobile-drawer-open.png
+  await cdpClient.screenshot(path.join(screenshotDir, "mobile-drawer-open.png"));
+
+  if (cdpClient.consoleErrors.length > 0 || cdpClient.exceptions.length > 0) {
+    throw new Error(
+      `Browser runtime errors detected: console=${JSON.stringify(cdpClient.consoleErrors)} exceptions=${JSON.stringify(cdpClient.exceptions)}`
+    );
+  }
+
+  console.log(
+    `L2 CDP Runtime Eval PASSED: UI==D1 parity ok, flood ring-buffer=${floodCount}, stream CLS=${floodCls}, DnD priority_order persisted, mobile overflow=0, 5 screenshots written to ${screenshotDir}`
+  );
+} finally {
+  if (cdpClient) cdpClient.close();
+  for (const proc of children) {
+    killGroup(proc);
+  }
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+}

@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: Cross-compile static binaries
+        run: make build-cross VERSION="${GITHUB_REF_NAME}"
+      - name: Generate SHA-256 manifest (version.json)
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPO="${GITHUB_REPOSITORY}"
+          TAG="${GITHUB_REF_NAME}"
+          RELEASED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          sha() { sha256sum "$1" | awk '{print $1}'; }
+          cat > bin/dist/version.json <<EOF
+          {
+            "version": "${TAG}",
+            "released_at": "${RELEASED_AT}",
+            "assets": {
+              "darwin_arm64": {
+                "url": "https://github.com/${REPO}/releases/download/${TAG}/ahub-darwin-arm64",
+                "sha256": "$(sha bin/dist/ahub-darwin-arm64)"
+              },
+              "darwin_amd64": {
+                "url": "https://github.com/${REPO}/releases/download/${TAG}/ahub-darwin-amd64",
+                "sha256": "$(sha bin/dist/ahub-darwin-amd64)"
+              },
+              "linux_amd64": {
+                "url": "https://github.com/${REPO}/releases/download/${TAG}/ahub-linux-amd64",
+                "sha256": "$(sha bin/dist/ahub-linux-amd64)"
+              },
+              "linux_arm64": {
+                "url": "https://github.com/${REPO}/releases/download/${TAG}/ahub-linux-arm64",
+                "sha256": "$(sha bin/dist/ahub-linux-arm64)"
+              },
+              "windows_amd64": {
+                "url": "https://github.com/${REPO}/releases/download/${TAG}/ahub-windows-amd64.exe",
+                "sha256": "$(sha bin/dist/ahub-windows-amd64.exe)"
+              }
+            }
+          }
+          EOF
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            bin/dist/ahub-darwin-arm64
+            bin/dist/ahub-darwin-amd64
+            bin/dist/ahub-linux-amd64
+            bin/dist/ahub-linux-arm64
+            bin/dist/ahub-windows-amd64.exe
+            bin/dist/version.json

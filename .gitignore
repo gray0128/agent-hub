@@ -1,21 +1,12 @@
-# Dependencies & Build Outputs
 node_modules/
 dist/
 .wrangler/
-
-# Local Environment & Secrets
-.dev.vars
+bin/
+decisions.tsv
+todo.md
+.audit/
 .env
 .env.*
-!.env.example
-
-# Go Binaries & Coverage
-bin/
-ahub
-*.exe
-coverage.out
-
-# OS & Agent Scratch Files
+evals/artifacts/
+coverage/
 .DS_Store
-.audit/
-*.todo.md

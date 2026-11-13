@@ -93,7 +93,7 @@
 
 1. `node.hello`（建连首帧必发）：上报 `conn_nonce`、`version`、`os`、`arch`、`max_concurrency`、`capabilities`（各 Agent 可执行状态、默认模型与别名表）及 `workspaces`（扫描到的项目短名与规范绝对路径列表）。
 2. `node.ping`：每 `25s` 发送一次，附带当前本机活跃任务 ID 列表 `active_run_ids`，同时续期节点 `last_seen_at` 及活跃任务租约。
-3. `run.event`：实时转发 Agent 执行事件，含 `run_id`、`seq`（单调递增）、`kind`（`status` | `tool_use` | `turn_end` | `approval_needed` | `stderr_warn`）、`payload`。`NodeHub` 将事件批量落入 D1 `run_events` 并广播给订阅该任务的 `/ws/stream` 客户端。
+3. `run.event` / `run.events`：实时转发 Agent 执行事件。单条帧 `run.event` 含 `run_id`、`seq`（单调递增）、`kind`（`status` | `tool_use` | `turn_end` | `approval_needed` | `stderr_warn` | `system`）、`payload` 与 `ts`；节点守护端每 `250ms`（或积满 `100` 条、或遇 `status`/`approval_needed` 立即刷新）可打包发送批量帧 `run.events`（`{type: "run.events", run_id, events: [{seq, kind, payload, ts}]}`）。`NodeHub` 将事件批量落入 D1 `run_events`（`INSERT OR IGNORE`）并原样广播给订阅该任务的 `/ws/stream` 客户端。
 4. `run.state`：即时同步 `claimed -> running` 或 `running -> needs_approval`（附 `remote_control_url`）状态切换。
 
 **Hub -> Node 帧**：
@@ -109,10 +109,10 @@
 - 单任务等待订阅（`ahub wait` / `client`）：传 `?run_id=run_xxx`（需有该任务读权限），接收 `run.event`、`run.updated`，并在任务到达终态或 `needs_approval` 时收到终结帧后由客户端主动断开。
 
 **Hub -> Client 帧**：
-- `snapshot`：建连瞬间下发当前最新快照（避免连接建立与首次 REST 拉取之间的竞态丢帧）。
+- `snapshot`：建连瞬间下发当前最新快照（包含 `nodes`、可选 `threads` 与 `runs`，避免连接建立与首次 REST 拉取之间的竞态丢帧）。
 - `node.status`：节点状态变更增量。
 - `run.updated`：任意 `Run` 状态、耗时或摘要变更。
-- `run.event`：实时执行流事件增量。
+- `run.event` / `run.events`：实时执行流事件增量（单条或批量）。
 - `error`：鉴权失效或订阅非法对象提示。
 
 ## 4. Cloudflare Queues 通知载荷契约
