@@ -47,6 +47,55 @@ function mergeBoundedEvents(existing: RunEventItem[], incoming: RunEventItem[]):
   return merged;
 }
 
+function runStatusRank(status: RunRecord["status"]): number {
+  switch (status) {
+    case "queued":
+      return 0;
+    case "claimed":
+      return 1;
+    case "running":
+    case "needs_approval":
+      return 2;
+    case "done":
+    case "failed":
+    case "cancelled":
+      return 3;
+  }
+}
+
+function isTerminalRunStatus(status: RunRecord["status"]): boolean {
+  return status === "done" || status === "failed" || status === "cancelled";
+}
+
+function mergeRunRecord(existing: RunRecord, incoming: RunRecord): RunRecord {
+  const existingTerminal = isTerminalRunStatus(existing.status);
+  const incomingTerminal = isTerminalRunStatus(incoming.status);
+  const existingTs = Date.parse(existing.updated_at || existing.created_at) || 0;
+  const incomingTs = Date.parse(incoming.updated_at || incoming.created_at) || 0;
+
+  const incomingIsStale =
+    (existingTerminal && !incomingTerminal) ||
+    existingTs > incomingTs ||
+    (existingTs === incomingTs && runStatusRank(incoming.status) < runStatusRank(existing.status));
+
+  if (incomingIsStale) {
+    return {
+      ...existing,
+      prompt: existing.prompt ?? incoming.prompt,
+      output_preview: existing.output_preview ?? incoming.output_preview,
+      output_md: existing.output_md ?? incoming.output_md
+    };
+  }
+
+  return {
+    ...existing,
+    ...incoming,
+    prompt: incoming.prompt ?? existing.prompt,
+    output_preview: incoming.output_preview ?? existing.output_preview,
+    output_md: incoming.output_md ?? existing.output_md
+  };
+}
+
 export const useTaskStore = create<TaskState>((set) => ({
   threads: [],
   runs: [],
@@ -82,7 +131,12 @@ export const useTaskStore = create<TaskState>((set) => ({
 
   setRuns: (runs) =>
     set((state) => {
-      const sorted = sortRuns(runs);
+      const prevById = new Map(state.runs.map((r) => [r.id, r]));
+      const merged = runs.map((r) => {
+        const prev = prevById.get(r.id);
+        return prev ? mergeRunRecord(prev, r) : r;
+      });
+      const sorted = sortRuns(merged);
       const validRun = state.selectedRunId && sorted.some((r) => r.id === state.selectedRunId);
       return {
         runs: sorted,
@@ -94,7 +148,9 @@ export const useTaskStore = create<TaskState>((set) => ({
     set((state) => {
       const idx = state.runs.findIndex((r) => r.id === run.id);
       const next =
-        idx >= 0 ? state.runs.map((r, i) => (i === idx ? run : r)) : [run, ...state.runs];
+        idx >= 0
+          ? state.runs.map((r, i) => (i === idx ? mergeRunRecord(r, run) : r))
+          : [run, ...state.runs];
       return {
         runs: sortRuns(next),
         selectedRunId: state.selectedRunId ?? run.id

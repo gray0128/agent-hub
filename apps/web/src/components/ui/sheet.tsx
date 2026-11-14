@@ -10,16 +10,18 @@ export const SheetClose = DialogPrimitive.Close;
 export interface SheetContentProps
   extends React.ComponentPropsWithoutRef<typeof DialogPrimitive.Content> {
   side?: "left" | "right";
+  title?: string;
 }
 
 export const SheetContent = React.forwardRef<
   React.ComponentRef<typeof DialogPrimitive.Content>,
   SheetContentProps
->(({ side = "left", className, children, ...props }, ref) => (
+>(({ side = "left", title = "面板", className, children, ...props }, ref) => (
   <DialogPrimitive.Portal>
     <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-black/60 backdrop-blur-[2px]" />
     <DialogPrimitive.Content
       ref={ref}
+      aria-describedby={undefined}
       className={cn(
         "fixed inset-y-0 z-50 flex w-[min(86vw,340px)] flex-col border-border bg-background shadow-2xl focus:outline-none",
         side === "left" ? "left-0 border-r" : "right-0 border-l",
@@ -27,12 +29,15 @@ export const SheetContent = React.forwardRef<
       )}
       {...props}
     >
-      <div className="flex h-12 items-center justify-end border-b border-border px-2">
+      <div className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border bg-surface-elevated pl-3 pr-1">
+        <DialogPrimitive.Title className="truncate text-xs font-semibold tracking-tight text-foreground">
+          {title}
+        </DialogPrimitive.Title>
         <DialogPrimitive.Close
           aria-label="关闭抽屉"
-          className="inline-flex h-11 w-11 items-center justify-center rounded-[6px] text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-[6px] text-muted-foreground transition-[color,background-color] duration-150 hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring cursor-pointer"
         >
-          <X className="h-4 w-4" strokeWidth={1.75} />
+          <X className="h-4 w-4" strokeWidth={1.75} aria-hidden="true" />
         </DialogPrimitive.Close>
       </div>
       <div className="min-h-0 flex-1 overflow-hidden">{children}</div>

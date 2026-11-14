@@ -1,13 +1,49 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { useDraggable } from "@dnd-kit/core";
 import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { FolderGit2, GitBranch, GripVertical, Pin, Plus, Search, Server } from "lucide-react";
+import { ChevronDown, ChevronUp, FolderGit2, GitBranch, GripVertical, Pin, Plus, Search, Server } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn, formatShortTime } from "@/lib/utils";
-import type { NodeRecord, ThreadRecord, WorkspaceEntry } from "@/types";
+import type { NodeRecord, RunRecord, RunStatus, ThreadRecord, WorkspaceEntry } from "@/types";
 import { NodeStatusDot } from "./StatusBadge";
+
+type ThreadFilterMode = "all" | "active" | "needs_approval";
+
+function statusDotClass(status?: RunStatus): string {
+  switch (status) {
+    case "running":
+    case "claimed":
+      return "bg-[var(--status-running)] animate-pulse";
+    case "needs_approval":
+      return "bg-[var(--status-approval)]";
+    case "failed":
+      return "bg-[var(--status-failed)]";
+    case "done":
+      return "bg-[var(--status-done)]";
+    case "queued":
+    case "cancelled":
+    default:
+      return "bg-muted-foreground/50";
+  }
+}
+
+function statusShortLabel(status?: RunStatus): string | null {
+  switch (status) {
+    case "running":
+    case "claimed":
+      return "执行中";
+    case "needs_approval":
+      return "待审批";
+    case "queued":
+      return "排队";
+    case "failed":
+      return "失败";
+    default:
+      return null;
+  }
+}
 
 function DraggableWorkspaceChip({
   nodeId,
@@ -33,16 +69,16 @@ function DraggableWorkspaceChip({
       {...listeners}
       {...attributes}
       data-testid={`workspace-chip-${nodeId}-${ws.key}`}
-      title={`${ws.path}（点击或拖拽至派发台）`}
+      title={`${ws.path}（点击选中或拖拽至派发台）`}
       className={cn(
-        "inline-flex min-h-11 md:min-h-0 items-center gap-1 rounded-[5px] border px-2 py-1 text-[11px] font-mono transition-colors duration-150 cursor-pointer",
+        "inline-flex min-h-11 md:min-h-0 max-w-full items-center gap-1 rounded-[5px] border px-2 py-1 text-[11px] font-mono transition-[color,background-color,border-color] duration-150 cursor-pointer",
         active
           ? "border-[var(--status-running)] bg-[var(--status-running)]/12 text-foreground"
           : "border-border bg-background/60 text-muted-foreground hover:border-foreground/30 hover:text-foreground",
-        isDragging && "opacity-50"
+        isDragging && "opacity-40"
       )}
     >
-      <FolderGit2 className="h-3 w-3 shrink-0" strokeWidth={1.75} />
+      <FolderGit2 className="h-3 w-3 shrink-0" strokeWidth={1.75} aria-hidden="true" />
       <span className="truncate max-w-[130px]">{ws.key}</span>
     </button>
   );
@@ -50,12 +86,14 @@ function DraggableWorkspaceChip({
 
 function SortableThreadRow({
   thread,
+  latestRunStatus,
   selected,
   onSelect,
   onTogglePin,
   onFork
 }: {
   thread: ThreadRecord;
+  latestRunStatus?: RunStatus;
   selected: boolean;
   onSelect: () => void;
   onTogglePin: () => void;
@@ -63,13 +101,15 @@ function SortableThreadRow({
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: `thread:${thread.id}`,
-    data: { type: "thread", threadId: thread.id }
+    data: { type: "thread", threadId: thread.id, pinned: thread.pinned }
   });
 
   const style = {
     transform: CSS.Transform.toString(transform),
     transition
   };
+
+  const stateHint = statusShortLabel(latestRunStatus);
 
   return (
     <div
@@ -78,10 +118,13 @@ function SortableThreadRow({
       data-testid={`thread-item-${thread.id}`}
       className={cn(
         "group flex items-start gap-1.5 border-b border-border px-2.5 py-2 transition-colors duration-150",
-        selected ? "bg-accent/80" : "hover:bg-accent/40",
-        isDragging && "opacity-60"
+        selected
+          ? "border-l-2 border-l-[var(--status-running)] bg-accent/80 pl-2"
+          : "hover:bg-accent/40",
+        isDragging && "opacity-40"
       )}
     >
+      {/* 1st button child: drag handle (must remain 1st <button> for CDP eval selector) */}
       <button
         type="button"
         aria-label="拖拽排序会话"
@@ -89,28 +132,45 @@ function SortableThreadRow({
         {...listeners}
         className="mt-0.5 inline-flex h-6 w-5 shrink-0 items-center justify-center rounded text-muted-foreground/60 hover:text-foreground cursor-grab active:cursor-grabbing"
       >
-        <GripVertical className="h-3.5 w-3.5" strokeWidth={1.75} />
+        <GripVertical className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
       </button>
 
+      {/* 2nd button child: select thread (must remain 2nd <button> for CDP eval selector) */}
       <button
         type="button"
         onClick={onSelect}
         className="min-w-0 flex-1 text-left cursor-pointer"
       >
         <div className="flex items-center justify-between gap-1.5">
-          <span className="truncate text-xs font-medium text-foreground">
-            {thread.title || thread.project_key || thread.id}
-          </span>
+          <div className="flex min-w-0 items-center gap-1.5">
+            <span
+              className={cn("h-2 w-2 shrink-0 rounded-full", statusDotClass(latestRunStatus))}
+              aria-hidden="true"
+            />
+            <span className="truncate text-xs font-medium text-foreground">
+              {thread.title || thread.project_key || thread.id}
+            </span>
+          </div>
           <span className="shrink-0 text-[10px] text-muted-foreground tabular-nums">
             {formatShortTime(thread.updated_at)}
           </span>
         </div>
-        <div className="mt-0.5 flex items-center gap-1.5 text-[11px] text-muted-foreground font-mono">
-          <span className="truncate">{thread.node_id}</span>
-          <span>/</span>
-          <span className="truncate">{thread.project_key}</span>
-          <span>·</span>
-          <span>{thread.agent}</span>
+        <div className="mt-0.5 flex items-center justify-between gap-1.5 text-[11px] font-mono text-muted-foreground">
+          <span className="min-w-0 truncate">
+            {thread.node_id} / {thread.project_key} · {thread.agent}
+          </span>
+          {stateHint ? (
+            <span
+              className={cn(
+                "shrink-0 font-sans text-[10px] font-medium",
+                latestRunStatus === "needs_approval" && "text-[var(--status-approval)]",
+                (latestRunStatus === "running" || latestRunStatus === "claimed") && "text-[var(--status-running)]",
+                latestRunStatus === "failed" && "text-[var(--status-failed)]"
+              )}
+            >
+              {stateHint}
+            </span>
+          ) : null}
         </div>
       </button>
 
@@ -118,8 +178,8 @@ function SortableThreadRow({
         <button
           type="button"
           onClick={onTogglePin}
-          aria-label="置顶会话"
-          title="置顶会话"
+          aria-label={thread.pinned ? "取消置顶会话" : "置顶会话"}
+          title={thread.pinned ? "取消置顶" : "置顶会话"}
           className={cn(
             "inline-flex h-7 w-7 items-center justify-center rounded-[5px] transition-colors duration-150 cursor-pointer",
             thread.pinned
@@ -127,7 +187,7 @@ function SortableThreadRow({
               : "text-muted-foreground hover:bg-accent hover:text-foreground"
           )}
         >
-          <Pin className="h-3.5 w-3.5" strokeWidth={1.75} />
+          <Pin className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
         </button>
         <button
           type="button"
@@ -136,7 +196,7 @@ function SortableThreadRow({
           title="分叉会话"
           className="inline-flex h-7 w-7 items-center justify-center rounded-[5px] text-muted-foreground hover:bg-accent hover:text-foreground transition-colors duration-150 cursor-pointer"
         >
-          <GitBranch className="h-3.5 w-3.5" strokeWidth={1.75} />
+          <GitBranch className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
         </button>
       </div>
     </div>
@@ -147,10 +207,12 @@ export interface FleetThreadsPaneProps {
   nodes: NodeRecord[];
   selectedNodeId: string | null;
   threads: ThreadRecord[];
+  runs: RunRecord[];
   selectedThreadId: string | null;
   activeWorkdir: string;
   activeTargetNodeId: string;
   threadQuery: string;
+  inDrawer?: boolean;
   onThreadQueryChange: (q: string) => void;
   onSelectNode: (nodeId: string) => void;
   onPickWorkspace: (nodeId: string, workdir: string) => void;
@@ -164,10 +226,12 @@ export function FleetThreadsPane({
   nodes,
   selectedNodeId,
   threads,
+  runs,
   selectedThreadId,
   activeWorkdir,
   activeTargetNodeId,
   threadQuery,
+  inDrawer = false,
   onThreadQueryChange,
   onSelectNode,
   onPickWorkspace,
@@ -176,25 +240,78 @@ export function FleetThreadsPane({
   onTogglePinThread,
   onForkThread
 }: FleetThreadsPaneProps) {
+  const [expandedNodes, setExpandedNodes] = useState<Record<string, boolean>>({});
+  const [statusFilter, setStatusFilter] = useState<ThreadFilterMode>("all");
+  const [onlySelectedNode, setOnlySelectedNode] = useState(false);
+
+  const latestRunByThread = useMemo(() => {
+    const map = new Map<string, RunRecord>();
+    for (const run of runs) {
+      const prev = map.get(run.thread_id);
+      if (!prev || run.created_at > prev.created_at) {
+        map.set(run.thread_id, run);
+      }
+    }
+    return map;
+  }, [runs]);
+
+  const { activeCount, approvalCount } = useMemo(() => {
+    let active = 0;
+    let approval = 0;
+    for (const t of threads) {
+      const st = latestRunByThread.get(t.id)?.status;
+      if (st === "needs_approval") {
+        approval += 1;
+        active += 1;
+      } else if (st === "running" || st === "claimed" || st === "queued") {
+        active += 1;
+      }
+    }
+    return { activeCount: active, approvalCount: approval };
+  }, [latestRunByThread, threads]);
+
   const filteredThreads = useMemo(() => {
     const q = threadQuery.trim().toLowerCase();
-    if (!q) return threads;
-    return threads.filter(
-      (t) =>
+    return threads.filter((t) => {
+      if (onlySelectedNode && selectedNodeId && t.node_id !== selectedNodeId) {
+        return false;
+      }
+      const st = latestRunByThread.get(t.id)?.status;
+      if (statusFilter === "active") {
+        if (st !== "running" && st !== "claimed" && st !== "queued" && st !== "needs_approval") {
+          return false;
+        }
+      } else if (statusFilter === "needs_approval") {
+        if (st !== "needs_approval") {
+          return false;
+        }
+      }
+      if (!q) return true;
+      return (
         t.title.toLowerCase().includes(q) ||
         t.node_id.toLowerCase().includes(q) ||
         t.project_key.toLowerCase().includes(q) ||
         t.agent.toLowerCase().includes(q)
-    );
-  }, [threads, threadQuery]);
+      );
+    });
+  }, [latestRunByThread, onlySelectedNode, selectedNodeId, statusFilter, threadQuery, threads]);
+
+  const hasActiveFilter = Boolean(threadQuery.trim() || statusFilter !== "all" || onlySelectedNode);
 
   return (
     <aside
+      aria-label="节点与会话列表"
       data-testid="fleet-threads-pane"
       className="flex h-full flex-col bg-surface-elevated overflow-hidden"
     >
       <div className="flex h-10 shrink-0 items-center justify-between border-b border-border px-3">
-        <span className="text-xs font-semibold tracking-tight text-foreground">节点与会话</span>
+        {inDrawer ? (
+          <span className="text-[11px] font-mono text-muted-foreground tabular-nums">
+            {nodes.length} 节点 · {threads.length} 会话
+          </span>
+        ) : (
+          <span className="text-xs font-semibold tracking-tight text-foreground">节点与会话</span>
+        )}
         <Button
           type="button"
           size="sm"
@@ -202,18 +319,40 @@ export function FleetThreadsPane({
           onClick={onNewThread}
           className="h-7 px-2 text-[11px]"
         >
-          <Plus className="h-3 w-3" strokeWidth={1.75} />
+          <Plus className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
           新建会话
         </Button>
       </div>
 
-      {/* Node directory + workspace chips */}
-      <div className="max-h-[44%] overflow-y-auto border-b border-border divide-y divide-border">
+      {/* Node directory + collapsible workspace chips */}
+      <div className="max-h-[40%] overflow-y-auto border-b border-border divide-y divide-border">
         {nodes.length === 0 ? (
           <div className="px-3 py-4 text-xs text-muted-foreground">暂无在线或历史节点</div>
         ) : (
           nodes.map((node) => {
             const isSelected = selectedNodeId === node.id;
+            const totalWs = node.workspaces.length;
+            const isExpanded = Boolean(expandedNodes[node.id]) || totalWs <= 4;
+            const chipLimit = isSelected ? 5 : 2;
+
+            let visibleWorkspaces = node.workspaces;
+            if (!isExpanded) {
+              const activeWs =
+                activeTargetNodeId === node.id
+                  ? node.workspaces.find((w) => w.path === activeWorkdir)
+                  : undefined;
+              const subset: WorkspaceEntry[] = [];
+              if (activeWs) subset.push(activeWs);
+              for (const ws of node.workspaces) {
+                if (subset.length >= chipLimit) break;
+                if (!subset.some((item) => item.path === ws.path)) {
+                  subset.push(ws);
+                }
+              }
+              visibleWorkspaces = subset;
+            }
+            const hiddenCount = Math.max(0, totalWs - visibleWorkspaces.length);
+
             return (
               <div
                 key={node.id}
@@ -230,13 +369,18 @@ export function FleetThreadsPane({
                   className="flex w-full items-center justify-between gap-2 text-left cursor-pointer"
                 >
                   <div className="flex min-w-0 items-center gap-1.5">
-                    <Server className="h-3.5 w-3.5 shrink-0 text-muted-foreground" strokeWidth={1.75} />
+                    <Server className="h-3.5 w-3.5 shrink-0 text-muted-foreground" strokeWidth={1.75} aria-hidden="true" />
                     <span className="truncate text-xs font-medium text-foreground">
                       {node.display_name || node.id}
                     </span>
-                    <span className="text-[10px] text-muted-foreground font-mono">{node.id}</span>
+                    {node.display_name && node.display_name !== node.id ? (
+                      <span className="truncate text-[10px] text-muted-foreground font-mono">{node.id}</span>
+                    ) : null}
                   </div>
                   <div className="flex shrink-0 items-center gap-2">
+                    <span className="text-[10px] font-mono text-muted-foreground tabular-nums">
+                      {totalWs}目录
+                    </span>
                     <span className="text-[11px] font-mono text-muted-foreground tabular-nums">
                       {node.active_runs_count}/{node.max_concurrency}
                     </span>
@@ -244,9 +388,9 @@ export function FleetThreadsPane({
                   </div>
                 </button>
 
-                {node.workspaces.length > 0 ? (
-                  <div className="mt-2 flex flex-wrap gap-1">
-                    {node.workspaces.map((ws) => (
+                {totalWs > 0 ? (
+                  <div className="mt-2 flex flex-wrap items-center gap-1">
+                    {visibleWorkspaces.map((ws) => (
                       <DraggableWorkspaceChip
                         key={`${node.id}-${ws.path}`}
                         nodeId={node.id}
@@ -255,6 +399,31 @@ export function FleetThreadsPane({
                         onSelect={() => onPickWorkspace(node.id, ws.path)}
                       />
                     ))}
+                    {totalWs > 4 ? (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setExpandedNodes((prev) => ({
+                            ...prev,
+                            [node.id]: !isExpanded
+                          }))
+                        }
+                        data-testid={`toggle-ws-${node.id}`}
+                        className="inline-flex min-h-6 items-center gap-0.5 rounded-[5px] border border-dashed border-border px-2 py-0.5 text-[10px] font-medium text-muted-foreground transition-colors duration-150 hover:border-foreground/30 hover:text-foreground tabular-nums cursor-pointer"
+                      >
+                        {isExpanded ? (
+                          <>
+                            收起
+                            <ChevronUp className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
+                          </>
+                        ) : (
+                          <>
+                            {isSelected ? `展开全部 (${totalWs})` : `+${hiddenCount} 目录`}
+                            <ChevronDown className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
+                          </>
+                        )}
+                      </button>
+                    ) : null}
                   </div>
                 ) : null}
               </div>
@@ -263,12 +432,13 @@ export function FleetThreadsPane({
         )}
       </div>
 
-      {/* Thread search + sortable list */}
-      <div className="shrink-0 border-b border-border px-2.5 py-2">
+      {/* Thread search + filter pills */}
+      <div className="shrink-0 space-y-1.5 border-b border-border px-2.5 py-2">
         <div className="relative flex items-center">
           <Search
             className="pointer-events-none absolute left-2.5 h-3.5 w-3.5 text-muted-foreground"
             strokeWidth={1.75}
+            aria-hidden="true"
           />
           <Input
             aria-label="筛选会话"
@@ -278,11 +448,89 @@ export function FleetThreadsPane({
             className="h-8 pl-8 text-xs"
           />
         </div>
+
+        <div className="flex flex-wrap items-center gap-1">
+          <button
+            type="button"
+            aria-pressed={statusFilter === "all"}
+            onClick={() => setStatusFilter("all")}
+            className={cn(
+              "inline-flex h-6 items-center rounded-[4px] border px-2 text-[10px] font-medium transition-colors duration-150 cursor-pointer tabular-nums",
+              statusFilter === "all"
+                ? "border-[var(--status-running)]/50 bg-[var(--status-running)]/12 text-foreground"
+                : "border-border bg-background/50 text-muted-foreground hover:text-foreground"
+            )}
+          >
+            全部 {threads.length}
+          </button>
+          <button
+            type="button"
+            aria-pressed={statusFilter === "active"}
+            onClick={() => setStatusFilter((prev) => (prev === "active" ? "all" : "active"))}
+            className={cn(
+              "inline-flex h-6 items-center rounded-[4px] border px-2 text-[10px] font-medium transition-colors duration-150 cursor-pointer tabular-nums",
+              statusFilter === "active"
+                ? "border-[var(--status-running)]/50 bg-[var(--status-running)]/12 text-foreground"
+                : "border-border bg-background/50 text-muted-foreground hover:text-foreground"
+            )}
+          >
+            进行中 {activeCount}
+          </button>
+          <button
+            type="button"
+            aria-pressed={statusFilter === "needs_approval"}
+            onClick={() => setStatusFilter((prev) => (prev === "needs_approval" ? "all" : "needs_approval"))}
+            className={cn(
+              "inline-flex h-6 items-center rounded-[4px] border px-2 text-[10px] font-medium transition-colors duration-150 cursor-pointer tabular-nums",
+              statusFilter === "needs_approval"
+                ? "border-[var(--status-approval)]/60 bg-[var(--status-approval)]/15 text-[var(--status-approval)]"
+                : "border-border bg-background/50 text-muted-foreground hover:text-foreground"
+            )}
+          >
+            待审批 {approvalCount}
+          </button>
+          {selectedNodeId ? (
+            <button
+              type="button"
+              aria-pressed={onlySelectedNode}
+              onClick={() => setOnlySelectedNode((prev) => !prev)}
+              className={cn(
+                "ml-auto inline-flex h-6 items-center rounded-[4px] border px-2 text-[10px] font-mono transition-colors duration-150 cursor-pointer",
+                onlySelectedNode
+                  ? "border-foreground/40 bg-accent text-foreground"
+                  : "border-border bg-background/50 text-muted-foreground hover:text-foreground"
+              )}
+            >
+              仅 {selectedNodeId}
+            </button>
+          ) : null}
+        </div>
       </div>
 
+      {/* Sortable thread list */}
       <div className="min-h-0 flex-1 overflow-y-auto">
         {filteredThreads.length === 0 ? (
-          <div className="px-3 py-6 text-center text-xs text-muted-foreground">暂无匹配会话</div>
+          <div className="space-y-2 px-3 py-6 text-center text-xs text-muted-foreground text-pretty">
+            <p>
+              {hasActiveFilter
+                ? "当前筛选条件下没有匹配的会话或任务。尝试清除节点或状态筛选条件。"
+                : "暂无历史会话"}
+            </p>
+            {hasActiveFilter ? (
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={() => {
+                  onThreadQueryChange("");
+                  setStatusFilter("all");
+                  setOnlySelectedNode(false);
+                }}
+              >
+                清除筛选
+              </Button>
+            ) : null}
+          </div>
         ) : (
           <SortableContext
             items={filteredThreads.map((t) => `thread:${t.id}`)}
@@ -292,6 +540,7 @@ export function FleetThreadsPane({
               <SortableThreadRow
                 key={thread.id}
                 thread={thread}
+                latestRunStatus={latestRunByThread.get(thread.id)?.status}
                 selected={selectedThreadId === thread.id}
                 onSelect={() => onSelectThread(thread.id)}
                 onTogglePin={() => onTogglePinThread(thread)}

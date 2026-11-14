@@ -1,13 +1,51 @@
+import { useEffect, useMemo, useState } from "react";
 import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { Activity, GitFork, GripVertical, ListOrdered, PauseCircle, PlayCircle, Sliders, XCircle } from "lucide-react";
+import {
+  Activity,
+  ChevronDown,
+  ChevronRight,
+  GitFork,
+  GripVertical,
+  ListOrdered,
+  PauseCircle,
+  PlayCircle,
+  Search,
+  Send,
+  Sliders,
+  XCircle
+} from "lucide-react";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { cn, formatShortTime } from "@/lib/utils";
+import {
+  cn,
+  type EventTone,
+  formatLeaseRemainingSec,
+  formatShortTime,
+  summarizeRunEvent
+} from "@/lib/utils";
 import type { InspectorTab } from "@/stores/workbench-store";
 import type { NodeRecord, RunEventItem, RunRecord } from "@/types";
+import { CopyButton } from "./CopyButton";
 import { NodeStatusDot, RunStatusBadge } from "./StatusBadge";
+
+function toneBadgeClass(tone: EventTone): string {
+  switch (tone) {
+    case "running":
+      return "border-[var(--status-running)]/35 bg-[var(--status-running)]/10 text-[var(--status-running)]";
+    case "warn":
+      return "border-[var(--status-failed)]/35 bg-[var(--status-failed)]/10 text-[var(--status-failed)]";
+    case "approval":
+      return "border-[var(--status-approval)]/40 bg-[var(--status-approval)]/12 text-[var(--status-approval)]";
+    case "done":
+      return "border-[var(--status-done)]/35 bg-[var(--status-done)]/10 text-[var(--status-done)]";
+    case "neutral":
+    default:
+      return "border-border bg-muted/60 text-muted-foreground";
+  }
+}
 
 function SortableQueuedRunRow({
   run,
@@ -33,7 +71,7 @@ function SortableQueuedRunRow({
       data-testid={`queued-item-${run.id}`}
       className={cn(
         "flex items-center gap-2 border-b border-border px-2.5 py-2 hover:bg-accent/40 transition-colors duration-150",
-        isDragging && "opacity-60"
+        isDragging && "opacity-40"
       )}
     >
       <button
@@ -43,7 +81,7 @@ function SortableQueuedRunRow({
         {...listeners}
         className="inline-flex h-7 w-5 shrink-0 items-center justify-center rounded text-muted-foreground hover:text-foreground cursor-grab active:cursor-grabbing"
       >
-        <GripVertical className="h-3.5 w-3.5" strokeWidth={1.75} />
+        <GripVertical className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
       </button>
 
       <button type="button" onClick={onSelect} className="min-w-0 flex-1 text-left cursor-pointer">
@@ -72,6 +110,7 @@ export interface InspectorPaneProps {
   onCancelRun: (runId: string, cascade: boolean) => void;
   onToggleNodeDrain: (node: NodeRecord) => void;
   onUpdateNodeConcurrency: (nodeId: string, maxConcurrency: number) => void;
+  onPickWorkspace: (nodeId: string, workdir: string) => void;
 }
 
 export function InspectorPane({
@@ -84,21 +123,70 @@ export function InspectorPane({
   onSelectRun,
   onCancelRun,
   onToggleNodeDrain,
-  onUpdateNodeConcurrency
+  onUpdateNodeConcurrency,
+  onPickWorkspace
 }: InspectorPaneProps) {
-  const queuedRuns = allRuns
-    .filter((r) => r.status === "queued")
-    .sort((a, b) => a.priority_order - b.priority_order);
+  const [expandedEvents, setExpandedEvents] = useState<Record<string, boolean>>({});
+  const [wsQuery, setWsQuery] = useState("");
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
+  const runIsActive = Boolean(
+    selectedRun &&
+      (selectedRun.status === "queued" ||
+        selectedRun.status === "claimed" ||
+        selectedRun.status === "running" ||
+        selectedRun.status === "needs_approval")
+  );
+  const hasLease = Boolean(runIsActive && selectedRun?.lease_expires_at);
+
+  useEffect(() => {
+    if (!hasLease) return;
+    setNowMs(Date.now());
+    const id = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [hasLease]);
+
+  const leaseText = useMemo(() => {
+    if (!hasLease || !selectedRun?.lease_expires_at) return null;
+    return formatLeaseRemainingSec(selectedRun.lease_expires_at, nowMs);
+  }, [hasLease, nowMs, selectedRun?.lease_expires_at]);
+
+  const queuedRuns = useMemo(
+    () =>
+      allRuns
+        .filter((r) => r.status === "queued")
+        .sort((a, b) => a.priority_order - b.priority_order),
+    [allRuns]
+  );
 
   const rootRunId = selectedRun?.root_run_id;
-  const lineageRuns = rootRunId
-    ? allRuns
-        .filter((r) => r.root_run_id === rootRunId)
-        .sort((a, b) => a.depth - b.depth || a.created_at.localeCompare(b.created_at))
-    : [];
+  const lineageRuns = useMemo(
+    () =>
+      rootRunId
+        ? allRuns
+            .filter((r) => r.root_run_id === rootRunId)
+            .sort((a, b) => a.depth - b.depth || a.created_at.localeCompare(b.created_at))
+        : [],
+    [allRuns, rootRunId]
+  );
+
+  const filteredWorkspaces = useMemo(() => {
+    const list = selectedNode?.workspaces ?? [];
+    const q = wsQuery.trim().toLowerCase();
+    if (!q) return list;
+    return list.filter(
+      (ws) => ws.key.toLowerCase().includes(q) || ws.path.toLowerCase().includes(q)
+    );
+  }, [selectedNode?.workspaces, wsQuery]);
+
+  const agentCapabilities = useMemo(() => {
+    const map = selectedNode?.capabilities?.agents ?? {};
+    return Object.entries(map).filter(([, cfg]) => cfg.enabled !== false && cfg.available !== false);
+  }, [selectedNode?.capabilities?.agents]);
 
   return (
     <aside
+      aria-label="实时检视与节点控制"
       data-testid="inspector-pane"
       className="flex h-full flex-col bg-surface-elevated overflow-hidden"
     >
@@ -109,20 +197,28 @@ export function InspectorPane({
       >
         <div className="shrink-0 border-b border-border px-2.5 py-1.5">
           <TabsList className="grid w-full grid-cols-4 h-8">
-            <TabsTrigger value="events" className="gap-1 px-1.5 text-[11px]">
-              <Activity className="h-3 w-3 hidden sm:inline" strokeWidth={1.75} />
+            <TabsTrigger value="events" className="gap-1 px-1 text-[11px]">
+              <Activity className="h-3 w-3 hidden sm:inline" strokeWidth={1.75} aria-hidden="true" />
               过程事件
             </TabsTrigger>
-            <TabsTrigger value="queue" className="gap-1 px-1.5 text-[11px]">
-              <ListOrdered className="h-3 w-3 hidden sm:inline" strokeWidth={1.75} />
-              待跑队列
+            <TabsTrigger value="queue" className="gap-1 px-1 text-[11px] tabular-nums">
+              <ListOrdered className="h-3 w-3 hidden sm:inline" strokeWidth={1.75} aria-hidden="true" />
+              <span>待跑队列</span>
+              <span
+                className={cn(
+                  "inline-block min-w-[1.1rem] rounded px-1 text-center text-[10px] leading-tight tabular-nums",
+                  queuedRuns.length > 0 ? "bg-foreground/10 text-foreground" : "text-muted-foreground/60"
+                )}
+              >
+                {queuedRuns.length}
+              </span>
             </TabsTrigger>
-            <TabsTrigger value="lineage" className="gap-1 px-1.5 text-[11px]">
-              <GitFork className="h-3 w-3 hidden sm:inline" strokeWidth={1.75} />
+            <TabsTrigger value="lineage" className="gap-1 px-1 text-[11px]">
+              <GitFork className="h-3 w-3 hidden sm:inline" strokeWidth={1.75} aria-hidden="true" />
               委派拓扑
             </TabsTrigger>
-            <TabsTrigger value="control" className="gap-1 px-1.5 text-[11px]">
-              <Sliders className="h-3 w-3 hidden sm:inline" strokeWidth={1.75} />
+            <TabsTrigger value="control" className="gap-1 px-1 text-[11px]">
+              <Sliders className="h-3 w-3 hidden sm:inline" strokeWidth={1.75} aria-hidden="true" />
               节点控制
             </TabsTrigger>
           </TabsList>
@@ -130,25 +226,31 @@ export function InspectorPane({
 
         {/* 1. Process Events (<= 500 ring buffer) */}
         <TabsContent value="events" className="mt-0 min-h-0 flex-1 flex flex-col overflow-hidden">
-          <div className="flex shrink-0 items-center justify-between border-b border-border px-3 py-2 text-[11px] text-muted-foreground tabular-nums">
-            <span>
+          <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-border px-3 text-[11px] text-muted-foreground tabular-nums">
+            <span className="truncate font-mono">
               {selectedRun ? `${selectedRun.id} · ${events.length} 条缓冲` : "未选择任务"}
             </span>
-            {selectedRun &&
-            (selectedRun.status === "queued" ||
-              selectedRun.status === "claimed" ||
-              selectedRun.status === "running" ||
-              selectedRun.status === "needs_approval") ? (
-              <Button
-                type="button"
-                size="sm"
-                variant="destructive"
-                onClick={() => onCancelRun(selectedRun.id, false)}
-                className="h-7 px-2 text-[11px]"
-              >
-                取消任务
-              </Button>
-            ) : null}
+            <div className="flex shrink-0 items-center gap-2">
+              {leaseText ? (
+                <span
+                  data-testid="lease-countdown"
+                  className="rounded-[4px] border border-[var(--status-running)]/35 bg-[var(--status-running)]/10 px-1.5 py-0.5 font-mono text-[10px] text-[var(--status-running)] tabular-nums"
+                >
+                  租约 {leaseText}
+                </span>
+              ) : null}
+              {selectedRun && runIsActive ? (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="destructive"
+                  onClick={() => onCancelRun(selectedRun.id, false)}
+                  className="h-6 px-2 text-[11px]"
+                >
+                  取消任务
+                </Button>
+              ) : null}
+            </div>
           </div>
 
           <div
@@ -161,19 +263,55 @@ export function InspectorPane({
                 暂无过程事件
               </div>
             ) : (
-              events.map((ev) => (
-                <div key={ev.seq} data-testid="event-row" className="px-3 py-1.5">
-                  <div className="flex items-center justify-between gap-2 text-muted-foreground tabular-nums">
-                    <span>
-                      #{ev.seq} · {ev.kind}
-                    </span>
-                    <span>{formatShortTime(ev.ts ?? ev.created_at)}</span>
+              events.map((ev) => {
+                const evKey = `${selectedRun?.id ?? "none"}:${ev.seq}`;
+                const expanded = Boolean(expandedEvents[evKey]);
+                const info = summarizeRunEvent(ev);
+
+                return (
+                  <div key={ev.seq} data-testid="event-row">
+                    <button
+                      type="button"
+                      aria-expanded={expanded}
+                      onClick={() =>
+                        setExpandedEvents((prev) => ({ ...prev, [evKey]: !expanded }))
+                      }
+                      className="w-full px-3 py-1.5 text-left hover:bg-accent/35 transition-colors duration-150 cursor-pointer"
+                    >
+                      <div className="flex items-center justify-between gap-2 tabular-nums">
+                        <div className="flex min-w-0 items-center gap-1.5">
+                          {expanded ? (
+                            <ChevronDown className="h-3 w-3 shrink-0 text-muted-foreground" aria-hidden="true" />
+                          ) : (
+                            <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground" aria-hidden="true" />
+                          )}
+                          <span className="shrink-0 text-[10px] text-muted-foreground">#{ev.seq}</span>
+                          <span
+                            className={cn(
+                              "shrink-0 rounded-[4px] border px-1.5 py-px font-sans text-[10px] font-medium leading-tight",
+                              toneBadgeClass(info.tone)
+                            )}
+                          >
+                            {info.badge}
+                          </span>
+                        </div>
+                        <span className="shrink-0 text-[10px] text-muted-foreground">
+                          {formatShortTime(ev.ts ?? ev.created_at)}
+                        </span>
+                      </div>
+                      <div className="mt-0.5 truncate pl-4 text-foreground/90">
+                        {info.summary}
+                      </div>
+                    </button>
+
+                    {expanded ? (
+                      <pre className="mx-3 mb-2 overflow-x-auto rounded-[5px] border border-border bg-background/70 p-2 text-[10px] leading-relaxed text-foreground/90 whitespace-pre-wrap break-all">
+                        {JSON.stringify(ev.payload, null, 2)}
+                      </pre>
+                    ) : null}
                   </div>
-                  <div className="mt-0.5 truncate text-foreground/90">
-                    {JSON.stringify(ev.payload)}
-                  </div>
-                </div>
-              ))
+                );
+              })
             )}
           </div>
         </TabsContent>
@@ -210,14 +348,17 @@ export function InspectorPane({
             lineageRuns.map((r) => (
               <div
                 key={r.id}
-                onClick={() => onSelectRun(r.id)}
                 style={{ paddingLeft: `${12 + r.depth * 18}px` }}
                 className={cn(
-                  "flex items-center justify-between gap-2 pr-3 py-2 cursor-pointer hover:bg-accent/40 transition-colors duration-150",
+                  "flex items-center justify-between gap-2 pr-3 py-2 hover:bg-accent/40 transition-colors duration-150",
                   selectedRun?.id === r.id && "bg-accent/60"
                 )}
               >
-                <div className="min-w-0">
+                <button
+                  type="button"
+                  onClick={() => onSelectRun(r.id)}
+                  className="min-w-0 flex-1 text-left cursor-pointer"
+                >
                   <div className="flex items-center gap-1.5">
                     <span className="text-[10px] font-mono text-muted-foreground tabular-nums">
                       D{r.depth}
@@ -227,7 +368,7 @@ export function InspectorPane({
                   <div className="truncate text-[11px] font-mono text-muted-foreground">
                     {r.node_id}:{r.workdir.split("/").pop()} ({r.agent})
                   </div>
-                </div>
+                </button>
                 <div className="flex shrink-0 items-center gap-1.5">
                   <RunStatusBadge status={r.status} />
                   {r.depth === 0 && lineageRuns.length > 1 ? (
@@ -235,14 +376,11 @@ export function InspectorPane({
                       type="button"
                       size="sm"
                       variant="outline"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onCancelRun(r.id, true);
-                      }}
+                      onClick={() => onCancelRun(r.id, true)}
                       title="级联取消整棵树"
                       className="h-7 px-2 text-[10px]"
                     >
-                      <XCircle className="h-3 w-3" strokeWidth={1.75} />
+                      <XCircle className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
                       级联取消整棵树
                     </Button>
                   ) : null}
@@ -258,15 +396,47 @@ export function InspectorPane({
             <div className="py-6 text-center text-xs text-muted-foreground">请从左侧选择节点</div>
           ) : (
             <div className="space-y-3">
-              <div className="flex items-center justify-between border-b border-border pb-2.5">
-                <div>
-                  <div className="text-xs font-semibold text-foreground">{selectedNode.display_name}</div>
-                  <div className="text-[11px] font-mono text-muted-foreground">
-                    {selectedNode.id} · {selectedNode.os}/{selectedNode.arch} · {selectedNode.version || "dev"}
+              <div className="flex items-start justify-between gap-2 border-b border-border pb-2.5">
+                <div className="min-w-0">
+                  <div className="truncate text-xs font-semibold text-foreground">
+                    {selectedNode.display_name || selectedNode.id}
+                  </div>
+                  <div className="mt-0.5 text-[11px] font-mono text-muted-foreground tabular-nums">
+                    {selectedNode.display_name && selectedNode.display_name !== selectedNode.id
+                      ? `${selectedNode.id} · `
+                      : ""}
+                    {selectedNode.os}/{selectedNode.arch} · {selectedNode.version || "dev"} · 心跳{" "}
+                    {formatShortTime(selectedNode.last_seen_at)}
                   </div>
                 </div>
                 <NodeStatusDot status={selectedNode.status} />
               </div>
+
+              <div className="flex items-center justify-between border-b border-border pb-2.5 text-xs">
+                <span className="text-muted-foreground">当前并发负载</span>
+                <span className="font-mono text-xs font-medium text-foreground tabular-nums">
+                  {selectedNode.active_runs_count} / {selectedNode.max_concurrency}
+                </span>
+              </div>
+
+              {agentCapabilities.length > 0 ? (
+                <div className="flex items-center justify-between gap-2 border-b border-border pb-2.5 text-xs">
+                  <span className="shrink-0 text-muted-foreground">可用 Agent</span>
+                  <div className="flex flex-wrap justify-end gap-1">
+                    {agentCapabilities.map(([agentName, cfg]) => (
+                      <Badge
+                        key={agentName}
+                        variant="outline"
+                        className="font-mono text-[10px]"
+                        title={cfg.default_model ? `默认模型: ${cfg.default_model}` : undefined}
+                      >
+                        {agentName}
+                        {cfg.default_model ? ` (${cfg.default_model})` : ""}
+                      </Badge>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
 
               <div className="flex items-center justify-between border-b border-border pb-2.5 text-xs">
                 <span className="text-muted-foreground">运行调度</span>
@@ -278,12 +448,12 @@ export function InspectorPane({
                 >
                   {selectedNode.status === "draining" ? (
                     <>
-                      <PlayCircle className="h-3.5 w-3.5" strokeWidth={1.75} />
+                      <PlayCircle className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
                       恢复派发
                     </>
                   ) : (
                     <>
-                      <PauseCircle className="h-3.5 w-3.5" strokeWidth={1.75} />
+                      <PauseCircle className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
                       排空节点
                     </>
                   )}
@@ -313,16 +483,84 @@ export function InspectorPane({
                 </div>
               </div>
 
-              <div className="space-y-1">
-                <div className="text-[11px] font-medium text-muted-foreground">已上报工作区</div>
-                <div className="divide-y divide-border border-t border-b border-border">
-                  {selectedNode.workspaces.map((ws) => (
-                    <div key={ws.path} className="flex items-center justify-between py-1.5 text-[11px] font-mono">
-                      <span className="truncate text-foreground">{ws.key}</span>
-                      <span className="truncate max-w-[160px] text-muted-foreground">{ws.path}</span>
-                    </div>
-                  ))}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[11px] font-medium text-muted-foreground tabular-nums">
+                    已上报工作区 ({selectedNode.workspaces.length})
+                  </span>
                 </div>
+
+                {selectedNode.workspaces.length > 5 ? (
+                  <div className="relative flex items-center">
+                    <Search
+                      className="pointer-events-none absolute left-2.5 h-3.5 w-3.5 text-muted-foreground"
+                      strokeWidth={1.75}
+                      aria-hidden="true"
+                    />
+                    <Input
+                      aria-label="筛选已上报工作区"
+                      value={wsQuery}
+                      onChange={(e) => setWsQuery(e.target.value)}
+                      placeholder="筛选工作区名称或完整路径..."
+                      className="h-8 pl-8 text-xs font-mono"
+                    />
+                  </div>
+                ) : null}
+
+                {filteredWorkspaces.length === 0 ? (
+                  <div className="rounded-[6px] border border-border bg-background/40 px-3 py-4 text-center text-xs text-muted-foreground">
+                    未找到匹配的工作区目录
+                  </div>
+                ) : (
+                  <div
+                    data-testid="control-workspaces-list"
+                    className="divide-y divide-border rounded-[6px] border border-border bg-background/50"
+                  >
+                    {filteredWorkspaces.map((ws) => (
+                      <div
+                        key={ws.path}
+                        data-testid={`control-ws-row-${ws.key}`}
+                        className="px-2.5 py-2 transition-colors duration-150 hover:bg-accent/35"
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="flex min-w-0 items-center gap-1.5">
+                            <span className="truncate font-mono text-xs font-medium text-foreground">
+                              {ws.key}
+                            </span>
+                            {ws.default_branch ? (
+                              <Badge variant="outline" className="font-mono text-[10px]">
+                                {ws.default_branch}
+                              </Badge>
+                            ) : null}
+                          </div>
+                          <div className="flex shrink-0 items-center gap-1">
+                            <CopyButton
+                              text={ws.path}
+                              label="复制路径"
+                              copiedLabel="已复制"
+                              variant="outline"
+                            />
+                            <button
+                              type="button"
+                              onClick={() => onPickWorkspace(selectedNode.id, ws.path)}
+                              data-testid={`control-pick-ws-${ws.key}`}
+                              className="inline-flex min-h-6 items-center gap-1 rounded-[5px] border border-border bg-card px-2 py-0.5 text-[11px] font-medium text-foreground transition-[color,background-color,transform] duration-150 active:scale-[0.97] hover:bg-accent cursor-pointer"
+                            >
+                              <Send className="h-3 w-3 text-[var(--status-running)]" strokeWidth={1.75} aria-hidden="true" />
+                              派发
+                            </button>
+                          </div>
+                        </div>
+                        <div
+                          className="mt-1 font-mono text-[11px] leading-snug text-muted-foreground break-all select-all"
+                          data-testid={`control-ws-path-${ws.key}`}
+                        >
+                          {ws.path}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
           )}

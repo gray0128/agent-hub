@@ -1,15 +1,40 @@
 import { useRef, useState } from "react";
 import { useDroppable } from "@dnd-kit/core";
-import { AlertTriangle, ExternalLink, FileText, GitBranch, Send, Shield, Square } from "lucide-react";
+import {
+  AlertTriangle,
+  ArrowLeftRight,
+  Bell,
+  ChevronDown,
+  ChevronUp,
+  ExternalLink,
+  FileText,
+  GitBranch,
+  GitFork,
+  Lock,
+  Send,
+  Shield,
+  SlidersHorizontal,
+  Square,
+  Terminal
+} from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
-import { cn, formatBytes, formatDurationMs, formatShortTime } from "@/lib/utils";
+import {
+  buildRunCliPreview,
+  cn,
+  formatBytes,
+  formatDurationMs,
+  formatNotifyBadgeMeta,
+  formatShortTime
+} from "@/lib/utils";
 import type { ComposerDraft } from "@/stores/workbench-store";
 import type { AgentName, EffortLevel, NodeRecord, RunEventItem, RunRecord, ThreadRecord } from "@/types";
+import { CopyButton } from "./CopyButton";
 import { RunStatusBadge } from "./StatusBadge";
 
 const AGENT_OPTIONS: AgentName[] = ["agy", "pi", "omp", "codex", "claude"];
@@ -21,12 +46,18 @@ const MODEL_OPTIONS: Record<AgentName, string[]> = {
   claude: ["claude-sonnet-4-5", "claude-opus-4-1"]
 };
 const EFFORT_OPTIONS: EffortLevel[] = ["low", "medium", "high", "xhigh"];
+const NOTIFY_LABELS: Record<ComposerDraft["notifyTarget"], string> = {
+  none: "不通知",
+  webhook: "Bot Webhook",
+  grok: "Grok"
+};
 
 export interface ConversationPaneProps {
   nodes: NodeRecord[];
   selectedThread: ThreadRecord | null;
   threadRuns: RunRecord[];
   selectedRunId: string | null;
+  hasLineage?: boolean;
   fullOutputByRunId: Record<string, string>;
   eventsByRunId: Record<string, RunEventItem[]>;
   composer: ComposerDraft;
@@ -36,6 +67,7 @@ export interface ConversationPaneProps {
   onLoadFullOutput: (runId: string) => void;
   onCancelRun: (runId: string, cascade: boolean) => void;
   onForkThread: (thread: ThreadRecord) => void;
+  onOpenLineage?: () => void;
   onSubmitPrompt: () => void;
 }
 
@@ -44,6 +76,7 @@ export function ConversationPane({
   selectedThread,
   threadRuns,
   selectedRunId,
+  hasLineage = false,
   fullOutputByRunId,
   eventsByRunId,
   composer,
@@ -53,6 +86,7 @@ export function ConversationPane({
   onLoadFullOutput,
   onCancelRun,
   onForkThread,
+  onOpenLineage,
   onSubmitPrompt
 }: ConversationPaneProps) {
   const { setNodeRef: setDropRef, isOver } = useDroppable({
@@ -61,10 +95,17 @@ export function ConversationPane({
 
   const lastCompositionEndRef = useRef<number>(0);
   const [composing, setComposing] = useState(false);
+  const [expandedCmdRuns, setExpandedCmdRuns] = useState<Record<string, boolean>>({});
+  const [expandedPrompts, setExpandedPrompts] = useState<Record<string, boolean>>({});
+  const [mobileParamsOpen, setMobileParamsOpen] = useState(false);
 
   const selectedNode = nodes.find((n) => n.id === composer.nodeId);
   const workspaces = selectedNode?.workspaces ?? [];
   const approvalRun = threadRuns.find((r) => r.status === "needs_approval") ?? null;
+
+  const isReplyMode = composer.mode === "reply" && selectedThread !== null;
+  const targetNodeId = isReplyMode ? selectedThread.node_id : composer.nodeId;
+  const targetNode = nodes.find((n) => n.id === targetNodeId);
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key !== "Enter" || e.shiftKey) return;
@@ -93,19 +134,43 @@ export function ConversationPane({
         {selectedThread ? (
           <>
             <div className="flex min-w-0 items-center gap-2">
-              <span className="truncate text-xs font-semibold text-foreground">
+              <h2 className="truncate text-xs font-semibold text-foreground text-balance">
                 {selectedThread.title || selectedThread.project_key}
-              </span>
-              <span className="rounded-[4px] border border-border px-1.5 py-0.5 text-[10px] font-mono text-muted-foreground">
+              </h2>
+              <span
+                title={selectedThread.workdir}
+                className="inline-flex items-center gap-1 rounded-[4px] border border-border px-1.5 py-0.5 text-[10px] font-mono text-muted-foreground"
+              >
                 {selectedThread.node_id}:{selectedThread.project_key}
               </span>
+              <CopyButton
+                text={selectedThread.workdir}
+                ariaLabel={`复制工作目录 ${selectedThread.workdir}`}
+                title={`复制目录路径：${selectedThread.workdir}`}
+                className="hidden sm:inline-flex"
+              />
               {selectedThread.native_session_id ? (
-                <span className="hidden sm:inline text-[10px] font-mono text-muted-foreground">
-                  session:{selectedThread.native_session_id.slice(0, 14)}
+                <span
+                  title={`native session: ${selectedThread.native_session_id}`}
+                  className="hidden lg:inline text-[10px] font-mono text-muted-foreground"
+                >
+                  session:{selectedThread.native_session_id.slice(0, 12)}
                 </span>
               ) : null}
             </div>
             <div className="flex items-center gap-1.5">
+              {hasLineage && onOpenLineage ? (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={onOpenLineage}
+                  className="min-h-11 md:min-h-0 md:h-7 px-2 text-[11px]"
+                >
+                  <GitFork className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
+                  委派拓扑
+                </Button>
+              ) : null}
               <Button
                 type="button"
                 variant="outline"
@@ -113,7 +178,7 @@ export function ConversationPane({
                 onClick={() => onForkThread(selectedThread)}
                 className="min-h-11 md:min-h-0 md:h-7 text-[11px]"
               >
-                <GitBranch className="h-3 w-3" strokeWidth={1.75} />
+                <GitBranch className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
                 分叉会话
               </Button>
             </div>
@@ -134,6 +199,7 @@ export function ConversationPane({
             <AlertTriangle
               className="h-4 w-4 shrink-0 text-[var(--status-approval)]"
               strokeWidth={1.75}
+              aria-hidden="true"
             />
             <div className="min-w-0">
               <div className="text-xs font-semibold text-[var(--status-approval)]">
@@ -163,7 +229,7 @@ export function ConversationPane({
                 rel="noreferrer"
                 data-testid="open-remote-approval-link"
               >
-                <ExternalLink className="h-3.5 w-3.5" strokeWidth={1.75} />
+                <ExternalLink className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
                 打开远程审批
               </a>
             </Button>
@@ -175,9 +241,11 @@ export function ConversationPane({
       <div className="min-h-0 flex-1 overflow-y-auto divide-y divide-border">
         {threadRuns.length === 0 ? (
           <div className="flex h-full flex-col items-center justify-center gap-1.5 px-6 text-center">
-            <p className="text-sm font-medium text-foreground">就绪 · 等待指令</p>
-            <p className="max-w-md text-xs text-muted-foreground">
-              从左侧拖拽或点击工作区，然后在下方输入 Prompt 派发至指定节点的本地 Agent。
+            <p className="text-sm font-medium text-foreground text-balance">
+              尚未创建任务。请在底部选择节点与项目目录并输入指令。
+            </p>
+            <p className="max-w-md text-xs text-muted-foreground text-pretty">
+              支持从左侧工作区芯片或右侧节点控制面板快速选定目录并派发至本地 Agent。
             </p>
           </div>
         ) : (
@@ -186,7 +254,17 @@ export function ConversationPane({
             const fullText = fullOutputByRunId[run.id];
             const displayMarkdown = fullText ?? run.output_md ?? run.output_preview ?? run.summary;
             const evCount = eventsByRunId[run.id]?.length ?? 0;
-            const isActive = run.status === "queued" || run.status === "claimed" || run.status === "running" || run.status === "needs_approval";
+            const isActive =
+              run.status === "queued" ||
+              run.status === "claimed" ||
+              run.status === "running" ||
+              run.status === "needs_approval";
+            const notifyMeta = formatNotifyBadgeMeta(run.notify_status, run.webhook_armed);
+            const cmdExpanded = Boolean(expandedCmdRuns[run.id]);
+            const cliPreview = buildRunCliPreview(run, selectedThread?.native_session_id);
+            const rawPrompt = run.prompt ?? "";
+            const isLongPrompt = rawPrompt.length > 260 || rawPrompt.split("\n").length > 5;
+            const promptExpanded = Boolean(expandedPrompts[run.id]);
 
             return (
               <article
@@ -195,18 +273,31 @@ export function ConversationPane({
                 data-run-id={run.id}
                 onClick={() => onSelectRun(run.id)}
                 className={cn(
-                  "px-4 py-3 transition-colors duration-150 cursor-pointer",
-                  isSelected ? "bg-surface-elevated/90" : "hover:bg-surface-elevated/40"
+                  "py-3 pr-4 transition-colors duration-150 cursor-pointer",
+                  isSelected
+                    ? "border-l-2 border-l-[var(--status-running)] bg-surface-elevated/90 pl-3.5"
+                    : "pl-4 hover:bg-surface-elevated/40"
                 )}
               >
-                <div className="flex h-7 items-center justify-between gap-2">
-                  <div className="flex min-w-0 items-center gap-2">
+                <div className="flex min-h-7 flex-wrap items-center justify-between gap-x-2 gap-y-1 sm:h-7 sm:flex-nowrap">
+                  <div className="flex min-w-0 flex-wrap items-center gap-1.5 overflow-hidden sm:flex-nowrap">
                     <RunStatusBadge status={run.status} />
-                    <span className="truncate text-xs font-mono text-foreground">{run.id}</span>
+                    <span className="min-w-0 truncate text-xs font-mono text-foreground">{run.id}</span>
                     {run.depth > 0 ? (
-                      <span className="shrink-0 rounded-[4px] border border-border px-1.5 py-0.5 text-[10px] font-mono text-muted-foreground tabular-nums">
+                      <Badge variant="outline" className="shrink-0 font-mono text-[10px]">
                         depth={run.depth}
-                      </span>
+                      </Badge>
+                    ) : null}
+                    {!run.sandbox ? (
+                      <Badge variant="approval" className="shrink-0 text-[10px]">
+                        非沙箱
+                      </Badge>
+                    ) : null}
+                    {notifyMeta ? (
+                      <Badge variant={notifyMeta.tone === "neutral" ? "outline" : notifyMeta.tone} className="shrink-0 text-[10px]">
+                        <Bell className="h-2.5 w-2.5" strokeWidth={1.75} aria-hidden="true" />
+                        {notifyMeta.label}
+                      </Badge>
                     ) : null}
                   </div>
 
@@ -217,23 +308,28 @@ export function ConversationPane({
                   </div>
                 </div>
 
-                <div className="mt-1 flex h-7 items-center justify-between gap-2 text-[11px] text-muted-foreground tabular-nums">
-                  <span className="min-w-0 truncate font-mono">
-                    {run.agent} · {run.resolved_model || run.model || "default"} · 过程事件：{evCount} 条
+                <div className="mt-1 flex min-h-7 flex-wrap items-center justify-between gap-x-2 gap-y-1 text-[11px] text-muted-foreground tabular-nums sm:h-7 sm:flex-nowrap">
+                  <span className="min-w-0 flex-1 truncate font-mono">
+                    {run.agent} · {run.resolved_model || run.model || "default"}
+                    {run.resolved_effort || run.effort ? `@${run.resolved_effort || run.effort}` : ""} · 过程事件：{evCount} 条
                   </span>
-                  <div className="flex shrink-0 items-center gap-1.5">
+                  <div
+                    className="flex shrink-0 items-center gap-1"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    {displayMarkdown ? (
+                      <CopyButton text={displayMarkdown} label="复制输出" copiedLabel="已复制" />
+                    ) : null}
+
                     {isActive ? (
                       <Button
                         type="button"
                         size="sm"
                         variant="outline"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          onCancelRun(run.id, false);
-                        }}
-                        className="h-7 px-2 text-[11px]"
+                        onClick={() => onCancelRun(run.id, false)}
+                        className="h-6 px-2 text-[11px]"
                       >
-                        <Square className="h-3 w-3" strokeWidth={1.75} />
+                        <Square className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
                         取消任务
                       </Button>
                     ) : run.truncated && !fullText ? (
@@ -241,22 +337,82 @@ export function ConversationPane({
                         type="button"
                         size="sm"
                         variant="ghost"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          onLoadFullOutput(run.id);
-                        }}
-                        className="h-7 px-2 text-[11px]"
+                        onClick={() => onLoadFullOutput(run.id)}
+                        className="h-6 px-2 text-[11px]"
                       >
-                        <FileText className="h-3 w-3" strokeWidth={1.75} />
+                        <FileText className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
                         加载完整输出
                       </Button>
                     ) : null}
+
+                    <button
+                      type="button"
+                      aria-expanded={cmdExpanded}
+                      onClick={() =>
+                        setExpandedCmdRuns((prev) => ({ ...prev, [run.id]: !cmdExpanded }))
+                      }
+                      data-testid={`toggle-cmd-${run.id}`}
+                      className={cn(
+                        "inline-flex min-h-6 items-center gap-1 rounded-[5px] border px-2 py-0.5 text-[11px] font-medium transition-colors duration-150 cursor-pointer",
+                        cmdExpanded
+                          ? "border-foreground/30 bg-accent text-foreground"
+                          : "border-border bg-transparent text-muted-foreground hover:bg-accent hover:text-foreground"
+                      )}
+                    >
+                      <Terminal className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
+                      命令
+                    </button>
                   </div>
                 </div>
 
-                {run.prompt ? (
-                  <div className="mt-2 border-l-2 border-border pl-3 text-xs text-foreground/90 whitespace-pre-wrap break-words">
-                    {run.prompt}
+                {cmdExpanded ? (
+                  <div
+                    onClick={(e) => e.stopPropagation()}
+                    data-testid={`run-cmd-preview-${run.id}`}
+                    className="mt-2 rounded-[6px] border border-border bg-muted/40 p-2 cursor-auto"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] text-muted-foreground">
+                      <span className="font-medium">
+                        下发执行命令（{run.sandbox ? "沙箱" : "跳过沙箱"} · 超时 {run.timeout_sec}s · 通知 {run.notify_status}）
+                      </span>
+                      <CopyButton text={cliPreview.fullCommand} label="复制命令" copiedLabel="已复制" variant="outline" />
+                    </div>
+                    <pre className="mt-1.5 overflow-x-auto font-mono text-[11px] leading-relaxed text-foreground whitespace-pre-wrap break-all">
+                      {cliPreview.fullCommand}
+                    </pre>
+                  </div>
+                ) : null}
+
+                {rawPrompt ? (
+                  <div className="mt-2 rounded-[6px] border border-border/80 bg-muted/30 px-3 py-2 text-xs text-foreground/90">
+                    <div className="mb-1 flex items-center justify-between gap-2 text-[10px] font-medium text-muted-foreground">
+                      <span>任务指令</span>
+                      {isLongPrompt ? (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setExpandedPrompts((prev) => ({ ...prev, [run.id]: !promptExpanded }));
+                          }}
+                          className="inline-flex items-center gap-0.5 text-[10px] text-muted-foreground hover:text-foreground cursor-pointer"
+                        >
+                          {promptExpanded ? "收起" : "展开全文"}
+                          {promptExpanded ? (
+                            <ChevronUp className="h-3 w-3" aria-hidden="true" />
+                          ) : (
+                            <ChevronDown className="h-3 w-3" aria-hidden="true" />
+                          )}
+                        </button>
+                      ) : null}
+                    </div>
+                    <div
+                      className={cn(
+                        "whitespace-pre-wrap break-words text-pretty",
+                        isLongPrompt && !promptExpanded && "line-clamp-4"
+                      )}
+                    >
+                      {rawPrompt}
+                    </div>
                   </div>
                 ) : null}
 
@@ -267,7 +423,7 @@ export function ConversationPane({
                 ) : null}
 
                 {displayMarkdown ? (
-                  <div className="mt-2.5 text-xs leading-relaxed text-foreground prose prose-sm max-w-none dark:prose-invert prose-pre:rounded-[6px] prose-pre:border prose-pre:border-border prose-pre:bg-muted/60 prose-pre:p-2.5 prose-code:text-[11px]">
+                  <div className="ahub-markdown mt-2.5">
                     <ReactMarkdown remarkPlugins={[remarkGfm]}>{displayMarkdown}</ReactMarkdown>
                   </div>
                 ) : null}
@@ -292,59 +448,133 @@ export function ConversationPane({
           isOver && "bg-[var(--status-running)]/10 border-[var(--status-running)]"
         )}
       >
-        <div className="mb-2 grid grid-cols-2 gap-1.5 sm:grid-cols-5">
-          <div className="min-w-0">
-            <label htmlFor="composer-node" className="mb-1 block text-[10px] text-muted-foreground">
-              选择节点
-            </label>
-            <Select
-              value={composer.nodeId || undefined}
-              onValueChange={(v) => {
-                const n = nodes.find((item) => item.id === v);
-                onPatchComposer({
-                  mode: "new",
-                  nodeId: v,
-                  workdir: n?.workspaces[0]?.path ?? ""
-                });
-              }}
-            >
-              <SelectTrigger id="composer-node" aria-label="选择节点">
-                <SelectValue placeholder="选择节点" />
-              </SelectTrigger>
-              <SelectContent>
-                {nodes.map((n) => (
-                  <SelectItem key={n.id} value={n.id}>
-                    {n.id} ({n.status === "online" ? "在线" : n.status === "draining" ? "已排空" : "离线"})
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+        {targetNode?.status === "offline" ? (
+          <div className="mb-2 rounded-[5px] border border-[var(--status-approval)]/40 bg-[var(--status-approval)]/10 px-2.5 py-1 text-[11px] text-[var(--status-approval)] text-pretty">
+            目标节点当前离线。现在提交的任务将安全进入排队队列，并在节点上线后自动开始执行。
           </div>
+        ) : null}
 
-          <div className="min-w-0">
-            <label htmlFor="composer-workdir" className="mb-1 block text-[10px] text-muted-foreground">
-              工作目录
-            </label>
-            <Select
-              value={composer.workdir || undefined}
-              onValueChange={(v) => onPatchComposer({ mode: "new", workdir: v })}
+        {/* Target binding mode strip: Reply (locked) vs New (selectable) */}
+        {isReplyMode ? (
+          <div className="mb-2 flex items-center justify-between gap-2 rounded-[6px] border border-border bg-background/60 px-2.5 py-1.5">
+            <div className="flex min-w-0 items-center gap-1.5 text-[11px]">
+              <Lock className="h-3 w-3 shrink-0 text-[var(--status-running)]" strokeWidth={1.75} aria-hidden="true" />
+              <span className="shrink-0 font-medium text-foreground">续聊绑定</span>
+              <span className="truncate font-mono text-muted-foreground" title={selectedThread.workdir}>
+                {selectedThread.node_id}:{selectedThread.project_key}
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => onPatchComposer({ mode: "new" })}
+              data-testid="switch-to-new-thread-btn"
+              className="inline-flex shrink-0 items-center gap-1 rounded-[4px] border border-border bg-card px-2 py-0.5 text-[11px] font-medium text-foreground hover:bg-accent cursor-pointer"
             >
-              <SelectTrigger id="composer-workdir" aria-label="工作目录">
-                <SelectValue placeholder={composer.workdir || "工作目录"} />
-              </SelectTrigger>
-              <SelectContent>
-                {workspaces.map((ws) => (
-                  <SelectItem key={ws.path} value={ws.path}>
-                    {ws.key}
-                  </SelectItem>
-                ))}
-                {composer.workdir && !workspaces.some((w) => w.path === composer.workdir) ? (
-                  <SelectItem value={composer.workdir}>{composer.workdir}</SelectItem>
-                ) : null}
-              </SelectContent>
-            </Select>
+              <ArrowLeftRight className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
+              切换为新建会话
+            </button>
           </div>
+        ) : (
+          <div className="mb-2 space-y-1.5">
+            {selectedThread ? (
+              <div className="flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
+                <span>新建独立会话</span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    onPatchComposer({
+                      mode: "reply",
+                      nodeId: selectedThread.node_id,
+                      workdir: selectedThread.workdir,
+                      agent: selectedThread.agent
+                    })
+                  }
+                  className="text-[11px] font-medium text-[var(--status-running)] hover:underline cursor-pointer"
+                >
+                  返回当前会话续聊
+                </button>
+              </div>
+            ) : null}
+            <div className="grid grid-cols-2 gap-1.5">
+              <div className="min-w-0">
+                <label htmlFor="composer-node" className="mb-1 block text-[10px] text-muted-foreground">
+                  选择节点
+                </label>
+                <Select
+                  value={composer.nodeId || undefined}
+                  onValueChange={(v) => {
+                    const n = nodes.find((item) => item.id === v);
+                    onPatchComposer({
+                      mode: "new",
+                      nodeId: v,
+                      workdir: n?.workspaces[0]?.path ?? ""
+                    });
+                  }}
+                >
+                  <SelectTrigger id="composer-node" aria-label="选择节点">
+                    <SelectValue placeholder="选择节点" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {nodes.map((n) => (
+                      <SelectItem key={n.id} value={n.id}>
+                        {n.id} ({n.status === "online" ? "在线" : n.status === "draining" ? "已排空" : "离线"})
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
 
+              <div className="min-w-0">
+                <label htmlFor="composer-workdir" className="mb-1 block text-[10px] text-muted-foreground">
+                  工作目录
+                </label>
+                <Select
+                  value={composer.workdir || undefined}
+                  onValueChange={(v) => onPatchComposer({ mode: "new", workdir: v })}
+                >
+                  <SelectTrigger id="composer-workdir" aria-label="工作目录">
+                    <SelectValue placeholder={composer.workdir || "工作目录"} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {workspaces.map((ws) => (
+                      <SelectItem key={ws.path} value={ws.path}>
+                        {ws.key}
+                      </SelectItem>
+                    ))}
+                    {composer.workdir && !workspaces.some((w) => w.path === composer.workdir) ? (
+                      <SelectItem value={composer.workdir}>{composer.workdir}</SelectItem>
+                    ) : null}
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Mobile compact parameter toggle (< 640px) */}
+        <div className="mb-2 flex items-center justify-between gap-2 sm:hidden">
+          <span className="truncate font-mono text-[11px] text-muted-foreground">
+            {composer.agent} · {composer.model || "default"} · {composer.effort || "auto"} ·{" "}
+            {NOTIFY_LABELS[composer.notifyTarget]}
+          </span>
+          <button
+            type="button"
+            aria-expanded={mobileParamsOpen}
+            onClick={() => setMobileParamsOpen((v) => !v)}
+            className="inline-flex h-7 shrink-0 items-center gap-1 rounded-[5px] border border-border bg-background/70 px-2 text-[11px] text-foreground cursor-pointer"
+          >
+            <SlidersHorizontal className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
+            {mobileParamsOpen ? "收起参数" : "参数"}
+          </button>
+        </div>
+
+        {/* Agent, Model, Effort & Notification Channel */}
+        <div
+          className={cn(
+            "mb-2 gap-1.5 sm:grid sm:grid-cols-4",
+            mobileParamsOpen ? "grid grid-cols-2" : "hidden"
+          )}
+        >
           <div className="min-w-0">
             <label htmlFor="composer-agent" className="mb-1 block text-[10px] text-muted-foreground">
               Agent
@@ -393,7 +623,7 @@ export function ConversationPane({
             </Select>
           </div>
 
-          <div className="min-w-0 col-span-2 sm:col-span-1">
+          <div className="min-w-0">
             <label htmlFor="composer-effort" className="mb-1 block text-[10px] text-muted-foreground">
               推理强度
             </label>
@@ -410,6 +640,27 @@ export function ConversationPane({
                     {eff}
                   </SelectItem>
                 ))}
+              </SelectContent>
+            </Select>
+          </div>
+
+          <div className="min-w-0">
+            <label htmlFor="composer-notify" className="mb-1 block text-[10px] text-muted-foreground">
+              通知通道
+            </label>
+            <Select
+              value={composer.notifyTarget}
+              onValueChange={(v) =>
+                onPatchComposer({ notifyTarget: v as ComposerDraft["notifyTarget"] })
+              }
+            >
+              <SelectTrigger id="composer-notify" aria-label="通知通道">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="none">不通知</SelectItem>
+                <SelectItem value="webhook">Bot Webhook</SelectItem>
+                <SelectItem value="grok">Grok</SelectItem>
               </SelectContent>
             </Select>
           </div>
@@ -434,29 +685,23 @@ export function ConversationPane({
 
         <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
           <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
-            <label className="inline-flex min-h-11 md:min-h-0 items-center gap-1.5 cursor-pointer">
+            <label className="inline-flex min-h-11 sm:min-h-0 items-center gap-1.5 cursor-pointer">
               <Switch
                 checked={composer.sandbox}
                 onCheckedChange={(checked) => onPatchComposer({ sandbox: checked })}
               />
-              <Shield className="h-3.5 w-3.5" strokeWidth={1.75} />
+              <Shield className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
               <span>沙箱隔离</span>
             </label>
-
-            {selectedThread && composer.mode === "reply" ? (
-              <span className="text-[11px] font-mono text-muted-foreground">
-                续聊会话：{selectedThread.title || selectedThread.id}
-              </span>
-            ) : null}
           </div>
 
           <Button
             type="submit"
             disabled={submitting || !composer.prompt.trim()}
             data-testid="submit-run-button"
-            className="min-h-11 md:min-h-0 md:h-8 px-4"
+            className="min-h-11 sm:min-h-0 sm:h-8 px-4"
           >
-            <Send className="h-3.5 w-3.5" strokeWidth={1.75} />
+            <Send className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
             {submitting ? "派发中..." : "发送指令"}
           </Button>
         </div>

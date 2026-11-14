@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Check, Copy, Download, KeyRound, Pencil, Plus, Terminal, Trash2, X } from "lucide-react";
+import { Download, KeyRound, Pencil, Plus, Terminal, Trash2, X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -22,6 +22,7 @@ import { apiClient, ApiClientError } from "@/lib/api-client";
 import { formatShortTime } from "@/lib/utils";
 import { useFleetStore } from "@/stores/fleet-store";
 import type { ApiKeyRecord } from "@/types";
+import { CopyButton } from "./CopyButton";
 
 export interface OnboardingDialogProps {
   open: boolean;
@@ -54,7 +55,6 @@ export function OnboardingDialog({
   const [tokenInput, setTokenInput] = useState(token);
   const [issuing, setIssuing] = useState(false);
   const [issueError, setIssueError] = useState<string | null>(null);
-  const [copiedId, setCopiedId] = useState<string | null>(null);
 
   useEffect(() => {
     setTokenInput(token);
@@ -69,16 +69,6 @@ export function OnboardingDialog({
     : `请读取 ${hubOrigin}/dl/bootstrap.md 中的最新节点自举说明，直接代我完成本机 ahub 程序与配套技能的检测、下载安装或版本更新；若本机已配置节点守护则重启服务使新版本生效，若首次接入则自动完成基础初始化并引导我补齐节点 Token 启动系统托管服务。`;
   const installCmd = `curl -fsSL ${hubOrigin}/dl/install.sh | AHUB_URL=${hubOrigin} sh && ~/.local/bin/ahub skill install && printf '%s' '${effectiveNodeToken}' | ~/.local/bin/ahub node init --id ${safeNodeName} --url ${hubOrigin} --token-stdin && ~/.local/bin/ahub node service install --activate`;
   const skillCmd = `mkdir -p ~/.agents/skills/ahub && curl -fsSL ${hubOrigin}/skill/SKILL.md -o ~/.agents/skills/ahub/SKILL.md`;
-
-  async function handleCopy(id: string, text: string) {
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopiedId(id);
-      setTimeout(() => setCopiedId((prev) => (prev === id ? null : prev)), 1500);
-    } catch {
-      // ignore clipboard errors in headless contexts
-    }
-  }
 
   async function handleIssueNodeKey() {
     if (!hasSession) {
@@ -150,53 +140,29 @@ export function OnboardingDialog({
               </div>
             )}
 
-            <div className="space-y-1.5 rounded-[6px] border border-border bg-card p-3">
-              <div className="flex items-center justify-between">
+            <div className="space-y-1.5 rounded-[8px] border border-border bg-card p-2">
+              <div className="flex items-center justify-between px-1">
                 <span className="text-[11px] font-medium text-muted-foreground">
                   发给节点本地 Agent 自动安装/更新（推荐）
                 </span>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="ghost"
-                  onClick={() => handleCopy("prompt", agentPrompt)}
-                >
-                  {copiedId === "prompt" ? (
-                    <Check className="h-3.5 w-3.5 text-[var(--status-done)]" strokeWidth={1.75} />
-                  ) : (
-                    <Copy className="h-3.5 w-3.5" strokeWidth={1.75} />
-                  )}
-                  {copiedId === "prompt" ? "已复制" : "复制"}
-                </Button>
+                <CopyButton text={agentPrompt} label="复制" copiedLabel="已复制" />
               </div>
               <pre
                 data-testid="onboarding-agent-prompt"
-                className="whitespace-pre-wrap break-words rounded-[5px] bg-muted/60 p-2.5 font-sans text-xs leading-relaxed text-foreground"
+                className="whitespace-pre-wrap break-words rounded-[4px] bg-muted/60 p-2.5 font-sans text-xs leading-relaxed text-foreground"
               >
                 {agentPrompt}
               </pre>
             </div>
 
-            <div className="space-y-1.5 rounded-[6px] border border-border bg-card p-3">
-              <div className="flex items-center justify-between">
+            <div className="space-y-1.5 rounded-[8px] border border-border bg-card p-2">
+              <div className="flex items-center justify-between px-1">
                 <span className="text-[11px] font-medium text-muted-foreground">
                   终端手工执行安装并启动服务（兜底）
                 </span>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="ghost"
-                  onClick={() => handleCopy("install", installCmd)}
-                >
-                  {copiedId === "install" ? (
-                    <Check className="h-3.5 w-3.5 text-[var(--status-done)]" />
-                  ) : (
-                    <Copy className="h-3.5 w-3.5" />
-                  )}
-                  {copiedId === "install" ? "已复制" : "复制"}
-                </Button>
+                <CopyButton text={installCmd} label="复制" copiedLabel="已复制" />
               </div>
-              <pre className="overflow-x-auto rounded-[5px] bg-muted/60 p-2.5 font-mono text-[11px] leading-relaxed text-foreground">
+              <pre className="overflow-x-auto rounded-[4px] bg-muted/60 p-2.5 font-mono text-[11px] leading-relaxed text-foreground">
                 {installCmd}
               </pre>
             </div>
@@ -221,26 +187,14 @@ export function OnboardingDialog({
           </TabsContent>
 
           <TabsContent value="skill" className="space-y-3 pt-1">
-            <div className="space-y-1.5 rounded-[6px] border border-border bg-card p-3">
-              <div className="flex items-center justify-between">
+            <div className="space-y-1.5 rounded-[8px] border border-border bg-card p-2">
+              <div className="flex items-center justify-between px-1">
                 <span className="text-[11px] font-medium text-muted-foreground">
                   安装内置跨机调度 Skill 文档
                 </span>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="ghost"
-                  onClick={() => handleCopy("skill", skillCmd)}
-                >
-                  {copiedId === "skill" ? (
-                    <Check className="h-3.5 w-3.5 text-[var(--status-done)]" />
-                  ) : (
-                    <Copy className="h-3.5 w-3.5" />
-                  )}
-                  {copiedId === "skill" ? "已复制" : "复制"}
-                </Button>
+                <CopyButton text={skillCmd} label="复制" copiedLabel="已复制" />
               </div>
-              <pre className="overflow-x-auto rounded-[5px] bg-muted/60 p-2.5 font-mono text-[11px] leading-relaxed text-foreground">
+              <pre className="overflow-x-auto rounded-[4px] bg-muted/60 p-2.5 font-mono text-[11px] leading-relaxed text-foreground">
                 {skillCmd}
               </pre>
             </div>
@@ -345,8 +299,8 @@ export function KeysDialog({
   const [webhookUrl, setWebhookUrl] = useState("");
   const [webhookKey, setWebhookKey] = useState("");
   const [freshSecret, setFreshSecret] = useState<string | null>(null);
-  const [copied, setCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [confirmRevokeId, setConfirmRevokeId] = useState<string | null>(null);
 
   const [editingKeyId, setEditingKeyId] = useState<string | null>(null);
   const [editAllowedNodesText, setEditAllowedNodesText] = useState("");
@@ -373,6 +327,7 @@ export function KeysDialog({
     if (open) {
       setFreshSecret(null);
       setEditingKeyId(null);
+      setConfirmRevokeId(null);
       void loadKeys();
     }
   }, [open, token, authenticated]);
@@ -458,6 +413,7 @@ export function KeysDialog({
     setError(null);
     try {
       await apiClient.revokeKey(token, keyId);
+      setConfirmRevokeId(null);
       if (editingKeyId === keyId) {
         setEditingKeyId(null);
       }
@@ -467,24 +423,13 @@ export function KeysDialog({
     }
   }
 
-  async function handleCopySecret() {
-    if (!freshSecret) return;
-    try {
-      await navigator.clipboard.writeText(freshSecret);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch {
-      // ignore
-    }
-  }
-
   const selectedCreateNodes = new Set(parseNodeList(allowedNodesText));
   const selectedEditNodes = new Set(parseNodeList(editAllowedNodesText));
   const canCreate = Boolean(name.trim() && hasSession && (scope !== "node" || boundNodeId.trim()));
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="w-[min(94vw,680px)]" data-testid="keys-dialog">
+      <DialogContent className="max-h-[90dvh] w-[min(94vw,680px)] overflow-y-auto" data-testid="keys-dialog">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <KeyRound className="h-4 w-4 text-[var(--status-running)]" strokeWidth={1.75} />
@@ -593,15 +538,12 @@ export function KeysDialog({
           </div>
 
           {freshSecret && (
-            <div className="rounded-[6px] border border-[var(--status-done)]/40 bg-[var(--status-done)]/10 p-2.5">
+            <div className="rounded-[8px] border border-[var(--status-done)]/40 bg-[var(--status-done)]/10 p-2.5">
               <div className="mb-1 flex items-center justify-between text-xs font-medium text-[var(--status-done)]">
                 <span>请立即保存新生成的明文密钥（关闭后不再显示）</span>
-                <Button type="button" size="sm" variant="ghost" onClick={handleCopySecret}>
-                  {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
-                  {copied ? "已复制" : "复制"}
-                </Button>
+                <CopyButton text={freshSecret} label="复制" copiedLabel="已复制" />
               </div>
-              <code className="block overflow-x-auto font-mono text-[11px] text-foreground">
+              <code className="block overflow-x-auto rounded-[4px] bg-background/40 px-2 py-1 font-mono text-[11px] text-foreground">
                 {freshSecret}
               </code>
             </div>
@@ -667,34 +609,64 @@ export function KeysDialog({
                         </div>
                         {!item.revoked_at && (
                           <div className="flex shrink-0 items-center gap-1">
-                            {item.scope === "client" && (
-                              <Button
-                                type="button"
-                                size="sm"
-                                variant="ghost"
-                                onClick={() => (isEditing ? setEditingKeyId(null) : startEdit(item))}
-                                data-testid={`edit-key-${item.id}`}
-                                aria-label={`编辑 ${item.name}`}
-                              >
-                                {isEditing ? (
-                                  <X className="h-3.5 w-3.5" strokeWidth={1.75} />
-                                ) : (
-                                  <Pencil className="h-3.5 w-3.5" strokeWidth={1.75} />
+                            {confirmRevokeId === item.id ? (
+                              <>
+                                <Button
+                                  type="button"
+                                  size="sm"
+                                  variant="destructive"
+                                  onClick={() => handleRevoke(item.id)}
+                                  data-testid={`confirm-revoke-${item.id}`}
+                                  className="h-7 px-2 text-[11px]"
+                                >
+                                  确认吊销
+                                </Button>
+                                <Button
+                                  type="button"
+                                  size="sm"
+                                  variant="ghost"
+                                  onClick={() => setConfirmRevokeId(null)}
+                                  className="h-7 px-2 text-[11px]"
+                                >
+                                  取消
+                                </Button>
+                              </>
+                            ) : (
+                              <>
+                                {item.scope === "client" && (
+                                  <Button
+                                    type="button"
+                                    size="sm"
+                                    variant="ghost"
+                                    onClick={() => (isEditing ? setEditingKeyId(null) : startEdit(item))}
+                                    data-testid={`edit-key-${item.id}`}
+                                    aria-label={`编辑 ${item.name}`}
+                                  >
+                                    {isEditing ? (
+                                      <X className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
+                                    ) : (
+                                      <Pencil className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
+                                    )}
+                                    {isEditing ? "收起" : "编辑绑定"}
+                                  </Button>
                                 )}
-                                {isEditing ? "收起" : "编辑绑定"}
-                              </Button>
+                                <Button
+                                  type="button"
+                                  size="sm"
+                                  variant="ghost"
+                                  onClick={() => {
+                                    setEditingKeyId(null);
+                                    setConfirmRevokeId(item.id);
+                                  }}
+                                  data-testid={`revoke-key-${item.id}`}
+                                  className="text-[var(--status-failed)] hover:text-[var(--status-failed)]"
+                                  aria-label={`吊销 ${item.name}`}
+                                >
+                                  <Trash2 className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
+                                  吊销
+                                </Button>
+                              </>
                             )}
-                            <Button
-                              type="button"
-                              size="sm"
-                              variant="ghost"
-                              onClick={() => handleRevoke(item.id)}
-                              className="text-[var(--status-failed)] hover:text-[var(--status-failed)]"
-                              aria-label={`吊销 ${item.name}`}
-                            >
-                              <Trash2 className="h-3.5 w-3.5" strokeWidth={1.75} />
-                              吊销
-                            </Button>
                           </div>
                         )}
                       </div>

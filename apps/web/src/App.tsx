@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   DndContext,
+  DragOverlay,
   type DragEndEvent,
+  type DragStartEvent,
   KeyboardSensor,
   PointerSensor,
   useSensor,
@@ -55,7 +57,29 @@ declare global {
   }
 }
 
+function useIsDesktop(): boolean {
+  const [isDesktop, setIsDesktop] = useState(() =>
+    typeof window !== "undefined" ? window.innerWidth >= 768 : true
+  );
+
+  useEffect(() => {
+    const mq = window.matchMedia("(min-width: 768px)");
+    const update = () => setIsDesktop(mq.matches);
+    update();
+    mq.addEventListener("change", update);
+    window.addEventListener("resize", update);
+    return () => {
+      mq.removeEventListener("change", update);
+      window.removeEventListener("resize", update);
+    };
+  }, []);
+
+  return isDesktop;
+}
+
 export function App() {
+  const isDesktop = useIsDesktop();
+
   const nodes = useFleetStore((s) => s.nodes);
   const selectedNodeId = useFleetStore((s) => s.selectedNodeId);
   const setNodes = useFleetStore((s) => s.setNodes);
@@ -105,7 +129,9 @@ export function App() {
   const patchComposer = useWorkbenchStore((s) => s.patchComposer);
 
   const [submitting, setSubmitting] = useState(false);
+  const [dragLabel, setDragLabel] = useState<string | null>(null);
   const wsClientRef = useRef<HubStreamClient | null>(null);
+  const fetchedDetailIdsRef = useRef<Set<string>>(new Set());
   const hasSession = authStatus === "authenticated" || Boolean(token);
 
   const sensors = useSensors(
@@ -177,6 +203,7 @@ export function App() {
   useEffect(() => {
     let cancelled = false;
     let client: HubStreamClient | null = null;
+    fetchedDetailIdsRef.current.clear();
     setAuthState("checking", null);
     setStreamStatus("connecting");
 
@@ -282,7 +309,7 @@ export function App() {
     upsertRun
   ]);
 
-  // Fetch events and summary preview for selected run when switched
+  // Fetch events for selected run when switched
   useEffect(() => {
     if (!hasSession || !selectedRunId) return;
     let cancelled = false;
@@ -296,22 +323,10 @@ export function App() {
       .catch(() => {
         // non-fatal background sync
       });
-
-    const curRun = useTaskStore.getState().runs.find((r) => r.id === selectedRunId);
-    if (curRun && !curRun.output_preview && !curRun.output_md) {
-      void apiClient
-        .fetchRunDetail(token, selectedRunId, "summary")
-        .then((res) => {
-          if (!cancelled) upsertRun(res.run);
-        })
-        .catch(() => {
-          // non-fatal background sync
-        });
-    }
     return () => {
       cancelled = true;
     };
-  }, [appendEvents, hasSession, selectedRunId, token, upsertRun]);
+  }, [appendEvents, hasSession, selectedRunId, token]);
 
   const selectedThread = useMemo(
     () => threads.find((t) => t.id === selectedThreadId) ?? null,
@@ -325,6 +340,35 @@ export function App() {
       .slice()
       .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at));
   }, [runs, selectedThreadId]);
+
+  // Hydrate markdown summary previews for terminal runs in active thread when loaded from list view
+  useEffect(() => {
+    if (!hasSession || threadRuns.length === 0) return;
+    let cancelled = false;
+    const missing = threadRuns
+      .slice(-8)
+      .filter(
+        (r) =>
+          (r.status === "done" || r.status === "failed" || r.status === "cancelled") &&
+          !r.output_preview &&
+          !r.output_md &&
+          !fetchedDetailIdsRef.current.has(r.id)
+      );
+    for (const run of missing) {
+      fetchedDetailIdsRef.current.add(run.id);
+      void apiClient
+        .fetchRunDetail(token, run.id, "summary")
+        .then((res) => {
+          if (!cancelled) upsertRun(res.run);
+        })
+        .catch(() => {
+          // non-fatal background sync
+        });
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [hasSession, threadRuns, token, upsertRun]);
 
   const selectedRun = useMemo(() => {
     if (selectedRunId) {
@@ -343,6 +387,25 @@ export function App() {
     () => (selectedRun ? eventsByRunId[selectedRun.id] ?? [] : []),
     [eventsByRunId, selectedRun]
   );
+
+  const hasLineage = useMemo(() => {
+    if (!selectedRun) return false;
+    if (selectedRun.depth > 0) return true;
+    return runs.some((r) => r.root_run_id === selectedRun.root_run_id && r.id !== selectedRun.id);
+  }, [runs, selectedRun]);
+
+  const fleetTelemetry = useMemo(() => {
+    const online = nodes.filter((n) => n.status === "online").length;
+    let running = 0;
+    let approval = 0;
+    let queued = 0;
+    for (const r of runs) {
+      if (r.status === "running" || r.status === "claimed") running += 1;
+      else if (r.status === "needs_approval") approval += 1;
+      else if (r.status === "queued") queued += 1;
+    }
+    return { online, total: nodes.length, running, approval, queued };
+  }, [nodes, runs]);
 
   function handleSelectThreadById(threadId: string) {
     const thread = threads.find((t) => t.id === threadId);
@@ -364,6 +427,10 @@ export function App() {
     selectNode(nodeId);
     patchComposer({ mode: "new", nodeId, workdir });
     setMobileLeftOpen(false);
+    setMobileRightOpen(false);
+    window.requestAnimationFrame(() => {
+      document.getElementById("prompt-input")?.focus();
+    });
   }
 
   function handleNewThread() {
@@ -376,6 +443,9 @@ export function App() {
       workdir: composer.workdir || targetNode?.workspaces?.[0]?.path || ""
     });
     setMobileLeftOpen(false);
+    window.requestAnimationFrame(() => {
+      document.getElementById("prompt-input")?.focus();
+    });
   }
 
   async function handleTogglePinThread(thread: ThreadRecord) {
@@ -485,7 +555,10 @@ export function App() {
       });
 
       if (res.run) {
-        upsertRun(res.run);
+        upsertRun({
+          ...res.run,
+          prompt: res.run.prompt ?? promptText
+        });
         selectThread(res.run.thread_id);
         selectRun(res.run.id);
         const threadsRes = await apiClient.fetchThreads(token);
@@ -499,7 +572,25 @@ export function App() {
     }
   }
 
+  function handleDragStart(event: DragStartEvent) {
+    const data = event.active.data.current as
+      | { type?: string; nodeId?: string; workdir?: string; threadId?: string; runId?: string }
+      | undefined;
+    if (data?.type === "workspace" && data.workdir) {
+      const key = data.workdir.split("/").pop() || data.workdir;
+      setDragLabel(`${data.nodeId ?? "node"}:${key}`);
+    } else if (data?.type === "queued" && data.runId) {
+      setDragLabel(`队列 ${data.runId}`);
+    } else if (data?.type === "thread" && data.threadId) {
+      const t = threads.find((item) => item.id === data.threadId);
+      setDragLabel(t?.title || t?.project_key || data.threadId);
+    } else {
+      setDragLabel(null);
+    }
+  }
+
   function handleDragEnd(event: DragEndEvent) {
+    setDragLabel(null);
     const { active, over } = event;
     if (!over) return;
     const activeData = active.data.current as
@@ -509,6 +600,45 @@ export function App() {
     if (activeData?.type === "workspace" && over.id === "composer-workdir-dropzone") {
       if (activeData.nodeId && activeData.workdir) {
         handlePickWorkspace(activeData.nodeId, activeData.workdir);
+      }
+      return;
+    }
+
+    if (activeData?.type === "thread" && activeData.threadId) {
+      const overData = over.data.current as { type?: string; threadId?: string } | undefined;
+      if (overData?.type !== "thread" || !overData.threadId || activeData.threadId === overData.threadId) {
+        return;
+      }
+      const activeThread = threads.find((t) => t.id === activeData.threadId);
+      const overThread = threads.find((t) => t.id === overData.threadId);
+      if (!activeThread || !overThread || activeThread.pinned !== overThread.pinned) {
+        return;
+      }
+
+      const group = threads.filter((t) => t.pinned === activeThread.pinned);
+      const oldIdx = group.findIndex((t) => t.id === activeThread.id);
+      const newIdx = group.findIndex((t) => t.id === overThread.id);
+      if (oldIdx < 0 || newIdx < 0) return;
+
+      const movedGroup = arrayMove(group, oldIdx, newIdx).map((t, idx) => ({
+        ...t,
+        sort_order: (idx + 1) * 100
+      }));
+      const byId = new Map(movedGroup.map((t) => [t.id, t]));
+      setThreads(threads.map((t) => byId.get(t.id) ?? t));
+
+      if (hasSession) {
+        const changed = movedGroup.filter((next) => {
+          const prev = group.find((g) => g.id === next.id);
+          return prev && prev.sort_order !== next.sort_order;
+        });
+        void Promise.all(
+          changed.map((t) =>
+            apiClient.patchThread(token, t.id, { sort_order: t.sort_order })
+          )
+        ).catch((err) => {
+          setErrorBanner(err instanceof ApiClientError ? err.message : "会话排序保存失败");
+        });
       }
       return;
     }
@@ -552,6 +682,7 @@ export function App() {
     nodes,
     selectedNodeId,
     threads,
+    runs,
     selectedThreadId,
     activeWorkdir: composer.workdir,
     activeTargetNodeId: composer.nodeId,
@@ -575,11 +706,41 @@ export function App() {
     onSelectRun: selectRun,
     onCancelRun: handleCancelRun,
     onToggleNodeDrain: handleToggleNodeDrain,
-    onUpdateNodeConcurrency: handleUpdateNodeConcurrency
+    onUpdateNodeConcurrency: handleUpdateNodeConcurrency,
+    onPickWorkspace: handlePickWorkspace
   };
 
+  const conversationElement = (
+    <ConversationPane
+      nodes={nodes}
+      selectedThread={selectedThread}
+      threadRuns={threadRuns}
+      selectedRunId={selectedRun?.id ?? null}
+      hasLineage={hasLineage}
+      fullOutputByRunId={fullOutputByRunId}
+      eventsByRunId={eventsByRunId}
+      composer={composer}
+      submitting={submitting}
+      onPatchComposer={patchComposer}
+      onSelectRun={selectRun}
+      onLoadFullOutput={handleLoadFullOutput}
+      onCancelRun={handleCancelRun}
+      onForkThread={handleForkThread}
+      onOpenLineage={() => {
+        setActiveTab("lineage");
+        if (!isDesktop) setMobileRightOpen(true);
+      }}
+      onSubmitPrompt={handleSubmitPrompt}
+    />
+  );
+
   return (
-    <DndContext sensors={sensors} onDragEnd={handleDragEnd}>
+    <DndContext
+      sensors={sensors}
+      onDragStart={handleDragStart}
+      onDragCancel={() => setDragLabel(null)}
+      onDragEnd={handleDragEnd}
+    >
       <div className="flex h-dvh w-screen flex-col overflow-hidden bg-background text-foreground">
         {/* Global slim header bar */}
         <header className="flex h-12 shrink-0 items-center justify-between gap-2 border-b border-border bg-card px-2 sm:px-3">
@@ -593,14 +754,14 @@ export function App() {
               aria-label="打开节点与会话列表"
               data-testid="mobile-left-trigger"
             >
-              <PanelLeft className="h-4 w-4" strokeWidth={1.75} />
+              <PanelLeft className="h-4 w-4" strokeWidth={1.75} aria-hidden="true" />
             </Button>
 
             <div className="flex items-center gap-2 px-1">
-              <span className="h-2 w-2 rounded-full bg-[var(--status-running)]" />
-              <span className="truncate font-mono text-sm font-semibold tracking-tight">
+              <span className="h-2 w-2 rounded-full bg-[var(--status-running)]" aria-hidden="true" />
+              <h1 className="truncate font-mono text-sm font-semibold tracking-tight">
                 agent-hub
-              </span>
+              </h1>
             </div>
 
             <span
@@ -608,6 +769,7 @@ export function App() {
               className="hidden items-center gap-1.5 rounded-[5px] border border-border bg-background px-2 py-0.5 text-[11px] text-muted-foreground sm:inline-flex"
             >
               <span
+                aria-hidden="true"
                 className={cn(
                   "h-1.5 w-1.5 rounded-full",
                   streamStatus === "connected" && "bg-[var(--status-done)]",
@@ -621,6 +783,31 @@ export function App() {
                   ? "连接中"
                   : "已断开"}
             </span>
+
+            <div className="hidden items-center gap-1.5 font-mono text-[11px] text-muted-foreground tabular-nums lg:inline-flex">
+              <button
+                type="button"
+                onClick={() => setActiveTab("control")}
+                className="inline-flex items-center gap-1 rounded-[5px] border border-border bg-background/60 px-2 py-0.5 hover:text-foreground cursor-pointer"
+              >
+                在线 {fleetTelemetry.online}/{fleetTelemetry.total}
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveTab("queue")}
+                className="inline-flex items-center gap-2 rounded-[5px] border border-border bg-background/60 px-2 py-0.5 hover:text-foreground cursor-pointer"
+              >
+                <span>运行 {fleetTelemetry.running}</span>
+                <span>排队 {fleetTelemetry.queued}</span>
+                <span
+                  className={cn(
+                    fleetTelemetry.approval > 0 && "text-[var(--status-approval)] font-medium"
+                  )}
+                >
+                  审批 {fleetTelemetry.approval}
+                </span>
+              </button>
+            </div>
           </div>
 
           <div className="flex shrink-0 items-center gap-1 sm:gap-1.5">
@@ -629,9 +816,10 @@ export function App() {
               variant="outline"
               onClick={() => setOnboardingOpen(true)}
               className="min-h-11 min-w-11 px-2.5 md:min-h-8 md:h-8 md:px-2.5"
+              aria-label="接入节点"
               data-testid="open-onboarding-btn"
             >
-              <Plus className="h-3.5 w-3.5" strokeWidth={1.75} />
+              <Plus className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
               <span className="hidden sm:inline">接入节点</span>
             </Button>
 
@@ -643,7 +831,7 @@ export function App() {
               aria-label="API Keys"
               data-testid="open-keys-btn"
             >
-              <KeyRound className="h-3.5 w-3.5" strokeWidth={1.75} />
+              <KeyRound className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
               <span className="hidden sm:inline">API Keys</span>
             </Button>
 
@@ -657,9 +845,9 @@ export function App() {
               data-testid="theme-toggle-btn"
             >
               {theme === "dark" ? (
-                <Sun className="h-4 w-4" strokeWidth={1.75} />
+                <Sun className="h-4 w-4" strokeWidth={1.75} aria-hidden="true" />
               ) : (
-                <Moon className="h-4 w-4" strokeWidth={1.75} />
+                <Moon className="h-4 w-4" strokeWidth={1.75} aria-hidden="true" />
               )}
             </Button>
 
@@ -672,7 +860,7 @@ export function App() {
               aria-label="打开检视面板"
               data-testid="mobile-right-trigger"
             >
-              <PanelRight className="h-4 w-4" strokeWidth={1.75} />
+              <PanelRight className="h-4 w-4" strokeWidth={1.75} aria-hidden="true" />
             </Button>
           </div>
         </header>
@@ -683,80 +871,49 @@ export function App() {
             className="flex shrink-0 items-center justify-between gap-2 border-b border-[var(--status-failed)]/40 bg-[var(--status-failed)]/10 px-3 py-1.5 text-xs text-[var(--status-failed)]"
           >
             <div className="flex min-w-0 items-center gap-1.5">
-              <AlertCircle className="h-3.5 w-3.5 shrink-0" strokeWidth={1.75} />
+              <AlertCircle className="h-3.5 w-3.5 shrink-0" strokeWidth={1.75} aria-hidden="true" />
               <span className="truncate">{errorBanner}</span>
             </div>
             <button
               type="button"
               onClick={() => setErrorBanner(null)}
               aria-label="关闭错误提示"
-              className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-[4px] hover:bg-black/10"
+              className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-[4px] hover:bg-black/10 cursor-pointer"
             >
-              <X className="h-3.5 w-3.5" />
+              <X className="h-3.5 w-3.5" aria-hidden="true" />
             </button>
           </div>
         )}
 
-        {/* Desktop 3-pane resizable layout */}
-        <main className="hidden min-h-0 flex-1 md:block">
-          <Group orientation="horizontal" className="h-full w-full">
-            <Panel id="fleet" defaultSize="22%" minSize="16%" maxSize="34%" className="h-full overflow-hidden">
-              <FleetThreadsPane {...fleetProps} />
-            </Panel>
-            <Separator className="w-px bg-border transition-colors duration-150 hover:bg-[var(--status-running)]" />
-            <Panel id="stream" defaultSize="48%" minSize="32%" className="h-full overflow-hidden">
-              <ConversationPane
-                nodes={nodes}
-                selectedThread={selectedThread}
-                threadRuns={threadRuns}
-                selectedRunId={selectedRun?.id ?? null}
-                fullOutputByRunId={fullOutputByRunId}
-                eventsByRunId={eventsByRunId}
-                composer={composer}
-                submitting={submitting}
-                onPatchComposer={patchComposer}
-                onSelectRun={selectRun}
-                onLoadFullOutput={handleLoadFullOutput}
-                onCancelRun={handleCancelRun}
-                onForkThread={handleForkThread}
-                onSubmitPrompt={handleSubmitPrompt}
-              />
-            </Panel>
-            <Separator className="w-px bg-border transition-colors duration-150 hover:bg-[var(--status-running)]" />
-            <Panel id="inspector" defaultSize="30%" minSize="22%" maxSize="44%" className="h-full overflow-hidden">
-              <InspectorPane {...inspectorProps} />
-            </Panel>
-          </Group>
-        </main>
-
-        {/* Mobile single-column stream + drawer sheets */}
-        <main className="min-h-0 flex-1 md:hidden">
-          <ConversationPane
-            nodes={nodes}
-            selectedThread={selectedThread}
-            threadRuns={threadRuns}
-            selectedRunId={selectedRun?.id ?? null}
-            fullOutputByRunId={fullOutputByRunId}
-            eventsByRunId={eventsByRunId}
-            composer={composer}
-            submitting={submitting}
-            onPatchComposer={patchComposer}
-            onSelectRun={selectRun}
-            onLoadFullOutput={handleLoadFullOutput}
-            onCancelRun={handleCancelRun}
-            onForkThread={handleForkThread}
-            onSubmitPrompt={handleSubmitPrompt}
-          />
+        {/* Single <main> landmark: 3-pane resizable on desktop, focused timeline on mobile */}
+        <main className="min-h-0 flex-1 overflow-hidden">
+          {isDesktop ? (
+            <Group orientation="horizontal" className="h-full w-full">
+              <Panel id="fleet" defaultSize="22%" minSize="16%" maxSize="34%" className="h-full overflow-hidden">
+                <FleetThreadsPane {...fleetProps} />
+              </Panel>
+              <Separator className="w-px bg-border transition-colors duration-150 hover:bg-[var(--status-running)]" />
+              <Panel id="stream" defaultSize="48%" minSize="32%" className="h-full overflow-hidden">
+                {conversationElement}
+              </Panel>
+              <Separator className="w-px bg-border transition-colors duration-150 hover:bg-[var(--status-running)]" />
+              <Panel id="inspector" defaultSize="30%" minSize="22%" maxSize="44%" className="h-full overflow-hidden">
+                <InspectorPane {...inspectorProps} />
+              </Panel>
+            </Group>
+          ) : (
+            conversationElement
+          )}
         </main>
 
         <Sheet open={mobileLeftOpen} onOpenChange={setMobileLeftOpen}>
-          <SheetContent side="left">
-            <FleetThreadsPane {...fleetProps} />
+          <SheetContent side="left" title="节点与会话">
+            <FleetThreadsPane {...fleetProps} inDrawer />
           </SheetContent>
         </Sheet>
 
         <Sheet open={mobileRightOpen} onOpenChange={setMobileRightOpen}>
-          <SheetContent side="right">
+          <SheetContent side="right" title="实时检视与节点控制">
             <InspectorPane {...inspectorProps} />
           </SheetContent>
         </Sheet>
@@ -781,6 +938,14 @@ export function App() {
           authKind={authKind}
         />
       </div>
+
+      <DragOverlay dropAnimation={null}>
+        {dragLabel ? (
+          <div className="rounded-[6px] border border-[var(--status-running)] bg-popover px-2.5 py-1 font-mono text-xs text-popover-foreground shadow-lg">
+            {dragLabel}
+          </div>
+        ) : null}
+      </DragOverlay>
     </DndContext>
   );
 }
