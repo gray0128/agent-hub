@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "wrangler dev --local --test-scheduled",
     "typecheck": "tsc --noEmit",
-    "test": "tsc --noEmit && node --test src/notify-queue.test.mjs"
+    "test": "tsc --noEmit && node --test src/auth.test.mjs src/notify-queue.test.mjs src/downloads.test.mjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261112.1",

@@ -14,6 +14,7 @@ import {
   type ThreadStatus,
   type WorkspaceEntry
 } from "./types";
+import { validateWebhookUrl } from "./webhook-crypto";
 
 const AGENTS = new Set<AgentName>(["agy", "pi", "omp", "codex", "claude"]);
 const EFFORTS = new Set<EffortLevel>(["", "off", "minimal", "low", "medium", "high", "xhigh", "max"]);
@@ -479,11 +480,22 @@ export function parseCreateKeyRequest(raw: unknown): {
   allowedNodes: string[];
   allowUnsandboxed: boolean;
   maxDepthLimit: number;
+  webhookUrl?: string;
+  webhookKey?: string;
 } {
   const obj = asRecord(raw, "CreateKeyRequest");
   rejectUnknownKeys(
     obj,
-    ["name", "scope", "bound_node_id", "allowed_nodes", "allow_unsandboxed", "max_depth_limit"],
+    [
+      "name",
+      "scope",
+      "bound_node_id",
+      "allowed_nodes",
+      "allow_unsandboxed",
+      "max_depth_limit",
+      "webhook_url",
+      "webhook_key"
+    ],
     "CreateKeyRequest"
   );
   const name = asRequiredString(obj, "name", 1, 128);
@@ -493,7 +505,10 @@ export function parseCreateKeyRequest(raw: unknown): {
   }
   const scope = scopeRaw as ApiScope;
   const boundNodeId = asOptionalString(obj, "bound_node_id", 64);
-  if (scope === "node" && (!boundNodeId || !NODE_ID_RE.test(boundNodeId))) {
+  if (boundNodeId !== undefined && !NODE_ID_RE.test(boundNodeId)) {
+    throw new HubError(400, "BAD_REQUEST", "Invalid bound_node_id.");
+  }
+  if (scope === "node" && !boundNodeId) {
     throw new HubError(400, "BAD_REQUEST", "bound_node_id is required for node scope keys.");
   }
   const allowedNodes: string[] = [];
@@ -501,23 +516,138 @@ export function parseCreateKeyRequest(raw: unknown): {
     if (!Array.isArray(obj["allowed_nodes"])) {
       throw new HubError(400, "BAD_REQUEST", "allowed_nodes must be an array.");
     }
+    const seen = new Set<string>();
     for (const item of obj["allowed_nodes"]) {
       if (typeof item !== "string" || !NODE_ID_RE.test(item)) {
         throw new HubError(400, "BAD_REQUEST", "Invalid node ID in allowed_nodes.");
       }
-      allowedNodes.push(item);
+      if (!seen.has(item)) {
+        seen.add(item);
+        allowedNodes.push(item);
+      }
     }
   }
   const allowUnsandboxed = asOptionalBoolean(obj, "allow_unsandboxed") ?? false;
   const maxDepthLimit = asOptionalInt(obj, "max_depth_limit", 0, 3) ?? 1;
+
+  const webhookUrlRaw = asOptionalString(obj, "webhook_url", 2048)?.trim();
+  const webhookKeyRaw = asOptionalString(obj, "webhook_key", 2048)?.trim();
+  if ((webhookUrlRaw || webhookKeyRaw) && scope !== "client") {
+    throw new HubError(400, "BAD_REQUEST", "webhook_url and webhook_key are only allowed for client scope keys.");
+  }
+  if (webhookKeyRaw && !webhookUrlRaw) {
+    throw new HubError(400, "BAD_REQUEST", "webhook_key requires webhook_url.");
+  }
+  let webhookUrl: string | undefined;
+  if (webhookUrlRaw) {
+    try {
+      webhookUrl = validateWebhookUrl(webhookUrlRaw).toString();
+    } catch (err) {
+      throw new HubError(400, "BAD_REQUEST", err instanceof Error ? err.message : "Invalid webhook_url.");
+    }
+  }
+
   return {
     name,
     scope,
     boundNodeId,
     allowedNodes,
     allowUnsandboxed,
-    maxDepthLimit
+    maxDepthLimit,
+    webhookUrl,
+    webhookKey: webhookKeyRaw || undefined
   };
+}
+
+export interface PatchKeyInput {
+  boundNodeId?: string | null;
+  allowedNodes?: string[];
+  allowUnsandboxed?: boolean;
+  maxDepthLimit?: number;
+  webhookUrl?: string;
+  webhookKey?: string;
+  clearWebhook?: boolean;
+}
+
+export function parsePatchKeyRequest(raw: unknown): PatchKeyInput {
+  const obj = asRecord(raw, "PatchKeyRequest");
+  rejectUnknownKeys(
+    obj,
+    [
+      "bound_node_id",
+      "allowed_nodes",
+      "allow_unsandboxed",
+      "max_depth_limit",
+      "webhook_url",
+      "webhook_key",
+      "clear_webhook"
+    ],
+    "PatchKeyRequest"
+  );
+  if (Object.keys(obj).length === 0) {
+    throw new HubError(400, "BAD_REQUEST", "PatchKeyRequest must specify at least one field.");
+  }
+
+  const out: PatchKeyInput = {};
+  if (obj["bound_node_id"] !== undefined) {
+    const val = obj["bound_node_id"];
+    if (val === null || val === "") {
+      out.boundNodeId = null;
+    } else if (typeof val === "string" && val.length <= 64 && NODE_ID_RE.test(val)) {
+      out.boundNodeId = val;
+    } else {
+      throw new HubError(400, "BAD_REQUEST", "Invalid bound_node_id.");
+    }
+  }
+
+  if (obj["allowed_nodes"] !== undefined) {
+    if (!Array.isArray(obj["allowed_nodes"])) {
+      throw new HubError(400, "BAD_REQUEST", "allowed_nodes must be an array.");
+    }
+    const allowed: string[] = [];
+    const seen = new Set<string>();
+    for (const item of obj["allowed_nodes"]) {
+      if (typeof item !== "string" || !NODE_ID_RE.test(item)) {
+        throw new HubError(400, "BAD_REQUEST", "Invalid node ID in allowed_nodes.");
+      }
+      if (!seen.has(item)) {
+        seen.add(item);
+        allowed.push(item);
+      }
+    }
+    out.allowedNodes = allowed;
+  }
+
+  const allowUnsandboxed = asOptionalBoolean(obj, "allow_unsandboxed");
+  if (allowUnsandboxed !== undefined) {
+    out.allowUnsandboxed = allowUnsandboxed;
+  }
+  const maxDepthLimit = asOptionalInt(obj, "max_depth_limit", 0, 3);
+  if (maxDepthLimit !== undefined) {
+    out.maxDepthLimit = maxDepthLimit;
+  }
+  const clearWebhook = asOptionalBoolean(obj, "clear_webhook");
+  if (clearWebhook !== undefined) {
+    out.clearWebhook = clearWebhook;
+  }
+
+  const webhookUrlRaw = asOptionalString(obj, "webhook_url", 2048);
+  const webhookKeyRaw = asOptionalString(obj, "webhook_key", 2048);
+  if (clearWebhook === true && (webhookUrlRaw !== undefined || webhookKeyRaw !== undefined)) {
+    throw new HubError(400, "BAD_REQUEST", "clear_webhook cannot be combined with webhook_url or webhook_key.");
+  }
+  if (webhookUrlRaw !== undefined) {
+    try {
+      out.webhookUrl = validateWebhookUrl(webhookUrlRaw).toString();
+    } catch (err) {
+      throw new HubError(400, "BAD_REQUEST", err instanceof Error ? err.message : "Invalid webhook_url.");
+    }
+  }
+  if (webhookKeyRaw !== undefined) {
+    out.webhookKey = webhookKeyRaw.trim();
+  }
+
+  return out;
 }
 
 function parseWorkspaceList(raw: unknown): WorkspaceEntry[] {

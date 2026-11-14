@@ -54,7 +54,10 @@ skills/ahub/SKILL.md             # 通过 go:embed 内嵌于二进制中
 | `ahub threads [--node <n>] [--q <keyword>] [--json]` | 查询历史会话线程 ID 以便跨轮续接 |
 | `ahub cancel <run_id> [--cascade] [--reason <text>] [--json]` | 取消单个任务；加 `--cascade` 时级联终止整棵 `root_run_id` 任务树 |
 | `ahub skill print \| install [--dir <path>]` | 打印内嵌 `SKILL.md`，或将其安装到指定 Agent Skill 目录（如 `~/.agents/skills/ahub/SKILL.md`） |
-| `ahub update [--check]` | 查询 `/dl/version.json` 并校验 SHA-256 原子替换当前二进制 |
+| `ahub update [--check] [--target <path>] [--no-restart] [--json]` | 查询 `/dl/version.json` 并校验 SHA-256 原子替换当前二进制；默认在更新本机活跃二进制后自动向运行中的 `ahub node serve` 发 `SIGHUP` 优雅排空重启，或在未运行进程间回退系统服务重载（`--no-restart` 或指定 `--target` 时跳过重启） |
+| `ahub node init [--id <node_id>] [--name <display_name>] [--url <hub_url>] [--token <token> \| --token-stdin] [--root <dir> ...] [--max-concurrency <n>] [--config <path>] [--force] [--json]` | 幂等创建或更新 `0600` 权限 `~/.config/ahub/node.json`，自动探测主机名、已有工作区根目录与本机已安装 Agent（`agy`/`pi`/`omp`/`codex`/`claude`），`--json` 输出脱敏（仅含布尔值 `has_token`） |
+| `ahub node status [--config <path>] [--target-dir <dir>] [--json]` | 零密钥泄露检查节点配置文件、工作区根、已启用 Agent、`has_token`、系统服务托管状态及 macOS `AhubDaemon.app` 签名与代码目录一致性，供 Agent 自举与巡检调用 |
+| `ahub node service install\|uninstall\|status [--bin <path>] [--config <path>] [--target-dir <dir>] [--recreate-app] [--activate] [--json]` | 生成、卸载或查询 macOS `LaunchAgent`（含冻结一次签名的 `~/Applications/AhubDaemon.app` 启动壳）与 Linux `systemd --user` 单元；指定 `--activate` 时加载并重启守护进程使新版本立即生效；指定 `--recreate-app` 时显式重建 `.app` 壳 |
 
 ### 3.3 标准退出码
 
@@ -120,7 +123,7 @@ skills/ahub/SKILL.md             # 通过 go:embed 内嵌于二进制中
 
 | Agent | 无头调用命令模板 | 会话续接参数 | 输出解析规则 |
 | --- | --- | --- | --- |
-| `agy` | `agy -p --output-format json [--sandbox] [--model <m>] [--effort <e>] [--print-timeout <t>] <prompt>` | `--conversation <native_session_id>` | 解析单对象 JSON 提取 `status`、`conversation_id`、`response`、`error`；**严禁采信返回的累计耗时，必须由 Go 守护端 `time.Since(startedAt)` 单调计时**；当 `status == "NEEDS_HUMAN_APPROVAL"` 时自动巡检/拉起远控守护并回填 `remote_control_url` |
+| `agy` | `agy --output-format json [--sandbox] [--model <m>] [--effort <e>] [--print-timeout <t>] -p=<prompt>` | `--conversation <native_session_id>` | 解析单对象 JSON 提取 `status`、`conversation_id`、`response`、`error`；**严禁采信返回的累计耗时，必须由 Go 守护端 `time.Since(startedAt)` 单调计时**；当 `status == "NEEDS_HUMAN_APPROVAL"` 时自动巡检/拉起远控守护并回填 `remote_control_url` |
 | `pi` | `pi --mode json -p --approve [--model <m>] [--thinking <e>] <prompt>` | `--session <native_session_id>` | 逐行解析 v3 NDJSON 事件流：从 `session` 帧提取会话 ID，从 `turn_end` 提取实际命中 `provider/model` 与思考等级，从 `agent_end` 提取最终文本输出，并将关键工具事件实时映射为 `run.event` 推往云端 |
 | `omp` | `omp --mode=json -p --auto-approve --max-time=<t> [--model=<m>] [--thinking=<e>] <prompt>` | `--resume=<native_session_id>` | 同上，逐行解析 v3 NDJSON 事件流并实时推送 `run.event` |
 | `codex` / `claude` | 各自非交互 JSON 模式（`codex exec --json` / `claude -p --output-format json`） | `codex exec resume --json <native_session_id> -` / `--session-id <id>` | 提取标准输出文本与会话 ID，实现多引擎统一抽象 |
@@ -133,16 +136,18 @@ skills/ahub/SKILL.md             # 通过 go:embed 内嵌于二进制中
 
 ### 4.3 守护生命周期、进程组隔离与系统托管
 
-1. **连接与自愈**：`ahub node serve` 主动建立 `wss://<hub_url>/ws/node`，发送 `node.hello` 后立即执行 `POST /api/v1/nodes/:id/claim` 清扫积压任务；断线时采用 `1s -> 2s -> 4s ...`（上限 `30s` + 随机抖动）指数退避重连，重连成功必定重新扫描队列。
+1. **连接与自愈**：`ahub node serve` 主动建立 `wss://<hub_url>/ws/node`（`DialWebSocket` 升级握手限时 `20s`，`node.hello -> hub.welcome` 首帧握手限时 `15s`），发送 `node.hello` 后立即执行 `POST /api/v1/nodes/:id/claim` 清扫积压任务；本地工作区扫描限时 `5s`（单飞后台协程防泄漏，若因外置盘休眠或 TCC 弹窗超时，先携带已缓存或空工作区列表完成上线并输出告警日志，待后台扫描返回后自动补发 `node.hello` 刷新工作区）；心跳周期同时执行带 `10s` 超时的底层 WebSocket `Ping/Pong` 探活与 `node.ping` 写校验，超时或写失败立即主动断开进入退避重连；断线时采用 `1s -> 2s -> 4s ...`（上限 `30s` + 随机抖动）指数退避重连，重连成功必定重新扫描队列。
 2. **本地 `workdir` 互斥与并发**：守护端维护按规范化 `workdir` 键控的本地锁，同一目录同时只允许运行一个任务，不同目录并发度受 `max_concurrency` 控制。
 3. **环境变量隔离与血统注入**：
    - 拉起子进程时构建干净环境变量列表，仅保留最小运行时集合（`PATH`、`HOME`、`USER`、`LOGNAME`、`SHELL`、`LANG`、`LC_ALL`、`TMPDIR`、`TERM`、`SSH_AUTH_SOCK`、`XDG_*`）。
    - **严禁**将节点自身的 `AHUB_TOKEN` 透传给子进程；若本机允许子 Agent 发起跨机委派，须在配置文件显式配置低权限 `client` Scope 的 `delegation_token` 写入子进程 `AHUB_TOKEN`。
    - 强制注入：`AHUB_RUN_ID`、`AHUB_THREAD_ID`、`AHUB_ROOT_RUN_ID`、`AHUB_DEPTH`（子进程调 `ahub run` 时自动携带，供云端拦截递归）。
 4. **独立进程组强杀**：Unix 平台设置 `SysProcAttr{Setpgid: true}`。收到 `hub.abort` 或超时时，向 `-pgid` 发送 `SIGTERM`，等待 `5 秒` 后未退出则向 `-pgid` 发送 `SIGKILL`，防止孤儿进程残留持锁。
-5. **系统托管（`ahub node service install`）**：
-   - **macOS**：直接写入 `~/Library/LaunchAgents/win.bobocai.ahub.node.plist`（运行于桌面用户 `gui/<uid>` 会话域），原生访问已解锁的登录钥匙串与本地模型 OAuth 登录态，彻底消除系统级守护进程降权胶水代码。
-   - **Linux**：写入 `~/.config/systemd/user/ahub-node.service`（开启 `Restart=always` 与 `loginctl enable-linger` 提示）。
+5. **系统托管、TCC 持久化与升级后自动平滑重载（`ahub node service install` / `ahub update`）**：
+   - **macOS 固定签名壳 `AhubDaemon.app`**：首次执行 `ahub node service install` 时在 `~/Applications/AhubDaemon.app` 生成轻量静态可执行壳并执行一次 ad-hoc `codesign --identifier win.bobocai.ahub.daemon --force --deep --sign -`（默认幂等冻结，不再于日常 `ahub update` 时覆写 `.app` 主二进制与 `CDHash`，除非显式传入 `--recreate-app`）。`LaunchAgent` `~/Library/LaunchAgents/win.bobocai.ahub.node.plist` 通过 `<bin_in_app> node shim --bin <~/.local/bin/ahub> --config <node.json>` 启动守护进程，使系统只需对 `AhubDaemon.app` 授予一次「完全磁盘访问权限」，后续 `ahub update` 替换 `~/.local/bin/ahub` 时外置盘 TCC 授权持续有效。
+   - **升级后优雅排空重载（`SIGHUP` + Exit Code `42`）**：`ahub node serve` 写明自身 PID 到 `~/.config/ahub/node.pid` 并监听 `SIGHUP`；收到 `SIGHUP` 后立即停止接收新任务，等待当前活跃子进程全部完成并回传云端终态后，优雅关闭 WebSocket 并以退出码 `42`（`ExitReload`）退出；外层 `ahub node shim` 捕获退出码 `42` 后在 `200ms` 后立即重新 `exec` 磁盘上的新版本 `<bin> node serve`（macOS 原生 `spawn` 继承 `AhubDaemon.app` 进程树与 TCC 权限；若为直连 `LaunchAgent`/`systemd` 则回退由服务管理器按退出重启或 `launchctl kickstart -k` / `systemctl --user restart`）。
+   - **远程自更新防自杀保护**：当 `ahub update` 处于远程任务子进程环境（`AHUB_RUN_ID` 非空）触发时，仅向在线 `node.pid` 发送 `SIGHUP` 排空重启（确保当前报告完 `done` 再重启），严禁在任务执行途中直接 `launchctl kickstart -k` 强杀父守护进程。
+   - **Linux**：写入 `~/.config/systemd/user/ahub-node.service`（开启 `Restart=always` 与 `loginctl enable-linger` 提示）；`ahub update` 时同样优先发 `SIGHUP` 排空退出或空闲状态下执行 `systemctl --user restart ahub-node.service`。
 
 ## 5. 配套 `skills/ahub/SKILL.md` 标准全文
 

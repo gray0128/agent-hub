@@ -109,6 +109,8 @@ export interface ApiKeyRecord {
   allowed_nodes: string[];
   allow_unsandboxed: boolean;
   max_depth_limit: number;
+  notify_webhook_host: string;
+  has_webhook: boolean;
   last_used_at: string | null;
   revoked_at: string | null;
   created_at: string;

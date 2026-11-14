@@ -31,6 +31,7 @@ function authHeaders(token: string, extra?: Record<string, string>): HeadersInit
 async function requestJson<T>(path: string, token: string, init: RequestInit = {}): Promise<T> {
   const res = await fetch(path, {
     ...init,
+    credentials: "same-origin",
     headers: authHeaders(
       token,
       init.body ? { "Content-Type": "application/json", ...(init.headers as Record<string, string> | undefined) } : (init.headers as Record<string, string> | undefined)
@@ -52,6 +53,13 @@ async function requestJson<T>(path: string, token: string, init: RequestInit = {
 }
 
 export const apiClient = {
+  fetchMe(token: string) {
+    return requestJson<{ ok: true; principal: { kind: string; scope: "admin" | "client" | "node" } }>(
+      "/api/v1/auth/me",
+      token
+    );
+  },
+
   fetchNodes(token: string) {
     return requestJson<{ ok: true; nodes: NodeRecord[] }>("/api/v1/nodes", token);
   },
@@ -163,12 +171,37 @@ export const apiClient = {
       allowed_nodes?: string[];
       allow_unsandboxed?: boolean;
       max_depth_limit?: number;
+      webhook_url?: string;
+      webhook_key?: string;
     }
   ) {
     return requestJson<{ ok: true; key: ApiKeyRecord; token: string }>("/api/v1/keys", token, {
       method: "POST",
       body: JSON.stringify(body)
     });
+  },
+
+  patchKey(
+    token: string,
+    keyId: string,
+    body: {
+      bound_node_id?: string | null;
+      allowed_nodes?: string[];
+      allow_unsandboxed?: boolean;
+      max_depth_limit?: number;
+      webhook_url?: string;
+      webhook_key?: string;
+      clear_webhook?: boolean;
+    }
+  ) {
+    return requestJson<{ ok: true; key: ApiKeyRecord }>(
+      `/api/v1/keys/${encodeURIComponent(keyId)}`,
+      token,
+      {
+        method: "PATCH",
+        body: JSON.stringify(body)
+      }
+    );
   },
 
   revokeKey(token: string, keyId: string) {

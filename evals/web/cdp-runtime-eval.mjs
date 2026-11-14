@@ -2,6 +2,7 @@
 import { execFileSync, spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -210,6 +211,13 @@ class CDPClient {
     });
   }
 
+  async fillInput(selector, text) {
+    await this.clickSelector(selector);
+    await this.evalJS(`document.querySelector(${JSON.stringify(selector)})?.focus()`);
+    await this.send("Input.insertText", { text });
+    await sleep(100);
+  }
+
   async typeAndPressEnter(selector, text) {
     await this.clickSelector(selector);
     await this.evalJS(`document.querySelector(${JSON.stringify(selector)})?.focus()`);
@@ -270,9 +278,70 @@ async function apiJson(hubUrl, token, reqPath, init = {}) {
   return data;
 }
 
+function toBase64Url(buf) {
+  return Buffer.from(buf)
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+async function createAccessTestServer(expectedAud) {
+  const keyPair = await crypto.webcrypto.subtle.generateKey(
+    {
+      name: "RSASSA-PKCS1-v1_5",
+      modulusLength: 2048,
+      publicExponent: new Uint8Array([1, 0, 1]),
+      hash: "SHA-256"
+    },
+    true,
+    ["sign", "verify"]
+  );
+  const pubJwk = await crypto.webcrypto.subtle.exportKey("jwk", keyPair.publicKey);
+  const jwksPayload = JSON.stringify({
+    keys: [{ ...pubJwk, kid: "cdp-eval-kid-1", use: "sig", alg: "RS256" }]
+  });
+  const port = await getFreePort();
+  const server = http.createServer((req, res) => {
+    if (req.url === "/cdn-cgi/access/certs") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(jwksPayload);
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise((resolve) => server.listen(port, "127.0.0.1", resolve));
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  const headerB64 = toBase64Url(
+    JSON.stringify({ alg: "RS256", typ: "JWT", kid: "cdp-eval-kid-1" })
+  );
+  const payloadB64 = toBase64Url(
+    JSON.stringify({
+      aud: [expectedAud],
+      exp: nowSec + 600,
+      nbf: nowSec - 10,
+      iss: `http://127.0.0.1:${port}`,
+      sub: "cdp-eval-user"
+    })
+  );
+  const signature = await crypto.webcrypto.subtle.sign(
+    "RSASSA-PKCS1-v1_5",
+    keyPair.privateKey,
+    new TextEncoder().encode(`${headerB64}.${payloadB64}`)
+  );
+  return {
+    server,
+    teamDomain: `http://127.0.0.1:${port}`,
+    accessJwt: `${headerB64}.${payloadB64}.${toBase64Url(new Uint8Array(signature))}`
+  };
+}
+
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ahub-cdp-eval-"));
 const children = [];
 let cdpClient = null;
+let jwksServer = null;
 
 try {
   fs.mkdirSync(screenshotDir, { recursive: true });
@@ -308,6 +377,9 @@ try {
   const hubPort = await getFreePort();
   const cdpPort = await getFreePort();
   const hubUrl = `http://127.0.0.1:${hubPort}`;
+  const accessAud = "cdp-eval-access-aud";
+  const accessMaterial = await createAccessTestServer(accessAud);
+  jwksServer = accessMaterial.server;
 
   const wranglerProc = spawn(
     "pnpm",
@@ -328,7 +400,13 @@ try {
       "--var",
       `HUB_PUBLIC_URL:${hubUrl}`,
       "--var",
-      "LEASE_TTL_SECONDS:30"
+      `CF_ACCESS_TEAM_DOMAIN:${accessMaterial.teamDomain}`,
+      "--var",
+      `CF_ACCESS_AUD:${accessAud}`,
+      "--var",
+      "LEASE_TTL_SECONDS:30",
+      "--var",
+      "WEBHOOK_ENCRYPTION_KEY:cdp-eval-master-secret-32bytes!!"
     ],
     {
       cwd: workerDir,
@@ -525,6 +603,84 @@ try {
   // Screenshot 1: desktop-dark-active.png
   await cdpClient.screenshot(path.join(screenshotDir, "desktop-dark-active.png"));
 
+  // Verify /dl/bootstrap.md endpoint and OnboardingDialog Agent prompt
+  const bootstrapResp = await fetch(`${hubUrl}/dl/bootstrap.md`);
+  if (bootstrapResp.status !== 200) {
+    throw new Error(`Expected GET /dl/bootstrap.md 200, got ${bootstrapResp.status}`);
+  }
+  const bootstrapText = await bootstrapResp.text();
+  if (!bootstrapText.includes(`${hubUrl}/dl/install.sh`) || bootstrapText.includes("__HUB_URL__")) {
+    throw new Error("/dl/bootstrap.md failed hub URL substitution check");
+  }
+
+  await cdpClient.clickSelector('[data-testid="open-onboarding-btn"]');
+  await sleep(250);
+  const agentPromptText = await cdpClient.evalJS(
+    `document.querySelector('[data-testid="onboarding-agent-prompt"]')?.textContent ?? ""`
+  );
+  if (!agentPromptText.includes(`${hubUrl}/dl/bootstrap.md`)) {
+    throw new Error(`OnboardingDialog Agent prompt missing bootstrap URL: ${agentPromptText}`);
+  }
+  await cdpClient.clickSelector('[data-testid="onboarding-dialog"] button[aria-label="关闭"]');
+  await sleep(250);
+  const dialogStillOpen = await cdpClient.evalJS(
+    `Boolean(document.querySelector('[data-testid="onboarding-dialog"]'))`
+  );
+  if (dialogStillOpen) {
+    throw new Error("Expected OnboardingDialog to close cleanly");
+  }
+
+  // Test KeysDialog multi-bot node binding + encrypted webhook host rendering & close
+  await cdpClient.clickSelector('[data-testid="open-keys-btn"]');
+  for (let i = 0; i < 30; i++) {
+    if (await cdpClient.evalJS(`Boolean(document.querySelector('[data-testid="keys-dialog"]'))`)) {
+      break;
+    }
+    if (i === 29) {
+      throw new Error("KeysDialog did not open");
+    }
+    await sleep(150);
+  }
+  await cdpClient.fillInput('[data-testid="key-name-input"]', "ui-multi-bot");
+  await cdpClient.fillInput('[data-testid="key-allowed-nodes-input"]', "macmini");
+  await cdpClient.fillInput('[data-testid="key-webhook-url-input"]', "https://hooks.x.ai/bot-ui-secret-path");
+  await cdpClient.fillInput('[data-testid="key-webhook-key-input"]', "wh_ui_secret_key_99");
+  await cdpClient.clickSelector('[data-testid="create-key-btn"]');
+  for (let i = 0; i < 40; i++) {
+    const found = await cdpClient.evalJS(
+      `Array.from(document.querySelectorAll('[data-testid^="key-webhook-badge-"]')).some((el) => el.textContent?.includes("Webhook: hooks.x.ai"))`
+    );
+    if (found) break;
+    if (i === 39) {
+      throw new Error("Created client key did not display Webhook: hooks.x.ai badge in KeysDialog");
+    }
+    await sleep(150);
+  }
+  const keysDialogText = await cdpClient.evalJS(
+    `document.querySelector('[data-testid="keys-dialog"]')?.textContent ?? ""`
+  );
+  if (keysDialogText.includes("wh_ui_secret_key_99") || keysDialogText.includes("bot-ui-secret-path")) {
+    throw new Error("KeysDialog leaked plaintext webhook secret or full webhook path into DOM");
+  }
+  const keysApi = await apiJson(hubUrl, adminToken, "/api/v1/keys");
+  const uiCreatedKey = keysApi.keys.find((k) => k.name === "ui-multi-bot");
+  if (
+    !uiCreatedKey ||
+    !uiCreatedKey.has_webhook ||
+    uiCreatedKey.notify_webhook_host !== "hooks.x.ai" ||
+    JSON.stringify(uiCreatedKey.allowed_nodes) !== JSON.stringify(["macmini"])
+  ) {
+    throw new Error(`Keys API parity mismatch for ui-multi-bot: ${JSON.stringify(uiCreatedKey)}`);
+  }
+  await cdpClient.clickSelector('[data-testid="keys-dialog"] button[aria-label="关闭"]');
+  await sleep(250);
+  const keysDialogStillOpen = await cdpClient.evalJS(
+    `Boolean(document.querySelector('[data-testid="keys-dialog"]'))`
+  );
+  if (keysDialogStillOpen) {
+    throw new Error("Expected KeysDialog to close cleanly");
+  }
+
   // Flood 2000 events and measure streaming CLS (must equal 0) + ring buffer cap (== 500)
   await cdpClient.evalJS(`window.__AHUB_CLS__ = 0; window.__AHUB_CLS_SOURCES__ = [];`);
   const floodRes = await apiJson(hubUrl, adminToken, "/api/v1/runs?wait_ms=0", {
@@ -710,6 +866,54 @@ try {
   // Screenshot 5: mobile-drawer-open.png
   await cdpClient.screenshot(path.join(screenshotDir, "mobile-drawer-open.png"));
 
+  // Zero-token Cloudflare Access cookie login verification in real Chromium
+  await cdpClient.setViewport(1440, 900, false);
+  await cdpClient.evalJS(`localStorage.removeItem("ahub-token")`);
+  await cdpClient.send("Network.enable");
+  const cookieRes = await cdpClient.send("Network.setCookie", {
+    name: "CF_Authorization",
+    value: accessMaterial.accessJwt,
+    url: hubUrl,
+    path: "/",
+    httpOnly: true,
+    sameSite: "Lax"
+  });
+  if (!cookieRes?.success) {
+    throw new Error(`Failed to set CF_Authorization cookie in Chromium: ${JSON.stringify(cookieRes)}`);
+  }
+  await cdpClient.send("Page.navigate", { url: `${hubUrl}/` });
+
+  let cookieState = null;
+  for (let i = 0; i < 40; i++) {
+    cookieState = await cdpClient.evalJS(`
+      (() => {
+        const s = window.__AHUB_EVAL__?.getState();
+        const storedToken = localStorage.getItem("ahub-token");
+        if (!s || s.streamStatus !== "connected" || s.authKind !== "access_jwt") return null;
+        return { ...s, storedToken };
+      })()
+    `);
+    if (cookieState) break;
+    await sleep(250);
+  }
+  if (!cookieState || cookieState.storedToken !== null || cookieState.nodes.length < 2) {
+    throw new Error(`Zero-token Cloudflare Access cookie flow failed: ${JSON.stringify(cookieState)}`);
+  }
+
+  await cdpClient.clickSelector('[data-testid="open-keys-btn"]');
+  await sleep(350);
+  const keysDialogInfo = await cdpClient.evalJS(`
+    (() => {
+      const dialog = document.querySelector('[data-testid="keys-dialog"]');
+      const errText = dialog?.querySelector('div[class*="status-failed"]')?.textContent ?? "";
+      const hasMacKey = Boolean(dialog?.textContent?.includes("node-macmini"));
+      return { open: Boolean(dialog), errText, hasMacKey };
+    })()
+  `);
+  if (!keysDialogInfo.open || keysDialogInfo.errText || !keysDialogInfo.hasMacKey) {
+    throw new Error(`KeysDialog failed under Access cookie auth: ${JSON.stringify(keysDialogInfo)}`);
+  }
+
   if (cdpClient.consoleErrors.length > 0 || cdpClient.exceptions.length > 0) {
     throw new Error(
       `Browser runtime errors detected: console=${JSON.stringify(cdpClient.consoleErrors)} exceptions=${JSON.stringify(cdpClient.exceptions)}`
@@ -717,10 +921,13 @@ try {
   }
 
   console.log(
-    `L2 CDP Runtime Eval PASSED: UI==D1 parity ok, flood ring-buffer=${floodCount}, stream CLS=${floodCls}, DnD priority_order persisted, mobile overflow=0, 5 screenshots written to ${screenshotDir}`
+    `L2 CDP Runtime Eval PASSED: UI==D1 parity ok, flood ring-buffer=${floodCount}, stream CLS=${floodCls}, DnD priority_order persisted, mobile overflow=0, zero-token CF Access cookie ok, 5 screenshots written to ${screenshotDir}`
   );
 } finally {
   if (cdpClient) cdpClient.close();
+  if (jwksServer) {
+    await new Promise((resolve) => jwksServer.close(() => resolve()));
+  }
   for (const proc of children) {
     killGroup(proc);
   }

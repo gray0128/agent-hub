@@ -35,7 +35,8 @@ export type ErrorCode =
   | "DELEGATION_CYCLE_DETECTED"
   | "IDEMPOTENCY_CONFLICT"
   | "INVALID_STATE_TRANSITION"
-  | "NODE_LEASE_EXPIRED";
+  | "NODE_LEASE_EXPIRED"
+  | "INTERNAL_ERROR";
 
 export class HubError extends Error {
   readonly status: number;
@@ -149,6 +150,8 @@ export interface ApiKeyRecord {
   allowed_nodes: string[];
   allow_unsandboxed: boolean;
   max_depth_limit: number;
+  notify_webhook_host: string;
+  has_webhook: boolean;
   revoked_at: string | null;
   last_used_at: string | null;
   created_at: string;
@@ -196,6 +199,7 @@ export interface Env {
   GROK_WEBHOOK_KEY?: string;
   WEBHOOK_URL?: string;
   WEBHOOK_KEY?: string;
+  WEBHOOK_ENCRYPTION_KEY?: string;
   RELEASE_BASE_URL?: string;
 }
 

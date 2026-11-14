@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -99,18 +100,22 @@ func LoadCredentialsFile() (Credentials, error) {
 }
 
 func SaveCredentials(hubURL, token string) error {
-	dir, err := ConfigDir()
+	path, err := CredentialsPath()
 	if err != nil {
 		return err
 	}
+	return writeJSONFile0600(path, Credentials{
+		URL:   strings.TrimRight(strings.TrimSpace(hubURL), "/"),
+		Token: strings.TrimSpace(token),
+	})
+}
+
+func writeJSONFile0600(path string, v interface{}) error {
+	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	path := filepath.Join(dir, "credentials")
-	payload, err := json.MarshalIndent(Credentials{
-		URL:   strings.TrimRight(strings.TrimSpace(hubURL), "/"),
-		Token: strings.TrimSpace(token),
-	}, "", "  ")
+	payload, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -153,24 +158,7 @@ func ResolveCredentials(flagURL, flagToken string) (string, string, error) {
 	return hubURL, token, nil
 }
 
-func LoadNodeConfig(path string) (*NodeConfig, error) {
-	if strings.TrimSpace(path) == "" {
-		var err error
-		path, err = DefaultNodeConfigPath()
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		path = ExpandPath(path)
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var cfg NodeConfig
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, err
-	}
+func normalizeNodeConfig(cfg *NodeConfig) {
 	if cfg.MaxConcurrency <= 0 {
 		cfg.MaxConcurrency = 4
 	}
@@ -180,12 +168,152 @@ func LoadNodeConfig(path string) (*NodeConfig, error) {
 	if cfg.HeartbeatIntervalSec <= 0 {
 		cfg.HeartbeatIntervalSec = 30
 	}
+	if strings.TrimSpace(cfg.HubURL) == "" {
+		cfg.HubURL = DefaultHubURL
+	}
+	cfg.HubURL = strings.TrimRight(strings.TrimSpace(cfg.HubURL), "/")
+}
+
+func resolveNodeConfigPath(path string) (string, error) {
+	if strings.TrimSpace(path) == "" {
+		return DefaultNodeConfigPath()
+	}
+	return ExpandPath(path), nil
+}
+
+func LoadNodeConfigRaw(path string) (*NodeConfig, string, bool, error) {
+	resolved, err := resolveNodeConfigPath(path)
+	if err != nil {
+		return nil, "", false, err
+	}
+	data, err := os.ReadFile(resolved)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, resolved, false, nil
+		}
+		return nil, resolved, false, err
+	}
+	var cfg NodeConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, resolved, true, err
+	}
+	normalizeNodeConfig(&cfg)
+	if len(cfg.SkipDirs) == 0 {
+		cfg.SkipDirs = []string{"Library", "Applications", "node_modules"}
+	}
+	return &cfg, resolved, true, nil
+}
+
+func SaveNodeConfig(path string, cfg *NodeConfig) (string, error) {
+	resolved, err := resolveNodeConfigPath(path)
+	if err != nil {
+		return "", err
+	}
+	normalizeNodeConfig(cfg)
+	if err := writeJSONFile0600(resolved, cfg); err != nil {
+		return "", err
+	}
+	return resolved, nil
+}
+
+func DefaultNodeID() string {
+	host, err := os.Hostname()
+	if err != nil {
+		return "local-node"
+	}
+	host = strings.TrimSpace(host)
+	if idx := strings.IndexByte(host, '.'); idx > 0 {
+		host = host[:idx]
+	}
+	host = strings.ToLower(host)
+	var b strings.Builder
+	for i := 0; i < len(host); i++ {
+		c := host[i]
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' {
+			b.WriteByte(c)
+		}
+	}
+	cleaned := strings.Trim(b.String(), "-_")
+	if cleaned == "" {
+		return "local-node"
+	}
+	return cleaned
+}
+
+func DetectProjectRoots() []string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return []string{"~/workspace"}
+	}
+	candidates := []string{"workspace", "projects", "github", "cnb", "code"}
+	roots := make([]string, 0, len(candidates))
+	for _, name := range candidates {
+		info, err := os.Stat(filepath.Join(home, name))
+		if err == nil && info.IsDir() {
+			roots = append(roots, "~/"+name)
+		}
+	}
+	if len(roots) == 0 {
+		return []string{"~/workspace"}
+	}
+	return roots
+}
+
+func DetectAgents(existing map[string]AgentConfig, lookPath func(string) (string, error)) map[string]AgentConfig {
+	out := make(map[string]AgentConfig, len(existing)+5)
+	for k, v := range existing {
+		out[k] = v
+	}
+	known := []string{"agy", "pi", "omp", "codex", "claude"}
+	for _, name := range known {
+		prev := out[name]
+		cmd := strings.TrimSpace(prev.Command)
+		if cmd == "" {
+			cmd = name
+		}
+		found := false
+		if lookPath != nil {
+			if resolved, err := lookPath(cmd); err == nil && strings.TrimSpace(resolved) != "" {
+				found = true
+			}
+		}
+		prev.Command = cmd
+		prev.Enabled = prev.Enabled || found
+		if name == "agy" && strings.TrimSpace(prev.DefaultModel) == "" {
+			prev.DefaultModel = "gemini-3.8-flash-high"
+		}
+		out[name] = prev
+	}
+	return out
+}
+
+func EnabledAgentNames(agents map[string]AgentConfig) []string {
+	names := make([]string, 0, len(agents))
+	for name, cfg := range agents {
+		if cfg.Enabled {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+func LoadNodeConfig(path string) (*NodeConfig, error) {
+	resolved, err := resolveNodeConfigPath(path)
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(resolved)
+	if err != nil {
+		return nil, err
+	}
+	var cfg NodeConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, err
+	}
+	normalizeNodeConfig(&cfg)
 	for i, r := range cfg.ProjectRoots {
 		cfg.ProjectRoots[i] = ExpandPath(r)
 	}
-	if cfg.HubURL == "" {
-		cfg.HubURL = DefaultHubURL
-	}
-	cfg.HubURL = strings.TrimRight(cfg.HubURL, "/")
 	return &cfg, nil
 }

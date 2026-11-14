@@ -1,6 +1,6 @@
 # agent-hub
 
-`agent-hub` 是面向多设备、多本地 Coding Agent 的云端任务中心与跨机调度底座。云端控制面运行于 Cloudflare（Workers、Static Assets、D1、Durable Objects WebSocket Hibernation 与 Queues，默认实例域名 `https://ahub.bobocai.win`，可通过 `AHUB_URL` 自定义），边缘节点与调用端统一使用零外部依赖的 Go 静态单二进制 `ahub`。本文档仓库当前阶段交付完整的架构设计、数据库契约、协议接口、CLI 规范、前端工程标准与实施路线图。
+`agent-hub` 是面向多设备、多本地 Coding Agent 的云端任务中心与跨机调度底座。云端控制面运行于 Cloudflare（Workers、Static Assets、D1、Durable Objects WebSocket Hibernation 与 Queues，默认实例域名 `https://ahub.bobocai.win`，可通过 `AHUB_URL` 自定义），边缘节点与调用端统一使用零外部依赖的 Go 静态单二进制 `ahub`。本文档说明节点自举安装与更新方式、仓库结构与规格文档索引。
 
 ## 核心设计原则
 
@@ -9,16 +9,52 @@
 3. **纯出站零隧道节点**：各工作机无需公网 IP，也无需部署 `cloudflared`。本地守护进程 `ahub node serve` 仅维持单条出站 `wss://` 长连接并与云端 D1 租约状态机配合，确保机器休眠或断网期间的任务持久入队、上线自动补领。
 4. **严格前端工程约束**：Web 控制台锁定 `shadcn/ui`（`radix-nova` 预设）、`lucide-react`、`motion/react`、`react-resizable-panels`、`@dnd-kit` 与 `zustand` 的「每类职责唯一库」白名单，组件源代码完全可控，杜绝重复依赖与模板化样式膨胀。
 
-## 目标仓库结构蓝图
+## 节点安装与日常更新（一句话 Agent 自举）
 
-以下目录契约用于后续编码阶段的单仓多包组织，当前仓库优先落盘 `AGENTS.md`、`README.md` 与 `docs/` 规格层：
+### 一句话交给本地 Agent 自动完成（推荐）
+
+无论节点机器是**首次接入**还是**已有旧版需要升级**，直接将以下固定提示词复制给目标机器上的任意本地 Coding Agent（如 Antigravity、Claude Code、CodeBuddy、Cursor、Trae、Pi、OMP 或 Codex）：
+
+```text
+请读取 https://ahub.bobocai.win/dl/bootstrap.md 中的最新节点自举说明，直接代我完成本机 ahub 程序与配套技能的检测、下载安装或版本更新；若本机已配置节点守护则重启服务使新版本生效，若首次接入则自动完成基础初始化并引导我补齐节点 Token 启动系统托管服务。
+```
+
+- **自建域名**：若控制面部署在自定义域名，只需将提示词中的 `https://ahub.bobocai.win` 替换为对应的 `AHUB_URL`。
+- **控制台一键带入 Token**：在 Web 控制台顶部点击「接入节点」，输入节点名称并签发 `node` Token 后，弹窗会自动生成已预填 `HUB_URL`、`node_id` 与节点 Token 的指令，可直接复制发给目标主机 Agent 一步完成激活。
+- **自动分流与安全边界**：
+  - **首次接入新节点**：Agent 自动拉取对应架构的零依赖 `ahub` 二进制（校验 `SHA-256` 并清理 macOS 隔离属性）、同步 `SKILL.md`、执行 `ahub node init` 自动探测主机名、工作区根目录与本机已安装 Agent（生成 `0600` 权限 `~/.config/ahub/node.json`），并通过 `--token-stdin` 写入节点 Token 后调用 `ahub node service install --activate` 启用系统托管（macOS `LaunchAgent` / Linux `systemd --user`）。
+  - **已接入节点日常更新**：Agent 自动运行 `ahub update --json` 原地原子替换二进制并刷新 `SKILL.md`，执行 `ahub node init --json` 幂等补齐新装 Agent，再通过 `ahub node service install --activate --json` 重启守护进程使新版立即接管，全程保留既有 `node_id`、Token 与工作区配置。
+  - **凭据隔离**：`bootstrap.md` 要求 Agent 全程严禁读取或打印 `~/.config/ahub/node.json` 与 `~/.config/ahub/credentials` 原文；状态探查统一使用脱敏的 `ahub node status --json`，节点 Token 仅通过标准输入管道传入。
+
+### 终端手工安装与升级（兜底参考）
+
+- **首次安装并接入节点**（macOS / Linux）：
+  ```sh
+  curl -fsSL https://ahub.bobocai.win/dl/install.sh | sh
+  ahub skill install
+  printf '%s' '<NODE_TOKEN>' | ahub node init --id <node_id> --token-stdin
+  ahub node service install --activate
+  ```
+- **已接入节点原地升级并重启服务**：
+  ```sh
+  ahub update && ahub skill install && ahub node service install --activate
+  ```
+- **仅作为调用端 CLI 授权**（不运行节点守护进程）：
+  ```sh
+  curl -fsSL https://ahub.bobocai.win/dl/install.sh | sh
+  ahub skill install
+  ahub auth login --url https://ahub.bobocai.win --token <CLIENT_OR_ADMIN_TOKEN>
+  ```
+
+## 仓库结构
 
 ```text
 agent-hub/
 ├── AGENTS.md                         # 项目级契约治理、Go/前端门禁与安全准则
-├── README.md                         # 项目入口与文档索引
+├── README.md                         # 项目入口、节点自举指南与文档索引
+├── TODO.md                           # 项目待办与完成记录
 ├── apps/
-│   ├── hub-worker/                   # Cloudflare Worker API、D1 迁移、DO NodeHub、Queue 消费者
+│   ├── hub-worker/                   # Cloudflare Worker API、D1 迁移、DO NodeHub、Queue 消费者与 /dl/bootstrap.md
 │   └── web/                          # React 19 + Vite + shadcn/ui (radix-nova) 控制台
 ├── cmd/
 │   └── ahub/                         # Go CLI 与守护进程统一入口

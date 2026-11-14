@@ -42,11 +42,15 @@ func main() {
 	args := os.Args[1:]
 	prompt := ""
 	readStdin := false
+	hasPromptFlag := false
 	passedSession := ""
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if a == "-" {
 			readStdin = true
+		} else if strings.HasPrefix(a, "-p=") {
+			prompt = strings.TrimPrefix(a, "-p=")
+			hasPromptFlag = true
 		} else if (a == "--conversation" || a == "--session" || a == "--session-id") && i+1 < len(args) {
 			passedSession = args[i+1]
 		} else if strings.HasPrefix(a, "--resume=") {
@@ -58,7 +62,7 @@ func main() {
 	if readStdin {
 		raw, _ := io.ReadAll(os.Stdin)
 		prompt = strings.TrimSpace(string(raw))
-	} else if len(args) > 0 {
+	} else if !hasPromptFlag && len(args) > 0 {
 		prompt = args[len(args)-1]
 	}
 

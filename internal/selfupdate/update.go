@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -21,6 +22,9 @@ type UpdateResult struct {
 	UpdateAvailable bool   `json:"update_available"`
 	Updated         bool   `json:"updated"`
 	BinaryPath      string `json:"binary_path,omitempty"`
+	DaemonRestarted bool   `json:"daemon_restarted"`
+	ReloadMode      string `json:"reload_mode,omitempty"`
+	DaemonAppPath   string `json:"daemon_app_path,omitempty"`
 }
 
 func CheckAndApply(ctx context.Context, client *api.Client, currentVersion string, checkOnly bool, targetBinary string) (*UpdateResult, error) {
@@ -34,7 +38,7 @@ func CheckAndApply(ctx context.Context, client *api.Client, currentVersion strin
 		return nil, fmt.Errorf("no release asset found for %s", assetKey)
 	}
 
-	available := manifest.Version != "" && manifest.Version != currentVersion
+	available := manifest.Version != "" && (currentVersion == "" || currentVersion == "dev" || normalizeVersion(manifest.Version) != normalizeVersion(currentVersion))
 	res := &UpdateResult{
 		CurrentVersion:  currentVersion,
 		LatestVersion:   manifest.Version,
@@ -103,10 +107,32 @@ func CheckAndApply(ctx context.Context, client *api.Client, currentVersion strin
 	if err := os.Chmod(tmpPath, 0o755); err != nil {
 		return nil, err
 	}
+	if runtime.GOOS == "darwin" {
+		if xattrPath, err := exec.LookPath("xattr"); err == nil {
+			_ = exec.Command(xattrPath, "-cr", tmpPath).Run()
+		}
+	}
+	var backupPath string
+	if runtime.GOOS == "windows" {
+		if _, statErr := os.Stat(targetBinary); statErr == nil {
+			backupPath = targetBinary + ".old"
+			_ = os.Remove(backupPath)
+			if err := os.Rename(targetBinary, backupPath); err != nil {
+				return nil, err
+			}
+		}
+	}
 	if err := os.Rename(tmpPath, targetBinary); err != nil {
+		if backupPath != "" {
+			_ = os.Rename(backupPath, targetBinary)
+		}
 		return nil, err
 	}
 	cleanup = false
 	res.Updated = true
 	return res, nil
+}
+
+func normalizeVersion(v string) string {
+	return strings.TrimPrefix(strings.TrimSpace(v), "v")
 }

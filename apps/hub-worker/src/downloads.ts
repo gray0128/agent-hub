@@ -1,9 +1,15 @@
 import skillMd from "../../../skills/ahub/SKILL.md";
+import bootstrapMdTemplate from "./bootstrap.md";
 import installShTemplate from "./install.sh";
 import { type Env, HubError } from "./types";
 import { nowIso } from "./ulid";
 
 const DEFAULT_RELEASE_BASE = "https://github.com/gray0128/agent-hub/releases/latest/download";
+
+function resolveHubUrl(request: Request, env: Env): string {
+  const origin = new URL(request.url).origin;
+  return (env.HUB_PUBLIC_URL?.trim() || origin || "https://ahub.bobocai.win").replace(/\/+$/, "");
+}
 
 export function handleSkillMd(): Response {
   return new Response(skillMd, {
@@ -15,10 +21,21 @@ export function handleSkillMd(): Response {
   });
 }
 
+export function handleBootstrapMd(request: Request, env: Env): Response {
+  const hubUrl = resolveHubUrl(request, env);
+  const body = bootstrapMdTemplate.replaceAll("__HUB_URL__", hubUrl);
+  return new Response(body, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/markdown; charset=utf-8",
+      "Cache-Control": "no-store"
+    }
+  });
+}
+
 export function handleInstallSh(request: Request, env: Env): Response {
-  const origin = new URL(request.url).origin;
-  const hubUrl = env.HUB_PUBLIC_URL?.trim() || origin || "https://ahub.bobocai.win";
-  const script = installShTemplate.replace("__HUB_URL__", hubUrl);
+  const hubUrl = resolveHubUrl(request, env);
+  const script = installShTemplate.replaceAll("__HUB_URL__", hubUrl);
   return new Response(script, {
     status: 200,
     headers: {
@@ -60,7 +77,7 @@ export async function handleVersionJson(request: Request, env: Env): Promise<Res
 
   return new Response(
     JSON.stringify({
-      version: "0.1.0",
+      version: "v0.1.0",
       released_at: nowIso(),
       assets
     }),

@@ -48,6 +48,8 @@ declare global {
         selectedRunId: string | null;
         theme: string;
         streamStatus: string;
+        authStatus: string;
+        authKind: string | null;
       };
     };
   }
@@ -77,6 +79,8 @@ export function App() {
 
   const theme = useWorkbenchStore((s) => s.theme);
   const token = useWorkbenchStore((s) => s.token);
+  const authStatus = useWorkbenchStore((s) => s.authStatus);
+  const authKind = useWorkbenchStore((s) => s.authKind);
   const streamStatus = useWorkbenchStore((s) => s.streamStatus);
   const activeTab = useWorkbenchStore((s) => s.activeTab);
   const threadQuery = useWorkbenchStore((s) => s.threadQuery);
@@ -89,6 +93,7 @@ export function App() {
 
   const toggleTheme = useWorkbenchStore((s) => s.toggleTheme);
   const setToken = useWorkbenchStore((s) => s.setToken);
+  const setAuthState = useWorkbenchStore((s) => s.setAuthState);
   const setStreamStatus = useWorkbenchStore((s) => s.setStreamStatus);
   const setActiveTab = useWorkbenchStore((s) => s.setActiveTab);
   const setThreadQuery = useWorkbenchStore((s) => s.setThreadQuery);
@@ -101,6 +106,7 @@ export function App() {
 
   const [submitting, setSubmitting] = useState(false);
   const wsClientRef = useRef<HubStreamClient | null>(null);
+  const hasSession = authStatus === "authenticated" || Boolean(token);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
@@ -122,7 +128,9 @@ export function App() {
           selectedThreadId: task.selectedThreadId,
           selectedRunId: task.selectedRunId,
           theme: wb.theme,
-          streamStatus: wb.streamStatus
+          streamStatus: wb.streamStatus,
+          authStatus: wb.authStatus,
+          authKind: wb.authKind
         };
       }
     };
@@ -165,91 +173,105 @@ export function App() {
     }
   }, [patchComposer, selectNode, selectRun, selectThread]);
 
-  // Initial REST hydrate + live WebSocket subscription
+  // Initial REST hydrate (supports Cloudflare Access same-origin cookie or Bearer token) + live WebSocket subscription
   useEffect(() => {
-    if (!token) {
-      setStreamStatus("disconnected");
-      return;
-    }
-
     let cancelled = false;
-    async function hydrateInitial() {
+    let client: HubStreamClient | null = null;
+    setAuthState("checking", null);
+    setStreamStatus("connecting");
+
+    async function hydrateAndConnect() {
       try {
-        const [nodesRes, threadsRes, runsRes] = await Promise.all([
+        const [meRes, nodesRes, threadsRes, runsRes] = await Promise.all([
+          apiClient.fetchMe(token),
           apiClient.fetchNodes(token),
           apiClient.fetchThreads(token),
           apiClient.fetchRuns(token, { limit: 200 })
         ]);
         if (cancelled) return;
+        setAuthState("authenticated", meRes.principal.kind);
         setNodes(nodesRes.nodes);
         setThreads(threadsRes.threads);
         setRuns(runsRes.runs);
         syncDefaultSelection();
         setErrorBanner(null);
+
+        client = new HubStreamClient(token, {
+          onStatusChange: (status) => {
+            if (!cancelled) setStreamStatus(status);
+          },
+          onFrame: (frame) => {
+            if (cancelled) return;
+            switch (frame.type) {
+              case "snapshot":
+                setNodes(frame.nodes ?? []);
+                if (frame.threads) setThreads(frame.threads);
+                setRuns(frame.runs ?? []);
+                syncDefaultSelection();
+                break;
+              case "node.status":
+                upsertNode(frame.node);
+                break;
+              case "run.updated":
+                upsertRun(frame.run);
+                if (!useTaskStore.getState().threads.some((t) => t.id === frame.run.thread_id)) {
+                  void apiClient
+                    .fetchThreads(token)
+                    .then((res) => {
+                      if (!cancelled) setThreads(res.threads);
+                    })
+                    .catch(() => {});
+                }
+                break;
+              case "run.event":
+                appendEvents(frame.run_id, [
+                  {
+                    seq: frame.seq,
+                    kind: frame.kind,
+                    payload: frame.payload,
+                    ts: frame.ts
+                  }
+                ]);
+                break;
+              case "run.events":
+                appendEvents(frame.run_id, frame.events);
+                break;
+            }
+          }
+        });
+        wsClientRef.current = client;
+        client.start();
       } catch (err) {
         if (cancelled) return;
+        setStreamStatus("disconnected");
+        if (err instanceof ApiClientError && err.status === 401) {
+          setAuthState("unauthenticated", null);
+          setErrorBanner(
+            token
+              ? "访问 Token 无效或已吊销，请重新输入。"
+              : "未检测到 Cloudflare Access 登录态，请在「接入节点 -> Token 登录」配置访问 Token。"
+          );
+          return;
+        }
         setErrorBanner(
-          err instanceof ApiClientError ? err.message : "无法连接到 Hub API，请检查 Token。"
+          err instanceof ApiClientError ? err.message : "无法连接到 Hub API，请检查网络或配置。"
         );
       }
     }
 
-    void hydrateInitial();
-
-    const client = new HubStreamClient(token, {
-      onStatusChange: (status) => {
-        if (!cancelled) setStreamStatus(status);
-      },
-      onFrame: (frame) => {
-        if (cancelled) return;
-        switch (frame.type) {
-          case "snapshot":
-            setNodes(frame.nodes ?? []);
-            if (frame.threads) setThreads(frame.threads);
-            setRuns(frame.runs ?? []);
-            syncDefaultSelection();
-            break;
-          case "node.status":
-            upsertNode(frame.node);
-            break;
-          case "run.updated":
-            upsertRun(frame.run);
-            if (!useTaskStore.getState().threads.some((t) => t.id === frame.run.thread_id)) {
-              void apiClient
-                .fetchThreads(token)
-                .then((res) => {
-                  if (!cancelled) setThreads(res.threads);
-                })
-                .catch(() => {});
-            }
-            break;
-          case "run.event":
-            appendEvents(frame.run_id, [
-              {
-                seq: frame.seq,
-                kind: frame.kind,
-                payload: frame.payload,
-                ts: frame.ts
-              }
-            ]);
-            break;
-          case "run.events":
-            appendEvents(frame.run_id, frame.events);
-            break;
-        }
-      }
-    });
-    wsClientRef.current = client;
-    client.start();
+    void hydrateAndConnect();
 
     return () => {
       cancelled = true;
-      client.stop();
+      if (client) {
+        client.stop();
+      }
       wsClientRef.current = null;
     };
   }, [
     token,
     appendEvents,
+    setAuthState,
     setErrorBanner,
     setNodes,
     setRuns,
@@ -262,7 +284,7 @@ export function App() {
 
   // Fetch events and summary preview for selected run when switched
   useEffect(() => {
-    if (!token || !selectedRunId) return;
+    if (!hasSession || !selectedRunId) return;
     let cancelled = false;
     void apiClient
       .fetchRunEvents(token, selectedRunId, 0, 200)
@@ -289,7 +311,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [appendEvents, selectedRunId, token, upsertRun]);
+  }, [appendEvents, hasSession, selectedRunId, token, upsertRun]);
 
   const selectedThread = useMemo(
     () => threads.find((t) => t.id === selectedThreadId) ?? null,
@@ -357,7 +379,7 @@ export function App() {
   }
 
   async function handleTogglePinThread(thread: ThreadRecord) {
-    if (!token) return;
+    if (!hasSession) return;
     try {
       const res = await apiClient.patchThread(token, thread.id, {
         pinned: !thread.pinned
@@ -369,7 +391,7 @@ export function App() {
   }
 
   async function handleForkThread(thread: ThreadRecord) {
-    if (!token) return;
+    if (!hasSession) return;
     try {
       const res = await apiClient.forkThread(token, thread.id, {
         node_id: thread.node_id,
@@ -393,7 +415,7 @@ export function App() {
   }
 
   async function handleLoadFullOutput(runId: string) {
-    if (!token) return;
+    if (!hasSession) return;
     try {
       const res = await apiClient.fetchRunDetail(token, runId, "full");
       upsertRun(res.run);
@@ -406,7 +428,7 @@ export function App() {
   }
 
   async function handleCancelRun(runId: string, cascade: boolean) {
-    if (!token) return;
+    if (!hasSession) return;
     try {
       const res = await apiClient.cancelRun(token, runId, cascade);
       res.cancelled_runs.forEach(upsertRun);
@@ -416,7 +438,7 @@ export function App() {
   }
 
   async function handleToggleNodeDrain(node: NodeRecord) {
-    if (!token) return;
+    if (!hasSession) return;
     try {
       const nextStatus = node.status === "draining" ? "online" : "draining";
       const res = await apiClient.patchNode(token, node.id, { status: nextStatus });
@@ -427,7 +449,7 @@ export function App() {
   }
 
   async function handleUpdateNodeConcurrency(nodeId: string, maxConcurrency: number) {
-    if (!token) return;
+    if (!hasSession) return;
     try {
       const res = await apiClient.patchNode(token, nodeId, {
         max_concurrency: maxConcurrency
@@ -439,7 +461,7 @@ export function App() {
   }
 
   async function handleSubmitPrompt() {
-    if (!token) {
+    if (!hasSession) {
       setOnboardingOpen(true);
       return;
     }
@@ -515,7 +537,7 @@ export function App() {
 
       const moved = arrayMove(nodeQueued, oldIdx, newIdx);
       const movedIds = moved.map((r) => r.id);
-      if (token) {
+      if (hasSession) {
         void apiClient
           .reorderQueuedRuns(token, activeData.nodeId, movedIds)
           .then((res) => res.runs.forEach(upsertRun))
@@ -743,13 +765,21 @@ export function App() {
           open={onboardingOpen}
           onOpenChange={setOnboardingOpen}
           token={token}
+          authenticated={authStatus === "authenticated"}
+          authKind={authKind}
           onApplyToken={(next) => {
             setToken(next);
             wsClientRef.current?.updateToken(next);
           }}
         />
 
-        <KeysDialog open={keysDialogOpen} onOpenChange={setKeysDialogOpen} token={token} />
+        <KeysDialog
+          open={keysDialogOpen}
+          onOpenChange={setKeysDialogOpen}
+          token={token}
+          authenticated={authStatus === "authenticated"}
+          authKind={authKind}
+        />
       </div>
     </DndContext>
   );

@@ -6,6 +6,7 @@ import {
   createApiKey,
   createRun,
   forkThread,
+  getApiKeyRawById,
   getRunById,
   heartbeatRun,
   listApiKeys,
@@ -14,6 +15,7 @@ import {
   listRuns,
   listThreads,
   mapRunRow,
+  patchApiKey,
   patchNode,
   patchQueuedRun,
   patchThread,
@@ -23,6 +25,7 @@ import {
 } from "./db";
 import {
   handleBinaryDownload,
+  handleBootstrapMd,
   handleInstallSh,
   handleSkillMd,
   handleVersionJson
@@ -49,11 +52,13 @@ import {
   parseForkThreadRequest,
   parseHeartbeatRequest,
   parsePatchNodeRequest,
+  parsePatchKeyRequest,
   parsePatchRunRequest,
   parsePatchThreadRequest,
   parseReorderRunsRequest,
   readJsonBody
 } from "./validation";
+import { decryptWebhookConfig, encryptWebhookConfig } from "./webhook-crypto";
 
 export { NodeHub };
 
@@ -65,6 +70,14 @@ function getNodeHubStub(env: Env): DurableObjectStub {
 function getLeaseTtl(env: Env): number {
   const parsed = Number.parseInt(env.LEASE_TTL_SECONDS || "90", 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 90;
+}
+
+function requireWebhookEncryptionKey(env: Env): string {
+  const encSecret = env.WEBHOOK_ENCRYPTION_KEY?.trim();
+  if (!encSecret) {
+    throw new HubError(500, "INTERNAL_ERROR", "WEBHOOK_ENCRYPTION_KEY is not configured.");
+  }
+  return encSecret;
 }
 
 function jsonError(err: unknown): Response {
@@ -120,6 +133,9 @@ export default {
       // Public bootstrap & skill distribution endpoints
       if (request.method === "GET" && pathname === "/skill/SKILL.md") {
         return handleSkillMd();
+      }
+      if (request.method === "GET" && pathname === "/dl/bootstrap.md") {
+        return handleBootstrapMd(request, env);
       }
       if (request.method === "GET" && pathname === "/dl/install.sh") {
         return handleInstallSh(request, env);
@@ -469,6 +485,16 @@ export default {
         if (request.method === "POST" && pathname === "/api/v1/keys") {
           requireScope(principal, ["admin"]);
           const body = parseCreateKeyRequest(await readJsonBody(request));
+          let notifyWebhookCiphertext = "";
+          let notifyWebhookHost = "";
+          if (body.webhookUrl) {
+            const encrypted = await encryptWebhookConfig(requireWebhookEncryptionKey(env), {
+              url: body.webhookUrl,
+              key: body.webhookKey
+            });
+            notifyWebhookCiphertext = encrypted.ciphertext;
+            notifyWebhookHost = encrypted.host;
+          }
           const prefixMap: Record<ApiScope, string> = {
             admin: "ahub_adm_",
             client: "ahub_cli_",
@@ -478,16 +504,85 @@ export default {
           const tokenSha256 = await sha256Hex(token);
           const key = await createApiKey(env.DB, {
             ...body,
+            notifyWebhookCiphertext,
+            notifyWebhookHost,
             token,
             tokenSha256
           });
           return Response.json({ ok: true, key, token }, { status: 201 });
         }
 
-        const revokeKeyMatch = /^\/api\/v1\/keys\/([^/]+)$/.exec(pathname);
-        if (request.method === "DELETE" && revokeKeyMatch) {
+        const keyMatch = /^\/api\/v1\/keys\/([^/]+)$/.exec(pathname);
+        if (request.method === "PATCH" && keyMatch) {
           requireScope(principal, ["admin"]);
-          const keyId = decodeURIComponent(revokeKeyMatch[1]!);
+          const keyId = decodeURIComponent(keyMatch[1]!);
+          const body = parsePatchKeyRequest(await readJsonBody(request));
+          const existing = await getApiKeyRawById(env.DB, keyId);
+          if (!existing) {
+            throw new HubError(404, "NOT_FOUND", `API key '${keyId}' not found.`);
+          }
+          if (existing.revoked_at !== null) {
+            throw new HubError(409, "INVALID_STATE_TRANSITION", "Cannot modify a revoked API key.");
+          }
+          if (existing.scope === "node" && body.boundNodeId !== undefined) {
+            throw new HubError(400, "BAD_REQUEST", "Cannot change bound_node_id of a node key.");
+          }
+          if (
+            (body.webhookUrl !== undefined || body.webhookKey !== undefined || body.clearWebhook !== undefined) &&
+            existing.scope !== "client"
+          ) {
+            throw new HubError(400, "BAD_REQUEST", "Webhook settings are only supported on client scope keys.");
+          }
+
+          let notifyWebhookCiphertext: string | undefined;
+          let notifyWebhookHost: string | undefined;
+          if (body.clearWebhook) {
+            notifyWebhookCiphertext = "";
+            notifyWebhookHost = "";
+          } else if (body.webhookUrl !== undefined) {
+            const encrypted = await encryptWebhookConfig(requireWebhookEncryptionKey(env), {
+              url: body.webhookUrl,
+              key: body.webhookKey
+            });
+            notifyWebhookCiphertext = encrypted.ciphertext;
+            notifyWebhookHost = encrypted.host;
+          } else if (body.webhookKey !== undefined) {
+            if (!existing.notify_webhook_ciphertext) {
+              throw new HubError(400, "BAD_REQUEST", "webhook_key requires webhook_url when no webhook is configured.");
+            }
+            const encSecret = requireWebhookEncryptionKey(env);
+            let current: { url: string; key?: string };
+            try {
+              current = await decryptWebhookConfig(encSecret, existing.notify_webhook_ciphertext);
+            } catch {
+              throw new HubError(
+                500,
+                "INTERNAL_ERROR",
+                "Existing encrypted webhook cannot be decrypted; pass a full webhook_url to overwrite it."
+              );
+            }
+            const encrypted = await encryptWebhookConfig(encSecret, {
+              url: current.url,
+              key: body.webhookKey || undefined
+            });
+            notifyWebhookCiphertext = encrypted.ciphertext;
+            notifyWebhookHost = encrypted.host;
+          }
+
+          const key = await patchApiKey(env.DB, keyId, {
+            boundNodeId: body.boundNodeId,
+            allowedNodes: body.allowedNodes,
+            allowUnsandboxed: body.allowUnsandboxed,
+            maxDepthLimit: body.maxDepthLimit,
+            notifyWebhookCiphertext,
+            notifyWebhookHost
+          });
+          return Response.json({ ok: true, key });
+        }
+
+        if (request.method === "DELETE" && keyMatch) {
+          requireScope(principal, ["admin"]);
+          const keyId = decodeURIComponent(keyMatch[1]!);
           const res = await revokeApiKey(env.DB, keyId);
           await doPost(env, "/internal/revoke-key", {
             key_id: keyId,

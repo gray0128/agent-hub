@@ -35,7 +35,9 @@ async function getAccessCerts(teamDomain: string): Promise<JwkWithKid[]> {
   if (cached && Date.now() - cached.fetchedAt < 300_000) {
     return cached.keys;
   }
-  const base = teamDomain.startsWith("https://") ? teamDomain : `https://${teamDomain}`;
+  const base = /^(https:\/\/|http:\/\/(127\.0\.0\.1|localhost)(:\d+)?(\/|$))/i.test(teamDomain)
+    ? teamDomain
+    : `https://${teamDomain}`;
   const resp = await fetch(`${base.replace(/\/+$/, "")}/cdn-cgi/access/certs`);
   if (!resp.ok) {
     throw new HubError(401, "UNAUTHORIZED", "Failed to fetch Cloudflare Access JWKS.");
@@ -144,6 +146,52 @@ function extractBearerToken(request: Request, allowWsProtocolToken: boolean): st
   return null;
 }
 
+export function extractSameOriginAccessCookie(request: Request): string | null {
+  const cookieHeader = request.headers.get("Cookie");
+  if (!cookieHeader) {
+    return null;
+  }
+  let cookieToken: string | null = null;
+  for (const part of cookieHeader.split(";")) {
+    const eqIdx = part.indexOf("=");
+    if (eqIdx <= 0) continue;
+    if (part.slice(0, eqIdx).trim() === "CF_Authorization") {
+      const value = part.slice(eqIdx + 1).trim();
+      if (value) {
+        cookieToken = value;
+        break;
+      }
+    }
+  }
+  if (!cookieToken) {
+    return null;
+  }
+
+  const secFetchSite = request.headers.get("Sec-Fetch-Site")?.trim().toLowerCase();
+  if (secFetchSite && secFetchSite !== "same-origin" && secFetchSite !== "none") {
+    throw new HubError(403, "FORBIDDEN_SCOPE", "Cross-site cookie authentication is forbidden.");
+  }
+
+  const expectedOrigin = new URL(request.url).origin;
+  const origin = request.headers.get("Origin")?.trim();
+  const method = request.method.toUpperCase();
+  const isWsUpgrade = request.headers.get("Upgrade")?.trim().toLowerCase() === "websocket";
+
+  if (isWsUpgrade || (method !== "GET" && method !== "HEAD" && method !== "OPTIONS")) {
+    if (origin !== expectedOrigin) {
+      throw new HubError(
+        403,
+        "FORBIDDEN_SCOPE",
+        "Same-origin Origin header is required for cookie authentication."
+      );
+    }
+  } else if (origin && origin !== expectedOrigin) {
+    throw new HubError(403, "FORBIDDEN_SCOPE", "Origin mismatch for cookie authentication.");
+  }
+
+  return cookieToken;
+}
+
 export async function authenticateRequest(
   request: Request,
   env: Env,
@@ -157,6 +205,10 @@ export async function authenticateRequest(
 
   const token = extractBearerToken(request, allowWsProtocolToken);
   if (!token) {
+    const accessCookieJwt = extractSameOriginAccessCookie(request);
+    if (accessCookieJwt) {
+      return verifyAccessJwt(accessCookieJwt, env);
+    }
     throw new HubError(401, "UNAUTHORIZED", "Missing authentication token.");
   }
 
@@ -238,6 +290,13 @@ export function ensureNodeAllowedForClient(principal: AuthPrincipal, nodeId: str
   if (principal.scope === "admin") return;
   if (principal.scope !== "client") {
     throw new HubError(403, "FORBIDDEN_SCOPE", "Node token cannot perform client operations.");
+  }
+  if (principal.boundNodeId && principal.boundNodeId !== nodeId) {
+    throw new HubError(
+      403,
+      "FORBIDDEN_SCOPE",
+      `Client key is bound to node '${principal.boundNodeId}' and cannot target '${nodeId}'.`
+    );
   }
   if (principal.allowedNodes.length > 0 && !principal.allowedNodes.includes(nodeId)) {
     throw new HubError(

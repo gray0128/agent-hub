@@ -60,7 +60,7 @@ func BuildCommandSpec(run api.RunRecord, agentCfg config.AgentConfig) (string, [
 	switch run.Agent {
 	case "agy":
 		expandedModel, expandedEffort := ExpandAgyModel(model, effort)
-		args = append(args, "-p", "--output-format", "json")
+		args = append(args, "--output-format", "json")
 		if run.Sandbox {
 			args = append(args, "--sandbox")
 		} else {
@@ -78,7 +78,7 @@ func BuildCommandSpec(run api.RunRecord, agentCfg config.AgentConfig) (string, [
 		if nativeSession != "" {
 			args = append(args, "--conversation", nativeSession)
 		}
-		args = append(args, run.Prompt)
+		args = append(args, "-p="+run.Prompt)
 
 	case "pi":
 		args = append(args, "--mode", "json", "-p")

@@ -96,7 +96,7 @@
 3. **右栏：Live Inspector & Queue Deck**
    - **Tab 1 实时事件流**：订阅当前选中 `Run` 的 `run_events`，以等宽时间线展示 `status`、`tool_use`、`turn_end`、`stderr_warn`，并实时计算 `lease_expires_at` 剩余秒数。
    - **Tab 2 节点排队甲板**：按节点与 `workdir` 分组展示待执行的 `queued` 任务与当前持锁占用目录，支持直接拖拽排序或跨节点改派。
-   - **Tab 3 凭证与接入设置**：仅当当前用户具备 `admin` 权限时可见，提供 `api_keys` 签发（选 `client` 或 `node` Scope、绑定节点白名单与深度限制）、明文单次复制弹窗、一键吊销，以及复制 `curl -fsSL https://ahub.bobocai.win/dl/install.sh | sh` 自举命令。
+   - **Tab 3 凭证与接入设置（及顶部「接入节点」弹窗）**：仅当当前用户具备 `admin` 权限时支持签发与编辑 `api_keys`（选 `client`、`node` 或 `admin` Scope）；其中 `client` Key 支持多选或留空设置「允许调度节点（`allowed_nodes`）」以及配置该 Bot 专属的「Webhook URL」与「Webhook Key」（支持 `1 Node <-> 1 Bot`、`N Nodes -> 1 Bot` 与 `M Bots <-> N Nodes` 组合映射，列表中脱敏展示已绑定节点列表及 `Webhook: <host>` 徽标并支持在线编辑）；弹窗提供一键复制发给节点本地 Agent 的一句话自举提示词（指向 `${HUB_URL}/dl/bootstrap.md`，签发节点 Token 后自动预填）、终端兜底安装命令（`${HUB_URL}/dl/install.sh` 配合 `ahub node init --token-stdin` 与 `ahub node service install --activate`）及各平台零依赖二进制直链（`/dl/ahub-<os>-<arch>`）。
 
 ### 3.2 移动端响应式降级（`< 768px`）
 
@@ -156,17 +156,25 @@ export interface TaskState {
 // 3. 工作台视图与草稿切片 (apps/web/src/stores/workbench-store.ts, 使用 persist 中间件)
 export interface WorkbenchState {
   theme: "dark" | "light" | "system";
+  authStatus: "checking" | "authenticated" | "unauthenticated";
+  authKind: string | null;
   activeThreadId: string | null;
   activeRunId: string | null;
   selectedNodeFilter: string | null;
   inspectorTab: "events" | "queue" | "keys";
   composerDraftByThread: Record<string, string>;
+  setAuthState: (status: WorkbenchState["authStatus"], kind?: string | null) => void;
   setActiveThread: (threadId: string | null) => void;
   setActiveRun: (runId: string | null) => void;
   setInspectorTab: (tab: WorkbenchState["inspectorTab"]) => void;
   setComposerDraft: (key: string, text: string) => void;
 }
 ```
+
+### 无本地 Token 时的 Cloudflare Access 会话探测
+
+- 页面加载时即使 `localStorage` 中不存在 `ahub-token`，工作台也必须主动发起同源会话探测（`GET /api/v1/auth/me` 配合初始 REST 拉取，`credentials: "same-origin"`），以无缝激活 Cloudflare Access 登录态（同源 `CF_Authorization` Cookie）并建立 `/ws/stream` 连接。
+- 仅当后端明确返回 `401 UNAUTHORIZED` 时，将 `authStatus` 置为 `"unauthenticated"`、停止 WebSocket 自动重连循环，并提示用户在「接入节点 -> Token 登录」配置访问 Token。
 
 ### 增量同步与断线补偿规则
 

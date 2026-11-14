@@ -59,8 +59,36 @@ func TestBuildCommandSpecAdapters(t *testing.T) {
 	if agyStdin != "" {
 		t.Fatalf("expected empty stdin for agy")
 	}
+	if len(agyArgs) < 3 || agyArgs[0] != "--output-format" || agyArgs[1] != "json" {
+		t.Fatalf("expected agy args to start with --output-format json, got %v", agyArgs)
+	}
+	for _, a := range agyArgs {
+		if a == "-p" {
+			t.Fatalf("unexpected standalone -p flag in agy args: %v", agyArgs)
+		}
+	}
 	agyJoined := strings.Join(agyArgs, " ")
-	if !strings.Contains(agyJoined, "--output-format json") || !strings.Contains(agyJoined, "--model gemini-4-carbon-high") {
+	if !strings.Contains(agyJoined, "--model gemini-4-carbon-high") {
 		t.Fatalf("unexpected agy args: %q", agyJoined)
+	}
+	if agyArgs[len(agyArgs)-1] != "-p=do task" {
+		t.Fatalf("expected agy prompt flag -p=do task at end, got %q", agyArgs[len(agyArgs)-1])
+	}
+
+	_, dashArgs, _, err := BuildCommandSpec(api.RunRecord{
+		Agent:   "agy",
+		Model:   "flash",
+		Effort:  "low",
+		Sandbox: true,
+		Prompt:  "- inspect repo",
+	}, config.AgentConfig{Command: "agy"})
+	if err != nil {
+		t.Fatalf("agy dash prompt err: %v", err)
+	}
+	if !strings.Contains(strings.Join(dashArgs, " "), "--sandbox") {
+		t.Fatalf("expected --sandbox in agy dash prompt args: %v", dashArgs)
+	}
+	if dashArgs[len(dashArgs)-1] != "-p=- inspect repo" {
+		t.Fatalf("expected final arg -p=- inspect repo, got %q", dashArgs[len(dashArgs)-1])
 	}
 }

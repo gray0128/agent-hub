@@ -2,6 +2,7 @@ import { create } from "zustand";
 import type { AgentName, EffortLevel } from "@/types";
 
 export type ThemeMode = "dark" | "light";
+export type AuthStatus = "checking" | "authenticated" | "unauthenticated";
 export type InspectorTab = "events" | "queue" | "lineage" | "control";
 export type StreamStatus = "connecting" | "connected" | "disconnected";
 
@@ -20,6 +21,8 @@ export interface ComposerDraft {
 interface WorkbenchState {
   theme: ThemeMode;
   token: string;
+  authStatus: AuthStatus;
+  authKind: string | null;
   streamStatus: StreamStatus;
   activeTab: InspectorTab;
   threadQuery: string;
@@ -32,6 +35,7 @@ interface WorkbenchState {
   setTheme: (theme: ThemeMode) => void;
   toggleTheme: () => void;
   setToken: (token: string) => void;
+  setAuthState: (authStatus: AuthStatus, authKind?: string | null) => void;
   setStreamStatus: (status: StreamStatus) => void;
   setActiveTab: (tab: InspectorTab) => void;
   setThreadQuery: (q: string) => void;
@@ -82,6 +86,8 @@ function applyThemeToDom(theme: ThemeMode): void {
 export const useWorkbenchStore = create<WorkbenchState>((set) => ({
   theme: readInitialTheme(),
   token: readInitialToken(),
+  authStatus: "checking",
+  authKind: null,
   streamStatus: "connecting",
   activeTab: "events",
   threadQuery: "",
@@ -118,8 +124,9 @@ export const useWorkbenchStore = create<WorkbenchState>((set) => ({
     } catch {
       // ignore
     }
-    set({ token: token.trim(), errorBanner: null });
+    set({ token: token.trim(), authStatus: "checking", authKind: null, errorBanner: null });
   },
+  setAuthState: (authStatus, authKind = null) => set({ authStatus, authKind }),
   setStreamStatus: (streamStatus) => set({ streamStatus }),
   setActiveTab: (activeTab) => set({ activeTab }),
   setThreadQuery: (threadQuery) => set({ threadQuery }),

@@ -6,9 +6,9 @@
 
 ### 1.1 认证方式
 
-| 入口范围 | 认证头 | 说明 |
+| 入口范围 | 认证头 / 凭证 | 说明 |
 | --- | --- | --- |
-| Web 浏览器控制台与管理接口 | `Cf-Access-Jwt-Assertion` 或 `Authorization: Bearer ahub_adm_<secret>` | 生产环境由 Cloudflare Access 拦截验证并注入 JWT；本地联调可开启 `admin` Token 回退 |
+| Web 浏览器控制台与管理接口 | `Cf-Access-Jwt-Assertion` 请求头、同源 `Cookie: CF_Authorization` 或 `Authorization: Bearer ahub_adm_<secret>` | 生产环境由 Cloudflare Access 拦截验证并注入 JWT；单域名部署下 `/api/*` 与 `/ws/*` 对机器路径配置 `Bypass` 后，浏览器同源携 `CF_Authorization` Cookie 发起请求，Worker 强制校验同源 `Origin` / `Sec-Fetch-Site` 并对 JWT 执行 RS256 JWKS、`exp` 与 `CF_ACCESS_AUD` 验签；本地联调可开启 `admin` Token 回退 |
 | 调用端 CLI（`client` / `admin`） | `Authorization: Bearer ahub_cli_<secret>` | 受限于 `api_keys` 绑定的节点白名单、`allow_unsandboxed` 与 `max_depth_limit` |
 | 节点守护端（`node`） | `Authorization: Bearer ahub_nod_<secret>` | 仅可操作 `bound_node_id` 对应的连接、认领与上报接口 |
 
@@ -73,10 +73,13 @@
 
 | 方法与路径 | 允许 Scope | 功能说明 | 关键请求/响应约定 |
 | --- | --- | --- | --- |
-| `GET /api/v1/keys` | `admin` | 列出所有 API Key 元数据（只返回 `key_prefix`，不返回明文） | 支持 `?scope=&include_revoked=false` |
-| `POST /api/v1/keys` | `admin` | 签发新的 `admin`、`client` 或 `node` 凭证 | 请求 `{name, scope, bound_node_id?, allowed_nodes?, allow_unsandboxed?, max_depth_limit?}`；仅本次响应返回明文 `token` |
+| `GET /api/v1/auth/me` | `admin`, `client`, `node` | 返回当前凭证或 Cloudflare Access 会话解析后的主体信息 | 响应 `{ok: true, principal: {kind, scope, bound_node_id, allowed_nodes, allow_unsandboxed, max_depth_limit}}`；浏览器无本地 Token 时用于静默探测 Access 会话态 |
+| `GET /api/v1/keys` | `admin` | 列出所有 API Key 元数据（只返回 `key_prefix` 与脱敏 `notify_webhook_host`/`has_webhook`，绝不返回明文 `token` 或 Webhook 密钥） | 支持 `?scope=&include_revoked=false` |
+| `POST /api/v1/keys` | `admin` | 签发新的 `admin`、`client` 或 `node` 凭证 | 请求 `{name, scope, bound_node_id?, allowed_nodes?, allow_unsandboxed?, max_depth_limit?, webhook_url?, webhook_key?}`；`webhook_url`/`webhook_key` 仅允许 `client` Key 设置，经 `WEBHOOK_ENCRYPTION_KEY` 加密后落库；仅本次响应返回明文 `token` |
+| `PATCH /api/v1/keys/:id` | `admin` | 增量更新未吊销凭证的节点绑定与独立 Bot Webhook 配置 | 请求 `{allowed_nodes?, bound_node_id?, allow_unsandboxed?, max_depth_limit?, webhook_url?, webhook_key?, clear_webhook?}`；支持 `1:1`、`N:1` 与 `M:N` 多 Bot 与节点映射调整，仅返回更新后的脱敏 `key` |
 | `DELETE /api/v1/keys/:id` | `admin` | 吊销指定凭证（立即写入 `revoked_at` 并踢掉关联在线节点 WS） | 响应 `{ok: true, revoked_at}` |
 | `GET /dl/install.sh` | 公开 | 一键安装脚本（供新机器与外部助手沙箱拉取 `ahub`） | 返回 `text/x-sh` |
+| `GET /dl/bootstrap.md` | 公开 | 面向本地 Coding Agent 的节点安装、升级、配置初始化与系统服务托管二合一自举指南 | 返回 `text/markdown; charset=utf-8`（自动注入当前 `HUB_PUBLIC_URL`） |
 | `GET /dl/version.json` | 公开 | 最新版本及各平台 SHA-256 校验表（供 `ahub update` 使用） | 返回 `{version, released_at, assets: {darwin_arm64: {url, sha256}, ...}}` |
 | `GET /dl/ahub-<os>-<arch>` | 公开 | 分发编译好的静态 Go 二进制或重定向至 Release 资产 | 二进制流或 `302` |
 | `GET /skill/SKILL.md` | 公开 | 返回最新配套 Agent Skill 文档 | 返回 `text/markdown; charset=utf-8` |
@@ -137,9 +140,15 @@
 }
 ```
 
-### 4.2 Grok Routine Webhook 回调格式
+### 4.2 Grok Routine Webhook 回调格式与多 Bot 隔离路由
 
-Queue Consumer 从 D1 读取最新摘要后，向环境变量配置的 `GROK_WEBHOOK_URL`（附带认证头 `Authorization: Bearer <GROK_WEBHOOK_KEY>`）发送 `POST` JSON：
+Queue Consumer 从 D1 按 `runs.created_by_key_id` 关联查询签发该任务的 `api_keys` 路由配置（目标选路顺序如下），随后发送 `POST` JSON：
+
+1. **专属 Bot Webhook（优先）**：若 `runs.created_by_key_id` 关联到未吊销的 `client` 凭证且 `notify_webhook_ciphertext` 非空，则以 Worker Secret `WEBHOOK_ENCRYPTION_KEY` 解密得到该 Bot 专属 `webhook_url` 与可选 `webhook_key`。
+2. **Fail-Closed 隔离保护**：若 `created_by_key_id` 对应凭证已被吊销（`revoked_at IS NOT NULL`）或专属 Webhook 解密失败（如缺失/轮换错误的 `WEBHOOK_ENCRYPTION_KEY`），Consumer **严禁回退至全局 `GROK_WEBHOOK_URL`**，必须直接将 `runs.notify_status` 标记为 `'failed'` 并 `ack()` 防止跨 Bot 串信泄露。
+3. **全局环境变量兜底**：仅当任务由非独立 Bot 凭证创建或对应 Key 未配置专属密文时，才回退使用环境变量 `GROK_WEBHOOK_URL` / `GROK_WEBHOOK_KEY`（通用 `webhook` 目标优先 `WEBHOOK_URL`）。
+
+发送时若存在 `webhook_key` 附带认证头 `Authorization: Bearer <webhook_key>`，载荷结构如下：
 
 ```json
 {
@@ -180,3 +189,4 @@ Queue Consumer 从 D1 读取最新摘要后，向环境变量配置的 `GROK_WEB
 | `IDEMPOTENCY_CONFLICT` | `409` | 重复的 `Idempotency-Key` 携带了不一致的参数 | 更换新的幂等键或复用原请求参数 |
 | `INVALID_STATE_TRANSITION` | `409` | 操作与当前 `status` 冲突（如试图修改已认领任务或覆盖终态） | 重新查询 `GET /api/v1/runs/:id` 对齐状态 |
 | `NODE_LEASE_EXPIRED` | `410` | 节点心跳租约超时未续期，任务已被回收标为失败 | 检查节点在线状态与本地工作区后决定是否重发 |
+| `INTERNAL_ERROR` | `500` | 服务端配置缺失（如未注入 `WEBHOOK_ENCRYPTION_KEY`）或加解密异常 | 检查 Worker Secret 与服务端日志并修复配置后重试 |

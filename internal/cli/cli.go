@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -27,6 +29,20 @@ type globalOpts struct {
 	URL   string
 	Token string
 	JSON  bool
+}
+
+type stringSliceFlag []string
+
+func (s *stringSliceFlag) String() string {
+	return strings.Join(*s, ",")
+}
+
+func (s *stringSliceFlag) Set(v string) error {
+	trimmed := strings.TrimSpace(v)
+	if trimmed != "" {
+		*s = append(*s, trimmed)
+	}
+	return nil
 }
 
 func Execute(args []string, version string) int {
@@ -636,8 +652,10 @@ func runUpdate(g globalOpts, args []string, version string) int {
 	fs.SetOutput(os.Stderr)
 	var checkOnly bool
 	var target string
+	var noRestart bool
 	fs.BoolVar(&checkOnly, "check", false, "check only")
 	fs.StringVar(&target, "target", "", "override binary path")
+	fs.BoolVar(&noRestart, "no-restart", false, "skip automatic daemon reload after updating")
 	if err := parseFlagsFlexible(fs, args, map[string]bool{"--target": true}); err != nil {
 		return api.ExitBadUsageOrInput
 	}
@@ -651,19 +669,41 @@ func runUpdate(g globalOpts, args []string, version string) int {
 	if err != nil {
 		return failErr(g.JSON, err)
 	}
+	if res.Updated {
+		if noRestart {
+			res.ReloadMode = "skipped_no_restart"
+		} else if strings.TrimSpace(target) != "" {
+			res.ReloadMode = "skipped_target_override"
+		} else {
+			restarted, mode := service.RefreshAndReloadAfterUpdate()
+			res.DaemonRestarted = restarted
+			res.ReloadMode = mode
+		}
+		if runtime.GOOS == "darwin" {
+			info := service.InspectDarwinDaemonApp("")
+			if info.Exists {
+				res.DaemonAppPath = info.AppPath
+			}
+		}
+	}
 	if g.JSON {
 		writeJSON(res)
 	} else {
-		fmt.Printf("current=%s latest=%s updated=%v\n", res.CurrentVersion, res.LatestVersion, res.Updated)
+		fmt.Printf("current=%s latest=%s updated=%v daemon_restarted=%v reload_mode=%s\n",
+			res.CurrentVersion, res.LatestVersion, res.Updated, res.DaemonRestarted, res.ReloadMode)
 	}
 	return api.ExitOK
 }
 
 func runNode(g globalOpts, args []string, version string) int {
 	if len(args) == 0 {
-		return failUsage(g.JSON, "usage: ahub node serve [--config <path>] | service install|uninstall|status")
+		return failUsage(g.JSON, "usage: ahub node init|status|serve|shim|service ...")
 	}
 	switch args[0] {
+	case "init":
+		return runNodeInit(g, args[1:])
+	case "status":
+		return runNodeStatus(g, args[1:])
 	case "serve":
 		fs := flag.NewFlagSet("node serve", flag.ContinueOnError)
 		fs.SetOutput(os.Stderr)
@@ -676,6 +716,7 @@ func runNode(g globalOpts, args []string, version string) int {
 		if err != nil {
 			return failErr(g.JSON, err)
 		}
+		_, cfgResolved, _, _ := config.LoadNodeConfigRaw(cfgPath)
 		if g.URL != "" {
 			cfg.HubURL = strings.TrimRight(g.URL, "/")
 		} else if envURL := strings.TrimSpace(os.Getenv("AHUB_URL")); envURL != "" {
@@ -689,42 +730,121 @@ func runNode(g globalOpts, args []string, version string) int {
 			return failUsage(g.JSON, "node token missing (set AHUB_TOKEN, --token, or node.json token)")
 		}
 
+		if _, err := daemon.WritePIDFile(cfgResolved); err != nil {
+			fmt.Fprintf(os.Stderr, "[ahub node] warning: write pid file failed: %v\n", err)
+		} else {
+			defer daemon.RemovePIDFile(cfgResolved, os.Getpid())
+		}
+
 		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 		defer stop()
 
 		d := daemon.New(cfg, resolvedToken, version)
+		reloadCh := make(chan os.Signal, 1)
+		daemon.NotifyReloadSignal(reloadCh)
+		defer daemon.StopReloadSignal(reloadCh)
+		go func() {
+			select {
+			case <-reloadCh:
+				d.RequestReload()
+			case <-ctx.Done():
+			}
+		}()
+
 		if err := d.Run(ctx); err != nil {
+			if errors.Is(err, daemon.ErrReloadRequested) {
+				return daemon.ExitReload
+			}
 			return failErr(g.JSON, err)
 		}
 		return api.ExitOK
 
+	case "shim":
+		fs := flag.NewFlagSet("node shim", flag.ContinueOnError)
+		fs.SetOutput(os.Stderr)
+		var binPath, cfgPath string
+		var selfTest bool
+		fs.StringVar(&binPath, "bin", "", "target ahub executable path")
+		fs.StringVar(&cfgPath, "config", "", "node.json config path")
+		fs.BoolVar(&selfTest, "self-test", false, "verify shim executable invocation and exit")
+		if err := parseFlagsFlexible(fs, args[1:], map[string]bool{"--bin": true, "--config": true}); err != nil {
+			return api.ExitBadUsageOrInput
+		}
+		if strings.TrimSpace(cfgPath) == "" {
+			if defCfg, err := config.DefaultNodeConfigPath(); err == nil {
+				cfgPath = defCfg
+			}
+		} else {
+			cfgPath = config.ExpandPath(cfgPath)
+		}
+		if strings.TrimSpace(binPath) != "" {
+			binPath = config.ExpandPath(binPath)
+		}
+		if selfTest {
+			if binPath != "" {
+				if _, err := os.Stat(binPath); err != nil {
+					return failErr(g.JSON, err)
+				}
+			}
+			if g.JSON {
+				writeJSON(map[string]interface{}{
+					"ok":          true,
+					"shim":        true,
+					"pid":         os.Getpid(),
+					"bin_path":    binPath,
+					"config_path": cfgPath,
+				})
+			} else {
+				fmt.Printf("shim ok pid=%d bin=%s config=%s\n", os.Getpid(), binPath, cfgPath)
+			}
+			return api.ExitOK
+		}
+		return service.RunShim(binPath, cfgPath)
+
 	case "service":
 		if len(args) < 2 {
-			return failUsage(g.JSON, "usage: ahub node service install|uninstall|status [--config <path>] [--target-dir <dir>] [--activate]")
+			return failUsage(g.JSON, "usage: ahub node service install|uninstall|status [--config <path>] [--target-dir <dir>] [--bin <path>] [--recreate-app] [--activate]")
 		}
 		sub := args[1]
 		fs := flag.NewFlagSet("node service", flag.ContinueOnError)
 		fs.SetOutput(os.Stderr)
 		var cfgPath, targetDir, binPath string
-		var activate bool
+		var activate, recreateApp bool
 		fs.StringVar(&cfgPath, "config", "", "node.json path")
 		fs.StringVar(&targetDir, "target-dir", "", "override destination directory")
 		fs.StringVar(&binPath, "bin", "", "override ahub binary path")
 		fs.BoolVar(&activate, "activate", false, "register with launchctl/systemctl")
+		fs.BoolVar(&recreateApp, "recreate-app", false, "force rebuild & re-sign macOS AhubDaemon.app wrapper")
 		if err := parseFlagsFlexible(fs, args[2:], map[string]bool{"--config": true, "--target-dir": true, "--bin": true}); err != nil {
 			return api.ExitBadUsageOrInput
 		}
 
 		switch sub {
 		case "install":
-			dest, err := service.Install(binPath, cfgPath, targetDir, activate)
+			res, err := service.InstallWithOptions(service.InstallOptions{
+				BinPath:     binPath,
+				ConfigPath:  cfgPath,
+				TargetDir:   targetDir,
+				Activate:    activate,
+				RecreateApp: recreateApp,
+			})
 			if err != nil {
 				return failErr(g.JSON, err)
 			}
 			if g.JSON {
-				writeJSON(map[string]interface{}{"ok": true, "path": dest})
+				payload := map[string]interface{}{"ok": true, "path": res.ServicePath}
+				if res.DaemonApp.AppPath != "" {
+					payload["daemon_app_path"] = res.DaemonApp.AppPath
+					payload["daemon_app_signed"] = res.DaemonApp.Signed
+					payload["daemon_app_cdhash"] = res.DaemonApp.CDHash
+				}
+				writeJSON(payload)
 			} else {
-				fmt.Printf("Service unit written to %s\n", dest)
+				fmt.Printf("Service unit written to %s\n", res.ServicePath)
+				if res.DaemonApp.AppPath != "" {
+					fmt.Printf("Darwin TCC wrapper: %s (signed=%v cdhash=%s)\n",
+						res.DaemonApp.AppPath, res.DaemonApp.Signed, res.DaemonApp.CDHash)
+				}
 			}
 			return api.ExitOK
 		case "uninstall":
@@ -756,8 +876,199 @@ func runNode(g globalOpts, args []string, version string) int {
 		}
 
 	default:
-		return failUsage(g.JSON, "usage: ahub node serve | service")
+		return failUsage(g.JSON, "usage: ahub node init|status|serve|service")
 	}
+}
+
+func runNodeInit(g globalOpts, args []string) int {
+	fs := flag.NewFlagSet("node init", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	var idFlag, nameFlag, urlFlag, tokenFlag, cfgPath string
+	var tokenStdin, force bool
+	var maxConcFlag int
+	var roots stringSliceFlag
+
+	fs.StringVar(&idFlag, "id", "", "node id")
+	fs.StringVar(&nameFlag, "name", "", "display name")
+	fs.StringVar(&urlFlag, "url", "", "hub url")
+	fs.StringVar(&tokenFlag, "token", "", "node api token")
+	fs.BoolVar(&tokenStdin, "token-stdin", false, "read node token from stdin")
+	fs.Var(&roots, "root", "project root directory (repeatable)")
+	fs.IntVar(&maxConcFlag, "max-concurrency", 0, "max concurrent runs")
+	fs.StringVar(&cfgPath, "config", "", "node.json config path")
+	fs.BoolVar(&force, "force", false, "overwrite existing node.json fields")
+
+	valFlags := map[string]bool{
+		"--id": true, "--name": true, "--url": true, "--token": true,
+		"--root": true, "--max-concurrency": true, "--config": true,
+	}
+	if err := parseFlagsFlexible(fs, args, valFlags); err != nil {
+		return api.ExitBadUsageOrInput
+	}
+
+	if tokenStdin {
+		raw, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return failErr(g.JSON, err)
+		}
+		stdinTok := strings.TrimSpace(string(raw))
+		if stdinTok == "" {
+			return failUsage(g.JSON, "token read from stdin is empty")
+		}
+		tokenFlag = stdinTok
+	}
+
+	loaded, _, existed, loadErr := config.LoadNodeConfigRaw(cfgPath)
+	if !force && loadErr != nil {
+		return failErr(g.JSON, loadErr)
+	}
+	var existing config.NodeConfig
+	if !force && loaded != nil {
+		existing = *loaded
+	}
+
+	nodeID := firstNonEmpty(idFlag, existing.NodeID, config.DefaultNodeID())
+	displayName := firstNonEmpty(nameFlag, existing.DisplayName, nodeID)
+	hubURL := strings.TrimRight(firstNonEmpty(urlFlag, g.URL, os.Getenv("AHUB_URL"), existing.HubURL, config.DefaultHubURL), "/")
+	token := firstNonEmpty(tokenFlag, g.Token, existing.Token)
+
+	maxConc := maxConcFlag
+	if maxConc <= 0 {
+		maxConc = existing.MaxConcurrency
+	}
+	if maxConc <= 0 {
+		maxConc = 4
+	}
+
+	projectRoots := []string(roots)
+	if len(projectRoots) == 0 {
+		projectRoots = existing.ProjectRoots
+	}
+	if len(projectRoots) == 0 {
+		projectRoots = config.DetectProjectRoots()
+	}
+
+	skipDirs := existing.SkipDirs
+	if len(skipDirs) == 0 {
+		skipDirs = []string{"Library", "Applications", "node_modules"}
+	}
+
+	remoteControlName := firstNonEmpty(existing.RemoteControlName, nodeID)
+	agents := config.DetectAgents(existing.Agents, exec.LookPath)
+
+	cfg := &config.NodeConfig{
+		NodeID:               nodeID,
+		DisplayName:          displayName,
+		HubURL:               hubURL,
+		Token:                token,
+		DelegationToken:      existing.DelegationToken,
+		MaxConcurrency:       maxConc,
+		HeartbeatIntervalSec: existing.HeartbeatIntervalSec,
+		ProjectRoots:         projectRoots,
+		SkipDirs:             skipDirs,
+		RemoteControlName:    remoteControlName,
+		Agents:               agents,
+	}
+
+	savedPath, err := config.SaveNodeConfig(cfgPath, cfg)
+	if err != nil {
+		return failErr(g.JSON, err)
+	}
+
+	hasToken := strings.TrimSpace(cfg.Token) != ""
+	enabledAgents := config.EnabledAgentNames(cfg.Agents)
+	if g.JSON {
+		writeJSON(map[string]interface{}{
+			"ok":              true,
+			"config_path":     savedPath,
+			"created":         !existed,
+			"node_id":         cfg.NodeID,
+			"display_name":    cfg.DisplayName,
+			"hub_url":         cfg.HubURL,
+			"max_concurrency": cfg.MaxConcurrency,
+			"project_roots":   cfg.ProjectRoots,
+			"enabled_agents":  enabledAgents,
+			"has_token":       hasToken,
+		})
+	} else {
+		fmt.Printf("Node config written to %s (node_id=%s, has_token=%v, agents=%s)\n",
+			savedPath, cfg.NodeID, hasToken, strings.Join(enabledAgents, ","))
+	}
+	return api.ExitOK
+}
+
+func runNodeStatus(g globalOpts, args []string) int {
+	fs := flag.NewFlagSet("node status", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	var cfgPath, targetDir string
+	fs.StringVar(&cfgPath, "config", "", "node.json config path")
+	fs.StringVar(&targetDir, "target-dir", "", "override service directory")
+	if err := parseFlagsFlexible(fs, args, map[string]bool{"--config": true, "--target-dir": true}); err != nil {
+		return api.ExitBadUsageOrInput
+	}
+
+	cfg, cfgResolved, cfgExists, loadErr := config.LoadNodeConfigRaw(cfgPath)
+	if cfgExists && loadErr != nil {
+		return failErr(g.JSON, loadErr)
+	}
+	svcPath, err := service.ServiceFilePath(targetDir)
+	if err != nil {
+		return failErr(g.JSON, err)
+	}
+	_, statErr := os.Stat(svcPath)
+	svcInstalled := statErr == nil
+
+	resolvedURL, credTok, _ := config.ResolveCredentials(g.URL, g.Token)
+	nodeID := ""
+	hubURL := resolvedURL
+	projectRoots := []string{}
+	enabledAgents := []string{}
+	hasToken := strings.TrimSpace(credTok) != ""
+
+	if cfg != nil {
+		nodeID = cfg.NodeID
+		if cfg.HubURL != "" {
+			hubURL = cfg.HubURL
+		}
+		if len(cfg.ProjectRoots) > 0 {
+			projectRoots = cfg.ProjectRoots
+		}
+		enabledAgents = config.EnabledAgentNames(cfg.Agents)
+		if strings.TrimSpace(cfg.Token) != "" {
+			hasToken = true
+		}
+	}
+
+	liveRec, daemonRunning := daemon.ReadLiveDaemonPID(cfgResolved)
+	appInfo := service.InspectDarwinDaemonApp(targetDir)
+
+	if g.JSON {
+		payload := map[string]interface{}{
+			"ok":                true,
+			"config_path":       cfgResolved,
+			"config_exists":     cfgExists,
+			"node_id":           nodeID,
+			"hub_url":           hubURL,
+			"project_roots":     projectRoots,
+			"enabled_agents":    enabledAgents,
+			"has_token":         hasToken,
+			"service_path":      svcPath,
+			"service_installed": svcInstalled,
+			"daemon_running":    daemonRunning,
+			"daemon_pid":        liveRec.PID,
+		}
+		if runtime.GOOS == "darwin" {
+			payload["daemon_app_path"] = appInfo.AppPath
+			payload["daemon_app_exists"] = appInfo.Exists
+			payload["daemon_app_signed"] = appInfo.Signed
+			payload["daemon_app_cdhash"] = appInfo.CDHash
+		}
+		writeJSON(payload)
+	} else {
+		fmt.Printf("config=%s exists=%v node_id=%s has_token=%v service=%s installed=%v daemon_running=%v daemon_pid=%d\n",
+			cfgResolved, cfgExists, nodeID, hasToken, svcPath, svcInstalled, daemonRunning, liveRec.PID)
+	}
+	return api.ExitOK
 }
 
 func isWaitStopState(status string) bool {
@@ -860,7 +1171,10 @@ Commands:
   threads         List threads
   cancel          Cancel a run (or entire tree with --cascade)
   skill           Print or install embedded SKILL.md
-  update          Check or apply atomic self-update
+  update          Check or apply atomic self-update (auto-reloads daemon unless --no-restart)
+  node init       Idempotently create or update node.json (supports --token-stdin)
+  node status     Inspect redacted node config, daemon PID, and service/app status
   node serve      Run node daemon over outbound WebSocket
+  node shim       Supervise target ahub binary for TCC wrapper (macOS AhubDaemon.app)
   node service    Install/uninstall/status for LaunchAgent or systemd --user`)
 }

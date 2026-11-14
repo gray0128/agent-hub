@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   updated_at TEXT NOT NULL
 );
 
--- 2. 三级鉴权凭证表（仅保存 SHA-256 摘要，绝不存明文）
+-- 2. 三级鉴权凭证表（仅保存 SHA-256 摘要，绝不存明文；多 Bot Webhook 配置经 AES-256-GCM 密文落库）
 CREATE TABLE IF NOT EXISTS api_keys (
   id TEXT PRIMARY KEY,                              -- key_<ulid>
   name TEXT NOT NULL,
@@ -38,6 +38,8 @@ CREATE TABLE IF NOT EXISTS api_keys (
   allowed_nodes_json TEXT NOT NULL DEFAULT '[]',    -- 空数组表示允许全部在线节点
   allow_unsandboxed INTEGER NOT NULL DEFAULT 0 CHECK (allow_unsandboxed IN (0, 1)),
   max_depth_limit INTEGER NOT NULL DEFAULT 1 CHECK (max_depth_limit >= 0 AND max_depth_limit <= 3),
+  notify_webhook_ciphertext TEXT NOT NULL DEFAULT '', -- client Key 专属 Webhook URL/Key 密文（AES-256-GCM，`v1:<iv_b64url>:<ct_b64url>`，以 `WEBHOOK_ENCRYPTION_KEY` 加密）
+  notify_webhook_host TEXT NOT NULL DEFAULT '',       -- 脱敏 Webhook 目标主机名（如 hooks.x.ai），仅用于控制台展示
   revoked_at TEXT,
   last_used_at TEXT,
   created_at TEXT NOT NULL

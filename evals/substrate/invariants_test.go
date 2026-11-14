@@ -25,6 +25,7 @@ import (
 
 	"github.com/gray0128/agent-hub/internal/api"
 	"github.com/gray0128/agent-hub/internal/config"
+	"github.com/gray0128/agent-hub/internal/daemon"
 	"github.com/gray0128/agent-hub/internal/selfupdate"
 )
 
@@ -159,6 +160,7 @@ func newTestHarness(t *testing.T) *testHarness {
 		"--var", "LEASE_TTL_SECONDS:3",
 		"--var", "HUB_PUBLIC_URL:"+hubURL,
 		"--var", "WEBHOOK_URL:"+webhookSrv.URL,
+		"--var", "WEBHOOK_ENCRYPTION_KEY:eval-test-master-secret-32bytes!!",
 		"--var", "RELEASE_BASE_URL:"+releaseSrv.URL,
 	)
 	wranglerCmd.Dir = workerDir
@@ -216,6 +218,11 @@ func newTestHarness(t *testing.T) *testHarness {
 }
 
 func (h *testHarness) createKey(name, scope, boundNodeID string, allowedNodes []string, maxDepth int) string {
+	_, tok := h.createKeyWithWebhook(name, scope, boundNodeID, allowedNodes, maxDepth, "", "")
+	return tok
+}
+
+func (h *testHarness) createKeyWithWebhook(name, scope, boundNodeID string, allowedNodes []string, maxDepth int, webhookURL, webhookKey string) (string, string) {
 	h.t.Helper()
 	payload := map[string]interface{}{
 		"name":            name,
@@ -225,6 +232,12 @@ func (h *testHarness) createKey(name, scope, boundNodeID string, allowedNodes []
 	}
 	if boundNodeID != "" {
 		payload["bound_node_id"] = boundNodeID
+	}
+	if webhookURL != "" {
+		payload["webhook_url"] = webhookURL
+	}
+	if webhookKey != "" {
+		payload["webhook_key"] = webhookKey
 	}
 	body, _ := json.Marshal(payload)
 	req, _ := http.NewRequest(http.MethodPost, h.hubURL+"/api/v1/keys", bytes.NewReader(body))
@@ -240,12 +253,15 @@ func (h *testHarness) createKey(name, scope, boundNodeID string, allowedNodes []
 		h.t.Fatalf("createKey status %d: %s", resp.StatusCode, string(raw))
 	}
 	var out struct {
+		Key struct {
+			ID string `json:"id"`
+		} `json:"key"`
 		Token string `json:"token"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		h.t.Fatal(err)
 	}
-	return out.Token
+	return out.Key.ID, out.Token
 }
 
 func (h *testHarness) makeWorkspaceDir(name string) string {
@@ -798,11 +814,36 @@ func TestInvariantSuite(t *testing.T) {
 			t.Fatalf("unexpected selfupdate result: %+v", updRes)
 		}
 
-		// 3. Service install --target-dir <tmp> & plutil -lint
+		// 3. Service install --target-dir <tmp> & darwin AhubDaemon.app freeze-once idempotency
 		svcDir := filepath.Join(h.tmpDir, "launch-agents")
-		code, stdout, stderr := h.runCLI("", "node", "service", "install", "--target-dir", svcDir)
+		code, stdout, stderr := h.runCLI("", "--json", "node", "service", "install", "--bin", h.ahubBin, "--target-dir", svcDir)
 		if code != 0 {
 			t.Fatalf("service install failed (%d): %s %s", code, stdout, stderr)
+		}
+		if runtime.GOOS == "darwin" {
+			var svcRes map[string]interface{}
+			if err := json.Unmarshal([]byte(stdout), &svcRes); err != nil {
+				t.Fatalf("invalid service install json: %v (%s)", err, stdout)
+			}
+			cdhash1, _ := svcRes["daemon_app_cdhash"].(string)
+			appPath, _ := svcRes["daemon_app_path"].(string)
+			if appPath == "" || cdhash1 == "" || svcRes["daemon_app_signed"] != true {
+				t.Fatalf("expected signed AhubDaemon.app with cdhash on darwin: %+v", svcRes)
+			}
+			if out, err := exec.Command("/usr/bin/codesign", "--verify", "--deep", "--strict", appPath).CombinedOutput(); err != nil {
+				t.Fatalf("codesign verify failed: %v\n%s", err, string(out))
+			}
+			code2, stdout2, stderr2 := h.runCLI("", "--json", "node", "service", "install", "--bin", h.ahubBin, "--target-dir", svcDir)
+			if code2 != 0 {
+				t.Fatalf("second service install failed (%d): %s %s", code2, stdout2, stderr2)
+			}
+			var svcRes2 map[string]interface{}
+			if err := json.Unmarshal([]byte(stdout2), &svcRes2); err != nil {
+				t.Fatal(err)
+			}
+			if svcRes2["daemon_app_cdhash"] != cdhash1 {
+				t.Fatalf("AhubDaemon.app CDHash drifted across idempotent install: %q vs %q", cdhash1, svcRes2["daemon_app_cdhash"])
+			}
 		}
 
 		// 4. Queues webhook notification delivery on --notify webhook
@@ -830,6 +871,217 @@ func TestInvariantSuite(t *testing.T) {
 				t.Fatalf("expected notify_status=sent, got %+v", r)
 			}
 			time.Sleep(100 * time.Millisecond)
+		}
+
+		// 5. N independent Grok Bots (1:1 / N:1 / M:N) + PATCH /api/v1/keys/:id + fail-closed isolation
+		type botHit struct {
+			Auth    string
+			Payload map[string]interface{}
+		}
+		botAlphaCh := make(chan botHit, 8)
+		botBetaCh := make(chan botHit, 8)
+		makeBotServer := func(ch chan botHit) *httptest.Server {
+			return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body map[string]interface{}
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				ch <- botHit{Auth: r.Header.Get("Authorization"), Payload: body}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"ok":true}`))
+			}))
+		}
+		botAlphaSrv := makeBotServer(botAlphaCh)
+		defer botAlphaSrv.Close()
+		botBetaSrv := makeBotServer(botBetaCh)
+		defer botBetaSrv.Close()
+
+		botAlphaKeyID, botAlphaTok := h.createKeyWithWebhook("grok-bot-alpha", "client", "", []string{"macmini"}, 1, botAlphaSrv.URL+"/hook", "sec_alpha_1")
+		_, botBetaTok := h.createKeyWithWebhook("grok-bot-beta", "client", "", []string{"mbp"}, 1, botBetaSrv.URL+"/hook", "sec_beta_2")
+
+		// Enforce allowed_nodes isolation: bot-alpha cannot dispatch to mbp
+		forbCode, _, forbErr := h.runCLI(`{"directives":[{"op":"sleep","ms":10}]}`,
+			"--token", botAlphaTok, "--json", "run", "--node", "mbp", "--dir", mbpDir, "--agent", "agy", "-")
+		if forbCode != api.ExitPolicyDenied {
+			t.Fatalf("expected ExitPolicyDenied (78) for bot-alpha targeting mbp, got %d (%s)", forbCode, forbErr)
+		}
+
+		alphaRun := h.mustRunCLIJSON(`{"directives":[{"op":"sleep","ms":20}]}`,
+			"--token", botAlphaTok, "run", "--node", "macmini", "--dir", alphaDir, "--agent", "agy", "--notify", "grok", "--wait", "0s", "-")
+		betaRun := h.mustRunCLIJSON(`{"directives":[{"op":"sleep","ms":20}]}`,
+			"--token", botBetaTok, "run", "--node", "mbp", "--dir", mbpDir, "--agent", "agy", "--notify", "grok", "--wait", "0s", "-")
+
+		select {
+		case hit := <-botAlphaCh:
+			if hit.Auth != "Bearer sec_alpha_1" || hit.Payload["run_id"] != alphaRun.ID {
+				t.Fatalf("unexpected bot-alpha hit: %+v", hit)
+			}
+		case <-time.After(8 * time.Second):
+			t.Fatalf("bot-alpha webhook not delivered within 8s")
+		}
+		select {
+		case hit := <-botBetaCh:
+			if hit.Auth != "Bearer sec_beta_2" || hit.Payload["run_id"] != betaRun.ID {
+				t.Fatalf("unexpected bot-beta hit: %+v", hit)
+			}
+		case <-time.After(8 * time.Second):
+			t.Fatalf("bot-beta webhook not delivered within 8s")
+		}
+		// Assert zero cross-talk onto global webhookSrv
+		select {
+		case stray := <-h.webhookCh:
+			t.Fatalf("multi-bot webhook leaked onto global webhook: %+v", stray)
+		case <-time.After(150 * time.Millisecond):
+		}
+
+		// PATCH /api/v1/keys/:id upgrades bot-alpha to manage ["macmini", "mbp"] and rotates webhook secret
+		patchBody, _ := json.Marshal(map[string]interface{}{
+			"allowed_nodes": []string{"macmini", "mbp"},
+			"webhook_url":   botAlphaSrv.URL + "/v2",
+			"webhook_key":   "sec_alpha_v2",
+		})
+		patchReq, _ := http.NewRequest(http.MethodPatch, h.hubURL+"/api/v1/keys/"+botAlphaKeyID, bytes.NewReader(patchBody))
+		patchReq.Header.Set("Authorization", "Bearer "+h.adminToken)
+		patchReq.Header.Set("Content-Type", "application/json")
+		patchResp, err := http.DefaultClient.Do(patchReq)
+		if err != nil {
+			t.Fatal(err)
+		}
+		patchRaw, _ := io.ReadAll(patchResp.Body)
+		patchResp.Body.Close()
+		if patchResp.StatusCode != 200 {
+			t.Fatalf("PATCH /api/v1/keys failed (%d): %s", patchResp.StatusCode, string(patchRaw))
+		}
+
+		alphaMbpRun := h.mustRunCLIJSON(`{"directives":[{"op":"sleep","ms":20}]}`,
+			"--token", botAlphaTok, "run", "--node", "mbp", "--dir", mbpDir, "--agent", "agy", "--notify", "grok", "--wait", "0s", "-")
+		select {
+		case hit := <-botAlphaCh:
+			if hit.Auth != "Bearer sec_alpha_v2" || hit.Payload["run_id"] != alphaMbpRun.ID {
+				t.Fatalf("unexpected rotated bot-alpha hit: %+v", hit)
+			}
+		case <-time.After(8 * time.Second):
+			t.Fatalf("rotated bot-alpha webhook not delivered within 8s")
+		}
+
+		// 6. node shim + SIGHUP graceful drain & reload while run is in-flight (Unix)
+		if runtime.GOOS != "windows" {
+			shimTok := h.createKey("shim-node-key", "node", "shim-node", []string{"shim-node"}, 0)
+			shimRoot := filepath.Join(h.tmpDir, "workspaces", "shim-root")
+			shimProj := h.makeWorkspaceDir(filepath.Join("shim-root", "proj-shim"))
+			shimCfgDir := filepath.Join(h.tmpDir, "shim-cfg")
+			if err := os.MkdirAll(shimCfgDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			shimCfgPath := filepath.Join(shimCfgDir, "node.json")
+			shimCfg := config.NodeConfig{
+				NodeID:               "shim-node",
+				DisplayName:          "shim-node",
+				HubURL:               h.hubURL,
+				Token:                shimTok,
+				MaxConcurrency:       1,
+				HeartbeatIntervalSec: 1,
+				ProjectRoots:         []string{shimRoot},
+				SkipDirs:             []string{"node_modules", ".git"},
+				Agents: map[string]config.AgentConfig{
+					"agy": {Enabled: true, Command: h.fakeAgentBin},
+				},
+			}
+			shimRaw, _ := json.MarshalIndent(shimCfg, "", "  ")
+			if err := os.WriteFile(shimCfgPath, shimRaw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			shimLogs := &bytes.Buffer{}
+			shimCmd := exec.Command(h.ahubBin, "node", "shim", "--bin", h.ahubBin, "--config", shimCfgPath)
+			shimCmd.Env = append(os.Environ(),
+				"AHUB_CONFIG_DIR="+shimCfgDir,
+				"AHUB_FAKEAGENT_LOG="+h.fakeLogPath,
+			)
+			shimCmd.Stdout = shimLogs
+			shimCmd.Stderr = shimLogs
+			shimCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			if err := shimCmd.Start(); err != nil {
+				t.Fatalf("start node shim failed: %v", err)
+			}
+			defer func() {
+				if shimCmd.Process != nil {
+					_ = syscall.Kill(-shimCmd.Process.Pid, syscall.SIGKILL)
+					_, _ = shimCmd.Process.Wait()
+				}
+			}()
+
+			var oldRec daemon.PIDRecord
+			pidDeadline := time.Now().Add(8 * time.Second)
+			for {
+				if rec, live := daemon.ReadLiveDaemonPID(shimCfgPath); live {
+					nodes, _ := client.ListNodes(context.Background(), true)
+					for _, n := range nodes {
+						if n.ID == "shim-node" && n.Status == "online" {
+							oldRec = rec
+							break
+						}
+					}
+					if oldRec.PID > 0 {
+						break
+					}
+				}
+				if time.Now().After(pidDeadline) {
+					t.Fatalf("shim-node did not write live node.pid and come online; logs:\n%s", shimLogs.String())
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+
+			inFlight := h.mustRunCLIJSON(`{"directives":[{"op":"sleep","ms":450}]}`,
+				"run", "--node", "shim-node", "--dir", shimProj, "--agent", "agy", "--wait", "0s", "-")
+			runStartDeadline := time.Now().Add(5 * time.Second)
+			for {
+				cur, err := client.GetRun(context.Background(), inFlight.ID, false, 1024)
+				if err == nil && (cur.Status == "claimed" || cur.Status == "running") {
+					break
+				}
+				if time.Now().After(runStartDeadline) {
+					t.Fatalf("in-flight run did not get claimed before SIGHUP: %+v", cur)
+				}
+				time.Sleep(40 * time.Millisecond)
+			}
+
+			if err := daemon.SendReloadSignal(oldRec.PID); err != nil {
+				t.Fatalf("SendReloadSignal(%d): %v", oldRec.PID, err)
+			}
+
+			// In-flight run MUST still drain and complete done cleanly before exit(42)
+			doneDeadline := time.Now().Add(8 * time.Second)
+			for {
+				cur, err := client.GetRun(context.Background(), inFlight.ID, false, 1024)
+				if err == nil && cur.Status == "done" {
+					break
+				}
+				if time.Now().After(doneDeadline) {
+					t.Fatalf("in-flight run failed to complete during SIGHUP drain: %+v; logs:\n%s", cur, shimLogs.String())
+				}
+				time.Sleep(80 * time.Millisecond)
+			}
+
+			// node shim must spawn a NEW child ahub node serve PID cleanly
+			respawnDeadline := time.Now().Add(8 * time.Second)
+			for {
+				if rec, live := daemon.ReadLiveDaemonPID(shimCfgPath); live && rec.PID != oldRec.PID {
+					nodes, _ := client.ListNodes(context.Background(), true)
+					online := false
+					for _, n := range nodes {
+						if n.ID == "shim-node" && n.Status == "online" {
+							online = true
+							break
+						}
+					}
+					if online {
+						break
+					}
+				}
+				if time.Now().After(respawnDeadline) {
+					t.Fatalf("node shim did not respawn a new child PID (old=%d); logs:\n%s", oldRec.PID, shimLogs.String())
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
 		}
 	})
 }

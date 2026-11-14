@@ -107,6 +107,8 @@ interface ApiKeyRow {
   allowed_nodes_json: string;
   allow_unsandboxed: number;
   max_depth_limit: number;
+  notify_webhook_ciphertext: string;
+  notify_webhook_host: string;
   revoked_at: string | null;
   last_used_at: string | null;
   created_at: string;
@@ -267,6 +269,8 @@ export function mapApiKeyRow(row: ApiKeyRow): ApiKeyRecord {
     allowed_nodes: parseStringArray(row.allowed_nodes_json),
     allow_unsandboxed: row.allow_unsandboxed === 1,
     max_depth_limit: row.max_depth_limit,
+    notify_webhook_host: row.notify_webhook_host ?? "",
+    has_webhook: Boolean(row.notify_webhook_ciphertext),
     revoked_at: row.revoked_at,
     last_used_at: row.last_used_at,
     created_at: row.created_at
@@ -1534,12 +1538,36 @@ export async function listApiKeys(
   if (!filters.includeRevoked) {
     where.push(`revoked_at IS NULL`);
   }
-  const sql = `SELECT id, name, scope, bound_node_id, key_prefix, allowed_nodes_json, allow_unsandboxed, max_depth_limit, revoked_at, last_used_at, created_at
+  const sql = `SELECT id, name, scope, bound_node_id, key_prefix, allowed_nodes_json, allow_unsandboxed, max_depth_limit, notify_webhook_ciphertext, notify_webhook_host, revoked_at, last_used_at, created_at
                FROM api_keys
                ${where.length ? "WHERE " + where.join(" AND ") : ""}
                ORDER BY created_at DESC`;
   const res = await db.prepare(sql).bind(...binds).all<ApiKeyRow>();
   return (res.results ?? []).map(mapApiKeyRow);
+}
+
+export async function getApiKeyRawById(db: D1Database, keyId: string): Promise<ApiKeyRow | null> {
+  return db
+    .prepare(
+      `SELECT id, name, scope, bound_node_id, key_prefix, allowed_nodes_json, allow_unsandboxed, max_depth_limit, notify_webhook_ciphertext, notify_webhook_host, revoked_at, last_used_at, created_at
+       FROM api_keys
+       WHERE id = ?1
+       LIMIT 1`
+    )
+    .bind(keyId)
+    .first<ApiKeyRow>();
+}
+
+async function ensureNodePlaceholder(db: D1Database, nodeId: string, now: string): Promise<void> {
+  // Ensure node placeholder row exists so foreign key constraints never fail when binding a key before first connect
+  await db
+    .prepare(
+      `INSERT INTO nodes (id, display_name, status, max_concurrency, active_runs_count, created_at, updated_at)
+       VALUES (?1, ?1, 'offline', 4, 0, ?2, ?2)
+       ON CONFLICT(id) DO NOTHING`
+    )
+    .bind(nodeId, now)
+    .run();
 }
 
 export async function createApiKey(
@@ -1551,6 +1579,8 @@ export async function createApiKey(
     allowedNodes: string[];
     allowUnsandboxed: boolean;
     maxDepthLimit: number;
+    notifyWebhookCiphertext?: string;
+    notifyWebhookHost?: string;
     token: string;
     tokenSha256: string;
   }
@@ -1559,22 +1589,14 @@ export async function createApiKey(
   const keyId = newId("key");
   const keyPrefix = input.token.slice(0, 14);
 
-  if (input.scope === "node" && input.boundNodeId) {
-    // Ensure node placeholder row exists so foreign key constraints never fail when issuing a node key before first connect
-    await db
-      .prepare(
-        `INSERT INTO nodes (id, display_name, status, max_concurrency, active_runs_count, created_at, updated_at)
-         VALUES (?1, ?1, 'offline', 4, 0, ?2, ?2)
-         ON CONFLICT(id) DO NOTHING`
-      )
-      .bind(input.boundNodeId, now)
-      .run();
+  if (input.boundNodeId) {
+    await ensureNodePlaceholder(db, input.boundNodeId, now);
   }
 
   await db
     .prepare(
-      `INSERT INTO api_keys (id, name, scope, bound_node_id, key_prefix, key_sha256, allowed_nodes_json, allow_unsandboxed, max_depth_limit, created_at)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`
+      `INSERT INTO api_keys (id, name, scope, bound_node_id, key_prefix, key_sha256, allowed_nodes_json, allow_unsandboxed, max_depth_limit, notify_webhook_ciphertext, notify_webhook_host, created_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)`
     )
     .bind(
       keyId,
@@ -1586,18 +1608,73 @@ export async function createApiKey(
       JSON.stringify(input.allowedNodes),
       input.allowUnsandboxed ? 1 : 0,
       input.maxDepthLimit,
+      input.notifyWebhookCiphertext ?? "",
+      input.notifyWebhookHost ?? "",
       now
     )
     .run();
 
-  const row = await db
-    .prepare(
-      `SELECT id, name, scope, bound_node_id, key_prefix, allowed_nodes_json, allow_unsandboxed, max_depth_limit, revoked_at, last_used_at, created_at
-       FROM api_keys WHERE id = ?1`
-    )
-    .bind(keyId)
-    .first<ApiKeyRow>();
+  const row = await getApiKeyRawById(db, keyId);
   return mapApiKeyRow(row!);
+}
+
+export async function patchApiKey(
+  db: D1Database,
+  keyId: string,
+  patch: {
+    boundNodeId?: string | null;
+    allowedNodes?: string[];
+    allowUnsandboxed?: boolean;
+    maxDepthLimit?: number;
+    notifyWebhookCiphertext?: string;
+    notifyWebhookHost?: string;
+  }
+): Promise<ApiKeyRecord> {
+  const now = nowIso();
+  if (patch.boundNodeId) {
+    await ensureNodePlaceholder(db, patch.boundNodeId, now);
+  }
+
+  const sets: string[] = [];
+  const binds: unknown[] = [];
+  if (patch.boundNodeId !== undefined) {
+    binds.push(patch.boundNodeId);
+    sets.push(`bound_node_id = ?${binds.length}`);
+  }
+  if (patch.allowedNodes !== undefined) {
+    binds.push(JSON.stringify(patch.allowedNodes));
+    sets.push(`allowed_nodes_json = ?${binds.length}`);
+  }
+  if (patch.allowUnsandboxed !== undefined) {
+    binds.push(patch.allowUnsandboxed ? 1 : 0);
+    sets.push(`allow_unsandboxed = ?${binds.length}`);
+  }
+  if (patch.maxDepthLimit !== undefined) {
+    binds.push(patch.maxDepthLimit);
+    sets.push(`max_depth_limit = ?${binds.length}`);
+  }
+  if (patch.notifyWebhookCiphertext !== undefined) {
+    binds.push(patch.notifyWebhookCiphertext);
+    sets.push(`notify_webhook_ciphertext = ?${binds.length}`);
+  }
+  if (patch.notifyWebhookHost !== undefined) {
+    binds.push(patch.notifyWebhookHost);
+    sets.push(`notify_webhook_host = ?${binds.length}`);
+  }
+
+  if (sets.length > 0) {
+    binds.push(keyId);
+    await db
+      .prepare(`UPDATE api_keys SET ${sets.join(", ")} WHERE id = ?${binds.length} AND revoked_at IS NULL`)
+      .bind(...binds)
+      .run();
+  }
+
+  const row = await getApiKeyRawById(db, keyId);
+  if (!row) {
+    throw new HubError(404, "NOT_FOUND", `API key '${keyId}' not found.`);
+  }
+  return mapApiKeyRow(row);
 }
 
 export async function revokeApiKey(

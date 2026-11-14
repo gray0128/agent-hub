@@ -73,5 +73,8 @@ fi
 
 mkdir -p "$INSTALL_DIR"
 chmod 0755 "$BIN_TMP"
+if [ "$OS" = "darwin" ] && command -v xattr >/dev/null 2>&1; then
+  xattr -cr "$BIN_TMP" 2>/dev/null || true
+fi
 mv "$BIN_TMP" "$INSTALL_DIR/ahub"
 echo "Installed ahub to $INSTALL_DIR/ahub"

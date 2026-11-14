@@ -15,10 +15,13 @@ import (
 	"github.com/coder/websocket"
 )
 
+const DefaultWSDialTimeout = 20 * time.Second
+
 type Client struct {
-	BaseURL    string
-	Token      string
-	HTTPClient *http.Client
+	BaseURL       string
+	Token         string
+	HTTPClient    *http.Client
+	WSDialTimeout time.Duration
 }
 
 func NewClient(baseURL, token string) *Client {
@@ -28,6 +31,7 @@ func NewClient(baseURL, token string) *Client {
 		HTTPClient: &http.Client{
 			Timeout: 60 * time.Second,
 		},
+		WSDialTimeout: DefaultWSDialTimeout,
 	}
 }
 
@@ -291,7 +295,18 @@ func (c *Client) DialWebSocket(ctx context.Context, path string) (*websocket.Con
 	if c.Token != "" {
 		headers.Set("Authorization", "Bearer "+c.Token)
 	}
+	dialTimeout := c.WSDialTimeout
+	if dialTimeout <= 0 {
+		dialTimeout = DefaultWSDialTimeout
+	}
+	dialClient := &http.Client{
+		Timeout: dialTimeout,
+	}
+	if c.HTTPClient != nil && c.HTTPClient.Transport != nil {
+		dialClient.Transport = c.HTTPClient.Transport
+	}
 	conn, _, err := websocket.Dial(ctx, wsEndpoint, &websocket.DialOptions{
+		HTTPClient: dialClient,
 		HTTPHeader: headers,
 	})
 	if err != nil {
