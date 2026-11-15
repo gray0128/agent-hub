@@ -111,7 +111,12 @@ skills/ahub/SKILL.md             # 通过 go:embed 内嵌于二进制中
     },
     "claude": {
       "enabled": false,
-      "command": "claude"
+      "command": "claude",
+      "models": [
+        "opus",
+        "sonnet",
+        "haiku"
+      ]
     }
   }
 }
@@ -123,20 +128,30 @@ skills/ahub/SKILL.md             # 通过 go:embed 内嵌于二进制中
 
 | Agent | 无头调用命令模板 | 会话续接参数 | 输出解析规则 |
 | --- | --- | --- | --- |
-| `agy` | `agy --output-format json [--sandbox] [--model <m>] [--effort <e>] [--print-timeout <t>] -p=<prompt>` | `--conversation <native_session_id>` | 解析单对象 JSON 提取 `status`、`conversation_id`、`response`、`error`；**严禁采信返回的累计耗时，必须由 Go 守护端 `time.Since(startedAt)` 单调计时**；当 `status == "NEEDS_HUMAN_APPROVAL"` 时自动巡检/拉起远控守护并回填 `remote_control_url` |
+| `agy` | `agy --output-format json [--sandbox] [--project <project_id>] [--model <m>] [--effort <e>] [--print-timeout <t>] -p=<prompt>` | `--conversation <native_session_id>` | 解析单对象 JSON 提取 `status`、`conversation_id`、`response`、`error`；**严禁采信返回的累计耗时，必须由 Go 守护端 `time.Since(startedAt)` 单调计时**；当 `status == "NEEDS_HUMAN_APPROVAL"` 时自动巡检/拉起远控守护并回填 `remote_control_url` |
 | `pi` | `pi --mode json -p --approve [--model <m>] [--thinking <e>] <prompt>` | `--session <native_session_id>` | 逐行解析 v3 NDJSON 事件流：从 `session` 帧提取会话 ID，从 `turn_end` 提取实际命中 `provider/model` 与思考等级，从 `agent_end` 提取最终文本输出，并将关键工具事件实时映射为 `run.event` 推往云端 |
 | `omp` | `omp --mode=json -p --auto-approve --max-time=<t> [--model=<m>] [--thinking=<e>] <prompt>` | `--resume=<native_session_id>` | 同上，逐行解析 v3 NDJSON 事件流并实时推送 `run.event` |
-| `codex` / `claude` | 各自非交互 JSON 模式（`codex exec --json` / `claude -p --output-format json`） | `codex exec resume --json <native_session_id> -` / `--session-id <id>` | 提取标准输出文本与会话 ID，实现多引擎统一抽象 |
+| `codex` / `claude` | `codex exec --json [-m <m>] [-c model_reasoning_effort="<e>"]` / `claude -p --output-format json [--model <m>]` | `codex exec resume --json [-m <m>] [-c model_reasoning_effort="<e>"] <native_session_id> -` / `--session-id <id>` | 提取标准输出文本与会话 ID，实现多引擎统一抽象 |
 
-#### 模型简称与思考强度映射表
+#### `agy` 项目归属解析规则
 
-- 思考强度支持标准值：`off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`（同步兼容 `carbon@high` 合写语法）。
-- `agy` 家族自动展开：`carbon` -> `gemini-4-carbon-<effort>`、`argon` -> `gemini-4-argon-<effort>`、`hydrogen` -> `gemini-4-hydrogen-<effort>`、`flash` -> `gemini-3.8-flash-<effort>`、`opus` -> `claude-opus-5-5-<effort>`、`sonnet` -> `claude-sonnet-5-5-<effort>`（除 `gemini-4-hydrogen` 原生支持 `xhigh` 外，其余家族的 `xhigh`/`max` 自动对齐 `-high` 并透传 `--effort`）。
+- 若 `agents.agy.args` 中尚未显式指定 `--project` 或 `--new-project`，`BuildCommandSpec` 会扫描 `~/.gemini/config/projects/*.json`（忽略 `default-cli-project`），将 `run.Workdir` 与各项目中的 `projectResources.resources[].folderUri` 及 `gitFolder.folderUri` 匹配，并按「精确目录匹配优先于最长父目录匹配 -> 完整项目（`!isWorkspaceOnly`）优先 -> 含项目级权限或配置优先 -> `id` 字典序」择优注入 `--project <project_id>`，避免新建或续聊会话落入 `CLI Project`（`default-cli-project`）导致归类错位与项目级权限失效。
+
+#### 模型简称、本地目录采集与思考强度映射表
+
+- 思考强度支持标准值：`off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`、`ultra`、`auto`（同步兼容 `carbon@high` 合写语法）。
+- `agy` 家族自动展开：支持短别名（`carbon` -> `gemini-4-carbon-<effort>`、`argon` -> `gemini-4-argon-<effort>`、`hydrogen` -> `gemini-4-hydrogen-<effort>`、`flash` -> `gemini-3.8-flash-<effort>`、`opus` -> `claude-opus-5-5-<effort>`、`sonnet` -> `claude-sonnet-5-5-<effort>`）以及完整基础模型 ID（如 `gemini-4-carbon`、`gpt-oss-120b`）按所选 `effort` 展开；若 `default_model` 自带 `-low`/`-medium`/`-high`/`-xhigh`/`-max` 后缀且调用显式指定 `effort`，则替换后缀并保留兼容档位夹逼（除 `gemini-4-hydrogen` 原生支持 `xhigh` 外，已知家族其余型号的 `xhigh`/`max` 自动对齐 `-high`）；对于 `gemini-pro-orchestrator*` 等无档位独立模型，保持原 ID 不追加后缀且不传递 `--effort`。
+- 节点侧各 Agent 模型目录采集路径：
+  - `agy`：执行 `agy models` 解析账号实时可用型号与显示名，将同源 `-low`/`-medium`/`-high`/`-xhigh`/`-max` 条目聚合为基础模型 ID + 可选 `efforts[]`，保留 `gemini-pro-orchestrator*` 等独立模型（`efforts: []`）。
+  - `omp`：执行 `omp models --json` 读取已配置 Provider 的 `selector`、`name` 与单模型 `thinking` 数组。
+  - `pi`：执行 `pi --list-models` 解析 `<provider>/<model>` 与 `thinking` 标记（`yes` 对应 `off..max`）。
+  - `codex`：读取 `~/.codex/config.toml`（`model`、`model_reasoning_effort`、`model_catalog_json` 与 `[model_providers.*]`）及 `~/.codex/models_cache.json`（过滤 `visibility == "list"` 条目，提取 `slug`、`display_name`、`default_reasoning_level` 与 `supported_reasoning_levels`），不向外上报任何密钥或鉴权 URL。
+  - `claude`：读取 `~/.claude/settings.json` 中的 `model` 与模型名称环境变量（`ANTHROPIC_MODEL`、`ANTHROPIC_REASONING_MODEL`、`ANTHROPIC_DEFAULT_*_MODEL`），合并 `node.json` 的可选 `agents.claude.models`、`default_model` 与 `opus`/`sonnet`/`haiku` 预设作为无档位模型列表兜底（`efforts: []`）。
 - `pi` / `omp` 省略 `model` 时保持各自本机默认配置文件选择，也可传 `provider/model` 全称。
 
 ### 4.3 守护生命周期、进程组隔离与系统托管
 
-1. **连接与自愈**：`ahub node serve` 主动建立 `wss://<hub_url>/ws/node`（`DialWebSocket` 升级握手限时 `20s`，`node.hello -> hub.welcome` 首帧握手限时 `15s`），发送 `node.hello` 后立即执行 `POST /api/v1/nodes/:id/claim` 清扫积压任务；本地工作区扫描限时 `5s`（单飞后台协程防泄漏，若因外置盘休眠或 TCC 弹窗超时，先携带已缓存或空工作区列表完成上线并输出告警日志，待后台扫描返回后自动补发 `node.hello` 刷新工作区）；心跳周期同时执行带 `10s` 超时的底层 WebSocket `Ping/Pong` 探活与 `node.ping` 写校验，超时或写失败立即主动断开进入退避重连；断线时采用 `1s -> 2s -> 4s ...`（上限 `30s` + 随机抖动）指数退避重连，重连成功必定重新扫描队列。
+1. **连接与自愈**：`ahub node serve` 主动建立 `wss://<hub_url>/ws/node`（`DialWebSocket` 升级握手限时 `20s`，`node.hello -> hub.welcome` 首帧握手限时 `15s`），发送 `node.hello` 后立即执行 `POST /api/v1/nodes/:id/claim` 清扫积压任务；本地工作区扫描限时 `5s`（单飞后台协程防泄漏，若因外置盘休眠或 TCC 弹窗超时，先携带已缓存或空工作区列表完成上线并输出告警日志，待后台扫描返回后自动补发 `node.hello` 刷新工作区）；各 Agent 本地模型目录采集采用同类单飞异步探测（单 CLI 命令限时 `4s`、基于 `BuildBaseSanitizedEnv` 剥离 `AHUB_TOKEN` 并在超时后强杀独立进程组，结果缓存 `10m`），首帧 `node.hello` 绝不阻塞在外部 CLI 探测上，待后台目录采集就绪后自动补发 `node.hello` 增量刷新；心跳周期同时执行带 `10s` 超时的底层 WebSocket `Ping/Pong` 探活与 `node.ping` 写校验，超时或写失败立即主动断开进入退避重连；断线时采用 `1s -> 2s -> 4s ...`（上限 `30s` + 随机抖动）指数退避重连，重连成功必定重新扫描队列。
 2. **本地 `workdir` 互斥与并发**：守护端维护按规范化 `workdir` 键控的本地锁，同一目录同时只允许运行一个任务，不同目录并发度受 `max_concurrency` 控制。
 3. **环境变量隔离与血统注入**：
    - 拉起子进程时构建干净环境变量列表，仅保留最小运行时集合（`PATH`、`HOME`、`USER`、`LOGNAME`、`SHELL`、`LANG`、`LC_ALL`、`TMPDIR`、`TERM`、`SSH_AUTH_SOCK`、`XDG_*`）。

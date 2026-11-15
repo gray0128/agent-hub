@@ -101,8 +101,8 @@ export const useWorkbenchStore = create<WorkbenchState>((set) => ({
     nodeId: "",
     workdir: "",
     agent: "agy",
-    model: "carbon",
-    effort: "high",
+    model: "",
+    effort: "",
     sandbox: true,
     notifyTarget: "none",
     prompt: ""

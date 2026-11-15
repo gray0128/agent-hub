@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   os TEXT NOT NULL DEFAULT '',                      -- darwin / linux / windows
   arch TEXT NOT NULL DEFAULT '',                    -- arm64 / amd64
   version TEXT NOT NULL DEFAULT '',                 -- ahub 二进制版本号
-  capabilities_json TEXT NOT NULL DEFAULT '{}',     -- 可用 agent、模型别名与 max_concurrency
+  capabilities_json TEXT NOT NULL DEFAULT '{}',     -- 可用 agent、实时模型目录与推理档位能力
   workspaces_json TEXT NOT NULL DEFAULT '[]',       -- 已发现工作区 [{key, path, default_branch}]
   status TEXT NOT NULL DEFAULT 'offline'
     CHECK (status IN ('online', 'offline', 'draining')),
@@ -74,7 +74,7 @@ CREATE TABLE IF NOT EXISTS runs (
   workdir TEXT NOT NULL,
   agent TEXT NOT NULL CHECK (agent IN ('agy', 'pi', 'omp', 'codex', 'claude')),
   model TEXT NOT NULL DEFAULT '',                   -- 请求指定的模型简称或全名
-  effort TEXT NOT NULL DEFAULT '',                  -- off / minimal / low / medium / high / xhigh / max
+  effort TEXT NOT NULL DEFAULT '',                  -- off / minimal / low / medium / high / xhigh / max / ultra / auto
   sandbox INTEGER NOT NULL DEFAULT 1 CHECK (sandbox IN (0, 1)),
   timeout_sec INTEGER NOT NULL DEFAULT 900 CHECK (timeout_sec >= 10 AND timeout_sec <= 7200),
   prompt TEXT NOT NULL,

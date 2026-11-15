@@ -48,40 +48,85 @@ function splitModelAndEffort(rawModel: string, rawEffort: string): { model: stri
   return { model, effort };
 }
 
+const AGY_EFFORT_SUFFIXES = ["-xhigh", "-medium", "-low", "-high", "-max"];
+
+function splitAgyEffortSuffix(modelId: string): {
+  stem: string;
+  effort: string;
+  hasSuffix: boolean;
+} {
+  const trimmed = modelId.trim();
+  const lower = trimmed.toLowerCase();
+  if (!trimmed || lower.includes("orchestrator")) {
+    return { stem: trimmed, effort: "", hasSuffix: false };
+  }
+  for (const suf of AGY_EFFORT_SUFFIXES) {
+    if (lower.endsWith(suf) && trimmed.length > suf.length) {
+      return {
+        stem: trimmed.slice(0, trimmed.length - suf.length),
+        effort: suf.slice(1),
+        hasSuffix: true
+      };
+    }
+  }
+  return { stem: trimmed, effort: "", hasSuffix: false };
+}
+
+function resolveKnownAgyFamily(raw: string): { base: string; supportsXHigh: boolean } | null {
+  switch (raw.trim().toLowerCase()) {
+    case "carbon":
+    case "gemini-4-carbon":
+      return { base: "gemini-4-carbon", supportsXHigh: false };
+    case "argon":
+    case "gemini-4-argon":
+      return { base: "gemini-4-argon", supportsXHigh: false };
+    case "hydrogen":
+    case "gemini-4-hydrogen":
+      return { base: "gemini-4-hydrogen", supportsXHigh: true };
+    case "flash":
+    case "gemini-3.8-flash":
+      return { base: "gemini-3.8-flash", supportsXHigh: false };
+    case "opus":
+    case "claude-opus-5-5":
+      return { base: "claude-opus-5-5", supportsXHigh: false };
+    case "sonnet":
+    case "claude-sonnet-5-5":
+      return { base: "claude-sonnet-5-5", supportsXHigh: false };
+    default:
+      return null;
+  }
+}
+
 function expandAgyModel(modelAlias: string, effort: string): { model: string; effort: string } {
   const { model, effort: eff } = splitModelAndEffort(modelAlias, effort);
   if (!model) return { model: "", effort: eff };
-
-  const suffixEffort = eff || "high";
-  let base = "";
-  let supportsXHigh = false;
-  switch (model.toLowerCase()) {
-    case "carbon":
-      base = "gemini-4-carbon";
-      break;
-    case "argon":
-      base = "gemini-4-argon";
-      break;
-    case "hydrogen":
-      base = "gemini-4-hydrogen";
-      supportsXHigh = true;
-      break;
-    case "flash":
-      base = "gemini-3.8-flash";
-      break;
-    case "opus":
-      base = "claude-opus-5-5";
-      break;
-    case "sonnet":
-      base = "claude-sonnet-5-5";
-      break;
-    default:
-      return { model, effort: eff };
+  if (model.toLowerCase().includes("orchestrator")) {
+    return { model, effort: "" };
   }
 
-  const mappedSuffix =
-    !supportsXHigh && (suffixEffort === "xhigh" || suffixEffort === "max") ? "high" : suffixEffort;
-  return { model: `${base}-${mappedSuffix}`, effort: eff };
+  const known = resolveKnownAgyFamily(model);
+  if (known) {
+    const suffixEffort = eff && eff !== "auto" ? eff : "high";
+    const mappedSuffix =
+      !known.supportsXHigh && (suffixEffort === "xhigh" || suffixEffort === "max")
+        ? "high"
+        : suffixEffort;
+    return { model: `${known.base}-${mappedSuffix}`, effort: eff };
+  }
+
+  const split = splitAgyEffortSuffix(model);
+  if (split.hasSuffix) {
+    if (!eff || eff === "auto") return { model, effort: eff };
+    const stemKnown = resolveKnownAgyFamily(split.stem);
+    const mappedSuffix =
+      stemKnown && !stemKnown.supportsXHigh && (eff === "xhigh" || eff === "max") ? "high" : eff;
+    return { model: `${split.stem}-${mappedSuffix}`, effort: eff };
+  }
+
+  if (eff && eff !== "off" && eff !== "auto") {
+    return { model: `${model}-${eff}`, effort: eff };
+  }
+  return { model, effort: eff };
 }
 
 export function shellQuote(value: string): string {
@@ -116,7 +161,7 @@ export function buildRunCliPreview(
         args.push("--output-format", "json");
         args.push(run.sandbox ? "--sandbox" : "--dangerously-skip-permissions");
         if (expanded.model) args.push("--model", expanded.model);
-        if (expanded.effort) args.push("--effort", expanded.effort);
+        if (expanded.effort && expanded.effort !== "auto") args.push("--effort", expanded.effort);
         if (run.timeout_sec > 0) args.push("--print-timeout", `${run.timeout_sec}s`);
         if (nativeSession) args.push("--conversation", nativeSession);
         args.push(`-p=${promptText}`);
@@ -126,7 +171,7 @@ export function buildRunCliPreview(
         args.push("--mode", "json", "-p");
         if (!run.sandbox) args.push("--approve");
         if (model) args.push("--model", model);
-        if (effort) args.push("--thinking", effort);
+        if (effort && effort !== "auto") args.push("--thinking", effort);
         if (nativeSession) args.push("--session", nativeSession);
         args.push(promptText);
         break;
@@ -134,7 +179,7 @@ export function buildRunCliPreview(
         args.push("--mode=json", "-p", "--auto-approve");
         if (run.timeout_sec > 0) args.push(`--max-time=${run.timeout_sec}`);
         if (model) args.push(`--model=${model}`);
-        if (effort) args.push(`--thinking=${effort}`);
+        if (effort && effort !== "auto") args.push(`--thinking=${effort}`);
         if (nativeSession) args.push(`--resume=${nativeSession}`);
         args.push(promptText);
         break;
@@ -142,10 +187,12 @@ export function buildRunCliPreview(
         if (nativeSession) {
           args.push("exec", "resume", "--json");
           if (model) args.push("-m", model);
+          if (effort && effort !== "auto") args.push("-c", `model_reasoning_effort="${effort}"`);
           args.push(nativeSession, "-");
         } else {
           args.push("exec", "--json");
           if (model) args.push("-m", model);
+          if (effort && effort !== "auto") args.push("-c", `model_reasoning_effort="${effort}"`);
           if (run.sandbox) {
             args.push("-s", "workspace-write");
           } else {

@@ -428,7 +428,42 @@ try {
     body: JSON.stringify({ name: "node-mbp", scope: "node", bound_node_id: "mbp" })
   });
 
-  function startNodeDaemon(nodeId, token, rootPath, maxConcurrency) {
+  const tmpCodexHome = path.join(tmpDir, "codex-home");
+  fs.mkdirSync(tmpCodexHome, { recursive: true });
+  fs.writeFileSync(
+    path.join(tmpCodexHome, "config.toml"),
+    'model = "gpt-5.6-sol"\nmodel_reasoning_effort = "medium"\n'
+  );
+  fs.writeFileSync(
+    path.join(tmpCodexHome, "models_cache.json"),
+    JSON.stringify({
+      models: [
+        {
+          slug: "gpt-5.6-sol",
+          display_name: "GPT-5.6 Sol",
+          visibility: "list",
+          default_reasoning_level: "medium",
+          supported_reasoning_levels: [
+            { effort: "low" },
+            { effort: "medium" },
+            { effort: "high" },
+            { effort: "xhigh" },
+            { effort: "max" },
+            { effort: "ultra" }
+          ]
+        },
+        {
+          slug: "codex-internal-hidden",
+          display_name: "Hidden Model",
+          visibility: "hide",
+          default_reasoning_level: "low",
+          supported_reasoning_levels: [{ effort: "low" }]
+        }
+      ]
+    })
+  );
+
+  function startNodeDaemon(nodeId, token, rootPath, maxConcurrency, agents, extraEnv = {}) {
     const cfgPath = path.join(tmpDir, `node-${nodeId}.json`);
     fs.writeFileSync(
       cfgPath,
@@ -441,28 +476,46 @@ try {
         heartbeat_interval_sec: 1,
         project_roots: [rootPath],
         skip_dirs: ["node_modules", ".git"],
-        agents: {
-          agy: { enabled: true, command: fakeAgentBin },
-          pi: { enabled: true, command: fakeAgentBin }
-        }
+        agents
       })
     );
     const proc = spawn(ahubBin, ["node", "serve", "--config", cfgPath], {
-      env: { ...process.env, AHUB_CONFIG_DIR: cfgDir },
+      env: { ...process.env, AHUB_CONFIG_DIR: cfgDir, ...extraEnv },
       detached: true,
       stdio: ["ignore", "pipe", "pipe"]
     });
     children.push(proc);
   }
 
-  startNodeDaemon("macmini", macKey.token, path.join(tmpDir, "workspaces"), 1);
-  startNodeDaemon("mbp", mbpKey.token, path.join(tmpDir, "workspaces-mbp"), 2);
+  startNodeDaemon(
+    "macmini",
+    macKey.token,
+    path.join(tmpDir, "workspaces"),
+    1,
+    {
+      agy: { enabled: true, command: fakeAgentBin, default_model: "carbon" },
+      codex: { enabled: true, command: fakeAgentBin }
+    },
+    { CODEX_HOME: tmpCodexHome }
+  );
+  startNodeDaemon("mbp", mbpKey.token, path.join(tmpDir, "workspaces-mbp"), 2, {
+    pi: { enabled: true, command: fakeAgentBin },
+    omp: { enabled: true, command: fakeAgentBin }
+  });
 
   for (let i = 0; i < 40; i++) {
     const res = await apiJson(hubUrl, adminToken, "/api/v1/nodes");
-    const online = res.nodes.filter((n) => n.status === "online").map((n) => n.id);
-    if (online.includes("macmini") && online.includes("mbp")) break;
-    if (i === 39) throw new Error(`Nodes failed to come online: ${JSON.stringify(res.nodes)}`);
+    const byId = Object.fromEntries(res.nodes.map((n) => [n.id, n]));
+    const macReady =
+      byId.macmini?.status === "online" &&
+      byId.macmini?.capabilities?.agents?.agy?.catalog_status === "ready" &&
+      byId.macmini?.capabilities?.agents?.codex?.catalog_status === "ready";
+    const mbpReady =
+      byId.mbp?.status === "online" &&
+      byId.mbp?.capabilities?.agents?.pi?.catalog_status === "ready" &&
+      byId.mbp?.capabilities?.agents?.omp?.catalog_status === "ready";
+    if (macReady && mbpReady) break;
+    if (i === 39) throw new Error(`Nodes failed to come online with ready catalogs: ${JSON.stringify(res.nodes)}`);
     await sleep(250);
   }
 
@@ -731,6 +784,211 @@ try {
   await cdpClient.clickSelector('[data-testid="theme-toggle-btn"]');
   await sleep(200);
 
+  // Verify 4-level node -> agent -> model -> effort Composer cascade + codex ultra dispatch
+  await cdpClient.clickSelector('[data-testid="switch-to-new-thread-btn"]');
+  await sleep(200);
+
+  await cdpClient.clickSelector("#composer-agent");
+  await sleep(150);
+  const macAgents = await cdpClient.evalJS(
+    `Array.from(document.querySelectorAll('[data-testid^="composer-agent-option-"]')).map(el => el.getAttribute("data-testid"))`
+  );
+  if (JSON.stringify(macAgents) !== JSON.stringify(["composer-agent-option-agy", "composer-agent-option-codex"])) {
+    throw new Error(`Expected macmini agent options [agy, codex], got ${JSON.stringify(macAgents)}`);
+  }
+  await cdpClient.clickSelector('[data-testid="composer-agent-option-agy"]');
+  await sleep(150);
+
+  await cdpClient.clickSelector("#composer-model");
+  await sleep(150);
+  await cdpClient.clickSelector('[data-testid="composer-model-option-gemini-pro-orchestrator"]');
+  await sleep(150);
+  const orchEffortState = await cdpClient.evalJS(`({
+    disabled: Boolean(document.querySelector('#composer-effort')?.disabled),
+    effort: window.__AHUB_EVAL__.getState().composer.effort
+  })`);
+  if (!orchEffortState.disabled || orchEffortState.effort !== "") {
+    throw new Error(
+      `Expected #composer-effort disabled and empty for gemini-pro-orchestrator, got ${JSON.stringify(orchEffortState)}`
+    );
+  }
+
+  await cdpClient.clickSelector("#composer-node");
+  await sleep(150);
+  await cdpClient.clickSelector('[data-testid="composer-node-option-mbp"]');
+  await sleep(200);
+  await cdpClient.clickSelector("#composer-agent");
+  await sleep(150);
+  const mbpAgents = await cdpClient.evalJS(
+    `Array.from(document.querySelectorAll('[data-testid^="composer-agent-option-"]')).map(el => el.getAttribute("data-testid"))`
+  );
+  if (JSON.stringify(mbpAgents) !== JSON.stringify(["composer-agent-option-pi", "composer-agent-option-omp"])) {
+    throw new Error(`Expected mbp agent options [pi, omp], got ${JSON.stringify(mbpAgents)}`);
+  }
+  await cdpClient.clickSelector('[data-testid="composer-agent-option-omp"]');
+  await sleep(150);
+  await cdpClient.clickSelector("#composer-model");
+  await sleep(150);
+  const hasOmpSonnet = await cdpClient.evalJS(
+    `Boolean(document.querySelector('[data-testid="composer-model-option-anthropic/claude-sonnet-4-5"]'))`
+  );
+  if (!hasOmpSonnet) {
+    throw new Error("Expected omp model option anthropic/claude-sonnet-4-5 on mbp");
+  }
+  await cdpClient.clickSelector('[data-testid="composer-model-option-anthropic/claude-sonnet-4-5"]');
+  await sleep(150);
+
+  await cdpClient.clickSelector("#composer-node");
+  await sleep(150);
+  await cdpClient.clickSelector('[data-testid="composer-node-option-macmini"]');
+  await sleep(200);
+  await cdpClient.clickSelector("#composer-agent");
+  await sleep(150);
+  await cdpClient.clickSelector('[data-testid="composer-agent-option-codex"]');
+  await sleep(150);
+
+  await cdpClient.clickSelector("#composer-model");
+  await sleep(150);
+  const hasHiddenCodexModel = await cdpClient.evalJS(
+    `Boolean(document.querySelector('[data-testid="composer-model-option-codex-internal-hidden"]'))`
+  );
+  if (hasHiddenCodexModel) {
+    throw new Error("Hidden codex model (visibility=hide) unexpectedly rendered in model options");
+  }
+  await cdpClient.clickSelector('[data-testid="composer-model-option-gpt-5.6-sol"]');
+  await sleep(150);
+
+  const codexEffortDisabled = await cdpClient.evalJS(
+    `Boolean(document.querySelector('#composer-effort')?.disabled)`
+  );
+  if (codexEffortDisabled) {
+    throw new Error("Expected #composer-effort enabled for codex gpt-5.6-sol");
+  }
+  await cdpClient.clickSelector("#composer-effort");
+  await sleep(150);
+  await cdpClient.clickSelector('[data-testid="composer-effort-option-ultra"]');
+  await sleep(150);
+
+  const beforeCodexIds = await cdpClient.evalJS(
+    `window.__AHUB_EVAL__.getState().runs.map(r => r.id)`
+  );
+  await cdpClient.typeAndPressEnter(
+    'textarea[placeholder*="输入任务指令"]',
+    "验证 codex ultra 调度"
+  );
+  let createdCodexRun = null;
+  for (let i = 0; i < 40; i++) {
+    const runsNow = await cdpClient.evalJS(`window.__AHUB_EVAL__.getState().runs`);
+    createdCodexRun = runsNow.find(
+      (r) => !beforeCodexIds.includes(r.id) && r.agent === "codex" && r.status === "done"
+    );
+    if (createdCodexRun) break;
+    if (i === 39) {
+      throw new Error(`Codex ultra run did not complete: ${JSON.stringify(runsNow.slice(0, 5))}`);
+    }
+    await sleep(200);
+  }
+  const apiCodexRun = (await apiJson(hubUrl, adminToken, `/api/v1/runs/${createdCodexRun.id}`)).run;
+  if (
+    apiCodexRun.agent !== "codex" ||
+    apiCodexRun.model !== "gpt-5.6-sol" ||
+    apiCodexRun.effort !== "ultra"
+  ) {
+    throw new Error(`D1 parity mismatch for codex ultra run: ${JSON.stringify(apiCodexRun)}`);
+  }
+
+  // Verify FleetThreadsPane dual-tab (会话 | 节点) and per-node collapsible workspace list
+  const initialFleetTab = await cdpClient.evalJS(`({
+    threadsActive: document.querySelector('[data-testid="fleet-tab-threads"]')?.getAttribute("data-state") === "active",
+    nodesRenderedOnThreadsTab: Boolean(document.querySelector('[data-testid="node-row-macmini"]'))
+  })`);
+  if (!initialFleetTab.threadsActive || initialFleetTab.nodesRenderedOnThreadsTab) {
+    throw new Error(`Expected initial left pane on 会话 tab without nodes DOM, got ${JSON.stringify(initialFleetTab)}`);
+  }
+
+  await cdpClient.clickSelector('[data-testid="fleet-tab-nodes"]');
+  await sleep(200);
+  const nodesTabOpen = await cdpClient.evalJS(`({
+    nodesActive: document.querySelector('[data-testid="fleet-tab-nodes"]')?.getAttribute("data-state") === "active",
+    hasMacRow: Boolean(document.querySelector('[data-testid="node-row-macmini"]')),
+    hasMacAlpha: Boolean(document.querySelector('[data-testid="workspace-chip-macmini-repo-alpha"]')),
+    hasMbpWeb: Boolean(document.querySelector('[data-testid="workspace-chip-mbp-repo-web"]')),
+    macExpanded: document.querySelector('[data-testid="toggle-ws-macmini"]')?.getAttribute("aria-expanded")
+  })`);
+  if (
+    !nodesTabOpen.nodesActive ||
+    !nodesTabOpen.hasMacRow ||
+    !nodesTabOpen.hasMacAlpha ||
+    !nodesTabOpen.hasMbpWeb ||
+    nodesTabOpen.macExpanded !== "true"
+  ) {
+    throw new Error(`Nodes tab failed to display expanded per-node workspaces: ${JSON.stringify(nodesTabOpen)}`);
+  }
+
+  // Collapse macmini workspaces independently while keeping mbp expanded
+  await cdpClient.clickSelector('[data-testid="toggle-ws-macmini"]');
+  await sleep(150);
+  const macCollapsedState = await cdpClient.evalJS(`({
+    macExpanded: document.querySelector('[data-testid="toggle-ws-macmini"]')?.getAttribute("aria-expanded"),
+    hasMacAlpha: Boolean(document.querySelector('[data-testid="workspace-chip-macmini-repo-alpha"]')),
+    hasMbpWeb: Boolean(document.querySelector('[data-testid="workspace-chip-mbp-repo-web"]'))
+  })`);
+  if (macCollapsedState.macExpanded !== "false" || macCollapsedState.hasMacAlpha || !macCollapsedState.hasMbpWeb) {
+    throw new Error(`Per-node workspace collapse check failed: ${JSON.stringify(macCollapsedState)}`);
+  }
+
+  // Expand macmini again individually
+  await cdpClient.clickSelector('[data-testid="toggle-ws-macmini"]');
+  await sleep(150);
+  const macReexpandedState = await cdpClient.evalJS(`({
+    macExpanded: document.querySelector('[data-testid="toggle-ws-macmini"]')?.getAttribute("aria-expanded"),
+    hasMacAlpha: Boolean(document.querySelector('[data-testid="workspace-chip-macmini-repo-alpha"]'))
+  })`);
+  if (macReexpandedState.macExpanded !== "true" || !macReexpandedState.hasMacAlpha) {
+    throw new Error(`Per-node workspace re-expand check failed: ${JSON.stringify(macReexpandedState)}`);
+  }
+
+  // Collapse all then expand all via global toggle
+  await cdpClient.clickSelector('[data-testid="toggle-all-node-ws"]');
+  await sleep(150);
+  const allCollapsed = await cdpClient.evalJS(`({
+    hasMacAlpha: Boolean(document.querySelector('[data-testid="workspace-chip-macmini-repo-alpha"]')),
+    hasMbpWeb: Boolean(document.querySelector('[data-testid="workspace-chip-mbp-repo-web"]'))
+  })`);
+  if (allCollapsed.hasMacAlpha || allCollapsed.hasMbpWeb) {
+    throw new Error(`Expected toggle-all-node-ws to collapse all workspaces, got ${JSON.stringify(allCollapsed)}`);
+  }
+  await cdpClient.clickSelector('[data-testid="toggle-all-node-ws"]');
+  await sleep(150);
+  const allReexpanded = await cdpClient.evalJS(`({
+    hasMacAlpha: Boolean(document.querySelector('[data-testid="workspace-chip-macmini-repo-alpha"]')),
+    hasMbpWeb: Boolean(document.querySelector('[data-testid="workspace-chip-mbp-repo-web"]'))
+  })`);
+  if (!allReexpanded.hasMacAlpha || !allReexpanded.hasMbpWeb) {
+    throw new Error(`Expected toggle-all-node-ws to re-expand all workspaces, got ${JSON.stringify(allReexpanded)}`);
+  }
+
+  // Clicking a workspace chip selects node+workdir in new mode
+  await cdpClient.clickSelector('[data-testid="workspace-chip-mbp-repo-web"]');
+  await sleep(150);
+  const afterPickWs = await cdpClient.evalJS(`({
+    nodeId: window.__AHUB_EVAL__.getState().composer.nodeId,
+    mode: window.__AHUB_EVAL__.getState().composer.mode
+  })`);
+  if (afterPickWs.nodeId !== "mbp" || afterPickWs.mode !== "new") {
+    throw new Error(`Expected clicking workspace chip to set nodeId=mbp & mode=new, got ${JSON.stringify(afterPickWs)}`);
+  }
+
+  // Switch back to 会话 tab so subsequent thread row selections operate cleanly
+  await cdpClient.clickSelector('[data-testid="fleet-tab-threads"]');
+  await sleep(200);
+  const backToThreads = await cdpClient.evalJS(
+    `document.querySelector('[data-testid="fleet-tab-threads"]')?.getAttribute("data-state") === "active"`
+  );
+  if (!backToThreads) {
+    throw new Error("Failed to switch back to fleet-tab-threads");
+  }
+
   // Seed blocking soft_approval run + 2 queued runs for approval & DnD reorder tests
   const approvalRes = await apiJson(hubUrl, adminToken, "/api/v1/runs?wait_ms=0", {
     method: "POST",
@@ -793,7 +1051,7 @@ try {
   await cdpClient.screenshot(path.join(screenshotDir, "approval-banner-state.png"));
 
   // Switch Inspector tab to 待跑队列 -> perform real CDP mouse drag-reorder of queued items!
-  await cdpClient.clickSelector('[role="tab"]:nth-of-type(2)');
+  await cdpClient.clickSelector('[data-testid="inspector-pane"] [role="tab"]:nth-of-type(2)');
   await sleep(300);
 
   const beforeOrder = await cdpClient.evalJS(

@@ -1,5 +1,15 @@
 export type AgentName = "agy" | "pi" | "omp" | "codex" | "claude";
-export type EffortLevel = "" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+export type EffortLevel =
+  | ""
+  | "off"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max"
+  | "ultra"
+  | "auto";
 export type NodeStatus = "online" | "offline" | "draining";
 export type ThreadStatus = "active" | "archived";
 export type RunStatus =
@@ -17,8 +27,24 @@ export interface WorkspaceEntry {
   default_branch?: string;
 }
 
+export interface ModelCapability {
+  id: string;
+  label: string;
+  efforts: EffortLevel[];
+  default_effort?: EffortLevel;
+}
+
+export interface AgentCapability {
+  enabled?: boolean;
+  available?: boolean;
+  default_model?: string;
+  default_effort?: EffortLevel;
+  catalog_status?: "pending" | "ready" | "fallback";
+  models?: ModelCapability[];
+}
+
 export interface NodeCapabilities {
-  agents?: Record<string, { enabled?: boolean; available?: boolean; default_model?: string }>;
+  agents?: Record<string, AgentCapability>;
   aliases?: Record<string, string>;
 }
 

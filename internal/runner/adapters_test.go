@@ -43,8 +43,48 @@ func TestBuildCommandSpecAdapters(t *testing.T) {
 		t.Fatalf("unexpected codex bin=%q stdin=%q", bin, stdinPrompt)
 	}
 	joined := strings.Join(args, " ")
-	if joined != "exec resume --json -m gpt-5 sess-123 -" {
-		t.Fatalf("expected codex resume syntax, got %q", joined)
+	if joined != `exec resume --json -m gpt-5 -c model_reasoning_effort="high" sess-123 -` {
+		t.Fatalf("expected codex resume syntax with reasoning effort, got %q", joined)
+	}
+
+	_, freshCodexArgs, _, err := BuildCommandSpec(api.RunRecord{
+		Agent:   "codex",
+		Model:   "gpt-5.6-sol",
+		Effort:  "ultra",
+		Sandbox: true,
+		Prompt:  "run ultra",
+	}, config.AgentConfig{Command: "codex"})
+	if err != nil {
+		t.Fatalf("codex fresh spec err: %v", err)
+	}
+	if strings.Join(freshCodexArgs, " ") != `exec --json -m gpt-5.6-sol -c model_reasoning_effort="ultra" -s workspace-write -` {
+		t.Fatalf("unexpected fresh codex ultra args: %v", freshCodexArgs)
+	}
+
+	_, overrideCodexArgs, _, err := BuildCommandSpec(api.RunRecord{
+		Agent:  "codex",
+		Model:  "gpt-5",
+		Effort: "high",
+		Prompt: "override",
+	}, config.AgentConfig{Command: "codex", Args: []string{"-c", "model_reasoning_effort=low"}})
+	if err != nil {
+		t.Fatalf("codex override spec err: %v", err)
+	}
+	if strings.Count(strings.Join(overrideCodexArgs, " "), "model_reasoning_effort") != 1 {
+		t.Fatalf("expected agentCfg.Args override to suppress duplicate model_reasoning_effort, got %v", overrideCodexArgs)
+	}
+
+	_, autoCodexArgs, _, err := BuildCommandSpec(api.RunRecord{
+		Agent:  "codex",
+		Model:  "gpt-5",
+		Effort: "auto",
+		Prompt: "auto effort",
+	}, config.AgentConfig{Command: "codex"})
+	if err != nil {
+		t.Fatalf("codex auto spec err: %v", err)
+	}
+	if strings.Contains(strings.Join(autoCodexArgs, " "), "model_reasoning_effort") {
+		t.Fatalf("expected auto effort to omit -c model_reasoning_effort, got %v", autoCodexArgs)
 	}
 
 	_, agyArgs, agyStdin, err := BuildCommandSpec(api.RunRecord{
@@ -90,5 +130,22 @@ func TestBuildCommandSpecAdapters(t *testing.T) {
 	}
 	if dashArgs[len(dashArgs)-1] != "-p=- inspect repo" {
 		t.Fatalf("expected final arg -p=- inspect repo, got %q", dashArgs[len(dashArgs)-1])
+	}
+
+	_, orchArgs, _, err := BuildCommandSpec(api.RunRecord{
+		Agent:  "agy",
+		Model:  "gemini-pro-orchestrator",
+		Effort: "high",
+		Prompt: "plan",
+	}, config.AgentConfig{Command: "agy"})
+	if err != nil {
+		t.Fatalf("agy orchestrator err: %v", err)
+	}
+	orchJoined := strings.Join(orchArgs, " ")
+	if !strings.Contains(orchJoined, "--model gemini-pro-orchestrator") {
+		t.Fatalf("expected orchestrator model unmodified, got %q", orchJoined)
+	}
+	if strings.Contains(orchJoined, "--effort") || strings.Contains(orchJoined, "-high") {
+		t.Fatalf("expected orchestrator to omit suffix and --effort flag, got %q", orchJoined)
 	}
 }

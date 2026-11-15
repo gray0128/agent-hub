@@ -19,9 +19,15 @@ var envAllowlist = map[string]bool{
 	"TMPDIR":        true,
 	"TERM":          true,
 	"SSH_AUTH_SOCK": true,
+	"CODEX_HOME":    true,
+	"USERPROFILE":   true,
+	"APPDATA":       true,
+	"LOCALAPPDATA":  true,
+	"SYSTEMROOT":    true,
 }
 
-func BuildSanitizedEnv(run api.RunRecord, hubURL, delegationToken string) []string {
+// BuildBaseSanitizedEnv keeps minimal runtime variables and strips AHUB_TOKEN and secrets.
+func BuildBaseSanitizedEnv() []string {
 	out := make([]string, 0, 24)
 	for _, entry := range os.Environ() {
 		idx := strings.IndexByte(entry, '=')
@@ -33,6 +39,11 @@ func BuildSanitizedEnv(run api.RunRecord, hubURL, delegationToken string) []stri
 			out = append(out, entry)
 		}
 	}
+	return out
+}
+
+func BuildSanitizedEnv(run api.RunRecord, hubURL, delegationToken string) []string {
+	out := BuildBaseSanitizedEnv()
 
 	if delegationToken != "" {
 		out = append(out, "AHUB_TOKEN="+delegationToken)

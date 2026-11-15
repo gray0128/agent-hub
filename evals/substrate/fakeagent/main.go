@@ -38,8 +38,52 @@ type scriptPayload struct {
 	Directives []directive `json:"directives"`
 }
 
+func maybeHandleCatalogQuery(args []string) bool {
+	hasModels := false
+	hasJSON := false
+	hasListModels := false
+	for _, a := range args {
+		switch a {
+		case "models":
+			hasModels = true
+		case "--json":
+			hasJSON = true
+		case "--list-models":
+			hasListModels = true
+		}
+	}
+	if hasListModels {
+		fmt.Println("provider   model               context   max-out   thinking   images")
+		fmt.Println("openai     gpt-5.4             200K      64K       yes        yes")
+		fmt.Println("anthropic  claude-haiku-4-5    200K      16K       no         no")
+		return true
+	}
+	if hasModels && hasJSON {
+		fmt.Println(`{"models":[{"provider":"anthropic","id":"claude-sonnet-4-5","selector":"anthropic/claude-sonnet-4-5","name":"Claude Sonnet 4.5","reasoning":true,"thinking":["off","minimal","low","medium","high","xhigh"]},{"provider":"openai","id":"gpt-5.4","selector":"openai/gpt-5.4","name":"GPT-5.4","reasoning":true,"thinking":["low","medium","high"]}]}`)
+		return true
+	}
+	if hasModels {
+		fmt.Println("Fetching available models...")
+		fmt.Println("gemini-4-carbon-low\tGemini 4 Carbon (Low)")
+		fmt.Println("gemini-4-carbon-medium\tGemini 4 Carbon (Medium)")
+		fmt.Println("gemini-4-carbon-high\tGemini 4 Carbon (High)")
+		fmt.Println("gemini-4-hydrogen-low\tGemini 4 Hydrogen (Low)")
+		fmt.Println("gemini-4-hydrogen-high\tGemini 4 Hydrogen (High)")
+		fmt.Println("gemini-4-hydrogen-xhigh\tGemini 4 Hydrogen (XHigh)")
+		fmt.Println("gemini-3.8-flash-low\tGemini 3.8 Flash (Low)")
+		fmt.Println("gemini-3.8-flash-medium\tGemini 3.8 Flash (Medium)")
+		fmt.Println("gemini-3.8-flash-high\tGemini 3.8 Flash (High)")
+		fmt.Println("gemini-pro-orchestrator\tGemini Pro Orchestrator")
+		return true
+	}
+	return false
+}
+
 func main() {
 	args := os.Args[1:]
+	if maybeHandleCatalogQuery(args) {
+		return
+	}
 	prompt := ""
 	readStdin := false
 	hasPromptFlag := false

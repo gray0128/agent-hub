@@ -1,7 +1,7 @@
 export type NodeStatus = "online" | "offline" | "draining";
 export type ApiScope = "admin" | "client" | "node";
 export type AgentName = "agy" | "pi" | "omp" | "codex" | "claude";
-export type EffortLevel = "" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+export type EffortLevel = "" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | "auto";
 export type ThreadStatus = "active" | "archived";
 export type RunStatus =
   | "queued"

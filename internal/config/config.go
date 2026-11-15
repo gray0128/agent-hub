@@ -21,6 +21,7 @@ type AgentConfig struct {
 	Command      string   `json:"command"`
 	Args         []string `json:"args,omitempty"`
 	DefaultModel string   `json:"default_model,omitempty"`
+	Models       []string `json:"models,omitempty"`
 }
 
 type NodeConfig struct {

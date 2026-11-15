@@ -2,14 +2,28 @@ import { useMemo, useState } from "react";
 import { useDraggable } from "@dnd-kit/core";
 import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { ChevronDown, ChevronUp, FolderGit2, GitBranch, GripVertical, Pin, Plus, Search, Server } from "lucide-react";
+import {
+  ChevronDown,
+  ChevronRight,
+  ChevronUp,
+  FolderGit2,
+  GitBranch,
+  GripVertical,
+  Pin,
+  Plus,
+  Search,
+  Server
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { ALL_AGENTS } from "@/lib/capabilities";
 import { cn, formatShortTime } from "@/lib/utils";
-import type { NodeRecord, RunRecord, RunStatus, ThreadRecord, WorkspaceEntry } from "@/types";
+import type { AgentName, NodeRecord, RunRecord, RunStatus, ThreadRecord, WorkspaceEntry } from "@/types";
 import { NodeStatusDot } from "./StatusBadge";
 
 type ThreadFilterMode = "all" | "active" | "needs_approval";
+type FleetTabMode = "threads" | "nodes";
 
 function statusDotClass(status?: RunStatus): string {
   switch (status) {
@@ -43,6 +57,15 @@ function statusShortLabel(status?: RunStatus): string | null {
     default:
       return null;
   }
+}
+
+function getNodeReadyAgents(node: NodeRecord): AgentName[] {
+  const agentsMap = node.capabilities?.agents;
+  if (!agentsMap) return [];
+  return ALL_AGENTS.filter((agent) => {
+    const cap = agentsMap[agent];
+    return Boolean(cap && cap.enabled !== false && cap.available !== false);
+  });
 }
 
 function DraggableWorkspaceChip({
@@ -79,7 +102,7 @@ function DraggableWorkspaceChip({
       )}
     >
       <FolderGit2 className="h-3 w-3 shrink-0" strokeWidth={1.75} aria-hidden="true" />
-      <span className="truncate max-w-[130px]">{ws.key}</span>
+      <span className="truncate max-w-[150px]">{ws.key}</span>
     </button>
   );
 }
@@ -240,7 +263,8 @@ export function FleetThreadsPane({
   onTogglePinThread,
   onForkThread
 }: FleetThreadsPaneProps) {
-  const [expandedNodes, setExpandedNodes] = useState<Record<string, boolean>>({});
+  const [leftTab, setLeftTab] = useState<FleetTabMode>("threads");
+  const [collapsedNodes, setCollapsedNodes] = useState<Record<string, boolean>>({});
   const [statusFilter, setStatusFilter] = useState<ThreadFilterMode>("all");
   const [onlySelectedNode, setOnlySelectedNode] = useState(false);
 
@@ -296,6 +320,19 @@ export function FleetThreadsPane({
     });
   }, [latestRunByThread, onlySelectedNode, selectedNodeId, statusFilter, threadQuery, threads]);
 
+  const onlineNodeCount = useMemo(
+    () => nodes.filter((n) => n.status === "online").length,
+    [nodes]
+  );
+  const totalWorkspaceCount = useMemo(
+    () => nodes.reduce((sum, n) => sum + n.workspaces.length, 0),
+    [nodes]
+  );
+  const nodesWithWorkspaces = useMemo(
+    () => nodes.filter((n) => n.workspaces.length > 0),
+    [nodes]
+  );
+  const hasExpandedNode = nodesWithWorkspaces.some((n) => !collapsedNodes[n.id]);
   const hasActiveFilter = Boolean(threadQuery.trim() || statusFilter !== "all" || onlySelectedNode);
 
   return (
@@ -304,252 +341,303 @@ export function FleetThreadsPane({
       data-testid="fleet-threads-pane"
       className="flex h-full flex-col bg-surface-elevated overflow-hidden"
     >
-      <div className="flex h-10 shrink-0 items-center justify-between border-b border-border px-3">
-        {inDrawer ? (
-          <span className="text-[11px] font-mono text-muted-foreground tabular-nums">
-            {nodes.length} 节点 · {threads.length} 会话
-          </span>
-        ) : (
-          <span className="text-xs font-semibold tracking-tight text-foreground">节点与会话</span>
-        )}
-        <Button
-          type="button"
-          size="sm"
-          variant="outline"
-          onClick={onNewThread}
-          className="h-7 px-2 text-[11px]"
-        >
-          <Plus className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
-          新建会话
-        </Button>
-      </div>
+      <Tabs
+        value={leftTab}
+        onValueChange={(v) => setLeftTab(v as FleetTabMode)}
+        className="flex h-full flex-col overflow-hidden"
+      >
+        <div className="flex shrink-0 items-center justify-between gap-2 border-b border-border px-2.5 py-1.5">
+          <TabsList className={cn("grid flex-1 grid-cols-2", inDrawer ? "h-10" : "h-8")}>
+            <TabsTrigger
+              value="threads"
+              data-testid="fleet-tab-threads"
+              className="gap-1.5 px-2 text-xs tabular-nums"
+            >
+              <span>会话</span>
+              <span className="inline-block min-w-[1.1rem] rounded px-1 text-center text-[10px] leading-tight text-muted-foreground tabular-nums">
+                {threads.length}
+              </span>
+            </TabsTrigger>
+            <TabsTrigger
+              value="nodes"
+              data-testid="fleet-tab-nodes"
+              className="gap-1.5 px-2 text-xs tabular-nums"
+            >
+              <span>节点</span>
+              <span className="inline-block min-w-[1.1rem] rounded px-1 text-center text-[10px] leading-tight text-muted-foreground tabular-nums">
+                {onlineNodeCount}/{nodes.length}
+              </span>
+            </TabsTrigger>
+          </TabsList>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            onClick={onNewThread}
+            data-testid="new-thread-btn"
+            className={cn("shrink-0 px-2 text-[11px]", inDrawer ? "h-10" : "h-8")}
+          >
+            <Plus className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
+            新建会话
+          </Button>
+        </div>
 
-      {/* Node directory + collapsible workspace chips */}
-      <div className="max-h-[40%] overflow-y-auto border-b border-border divide-y divide-border">
-        {nodes.length === 0 ? (
-          <div className="px-3 py-4 text-xs text-muted-foreground">暂无在线或历史节点</div>
-        ) : (
-          nodes.map((node) => {
-            const isSelected = selectedNodeId === node.id;
-            const totalWs = node.workspaces.length;
-            const isExpanded = Boolean(expandedNodes[node.id]) || totalWs <= 4;
-            const chipLimit = isSelected ? 5 : 2;
+        {/* Tab 1: Threads (search + status filter + sortable list) */}
+        <TabsContent value="threads" className="mt-0 min-h-0 flex-1 flex flex-col overflow-hidden">
+          <div className="shrink-0 space-y-1.5 border-b border-border px-2.5 py-2">
+            <div className="relative flex items-center">
+              <Search
+                className="pointer-events-none absolute left-2.5 h-3.5 w-3.5 text-muted-foreground"
+                strokeWidth={1.75}
+                aria-hidden="true"
+              />
+              <Input
+                aria-label="筛选会话"
+                data-testid="thread-search-input"
+                value={threadQuery}
+                onChange={(e) => onThreadQueryChange(e.target.value)}
+                placeholder="搜索会话标题、节点或目录..."
+                className="h-8 pl-8 text-xs"
+              />
+            </div>
 
-            let visibleWorkspaces = node.workspaces;
-            if (!isExpanded) {
-              const activeWs =
-                activeTargetNodeId === node.id
-                  ? node.workspaces.find((w) => w.path === activeWorkdir)
-                  : undefined;
-              const subset: WorkspaceEntry[] = [];
-              if (activeWs) subset.push(activeWs);
-              for (const ws of node.workspaces) {
-                if (subset.length >= chipLimit) break;
-                if (!subset.some((item) => item.path === ws.path)) {
-                  subset.push(ws);
-                }
-              }
-              visibleWorkspaces = subset;
-            }
-            const hiddenCount = Math.max(0, totalWs - visibleWorkspaces.length);
-
-            return (
-              <div
-                key={node.id}
-                data-testid={`node-row-${node.id}`}
-                data-node-status={node.status}
+            <div className="flex flex-wrap items-center gap-1">
+              <button
+                type="button"
+                aria-pressed={statusFilter === "all"}
+                onClick={() => setStatusFilter("all")}
                 className={cn(
-                  "px-3 py-2 transition-colors duration-150",
-                  isSelected ? "bg-accent/60" : "hover:bg-accent/30"
+                  "inline-flex h-6 items-center rounded-[4px] border px-2 text-[10px] font-medium transition-colors duration-150 cursor-pointer tabular-nums",
+                  statusFilter === "all"
+                    ? "border-[var(--status-running)]/50 bg-[var(--status-running)]/12 text-foreground"
+                    : "border-border bg-background/50 text-muted-foreground hover:text-foreground"
                 )}
               >
+                全部 {threads.length}
+              </button>
+              <button
+                type="button"
+                aria-pressed={statusFilter === "active"}
+                onClick={() => setStatusFilter((prev) => (prev === "active" ? "all" : "active"))}
+                className={cn(
+                  "inline-flex h-6 items-center rounded-[4px] border px-2 text-[10px] font-medium transition-colors duration-150 cursor-pointer tabular-nums",
+                  statusFilter === "active"
+                    ? "border-[var(--status-running)]/50 bg-[var(--status-running)]/12 text-foreground"
+                    : "border-border bg-background/50 text-muted-foreground hover:text-foreground"
+                )}
+              >
+                进行中 {activeCount}
+              </button>
+              <button
+                type="button"
+                aria-pressed={statusFilter === "needs_approval"}
+                onClick={() =>
+                  setStatusFilter((prev) => (prev === "needs_approval" ? "all" : "needs_approval"))
+                }
+                className={cn(
+                  "inline-flex h-6 items-center rounded-[4px] border px-2 text-[10px] font-medium transition-colors duration-150 cursor-pointer tabular-nums",
+                  statusFilter === "needs_approval"
+                    ? "border-[var(--status-approval)]/60 bg-[var(--status-approval)]/15 text-[var(--status-approval)]"
+                    : "border-border bg-background/50 text-muted-foreground hover:text-foreground"
+                )}
+              >
+                待审批 {approvalCount}
+              </button>
+              {selectedNodeId ? (
                 <button
                   type="button"
-                  onClick={() => onSelectNode(node.id)}
-                  className="flex w-full items-center justify-between gap-2 text-left cursor-pointer"
+                  aria-pressed={onlySelectedNode}
+                  onClick={() => setOnlySelectedNode((prev) => !prev)}
+                  className={cn(
+                    "ml-auto inline-flex h-6 items-center rounded-[4px] border px-2 text-[10px] font-mono transition-colors duration-150 cursor-pointer",
+                    onlySelectedNode
+                      ? "border-foreground/40 bg-accent text-foreground"
+                      : "border-border bg-background/50 text-muted-foreground hover:text-foreground"
+                  )}
                 >
-                  <div className="flex min-w-0 items-center gap-1.5">
-                    <Server className="h-3.5 w-3.5 shrink-0 text-muted-foreground" strokeWidth={1.75} aria-hidden="true" />
-                    <span className="truncate text-xs font-medium text-foreground">
-                      {node.display_name || node.id}
-                    </span>
-                    {node.display_name && node.display_name !== node.id ? (
-                      <span className="truncate text-[10px] text-muted-foreground font-mono">{node.id}</span>
-                    ) : null}
-                  </div>
-                  <div className="flex shrink-0 items-center gap-2">
-                    <span className="text-[10px] font-mono text-muted-foreground tabular-nums">
-                      {totalWs}目录
-                    </span>
-                    <span className="text-[11px] font-mono text-muted-foreground tabular-nums">
-                      {node.active_runs_count}/{node.max_concurrency}
-                    </span>
-                    <NodeStatusDot status={node.status} />
-                  </div>
+                  仅 {selectedNodeId}
                 </button>
+              ) : null}
+            </div>
+          </div>
 
-                {totalWs > 0 ? (
-                  <div className="mt-2 flex flex-wrap items-center gap-1">
-                    {visibleWorkspaces.map((ws) => (
-                      <DraggableWorkspaceChip
-                        key={`${node.id}-${ws.path}`}
-                        nodeId={node.id}
-                        ws={ws}
-                        active={activeTargetNodeId === node.id && activeWorkdir === ws.path}
-                        onSelect={() => onPickWorkspace(node.id, ws.path)}
-                      />
-                    ))}
-                    {totalWs > 4 ? (
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setExpandedNodes((prev) => ({
-                            ...prev,
-                            [node.id]: !isExpanded
-                          }))
-                        }
-                        data-testid={`toggle-ws-${node.id}`}
-                        className="inline-flex min-h-6 items-center gap-0.5 rounded-[5px] border border-dashed border-border px-2 py-0.5 text-[10px] font-medium text-muted-foreground transition-colors duration-150 hover:border-foreground/30 hover:text-foreground tabular-nums cursor-pointer"
-                      >
-                        {isExpanded ? (
-                          <>
-                            收起
-                            <ChevronUp className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
-                          </>
-                        ) : (
-                          <>
-                            {isSelected ? `展开全部 (${totalWs})` : `+${hiddenCount} 目录`}
-                            <ChevronDown className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
-                          </>
-                        )}
-                      </button>
-                    ) : null}
-                  </div>
+          <div className="min-h-0 flex-1 overflow-y-auto">
+            {filteredThreads.length === 0 ? (
+              <div className="space-y-2 px-3 py-6 text-center text-xs text-muted-foreground text-pretty">
+                <p>
+                  {hasActiveFilter
+                    ? "当前筛选条件下没有匹配的会话或任务。尝试清除节点或状态筛选条件。"
+                    : "暂无历史会话"}
+                </p>
+                {hasActiveFilter ? (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    onClick={() => {
+                      onThreadQueryChange("");
+                      setStatusFilter("all");
+                      setOnlySelectedNode(false);
+                    }}
+                  >
+                    清除筛选
+                  </Button>
                 ) : null}
               </div>
-            );
-          })
-        )}
-      </div>
-
-      {/* Thread search + filter pills */}
-      <div className="shrink-0 space-y-1.5 border-b border-border px-2.5 py-2">
-        <div className="relative flex items-center">
-          <Search
-            className="pointer-events-none absolute left-2.5 h-3.5 w-3.5 text-muted-foreground"
-            strokeWidth={1.75}
-            aria-hidden="true"
-          />
-          <Input
-            aria-label="筛选会话"
-            value={threadQuery}
-            onChange={(e) => onThreadQueryChange(e.target.value)}
-            placeholder="搜索会话标题、节点或目录..."
-            className="h-8 pl-8 text-xs"
-          />
-        </div>
-
-        <div className="flex flex-wrap items-center gap-1">
-          <button
-            type="button"
-            aria-pressed={statusFilter === "all"}
-            onClick={() => setStatusFilter("all")}
-            className={cn(
-              "inline-flex h-6 items-center rounded-[4px] border px-2 text-[10px] font-medium transition-colors duration-150 cursor-pointer tabular-nums",
-              statusFilter === "all"
-                ? "border-[var(--status-running)]/50 bg-[var(--status-running)]/12 text-foreground"
-                : "border-border bg-background/50 text-muted-foreground hover:text-foreground"
-            )}
-          >
-            全部 {threads.length}
-          </button>
-          <button
-            type="button"
-            aria-pressed={statusFilter === "active"}
-            onClick={() => setStatusFilter((prev) => (prev === "active" ? "all" : "active"))}
-            className={cn(
-              "inline-flex h-6 items-center rounded-[4px] border px-2 text-[10px] font-medium transition-colors duration-150 cursor-pointer tabular-nums",
-              statusFilter === "active"
-                ? "border-[var(--status-running)]/50 bg-[var(--status-running)]/12 text-foreground"
-                : "border-border bg-background/50 text-muted-foreground hover:text-foreground"
-            )}
-          >
-            进行中 {activeCount}
-          </button>
-          <button
-            type="button"
-            aria-pressed={statusFilter === "needs_approval"}
-            onClick={() => setStatusFilter((prev) => (prev === "needs_approval" ? "all" : "needs_approval"))}
-            className={cn(
-              "inline-flex h-6 items-center rounded-[4px] border px-2 text-[10px] font-medium transition-colors duration-150 cursor-pointer tabular-nums",
-              statusFilter === "needs_approval"
-                ? "border-[var(--status-approval)]/60 bg-[var(--status-approval)]/15 text-[var(--status-approval)]"
-                : "border-border bg-background/50 text-muted-foreground hover:text-foreground"
-            )}
-          >
-            待审批 {approvalCount}
-          </button>
-          {selectedNodeId ? (
-            <button
-              type="button"
-              aria-pressed={onlySelectedNode}
-              onClick={() => setOnlySelectedNode((prev) => !prev)}
-              className={cn(
-                "ml-auto inline-flex h-6 items-center rounded-[4px] border px-2 text-[10px] font-mono transition-colors duration-150 cursor-pointer",
-                onlySelectedNode
-                  ? "border-foreground/40 bg-accent text-foreground"
-                  : "border-border bg-background/50 text-muted-foreground hover:text-foreground"
-              )}
-            >
-              仅 {selectedNodeId}
-            </button>
-          ) : null}
-        </div>
-      </div>
-
-      {/* Sortable thread list */}
-      <div className="min-h-0 flex-1 overflow-y-auto">
-        {filteredThreads.length === 0 ? (
-          <div className="space-y-2 px-3 py-6 text-center text-xs text-muted-foreground text-pretty">
-            <p>
-              {hasActiveFilter
-                ? "当前筛选条件下没有匹配的会话或任务。尝试清除节点或状态筛选条件。"
-                : "暂无历史会话"}
-            </p>
-            {hasActiveFilter ? (
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                onClick={() => {
-                  onThreadQueryChange("");
-                  setStatusFilter("all");
-                  setOnlySelectedNode(false);
-                }}
+            ) : (
+              <SortableContext
+                items={filteredThreads.map((t) => `thread:${t.id}`)}
+                strategy={verticalListSortingStrategy}
               >
-                清除筛选
-              </Button>
-            ) : null}
+                {filteredThreads.map((thread) => (
+                  <SortableThreadRow
+                    key={thread.id}
+                    thread={thread}
+                    latestRunStatus={latestRunByThread.get(thread.id)?.status}
+                    selected={selectedThreadId === thread.id}
+                    onSelect={() => onSelectThread(thread.id)}
+                    onTogglePin={() => onTogglePinThread(thread)}
+                    onFork={() => onForkThread(thread)}
+                  />
+                ))}
+              </SortableContext>
+            )}
           </div>
-        ) : (
-          <SortableContext
-            items={filteredThreads.map((t) => `thread:${t.id}`)}
-            strategy={verticalListSortingStrategy}
-          >
-            {filteredThreads.map((thread) => (
-              <SortableThreadRow
-                key={thread.id}
-                thread={thread}
-                latestRunStatus={latestRunByThread.get(thread.id)?.status}
-                selected={selectedThreadId === thread.id}
-                onSelect={() => onSelectThread(thread.id)}
-                onTogglePin={() => onTogglePinThread(thread)}
-                onFork={() => onForkThread(thread)}
-              />
-            ))}
-          </SortableContext>
-        )}
-      </div>
+        </TabsContent>
+
+        {/* Tab 2: Nodes (per-node collapsible workspaces + drag/pick target) */}
+        <TabsContent value="nodes" className="mt-0 min-h-0 flex-1 flex flex-col overflow-hidden">
+          {nodes.length > 0 ? (
+            <div className="flex shrink-0 items-center justify-between gap-2 border-b border-border px-3 py-1.5 text-[11px] text-muted-foreground tabular-nums">
+              <span>
+                {onlineNodeCount}/{nodes.length} 在线 · {totalWorkspaceCount} 目录
+              </span>
+              {nodesWithWorkspaces.length > 0 ? (
+                <button
+                  type="button"
+                  data-testid="toggle-all-node-ws"
+                  onClick={() => {
+                    const nextCollapsed: Record<string, boolean> = {};
+                    for (const n of nodesWithWorkspaces) {
+                      nextCollapsed[n.id] = hasExpandedNode;
+                    }
+                    setCollapsedNodes(nextCollapsed);
+                  }}
+                  className="inline-flex items-center gap-1 rounded-[4px] border border-border bg-background/60 px-2 py-0.5 text-[10px] font-medium text-foreground hover:bg-accent transition-colors duration-150 cursor-pointer"
+                >
+                  {hasExpandedNode ? (
+                    <>
+                      全部收起
+                      <ChevronUp className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
+                    </>
+                  ) : (
+                    <>
+                      全部展开
+                      <ChevronDown className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
+                    </>
+                  )}
+                </button>
+              ) : null}
+            </div>
+          ) : null}
+
+          <div className="min-h-0 flex-1 overflow-y-auto divide-y divide-border">
+            {nodes.length === 0 ? (
+              <div className="px-3 py-6 text-center text-xs text-muted-foreground">暂无在线或历史节点</div>
+            ) : (
+              nodes.map((node) => {
+                const isSelected = selectedNodeId === node.id;
+                const totalWs = node.workspaces.length;
+                const isWsCollapsed = Boolean(collapsedNodes[node.id]);
+                const readyAgents = getNodeReadyAgents(node);
+
+                return (
+                  <div
+                    key={node.id}
+                    data-testid={`node-row-${node.id}`}
+                    data-node-status={node.status}
+                    className={cn(
+                      "px-3 py-2.5 transition-colors duration-150",
+                      isSelected ? "bg-accent/60" : "hover:bg-accent/30"
+                    )}
+                  >
+                    <div className="flex items-center justify-between gap-1.5">
+                      <button
+                        type="button"
+                        data-testid={`select-node-${node.id}`}
+                        onClick={() => onSelectNode(node.id)}
+                        className="flex min-w-0 flex-1 items-center justify-between gap-2 text-left cursor-pointer"
+                      >
+                        <div className="flex min-w-0 items-center gap-1.5">
+                          <NodeStatusDot status={node.status} />
+                          <Server className="h-3.5 w-3.5 shrink-0 text-muted-foreground" strokeWidth={1.75} aria-hidden="true" />
+                          <span className="truncate text-xs font-medium text-foreground">
+                            {node.display_name || node.id}
+                          </span>
+                          {node.display_name && node.display_name !== node.id ? (
+                            <span className="truncate text-[10px] text-muted-foreground font-mono">
+                              {node.id}
+                            </span>
+                          ) : null}
+                        </div>
+                        <span className="shrink-0 text-[11px] font-mono text-muted-foreground tabular-nums">
+                          {node.active_runs_count}/{node.max_concurrency}
+                        </span>
+                      </button>
+
+                      {totalWs > 0 ? (
+                        <button
+                          type="button"
+                          data-testid={`toggle-ws-${node.id}`}
+                          aria-expanded={!isWsCollapsed}
+                          aria-label={isWsCollapsed ? `展开 ${node.id} 工作目录` : `收起 ${node.id} 工作目录`}
+                          onClick={() =>
+                            setCollapsedNodes((prev) => ({
+                              ...prev,
+                              [node.id]: !isWsCollapsed
+                            }))
+                          }
+                          className="inline-flex shrink-0 items-center gap-1 rounded-[5px] border border-border bg-background/60 px-2 py-0.5 text-[10px] font-mono text-muted-foreground hover:border-foreground/30 hover:text-foreground transition-colors duration-150 tabular-nums cursor-pointer"
+                        >
+                          <span>{totalWs} 目录</span>
+                          {isWsCollapsed ? (
+                            <ChevronRight className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
+                          ) : (
+                            <ChevronDown className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
+                          )}
+                        </button>
+                      ) : null}
+                    </div>
+
+                    {readyAgents.length > 0 ? (
+                      <div className="mt-1 truncate pl-5 font-mono text-[10px] text-muted-foreground">
+                        {readyAgents.join(" · ")}
+                      </div>
+                    ) : null}
+
+                    {!isWsCollapsed && totalWs > 0 ? (
+                      <div
+                        data-testid={`node-workspaces-${node.id}`}
+                        className="mt-2 flex flex-wrap items-center gap-1"
+                      >
+                        {node.workspaces.map((ws) => (
+                          <DraggableWorkspaceChip
+                            key={`${node.id}-${ws.path}`}
+                            nodeId={node.id}
+                            ws={ws}
+                            active={activeTargetNodeId === node.id && activeWorkdir === ws.path}
+                            onSelect={() => onPickWorkspace(node.id, ws.path)}
+                          />
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </TabsContent>
+      </Tabs>
     </aside>
   );
 }

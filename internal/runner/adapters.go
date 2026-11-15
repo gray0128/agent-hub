@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -66,10 +67,15 @@ func BuildCommandSpec(run api.RunRecord, agentCfg config.AgentConfig) (string, [
 		} else {
 			args = append(args, "--dangerously-skip-permissions")
 		}
+		if !hasAgyProjectFlag(agentCfg.Args) {
+			if projectID := ResolveAgyProjectID(run.Workdir); projectID != "" {
+				args = append(args, "--project", projectID)
+			}
+		}
 		if expandedModel != "" {
 			args = append(args, "--model", expandedModel)
 		}
-		if expandedEffort != "" {
+		if expandedEffort != "" && expandedEffort != "auto" {
 			args = append(args, "--effort", expandedEffort)
 		}
 		if run.TimeoutSec > 0 {
@@ -88,7 +94,7 @@ func BuildCommandSpec(run api.RunRecord, agentCfg config.AgentConfig) (string, [
 		if model != "" {
 			args = append(args, "--model", model)
 		}
-		if effort != "" {
+		if effort != "" && effort != "auto" {
 			args = append(args, "--thinking", effort)
 		}
 		if nativeSession != "" {
@@ -104,7 +110,7 @@ func BuildCommandSpec(run api.RunRecord, agentCfg config.AgentConfig) (string, [
 		if model != "" {
 			args = append(args, "--model="+model)
 		}
-		if effort != "" {
+		if effort != "" && effort != "auto" {
 			args = append(args, "--thinking="+effort)
 		}
 		if nativeSession != "" {
@@ -118,11 +124,17 @@ func BuildCommandSpec(run api.RunRecord, agentCfg config.AgentConfig) (string, [
 			if model != "" {
 				args = append(args, "-m", model)
 			}
+			if effort != "" && effort != "auto" && !hasCodexReasoningEffortOverride(agentCfg.Args) {
+				args = append(args, "-c", fmt.Sprintf("model_reasoning_effort=%q", effort))
+			}
 			args = append(args, nativeSession, "-")
 		} else {
 			args = append(args, "exec", "--json")
 			if model != "" {
 				args = append(args, "-m", model)
+			}
+			if effort != "" && effort != "auto" && !hasCodexReasoningEffortOverride(agentCfg.Args) {
+				args = append(args, "-c", fmt.Sprintf("model_reasoning_effort=%q", effort))
 			}
 			if run.Sandbox {
 				args = append(args, "-s", "workspace-write")
@@ -577,3 +589,77 @@ func truncateStr(s string, maxChars int) string {
 	}
 	return string(r[:maxChars]) + "..."
 }
+
+func hasCodexReasoningEffortOverride(args []string) bool {
+	for i := 0; i < len(args); i++ {
+		arg := strings.TrimSpace(args[i])
+		if arg == "-c" || arg == "--config" {
+			if i+1 < len(args) && strings.HasPrefix(strings.TrimSpace(args[i+1]), "model_reasoning_effort") {
+				return true
+			}
+			i++
+			continue
+		}
+		if strings.HasPrefix(arg, "--config=") {
+			val := strings.TrimSpace(strings.TrimPrefix(arg, "--config="))
+			if strings.HasPrefix(val, "model_reasoning_effort") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// RunCommandOutputBounded executes bin in an isolated process group and returns stdout within timeout.
+func RunCommandOutputBounded(ctx context.Context, timeout time.Duration, env []string, bin string, args ...string) ([]byte, error) {
+	if timeout <= 0 {
+		timeout = 4 * time.Second
+	}
+	runCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	cmd := exec.Command(bin, args...)
+	if len(env) > 0 {
+		cmd.Env = env
+	}
+	configureProcGroup(cmd)
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- cmd.Wait()
+	}()
+
+	var waitErr error
+	select {
+	case waitErr = <-waitDone:
+	case <-runCtx.Done():
+		killProcessGroup(cmd, 2*time.Second)
+		select {
+		case waitErr = <-waitDone:
+		case <-time.After(3 * time.Second):
+			return nil, runCtx.Err()
+		}
+		if err := runCtx.Err(); err != nil {
+			return nil, err
+		}
+	}
+
+	if waitErr != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg != "" {
+			return stdout.Bytes(), fmt.Errorf("%w: %s", waitErr, msg)
+		}
+		return stdout.Bytes(), waitErr
+	}
+	return stdout.Bytes(), nil
+}
+

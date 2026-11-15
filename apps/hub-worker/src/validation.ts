@@ -17,7 +17,8 @@ import {
 import { validateWebhookUrl } from "./webhook-crypto";
 
 const AGENTS = new Set<AgentName>(["agy", "pi", "omp", "codex", "claude"]);
-const EFFORTS = new Set<EffortLevel>(["", "off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+const EFFORTS = new Set<EffortLevel>(["", "off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "auto"]);
+const CATALOG_STATUSES = new Set(["pending", "ready", "fallback"]);
 const EVENT_KINDS = new Set<RunEventKind>([
   "status",
   "tool_use",
@@ -680,6 +681,66 @@ function parseEventInput(raw: unknown): RunEventInput {
   return { seq, kind: kindRaw as RunEventKind, payload, ts };
 }
 
+function parseNodeCapabilities(raw: unknown): Record<string, unknown> {
+  const obj = asRecord(raw, "capabilities");
+  if (obj["agents"] !== undefined) {
+    const agentsObj = asRecord(obj["agents"], "capabilities.agents");
+    for (const [agentName, rawAgentCap] of Object.entries(agentsObj)) {
+      const cap = asRecord(rawAgentCap, `capabilities.agents.${agentName}`);
+      asOptionalBoolean(cap, "enabled");
+      asOptionalBoolean(cap, "available");
+      asOptionalString(cap, "default_model", 128);
+      const defaultEffort = asOptionalString(cap, "default_effort", 32);
+      if (defaultEffort !== undefined && !EFFORTS.has(defaultEffort as EffortLevel)) {
+        throw new HubError(400, "BAD_REQUEST", `Unsupported default_effort '${defaultEffort}' in capabilities.agents.${agentName}.`);
+      }
+      const catalogStatus = asOptionalString(cap, "catalog_status", 32);
+      if (catalogStatus !== undefined && !CATALOG_STATUSES.has(catalogStatus)) {
+        throw new HubError(400, "BAD_REQUEST", `Unsupported catalog_status '${catalogStatus}' in capabilities.agents.${agentName}.`);
+      }
+      if (cap["models"] !== undefined) {
+        if (!Array.isArray(cap["models"])) {
+          throw new HubError(400, "BAD_REQUEST", `capabilities.agents.${agentName}.models must be an array.`);
+        }
+        if (cap["models"].length > 500) {
+          throw new HubError(400, "BAD_REQUEST", `capabilities.agents.${agentName}.models exceeds max length 500.`);
+        }
+        for (let i = 0; i < cap["models"].length; i++) {
+          const item = asRecord(cap["models"][i], `capabilities.agents.${agentName}.models[${i}]`);
+          rejectUnknownKeys(
+            item,
+            ["id", "label", "efforts", "default_effort"],
+            `capabilities.agents.${agentName}.models[${i}]`
+          );
+          asRequiredString(item, "id", 1, 128);
+          asRequiredString(item, "label", 0, 160);
+          if (!Array.isArray(item["efforts"])) {
+            throw new HubError(400, "BAD_REQUEST", `capabilities.agents.${agentName}.models[${i}].efforts must be an array.`);
+          }
+          for (const eff of item["efforts"]) {
+            if (typeof eff !== "string" || eff === "" || !EFFORTS.has(eff as EffortLevel)) {
+              throw new HubError(400, "BAD_REQUEST", `Invalid effort '${String(eff)}' in capabilities.agents.${agentName}.models[${i}].efforts.`);
+            }
+          }
+          const modelDefaultEffort = asOptionalString(item, "default_effort", 32);
+          if (modelDefaultEffort !== undefined && !EFFORTS.has(modelDefaultEffort as EffortLevel)) {
+            throw new HubError(400, "BAD_REQUEST", `Invalid default_effort '${modelDefaultEffort}' in capabilities.agents.${agentName}.models[${i}].`);
+          }
+        }
+      }
+    }
+  }
+  if (obj["aliases"] !== undefined) {
+    const aliasesObj = asRecord(obj["aliases"], "capabilities.aliases");
+    for (const [alias, target] of Object.entries(aliasesObj)) {
+      if (typeof target !== "string" || target.length > 128) {
+        throw new HubError(400, "BAD_REQUEST", `capabilities.aliases.${alias} must be a string <= 128 chars.`);
+      }
+    }
+  }
+  return obj;
+}
+
 export function parseNodeWsFrame(raw: unknown): NodeInboundFrame {
   const obj = asRecord(raw, "WebSocketFrame");
   const type = asRequiredString(obj, "type");
@@ -697,7 +758,7 @@ export function parseNodeWsFrame(raw: unknown): NodeInboundFrame {
         os: asOptionalString(obj, "os", 32) ?? "",
         arch: asOptionalString(obj, "arch", 32) ?? "",
         max_concurrency: asOptionalInt(obj, "max_concurrency", 1, 16) ?? 4,
-        capabilities: asRecord(obj["capabilities"], "capabilities"),
+        capabilities: parseNodeCapabilities(obj["capabilities"]),
         workspaces: parseWorkspaceList(obj["workspaces"])
       };
     }

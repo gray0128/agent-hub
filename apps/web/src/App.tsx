@@ -48,6 +48,7 @@ declare global {
         eventsByRunId: ReturnType<typeof useTaskStore.getState>["eventsByRunId"];
         selectedThreadId: string | null;
         selectedRunId: string | null;
+        composer: ReturnType<typeof useWorkbenchStore.getState>["composer"];
         theme: string;
         streamStatus: string;
         authStatus: string;
@@ -153,6 +154,7 @@ export function App() {
           eventsByRunId: task.eventsByRunId,
           selectedThreadId: task.selectedThreadId,
           selectedRunId: task.selectedRunId,
+          composer: wb.composer,
           theme: wb.theme,
           streamStatus: wb.streamStatus,
           authStatus: wb.authStatus,
@@ -190,7 +192,9 @@ export function App() {
         mode: "reply",
         nodeId: first.node_id,
         workdir: first.workdir,
-        agent: first.agent
+        agent: first.agent,
+        model: "",
+        effort: ""
       });
       const firstRun = curRuns.find((r) => r.thread_id === first.id);
       if (firstRun) selectRun(firstRun.id);
@@ -412,11 +416,14 @@ export function App() {
     if (!thread) return;
     selectThread(thread.id);
     selectNode(thread.node_id);
+    const sameBinding =
+      thread.node_id === composer.nodeId && thread.agent === composer.agent;
     patchComposer({
       mode: "reply",
       nodeId: thread.node_id,
       workdir: thread.workdir,
-      agent: thread.agent
+      agent: thread.agent,
+      ...(sameBinding ? {} : { model: "", effort: "" })
     });
     const latest = runs.find((r) => r.thread_id === thread.id);
     if (latest) selectRun(latest.id);
@@ -425,7 +432,13 @@ export function App() {
 
   function handlePickWorkspace(nodeId: string, workdir: string) {
     selectNode(nodeId);
-    patchComposer({ mode: "new", nodeId, workdir });
+    const sameNode = nodeId === composer.nodeId;
+    patchComposer({
+      mode: "new",
+      nodeId,
+      workdir,
+      ...(sameNode ? {} : { model: "", effort: "" })
+    });
     setMobileLeftOpen(false);
     setMobileRightOpen(false);
     window.requestAnimationFrame(() => {
@@ -477,7 +490,9 @@ export function App() {
         mode: "reply",
         nodeId: res.thread.node_id,
         workdir: res.thread.workdir,
-        agent: res.thread.agent
+        agent: res.thread.agent,
+        model: "",
+        effort: ""
       });
     } catch (err) {
       setErrorBanner(err instanceof ApiClientError ? err.message : "分叉线程失败");
@@ -547,8 +562,8 @@ export function App() {
           ? { thread_id: useThread.id }
           : { node_id: composer.nodeId || undefined, workdir: composer.workdir || undefined }),
         agent: composer.agent,
-        model: composer.model,
-        effort: composer.effort,
+        model: composer.model.trim() || undefined,
+        effort: composer.effort || undefined,
         sandbox: composer.sandbox,
         notify: { target: composer.notifyTarget },
         prompt: promptText

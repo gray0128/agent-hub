@@ -15,7 +15,58 @@
         "os": { "type": "string" },
         "arch": { "type": "string" },
         "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 16 },
-        "capabilities": { "type": "object" },
+        "capabilities": {
+          "type": "object",
+          "properties": {
+            "agents": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "object",
+                "properties": {
+                  "enabled": { "type": "boolean" },
+                  "available": { "type": "boolean" },
+                  "default_model": { "type": "string", "maxLength": 128 },
+                  "default_effort": {
+                    "type": "string",
+                    "enum": ["", "off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "auto"]
+                  },
+                  "catalog_status": {
+                    "type": "string",
+                    "enum": ["pending", "ready", "fallback"]
+                  },
+                  "models": {
+                    "type": "array",
+                    "maxItems": 500,
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["id", "label", "efforts"],
+                      "properties": {
+                        "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+                        "label": { "type": "string", "maxLength": 160 },
+                        "efforts": {
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "enum": ["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "auto"]
+                          }
+                        },
+                        "default_effort": {
+                          "type": "string",
+                          "enum": ["", "off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "auto"]
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "aliases": {
+              "type": "object",
+              "additionalProperties": { "type": "string" }
+            }
+          }
+        },
         "workspaces": {
           "type": "array",
           "items": {

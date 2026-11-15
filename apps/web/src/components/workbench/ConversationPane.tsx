@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useDroppable } from "@dnd-kit/core";
 import {
   AlertTriangle,
@@ -21,9 +21,16 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
+import {
+  getAvailableAgents,
+  reconcileComposerDraft,
+  resolveAgentCatalog,
+  resolveEffortState
+} from "@/lib/capabilities";
 import {
   buildRunCliPreview,
   cn,
@@ -37,15 +44,8 @@ import type { AgentName, EffortLevel, NodeRecord, RunEventItem, RunRecord, Threa
 import { CopyButton } from "./CopyButton";
 import { RunStatusBadge } from "./StatusBadge";
 
-const AGENT_OPTIONS: AgentName[] = ["agy", "pi", "omp", "codex", "claude"];
-const MODEL_OPTIONS: Record<AgentName, string[]> = {
-  agy: ["carbon", "argon", "hydrogen", "flash", "opus", "sonnet"],
-  pi: ["claude-sonnet-4-5", "gpt-5", "gemini-2.5-pro"],
-  omp: ["claude-sonnet-4-5", "gpt-5"],
-  codex: ["gpt-5", "o3"],
-  claude: ["claude-sonnet-4-5", "claude-opus-4-1"]
-};
-const EFFORT_OPTIONS: EffortLevel[] = ["low", "medium", "high", "xhigh"];
+const DEFAULT_OPTION_VALUE = "__default__";
+const CUSTOM_OPTION_VALUE = "__custom__";
 const NOTIFY_LABELS: Record<ComposerDraft["notifyTarget"], string> = {
   none: "不通知",
   webhook: "Bot Webhook",
@@ -98,6 +98,7 @@ export function ConversationPane({
   const [expandedCmdRuns, setExpandedCmdRuns] = useState<Record<string, boolean>>({});
   const [expandedPrompts, setExpandedPrompts] = useState<Record<string, boolean>>({});
   const [mobileParamsOpen, setMobileParamsOpen] = useState(false);
+  const [customModelMode, setCustomModelMode] = useState(false);
 
   const selectedNode = nodes.find((n) => n.id === composer.nodeId);
   const workspaces = selectedNode?.workspaces ?? [];
@@ -106,6 +107,41 @@ export function ConversationPane({
   const isReplyMode = composer.mode === "reply" && selectedThread !== null;
   const targetNodeId = isReplyMode ? selectedThread.node_id : composer.nodeId;
   const targetNode = nodes.find((n) => n.id === targetNodeId);
+
+  const availableAgents = useMemo(() => getAvailableAgents(targetNode), [targetNode]);
+  const agentOptions = useMemo(
+    () =>
+      isReplyMode && selectedThread && !availableAgents.includes(selectedThread.agent)
+        ? [selectedThread.agent, ...availableAgents]
+        : availableAgents,
+    [availableAgents, isReplyMode, selectedThread]
+  );
+  const catalog = useMemo(
+    () => resolveAgentCatalog(targetNode, composer.agent),
+    [targetNode, composer.agent]
+  );
+  const effortState = useMemo(
+    () => resolveEffortState(targetNode, composer.agent, composer.model),
+    [targetNode, composer.agent, composer.model]
+  );
+
+  useEffect(() => {
+    const patch = reconcileComposerDraft(composer, targetNode, isReplyMode);
+    if (patch) {
+      onPatchComposer(patch);
+    }
+  }, [composer.agent, composer.model, composer.effort, targetNode, isReplyMode, onPatchComposer]);
+
+  const modelInCatalog = catalog.models.some((m) => m.id === composer.model);
+  const showCustomModelInput =
+    customModelMode ||
+    (catalog.status !== "pending" && composer.model !== "" && !modelInCatalog);
+  const modelSelectValue = composer.model ? composer.model : DEFAULT_OPTION_VALUE;
+  const effortSelectValue = !effortState.supportsEffort
+    ? DEFAULT_OPTION_VALUE
+    : composer.effort && effortState.efforts.includes(composer.effort)
+      ? composer.effort
+      : DEFAULT_OPTION_VALUE;
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key !== "Enter" || e.shiftKey) return;
@@ -461,7 +497,7 @@ export function ConversationPane({
               <Lock className="h-3 w-3 shrink-0 text-[var(--status-running)]" strokeWidth={1.75} aria-hidden="true" />
               <span className="shrink-0 font-medium text-foreground">续聊绑定</span>
               <span className="truncate font-mono text-muted-foreground" title={selectedThread.workdir}>
-                {selectedThread.node_id}:{selectedThread.project_key}
+                {selectedThread.node_id}:{selectedThread.project_key} · {selectedThread.agent}
               </span>
             </div>
             <button
@@ -481,14 +517,19 @@ export function ConversationPane({
                 <span>新建独立会话</span>
                 <button
                   type="button"
-                  onClick={() =>
+                  onClick={() => {
+                    const sameBinding =
+                      selectedThread.node_id === composer.nodeId &&
+                      selectedThread.agent === composer.agent;
+                    setCustomModelMode(false);
                     onPatchComposer({
                       mode: "reply",
                       nodeId: selectedThread.node_id,
                       workdir: selectedThread.workdir,
-                      agent: selectedThread.agent
-                    })
-                  }
+                      agent: selectedThread.agent,
+                      ...(sameBinding ? {} : { model: "", effort: "" })
+                    });
+                  }}
                   className="text-[11px] font-medium text-[var(--status-running)] hover:underline cursor-pointer"
                 >
                   返回当前会话续聊
@@ -504,10 +545,24 @@ export function ConversationPane({
                   value={composer.nodeId || undefined}
                   onValueChange={(v) => {
                     const n = nodes.find((item) => item.id === v);
+                    const nextAgents = getAvailableAgents(n);
+                    const nextAgent = nextAgents.includes(composer.agent)
+                      ? composer.agent
+                      : (nextAgents[0] ?? composer.agent);
+                    const nextCatalog = resolveAgentCatalog(n, nextAgent);
+                    const nextModel = nextCatalog.defaultModel || nextCatalog.models[0]?.id || "";
+                    const nextEffState = resolveEffortState(n, nextAgent, nextModel);
+                    const nextEffort = nextEffState.supportsEffort
+                      ? nextEffState.defaultEffort || ""
+                      : "";
+                    setCustomModelMode(false);
                     onPatchComposer({
                       mode: "new",
                       nodeId: v,
-                      workdir: n?.workspaces[0]?.path ?? ""
+                      workdir: n?.workspaces[0]?.path ?? "",
+                      agent: nextAgent,
+                      model: nextModel,
+                      effort: nextEffort
                     });
                   }}
                 >
@@ -516,7 +571,7 @@ export function ConversationPane({
                   </SelectTrigger>
                   <SelectContent>
                     {nodes.map((n) => (
-                      <SelectItem key={n.id} value={n.id}>
+                      <SelectItem key={n.id} value={n.id} data-testid={`composer-node-option-${n.id}`}>
                         {n.id} ({n.status === "online" ? "在线" : n.status === "draining" ? "已排空" : "离线"})
                       </SelectItem>
                     ))}
@@ -580,21 +635,30 @@ export function ConversationPane({
               Agent
             </label>
             <Select
+              disabled={isReplyMode}
               value={composer.agent}
               onValueChange={(v) => {
                 const nextAgent = v as AgentName;
+                const nextCatalog = resolveAgentCatalog(targetNode, nextAgent);
+                const nextModel = nextCatalog.defaultModel || nextCatalog.models[0]?.id || "";
+                const nextEffState = resolveEffortState(targetNode, nextAgent, nextModel);
+                const nextEffort = nextEffState.supportsEffort
+                  ? nextEffState.defaultEffort || ""
+                  : "";
+                setCustomModelMode(false);
                 onPatchComposer({
                   agent: nextAgent,
-                  model: MODEL_OPTIONS[nextAgent]?.[0] ?? ""
+                  model: nextModel,
+                  effort: nextEffort
                 });
               }}
             >
-              <SelectTrigger id="composer-agent" aria-label="Agent">
+              <SelectTrigger id="composer-agent" aria-label="Agent" disabled={isReplyMode}>
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                {AGENT_OPTIONS.map((a) => (
-                  <SelectItem key={a} value={a}>
+                {agentOptions.map((a) => (
+                  <SelectItem key={a} value={a} data-testid={`composer-agent-option-${a}`}>
                     {a}
                   </SelectItem>
                 ))}
@@ -603,24 +667,76 @@ export function ConversationPane({
           </div>
 
           <div className="min-w-0">
-            <label htmlFor="composer-model" className="mb-1 block text-[10px] text-muted-foreground">
+            <label
+              htmlFor={showCustomModelInput ? "composer-model-custom" : "composer-model"}
+              className="mb-1 block text-[10px] text-muted-foreground"
+            >
               模型
             </label>
-            <Select
-              value={composer.model}
-              onValueChange={(v) => onPatchComposer({ model: v })}
-            >
-              <SelectTrigger id="composer-model" aria-label="模型">
-                <SelectValue placeholder="默认模型" />
-              </SelectTrigger>
-              <SelectContent>
-                {(MODEL_OPTIONS[composer.agent] ?? ["carbon"]).map((m) => (
-                  <SelectItem key={m} value={m}>
-                    {m}
+            {showCustomModelInput ? (
+              <div className="flex items-center gap-1">
+                <Input
+                  id="composer-model-custom"
+                  data-testid="composer-model-custom-input"
+                  value={composer.model}
+                  onChange={(e) => onPatchComposer({ model: e.target.value })}
+                  placeholder={catalog.defaultModel ? `默认: ${catalog.defaultModel}` : "输入模型 ID"}
+                  className="h-8 font-mono text-xs"
+                />
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    setCustomModelMode(false);
+                    onPatchComposer({ model: catalog.defaultModel || "" });
+                  }}
+                  className="h-8 shrink-0 px-2 text-[11px]"
+                >
+                  列表
+                </Button>
+              </div>
+            ) : (
+              <Select
+                value={modelSelectValue}
+                onValueChange={(v) => {
+                  if (v === CUSTOM_OPTION_VALUE) {
+                    setCustomModelMode(true);
+                    return;
+                  }
+                  setCustomModelMode(false);
+                  const nextModel = v === DEFAULT_OPTION_VALUE ? "" : v;
+                  const nextEffState = resolveEffortState(targetNode, composer.agent, nextModel);
+                  let nextEffort = composer.effort;
+                  if (!nextEffState.supportsEffort) {
+                    nextEffort = "";
+                  } else if (nextEffort !== "" && !nextEffState.efforts.includes(nextEffort)) {
+                    nextEffort = nextEffState.defaultEffort || nextEffState.efforts[0] || "";
+                  }
+                  onPatchComposer({ model: nextModel, effort: nextEffort });
+                }}
+              >
+                <SelectTrigger id="composer-model" aria-label="模型">
+                  <SelectValue placeholder="跟随节点默认" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={DEFAULT_OPTION_VALUE} data-testid="composer-model-option-default">
+                    {catalog.defaultModel ? `跟随默认 (${catalog.defaultModel})` : "跟随节点默认"}
                   </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+                  {catalog.models.map((m) => (
+                    <SelectItem key={m.id} value={m.id} data-testid={`composer-model-option-${m.id}`}>
+                      {m.label && m.label !== m.id ? `${m.label} (${m.id})` : m.id}
+                    </SelectItem>
+                  ))}
+                  {composer.model !== "" && !modelInCatalog ? (
+                    <SelectItem value={composer.model}>{composer.model}</SelectItem>
+                  ) : null}
+                  <SelectItem value={CUSTOM_OPTION_VALUE} data-testid="composer-model-option-custom">
+                    手动输入模型...
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+            )}
           </div>
 
           <div className="min-w-0">
@@ -628,15 +744,27 @@ export function ConversationPane({
               推理强度
             </label>
             <Select
-              value={composer.effort}
-              onValueChange={(v) => onPatchComposer({ effort: v as EffortLevel })}
+              disabled={!effortState.supportsEffort}
+              value={effortSelectValue}
+              onValueChange={(v) =>
+                onPatchComposer({
+                  effort: v === DEFAULT_OPTION_VALUE ? "" : (v as EffortLevel)
+                })
+              }
             >
-              <SelectTrigger id="composer-effort" aria-label="推理强度">
-                <SelectValue />
+              <SelectTrigger id="composer-effort" aria-label="推理强度" disabled={!effortState.supportsEffort}>
+                <SelectValue placeholder={!effortState.supportsEffort ? "无推理档位" : "默认 / 自动"} />
               </SelectTrigger>
               <SelectContent>
-                {EFFORT_OPTIONS.map((eff) => (
-                  <SelectItem key={eff} value={eff}>
+                <SelectItem value={DEFAULT_OPTION_VALUE} data-testid="composer-effort-option-default">
+                  {!effortState.supportsEffort
+                    ? "当前模型无推理档位"
+                    : effortState.defaultEffort
+                      ? `跟随默认 (${effortState.defaultEffort})`
+                      : "默认 / 自动"}
+                </SelectItem>
+                {effortState.efforts.map((eff) => (
+                  <SelectItem key={eff} value={eff} data-testid={`composer-effort-option-${eff}`}>
                     {eff}
                   </SelectItem>
                 ))}

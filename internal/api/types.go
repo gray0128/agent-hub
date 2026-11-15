@@ -6,6 +6,22 @@ type WorkspaceEntry struct {
 	DefaultBranch string `json:"default_branch,omitempty"`
 }
 
+type ModelCapability struct {
+	ID            string   `json:"id"`
+	Label         string   `json:"label"`
+	Efforts       []string `json:"efforts"`
+	DefaultEffort string   `json:"default_effort,omitempty"`
+}
+
+type AgentCapability struct {
+	Enabled       bool              `json:"enabled"`
+	Available     bool              `json:"available"`
+	DefaultModel  string            `json:"default_model"`
+	DefaultEffort string            `json:"default_effort,omitempty"`
+	CatalogStatus string            `json:"catalog_status,omitempty"`
+	Models        []ModelCapability `json:"models,omitempty"`
+}
+
 type NodeRecord struct {
 	ID              string                 `json:"id"`
 	DisplayName     string                 `json:"display_name"`

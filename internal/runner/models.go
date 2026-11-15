@@ -2,6 +2,8 @@ package runner
 
 import "strings"
 
+var agyEffortSuffixes = []string{"-xhigh", "-medium", "-low", "-high", "-max"}
+
 func SplitModelAndEffort(rawModel, rawEffort string) (string, string) {
 	model := strings.TrimSpace(rawModel)
 	effort := strings.TrimSpace(rawEffort)
@@ -14,40 +16,74 @@ func SplitModelAndEffort(rawModel, rawEffort string) (string, string) {
 	return model, effort
 }
 
+// SplitAgyEffortSuffix extracts the trailing tier suffix on an agy model ID when applicable.
+func SplitAgyEffortSuffix(modelID string) (stem string, effort string, hasSuffix bool) {
+	trimmed := strings.TrimSpace(modelID)
+	lower := strings.ToLower(trimmed)
+	if trimmed == "" || strings.Contains(lower, "orchestrator") {
+		return trimmed, "", false
+	}
+	for _, suf := range agyEffortSuffixes {
+		if strings.HasSuffix(lower, suf) && len(trimmed) > len(suf) {
+			return trimmed[:len(trimmed)-len(suf)], suf[1:], true
+		}
+	}
+	return trimmed, "", false
+}
+
+func resolveKnownAgyFamily(raw string) (base string, supportsXHigh bool, known bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "carbon", "gemini-4-carbon":
+		return "gemini-4-carbon", false, true
+	case "argon", "gemini-4-argon":
+		return "gemini-4-argon", false, true
+	case "hydrogen", "gemini-4-hydrogen":
+		return "gemini-4-hydrogen", true, true
+	case "flash", "gemini-3.8-flash":
+		return "gemini-3.8-flash", false, true
+	case "opus", "claude-opus-5-5":
+		return "claude-opus-5-5", false, true
+	case "sonnet", "claude-sonnet-5-5":
+		return "claude-sonnet-5-5", false, true
+	default:
+		return "", false, false
+	}
+}
+
 func ExpandAgyModel(modelAlias, effort string) (string, string) {
 	model, eff := SplitModelAndEffort(modelAlias, effort)
 	if model == "" {
 		return "", eff
 	}
-
-	suffixEffort := eff
-	if suffixEffort == "" {
-		suffixEffort = "high"
+	if strings.Contains(strings.ToLower(model), "orchestrator") {
+		return model, ""
 	}
 
-	var base string
-	supportsXHigh := false
-	switch strings.ToLower(model) {
-	case "carbon":
-		base = "gemini-4-carbon"
-	case "argon":
-		base = "gemini-4-argon"
-	case "hydrogen":
-		base = "gemini-4-hydrogen"
-		supportsXHigh = true
-	case "flash":
-		base = "gemini-3.8-flash"
-	case "opus":
-		base = "claude-opus-5-5"
-	case "sonnet":
-		base = "claude-sonnet-5-5"
-	default:
-		return model, eff
+	if base, supportsXHigh, known := resolveKnownAgyFamily(model); known {
+		suffixEffort := eff
+		if suffixEffort == "" || suffixEffort == "auto" {
+			suffixEffort = "high"
+		}
+		if !supportsXHigh && (suffixEffort == "xhigh" || suffixEffort == "max") {
+			suffixEffort = "high"
+		}
+		return base + "-" + suffixEffort, eff
 	}
 
-	mappedSuffix := suffixEffort
-	if !supportsXHigh && (mappedSuffix == "xhigh" || mappedSuffix == "max") {
-		mappedSuffix = "high"
+	if stem, _, hasSuffix := SplitAgyEffortSuffix(model); hasSuffix {
+		if eff == "" || eff == "auto" {
+			return model, eff
+		}
+		_, stemXHigh, stemKnown := resolveKnownAgyFamily(stem)
+		suffixEffort := eff
+		if stemKnown && !stemXHigh && (suffixEffort == "xhigh" || suffixEffort == "max") {
+			suffixEffort = "high"
+		}
+		return stem + "-" + suffixEffort, eff
 	}
-	return base + "-" + mappedSuffix, eff
+
+	if eff != "" && eff != "off" && eff != "auto" {
+		return model + "-" + eff, eff
+	}
+	return model, eff
 }

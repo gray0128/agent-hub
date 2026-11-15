@@ -123,6 +123,87 @@ const cases = [
     }
   },
   {
+    name: "run-create valid with ultra effort",
+    schema: "run-create.schema.json",
+    valid: true,
+    payload: {
+      node_id: "macmini",
+      workdir: "demo",
+      agent: "codex",
+      model: "gpt-5.6-sol",
+      effort: "ultra",
+      prompt: "Run deep analysis"
+    }
+  },
+  {
+    name: "ws-frames valid node.hello with capabilities catalog",
+    schema: "ws-frames.schema.json",
+    valid: true,
+    payload: {
+      type: "node.hello",
+      conn_nonce: "nonce-12345678",
+      version: "0.2.0",
+      os: "darwin",
+      arch: "arm64",
+      max_concurrency: 4,
+      capabilities: {
+        agents: {
+          agy: {
+            enabled: true,
+            available: true,
+            default_model: "gemini-3.8-flash-high",
+            default_effort: "high",
+            catalog_status: "ready",
+            models: [
+              {
+                id: "gemini-3.8-flash",
+                label: "Gemini 3.8 Flash",
+                efforts: ["low", "medium", "high"],
+                default_effort: "high"
+              },
+              {
+                id: "gemini-pro-orchestrator",
+                label: "Orchestrator (Carbon)",
+                efforts: []
+              }
+            ]
+          }
+        }
+      },
+      workspaces: []
+    }
+  },
+  {
+    name: "ws-frames invalid node.hello unknown model effort",
+    schema: "ws-frames.schema.json",
+    valid: false,
+    payload: {
+      type: "node.hello",
+      conn_nonce: "nonce-12345678",
+      version: "0.2.0",
+      os: "darwin",
+      arch: "arm64",
+      max_concurrency: 4,
+      capabilities: {
+        agents: {
+          agy: {
+            enabled: true,
+            available: true,
+            catalog_status: "ready",
+            models: [
+              {
+                id: "gemini-4-carbon",
+                label: "Gemini 4 Carbon",
+                efforts: ["turbo"]
+              }
+            ]
+          }
+        }
+      },
+      workspaces: []
+    }
+  },
+  {
     name: "ws-frames invalid empty run.events",
     schema: "ws-frames.schema.json",
     valid: false,

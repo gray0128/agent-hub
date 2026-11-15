@@ -17,6 +17,14 @@ func TestExpandAgyModel(t *testing.T) {
 		{"opus", "", "claude-opus-5-5-high", ""},
 		{"sonnet", "low", "claude-sonnet-5-5-low", "low"},
 		{"gemini-3.8-flash-high", "high", "gemini-3.8-flash-high", "high"},
+		{"gemini-3.8-flash-high", "low", "gemini-3.8-flash-low", "low"},
+		{"gemini-3.8-flash-high", "", "gemini-3.8-flash-high", ""},
+		{"gemini-4-carbon", "medium", "gemini-4-carbon-medium", "medium"},
+		{"gemini-4-hydrogen", "xhigh", "gemini-4-hydrogen-xhigh", "xhigh"},
+		{"gpt-oss-120b", "medium", "gpt-oss-120b-medium", "medium"},
+		{"gpt-oss-120b", "", "gpt-oss-120b", ""},
+		{"gemini-pro-orchestrator", "high", "gemini-pro-orchestrator", ""},
+		{"gemini-pro-orchestrator-argon", "medium", "gemini-pro-orchestrator-argon", ""},
 	}
 	for _, tc := range cases {
 		gotModel, gotEffort := ExpandAgyModel(tc.model, tc.effort)

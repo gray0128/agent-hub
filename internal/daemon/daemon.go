@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"math/big"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sync"
@@ -41,6 +40,8 @@ type Daemon struct {
 	pingTimeout          time.Duration
 	workspaceScanTimeout time.Duration
 	workspaceScanFn      func(roots, skipDirs []string) []api.WorkspaceEntry
+	catalogProbeTimeout  time.Duration
+	catalogCacheTTL      time.Duration
 
 	mu                  sync.Mutex
 	activeDirs          map[string]struct{}
@@ -50,6 +51,9 @@ type Daemon struct {
 	cachedWorkspaces    []api.WorkspaceEntry
 	cachedWorkspacesSeq uint64
 	scanInFlight        bool
+	cachedAgentCaps     map[string]api.AgentCapability
+	cachedCapsAt        time.Time
+	capRefreshInFlight  bool
 	draining            bool
 	reloadCh            chan struct{}
 	claimMu             sync.Mutex
@@ -69,8 +73,11 @@ func New(cfg *config.NodeConfig, token, version string) *Daemon {
 		pingTimeout:          defaultPingTimeout,
 		workspaceScanTimeout: defaultWorkspaceScanTimeout,
 		workspaceScanFn:      ScanWorkspaces,
+		catalogProbeTimeout:  defaultCatalogProbeTimeout,
+		catalogCacheTTL:      defaultCatalogCacheTTL,
 		activeDirs:           make(map[string]struct{}),
 		activeRuns:           make(map[string]context.CancelFunc),
+		cachedAgentCaps:      make(map[string]api.AgentCapability),
 		reloadCh:             make(chan struct{}),
 	}
 	d.batcher = NewEventBatcher(250*time.Millisecond, 100, d.sendEventBatch)
@@ -354,6 +361,7 @@ func (d *Daemon) connectAndServe(ctx context.Context) error {
 
 	sessionCtx, cancelSession := context.WithCancel(ctx)
 	defer cancelSession()
+	go d.refreshModelCatalogsAsync(sessionCtx)
 	pingErrCh := make(chan error, 1)
 
 	go func() {
@@ -658,34 +666,6 @@ func (d *Daemon) activeRunIDs() []string {
 		out = append(out, id)
 	}
 	return out
-}
-
-func (d *Daemon) probeCapabilities() map[string]interface{} {
-	agents := make(map[string]interface{})
-	for name, cfg := range d.cfg.Agents {
-		cmd := cfg.Command
-		if cmd == "" {
-			cmd = name
-		}
-		expanded := config.ExpandPath(cmd)
-		_, lookupErr := exec.LookPath(expanded)
-		agents[name] = map[string]interface{}{
-			"enabled":       cfg.Enabled,
-			"available":     lookupErr == nil,
-			"default_model": cfg.DefaultModel,
-		}
-	}
-	return map[string]interface{}{
-		"agents": agents,
-		"aliases": map[string]string{
-			"carbon":   "gemini-4-carbon-high",
-			"argon":    "gemini-4-argon-high",
-			"hydrogen": "gemini-4-hydrogen-high",
-			"flash":    "gemini-3.8-flash-high",
-			"opus":     "claude-opus-5-5-high",
-			"sonnet":   "claude-sonnet-5-5-high",
-		},
-	}
 }
 
 func newNonce() string {
