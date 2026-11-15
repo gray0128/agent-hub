@@ -201,7 +201,7 @@ func ExecuteRun(
 		cmd.Stdin = strings.NewReader(stdinPrompt)
 	}
 
-	stdoutPipe, err := cmd.StdoutPipe()
+	stdoutR, stdoutW, err := os.Pipe()
 	if err != nil {
 		return Result{
 			Status:       "failed",
@@ -210,8 +210,10 @@ func ExecuteRun(
 			ErrorMessage: err.Error(),
 		}
 	}
-	stderrPipe, err := cmd.StderrPipe()
+	stderrR, stderrW, err := os.Pipe()
 	if err != nil {
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
 		return Result{
 			Status:       "failed",
 			DurationMs:   time.Since(startedAt).Milliseconds(),
@@ -219,8 +221,14 @@ func ExecuteRun(
 			ErrorMessage: err.Error(),
 		}
 	}
+	cmd.Stdout = stdoutW
+	cmd.Stderr = stderrW
 
 	if err := cmd.Start(); err != nil {
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
+		_ = stderrR.Close()
+		_ = stderrW.Close()
 		return Result{
 			Status:       "failed",
 			DurationMs:   time.Since(startedAt).Milliseconds(),
@@ -228,11 +236,18 @@ func ExecuteRun(
 			ErrorMessage: err.Error(),
 		}
 	}
+	_ = stdoutW.Close()
+	_ = stderrW.Close()
+
+	const maxRawStdoutCaptureBytes = 64 * 1024
 
 	var mu sync.Mutex
 	var rawStdoutLines []string
+	var rawStdoutBytes int
 	var rawStderrLines []string
 	var parsedOutputText strings.Builder
+	var streamedAssistantText strings.Builder
+	var sawStructuredEvent bool
 	var finalSummary string
 	var nativeSessionID string
 	var resolvedModel string
@@ -250,6 +265,11 @@ func ExecuteRun(
 	}
 
 	processJSONLine := func(obj map[string]interface{}) {
+		evType, _ := stringField(obj, "type", "event", "kind")
+		if evType != "" || hasAnyKey(obj, "status", "conversation_id", "session_id", "thread_id", "response", "result", "output", "error") {
+			sawStructuredEvent = true
+		}
+
 		if sid, ok := stringField(obj, "conversation_id", "session_id", "thread_id"); ok {
 			nativeSessionID = sid
 		}
@@ -258,14 +278,15 @@ func ExecuteRun(
 				nativeSessionID = sid
 			}
 		}
-		if rm, ok := stringField(obj, "resolved_model", "model"); ok {
-			resolvedModel = rm
+		if evType == "session" {
+			if sid, ok := stringField(obj, "id"); ok {
+				nativeSessionID = sid
+			}
 		}
+
+		updateModelAndProvider(&resolvedModel, obj)
 		if re, ok := stringField(obj, "resolved_effort", "thinking", "effort"); ok {
 			resolvedEffort = re
-		}
-		if prov, ok := stringField(obj, "provider"); ok && resolvedModel != "" && !strings.Contains(resolvedModel, "/") {
-			resolvedModel = prov + "/" + resolvedModel
 		}
 		if rcu, ok := stringField(obj, "remote_control_url"); ok {
 			remoteControlURL = rcu
@@ -273,45 +294,211 @@ func ExecuteRun(
 		if st, ok := stringField(obj, "status"); ok {
 			agyStatus = st
 		}
-		if errStr, ok := stringField(obj, "error"); ok {
+		if errStr := extractErrorMessage(obj["error"]); errStr != "" {
 			agyError = errStr
 		}
-		if respStr, ok := stringField(obj, "response", "result", "text", "output"); ok {
-			parsedOutputText.Reset()
-			parsedOutputText.WriteString(respStr)
+		if evType == "" || evType == "agent_end" || evType == "result" {
+			if respStr, ok := stringField(obj, "response", "result", "text", "output"); ok {
+				parsedOutputText.Reset()
+				parsedOutputText.WriteString(respStr)
+			}
 		}
 		if sumStr, ok := stringField(obj, "summary"); ok {
 			finalSummary = sumStr
 		}
 
-		evType, _ := stringField(obj, "type", "event", "kind")
 		switch evType {
-		case "session":
-			emitEvent("status", obj)
+		case "session", "thread.started":
+			payload := map[string]interface{}{"stage": "session"}
+			if nativeSessionID != "" {
+				payload["session_id"] = nativeSessionID
+			}
+			if cwd, ok := stringField(obj, "cwd"); ok {
+				payload["cwd"] = cwd
+			}
+			if resolvedModel != "" {
+				payload["resolved_model"] = resolvedModel
+			}
+			emitEvent("status", payload)
+
 		case "tool_use":
 			emitEvent("tool_use", obj)
-		case "turn_end":
+
+		case "tool_execution_start":
+			toolName, _ := stringField(obj, "toolName", "tool", "name")
+			toolCallID, _ := stringField(obj, "toolCallId", "tool_call_id", "id")
+			args, _ := obj["args"].(map[string]interface{})
+			if args == nil {
+				args, _ = obj["arguments"].(map[string]interface{})
+			}
+			emitEvent("tool_use", buildCompactToolUsePayload(toolName, toolCallID, args))
+
+		case "tool_execution_end":
+			if isErr, _ := obj["isError"].(bool); isErr {
+				errLine := extractToolResultError(obj["result"])
+				if errLine == "" {
+					errLine = "tool execution failed"
+					if tn, ok := stringField(obj, "toolName", "tool"); ok {
+						errLine = tn + " failed"
+					}
+				}
+				emitEvent("stderr_warn", map[string]interface{}{"line": truncateStr(errLine, 512)})
+			}
+
+		case "item.started":
+			if item, ok := obj["item"].(map[string]interface{}); ok {
+				if payload := buildCodexToolStartPayload(item); payload != nil {
+					emitEvent("tool_use", payload)
+				}
+			}
+
+		case "item.updated":
+			if item, ok := obj["item"].(map[string]interface{}); ok {
+				if itemType, _ := stringField(item, "type"); itemType == "agent_message" {
+					if txt, ok := item["text"].(string); ok && txt != "" {
+						streamedAssistantText.Reset()
+						streamedAssistantText.WriteString(txt)
+					}
+				}
+			}
+
+		case "item.completed":
+			if item, ok := obj["item"].(map[string]interface{}); ok {
+				itemType, _ := stringField(item, "type")
+				switch itemType {
+				case "agent_message":
+					if txt, ok := stringField(item, "text"); ok {
+						parsedOutputText.Reset()
+						parsedOutputText.WriteString(txt)
+						streamedAssistantText.Reset()
+					}
+				case "command_execution":
+					if exitCode, ok := intField(item, "exit_code"); ok && exitCode != 0 {
+						line := fmt.Sprintf("command exited %d", exitCode)
+						if cmd, ok := stringField(item, "command", "cmd"); ok {
+							line = fmt.Sprintf("command exited %d: %s", exitCode, truncateStr(cmd, 240))
+						}
+						emitEvent("stderr_warn", map[string]interface{}{"line": truncateStr(line, 512)})
+					}
+				case "error":
+					if msg, ok := stringField(item, "message", "error"); ok {
+						emitEvent("stderr_warn", map[string]interface{}{"line": truncateStr(msg, 512)})
+					}
+				}
+			}
+
+		case "message_start":
 			if msg, ok := obj["message"].(map[string]interface{}); ok {
-				if m, ok := stringField(msg, "model"); ok {
-					resolvedModel = m
-				}
-				if p, ok := stringField(msg, "provider"); ok && resolvedModel != "" && !strings.Contains(resolvedModel, "/") {
-					resolvedModel = p + "/" + resolvedModel
+				if role, _ := stringField(msg, "role"); role == "assistant" {
+					streamedAssistantText.Reset()
 				}
 			}
-			emitEvent("turn_end", obj)
-		case "agent_end":
-			if msg, ok := stringField(obj, "text", "output", "response"); ok {
-				parsedOutputText.Reset()
-				parsedOutputText.WriteString(msg)
+
+		case "message_update":
+			if ame, ok := obj["assistantMessageEvent"].(map[string]interface{}); ok {
+				if deltaType, _ := stringField(ame, "type"); deltaType == "text_delta" {
+					if delta, ok := ame["delta"].(string); ok && delta != "" {
+						streamedAssistantText.WriteString(delta)
+					}
+				}
 			}
+
+		case "message_end":
+			if msg, ok := obj["message"].(map[string]interface{}); ok {
+				role, _ := stringField(msg, "role")
+				if role == "" || role == "assistant" {
+					updateModelAndProvider(&resolvedModel, msg)
+					if txt, ok := extractAssistantMessageText(msg); ok {
+						parsedOutputText.Reset()
+						parsedOutputText.WriteString(txt)
+					}
+					if role == "assistant" {
+						streamedAssistantText.Reset()
+					}
+					if sr, _ := stringField(msg, "stopReason", "stop_reason"); sr == "error" {
+						if em, ok := stringField(msg, "errorMessage", "error"); ok {
+							agyError = em
+							emitEvent("stderr_warn", map[string]interface{}{"line": truncateStr(em, 512)})
+						}
+					}
+				}
+			}
+
+		case "turn_end", "turn.completed":
+			payload := map[string]interface{}{}
+			var stopReason string
+			var usage interface{}
+			if msg, ok := obj["message"].(map[string]interface{}); ok {
+				role, _ := stringField(msg, "role")
+				if role == "" || role == "assistant" {
+					updateModelAndProvider(&resolvedModel, msg)
+				}
+				if sr, ok := stringField(msg, "stopReason", "stop_reason"); ok {
+					stopReason = sr
+				}
+				if u, exists := msg["usage"]; exists {
+					usage = compactUsageMap(u)
+				}
+			}
+			if usage == nil {
+				if u, exists := obj["usage"]; exists {
+					usage = compactUsageMap(u)
+				}
+			}
+			if resolvedModel != "" {
+				payload["resolved_model"] = resolvedModel
+			}
+			if stopReason != "" {
+				payload["stop_reason"] = stopReason
+			}
+			if usage != nil {
+				payload["usage"] = usage
+			}
+			emitEvent("turn_end", payload)
+
+		case "compaction_start", "compaction_end", "auto_retry_start", "auto_retry_end":
+			payload := map[string]interface{}{"stage": evType}
+			if reason, ok := stringField(obj, "reason", "errorMessage"); ok {
+				payload["reason"] = truncateStr(reason, 256)
+			}
+			if attempt, ok := intField(obj, "attempt"); ok {
+				payload["attempt"] = attempt
+			}
+			emitEvent("status", payload)
+
+		case "agent_end", "result":
 			if msgs, ok := obj["messages"].([]interface{}); ok {
+				if model, sr, errMsg := inspectLastAssistantMeta(msgs); model != "" || sr != "" {
+					if model != "" && resolvedModel == "" {
+						resolvedModel = model
+					}
+					if sr == "error" && errMsg != "" && agyError == "" {
+						agyError = errMsg
+					}
+				}
 				if extracted := extractLastAssistantText(msgs); extracted != "" {
 					parsedOutputText.Reset()
 					parsedOutputText.WriteString(extracted)
+				} else if agyError != "" && parsedOutputText.Len() == 0 {
+					agyStatus = "ERROR"
 				}
 			}
-			emitEvent("status", map[string]interface{}{"stage": "agent_end"})
+			if evType == "result" {
+				if isErr, ok := obj["is_error"].(bool); ok && isErr {
+					agyStatus = "ERROR"
+					if agyError == "" {
+						if msg, ok := stringField(obj, "result", "error"); ok {
+							agyError = msg
+						}
+					}
+				}
+			}
+			payload := map[string]interface{}{"stage": "agent_end"}
+			if resolvedModel != "" {
+				payload["resolved_model"] = resolvedModel
+			}
+			emitEvent("status", payload)
+
 		case "approval_needed":
 			inApproval = true
 			if remoteControlURL == "" {
@@ -332,6 +519,7 @@ func ExecuteRun(
 			if callbacks.OnState != nil {
 				callbacks.OnState("needs_approval", remoteControlURL, resolvedModel, resolvedEffort)
 			}
+
 		case "resumed":
 			if inApproval {
 				inApproval = false
@@ -340,11 +528,19 @@ func ExecuteRun(
 					callbacks.OnState("running", remoteControlURL, resolvedModel, resolvedEffort)
 				}
 			}
+
 		case "status":
 			emitEvent("status", obj)
-		default:
-			if evType != "" {
-				emitEvent("status", obj)
+
+		case "turn.failed", "error":
+			errMsg := extractErrorMessage(obj["error"])
+			if errMsg == "" {
+				errMsg, _ = stringField(obj, "message", "errorMessage")
+			}
+			agyStatus = "ERROR"
+			if errMsg != "" {
+				agyError = errMsg
+				emitEvent("stderr_warn", map[string]interface{}{"line": truncateStr(errMsg, 512)})
 			}
 		}
 	}
@@ -354,7 +550,7 @@ func ExecuteRun(
 
 	go func() {
 		defer wg.Done()
-		_ = ReadLinesBounded(stdoutPipe, func(line []byte) {
+		_ = ReadLinesBounded(stdoutR, func(line []byte) {
 			trimmed := strings.TrimSpace(string(line))
 			if trimmed == "" {
 				return
@@ -362,7 +558,10 @@ func ExecuteRun(
 			var obj map[string]interface{}
 			mu.Lock()
 			defer mu.Unlock()
-			rawStdoutLines = append(rawStdoutLines, trimmed)
+			if rawStdoutBytes < maxRawStdoutCaptureBytes {
+				rawStdoutLines = append(rawStdoutLines, trimmed)
+				rawStdoutBytes += len(trimmed) + 1
+			}
 			if json.Unmarshal([]byte(trimmed), &obj) == nil && obj != nil {
 				processJSONLine(obj)
 			} else {
@@ -376,7 +575,7 @@ func ExecuteRun(
 
 	go func() {
 		defer wg.Done()
-		_ = ReadLinesBounded(stderrPipe, func(line []byte) {
+		_ = ReadLinesBounded(stderrR, func(line []byte) {
 			trimmed := strings.TrimSpace(string(line))
 			if trimmed == "" {
 				return
@@ -403,17 +602,33 @@ func ExecuteRun(
 		waitErr = <-waitDone
 	}
 
-	wg.Wait()
+	readersDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(readersDone)
+	}()
+	select {
+	case <-readersDone:
+	case <-time.After(2 * time.Second):
+		_ = stdoutR.Close()
+		_ = stderrR.Close()
+		<-readersDone
+	}
+	_ = stdoutR.Close()
+	_ = stderrR.Close()
 	durationMs := time.Since(startedAt).Milliseconds()
 
 	mu.Lock()
 	defer mu.Unlock()
 
 	outputMD := parsedOutputText.String()
-	if outputMD == "" && len(rawStdoutLines) > 0 {
+	if outputMD == "" && streamedAssistantText.Len() > 0 {
+		outputMD = streamedAssistantText.String()
+	}
+	if outputMD == "" && !sawStructuredEvent && len(rawStdoutLines) > 0 {
 		outputMD = strings.Join(rawStdoutLines, "\n")
 	}
-	if outputMD == "" && len(rawStderrLines) > 0 {
+	if outputMD == "" && !errors.Is(ctx.Err(), context.Canceled) && len(rawStderrLines) > 0 {
 		outputMD = strings.Join(rawStderrLines, "\n")
 	}
 
@@ -607,6 +822,163 @@ func checkLocalAuthHealthSnapshot(overridePath string) string {
 	return ""
 }
 
+func hasAnyKey(obj map[string]interface{}, keys ...string) bool {
+	for _, k := range keys {
+		if _, exists := obj[k]; exists {
+			return true
+		}
+	}
+	return false
+}
+
+func updateModelAndProvider(resolvedModel *string, m map[string]interface{}) {
+	if rm, ok := stringField(m, "resolved_model", "model"); ok {
+		*resolvedModel = rm
+	}
+	if prov, ok := stringField(m, "provider"); ok && *resolvedModel != "" && !strings.Contains(*resolvedModel, "/") {
+		*resolvedModel = prov + "/" + *resolvedModel
+	}
+}
+
+func extractErrorMessage(raw interface{}) string {
+	switch v := raw.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case map[string]interface{}:
+		if msg, ok := stringField(v, "message", "error", "detail"); ok {
+			return msg
+		}
+	}
+	return ""
+}
+
+func extractToolResultError(raw interface{}) string {
+	switch v := raw.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case map[string]interface{}:
+		if msg, ok := stringField(v, "error", "message", "text"); ok {
+			return msg
+		}
+		if parts, ok := v["content"].([]interface{}); ok {
+			for _, p := range parts {
+				if pm, ok := p.(map[string]interface{}); ok {
+					if t, ok := stringField(pm, "text"); ok {
+						return t
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func buildCompactToolUsePayload(toolName, toolCallID string, args map[string]interface{}) map[string]interface{} {
+	tool := strings.TrimSpace(toolName)
+	if tool == "" {
+		tool = "tool"
+	}
+	payload := map[string]interface{}{
+		"tool": tool,
+	}
+	if id := strings.TrimSpace(toolCallID); id != "" {
+		payload["tool_call_id"] = id
+	}
+	if len(args) > 0 {
+		if cmd, ok := stringField(args, "command", "cmd"); ok {
+			payload["command"] = truncateStr(cmd, 512)
+		} else if p, ok := stringField(args, "path", "file_path", "filePath", "TargetFile", "Path"); ok {
+			payload["path"] = truncateStr(p, 512)
+		} else if f, ok := stringField(args, "file"); ok {
+			payload["file"] = truncateStr(f, 512)
+		} else if s, ok := stringField(args, "query", "url", "pattern", "prompt", "description", "toolSummary"); ok {
+			payload["summary"] = truncateStr(s, 512)
+		} else if b, err := json.Marshal(args); err == nil {
+			raw := strings.TrimSpace(string(b))
+			if raw != "" && raw != "{}" {
+				payload["summary"] = truncateStr(raw, 256)
+			}
+		}
+	}
+	return payload
+}
+
+func buildCodexToolStartPayload(item map[string]interface{}) map[string]interface{} {
+	itemType, _ := stringField(item, "type")
+	itemID, _ := stringField(item, "id")
+	switch itemType {
+	case "command_execution":
+		cmd, _ := stringField(item, "command", "cmd")
+		return buildCompactToolUsePayload("bash", itemID, map[string]interface{}{"command": cmd})
+	case "mcp_tool_call":
+		tool, _ := stringField(item, "tool", "name")
+		if server, ok := stringField(item, "server"); ok && tool != "" {
+			tool = server + "." + tool
+		} else if tool == "" {
+			tool = "mcp_tool"
+		}
+		args, _ := item["arguments"].(map[string]interface{})
+		return buildCompactToolUsePayload(tool, itemID, args)
+	case "file_change":
+		args := map[string]interface{}{}
+		if p, ok := stringField(item, "path", "file"); ok {
+			args["path"] = p
+		} else if changes, ok := item["changes"].([]interface{}); ok && len(changes) > 0 {
+			if first, ok := changes[0].(map[string]interface{}); ok {
+				if p, ok := stringField(first, "path", "file"); ok {
+					if len(changes) > 1 {
+						args["summary"] = fmt.Sprintf("%s (+%d files)", p, len(changes)-1)
+					} else {
+						args["path"] = p
+					}
+				}
+			}
+		}
+		return buildCompactToolUsePayload("file_change", itemID, args)
+	case "web_search":
+		q, _ := stringField(item, "query")
+		return buildCompactToolUsePayload("web_search", itemID, map[string]interface{}{"query": q})
+	default:
+		return nil
+	}
+}
+
+func compactUsageMap(raw interface{}) map[string]interface{} {
+	m, ok := raw.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	out := map[string]interface{}{}
+	for k, v := range m {
+		switch n := v.(type) {
+		case float64, int, int64:
+			out[k] = n
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func intField(obj map[string]interface{}, keys ...string) (int, bool) {
+	for _, k := range keys {
+		raw, exists := obj[k]
+		if !exists {
+			continue
+		}
+		switch v := raw.(type) {
+		case float64:
+			return int(v), true
+		case int:
+			return v, true
+		case int64:
+			return int(v), true
+		}
+	}
+	return 0, false
+}
+
 func stringField(obj map[string]interface{}, keys ...string) (string, bool) {
 	for _, k := range keys {
 		if raw, exists := obj[k]; exists {
@@ -618,27 +990,60 @@ func stringField(obj map[string]interface{}, keys ...string) (string, bool) {
 	return "", false
 }
 
+func inspectLastAssistantMeta(msgs []interface{}) (model string, stopReason string, errMsg string) {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		m, ok := msgs[i].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if role, hasRole := m["role"].(string); hasRole && strings.TrimSpace(role) != "" && role != "assistant" {
+			continue
+		}
+		updateModelAndProvider(&model, m)
+		stopReason, _ = stringField(m, "stopReason", "stop_reason")
+		errMsg, _ = stringField(m, "errorMessage", "error")
+		return model, stopReason, errMsg
+	}
+	return "", "", ""
+}
+
+func extractAssistantMessageText(m map[string]interface{}) (string, bool) {
+	if role, hasRole := m["role"].(string); hasRole && strings.TrimSpace(role) != "" && role != "assistant" {
+		return "", false
+	}
+	if text, ok := stringField(m, "text", "content"); ok {
+		return text, true
+	}
+	if parts, ok := m["content"].([]interface{}); ok {
+		var sb strings.Builder
+		for _, p := range parts {
+			pm, ok := p.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			partType, _ := stringField(pm, "type")
+			if partType != "" && partType != "text" {
+				continue
+			}
+			if t, ok := pm["text"].(string); ok {
+				sb.WriteString(t)
+			}
+		}
+		if strings.TrimSpace(sb.String()) != "" {
+			return sb.String(), true
+		}
+	}
+	return "", false
+}
+
 func extractLastAssistantText(msgs []interface{}) string {
 	for i := len(msgs) - 1; i >= 0; i-- {
 		m, ok := msgs[i].(map[string]interface{})
 		if !ok {
 			continue
 		}
-		if text, ok := stringField(m, "text", "content"); ok {
-			return text
-		}
-		if parts, ok := m["content"].([]interface{}); ok {
-			var sb strings.Builder
-			for _, p := range parts {
-				if pm, ok := p.(map[string]interface{}); ok {
-					if t, ok := stringField(pm, "text"); ok {
-						sb.WriteString(t)
-					}
-				}
-			}
-			if sb.Len() > 0 {
-				return sb.String()
-			}
+		if txt, ok := extractAssistantMessageText(m); ok {
+			return txt
 		}
 	}
 	return ""

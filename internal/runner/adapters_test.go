@@ -2,11 +2,15 @@ package runner
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/gray0128/agent-hub/internal/api"
 	"github.com/gray0128/agent-hub/internal/config"
@@ -329,5 +333,410 @@ func TestExecuteRunApprovalNeededReadOnlyDegradation(t *testing.T) {
 	}
 	if _, err := os.Stat(sentinel); !os.IsNotExist(err) {
 		t.Fatalf("CRITICAL: ExecuteRun invoked remote-control start")
+	}
+}
+
+type capturedEvent struct {
+	kind    string
+	payload map[string]interface{}
+}
+
+func TestExecuteRunPiStreamingFiltersNoiseAndMapsTools(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test skipped on windows")
+	}
+	tmpDir := t.TempDir()
+	ndjsonPath := filepath.Join(tmpDir, "pi-stream.jsonl")
+
+	marshalLine := func(v interface{}) string {
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+
+	var lines []string
+	lines = append(lines, marshalLine(map[string]interface{}{
+		"type":      "session",
+		"version":   3,
+		"id":        "01a1da3b-test-uuid",
+		"cwd":       tmpDir,
+		"timestamp": "2026-11-15T10:00:00Z",
+	}))
+	lines = append(lines, `{"type":"agent_start"}`, `{"type":"turn_start"}`)
+	lines = append(lines, marshalLine(map[string]interface{}{
+		"type": "message_start",
+		"message": map[string]interface{}{
+			"role":    "assistant",
+			"content": []interface{}{},
+		},
+	}))
+	for i := 0; i < 150; i++ {
+		deltaType := "thinking_delta"
+		delta := fmt.Sprintf("thought-%d ", i)
+		if i >= 120 {
+			deltaType = "toolcall_delta"
+			delta = fmt.Sprintf("arg-%d", i)
+		}
+		lines = append(lines, marshalLine(map[string]interface{}{
+			"type": "message_update",
+			"assistantMessageEvent": map[string]interface{}{
+				"type":  deltaType,
+				"delta": delta,
+			},
+		}))
+	}
+	lines = append(lines, marshalLine(map[string]interface{}{
+		"type": "message_end",
+		"message": map[string]interface{}{
+			"role":     "assistant",
+			"provider": "openai-codex",
+			"model":    "gpt-5.4",
+			"content": []interface{}{
+				map[string]interface{}{"type": "thinking", "thinking": "internal thought"},
+				map[string]interface{}{"type": "toolCall", "id": "call_1", "name": "bash"},
+			},
+		},
+	}))
+	lines = append(lines, marshalLine(map[string]interface{}{
+		"type":       "tool_execution_start",
+		"toolCallId": "call_1",
+		"toolName":   "bash",
+		"args":       map[string]interface{}{"command": "git status --short"},
+	}))
+	for i := 0; i < 20; i++ {
+		lines = append(lines, marshalLine(map[string]interface{}{
+			"type":       "tool_execution_update",
+			"toolCallId": "call_1",
+			"toolName":   "bash",
+			"partialResult": map[string]interface{}{
+				"content": []interface{}{map[string]interface{}{"type": "text", "text": fmt.Sprintf("line %d", i)}},
+			},
+		}))
+	}
+	lines = append(lines, marshalLine(map[string]interface{}{
+		"type":       "tool_execution_end",
+		"toolCallId": "call_1",
+		"toolName":   "bash",
+		"isError":    false,
+		"result":     strings.Repeat("stdout ", 2000),
+	}))
+	lines = append(lines, marshalLine(map[string]interface{}{
+		"type": "turn_end",
+		"message": map[string]interface{}{
+			"role":       "assistant",
+			"provider":   "openai-codex",
+			"model":      "gpt-5.4",
+			"stopReason": "toolUse",
+			"usage":      map[string]interface{}{"input": 100, "output": 20},
+		},
+		"toolResults": []interface{}{strings.Repeat("huge-tool-result-", 3000)},
+	}))
+
+	// Turn 2 streams actual assistant markdown answer
+	lines = append(lines, `{"type":"turn_start"}`)
+	lines = append(lines, marshalLine(map[string]interface{}{
+		"type":    "message_start",
+		"message": map[string]interface{}{"role": "assistant", "content": []interface{}{}},
+	}))
+	lines = append(lines,
+		marshalLine(map[string]interface{}{"type": "message_update", "assistantMessageEvent": map[string]interface{}{"type": "text_delta", "delta": "Hello **world**"}}),
+		marshalLine(map[string]interface{}{"type": "message_update", "assistantMessageEvent": map[string]interface{}{"type": "text_delta", "delta": "\nDone."}}),
+	)
+	assistantMsg2 := map[string]interface{}{
+		"role":       "assistant",
+		"provider":   "openai-codex",
+		"model":      "gpt-5.4",
+		"stopReason": "stop",
+		"content": []interface{}{
+			map[string]interface{}{"type": "thinking", "thinking": "secret reasoning"},
+			map[string]interface{}{"type": "text", "text": "Hello **world**\nDone."},
+		},
+	}
+	lines = append(lines, marshalLine(map[string]interface{}{"type": "message_end", "message": assistantMsg2}))
+	lines = append(lines, marshalLine(map[string]interface{}{"type": "turn_end", "message": assistantMsg2, "toolResults": []interface{}{}}))
+	lines = append(lines, marshalLine(map[string]interface{}{
+		"type": "agent_end",
+		"messages": []interface{}{
+			map[string]interface{}{"role": "user", "content": []interface{}{map[string]interface{}{"type": "text", "text": "user prompt"}}},
+			assistantMsg2,
+			map[string]interface{}{"role": "toolResult", "content": []interface{}{map[string]interface{}{"type": "text", "text": "tool stdout should not leak"}}},
+		},
+	}))
+
+	if err := os.WriteFile(ndjsonPath, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fakePi := filepath.Join(tmpDir, "fake-pi")
+	script := "#!/usr/bin/env bash\ncat \"" + ndjsonPath + "\"\n"
+	if err := os.WriteFile(fakePi, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	var events []capturedEvent
+	res := ExecuteRun(
+		context.Background(),
+		api.RunRecord{ID: "run_pi_1", Agent: "pi", Workdir: tmpDir, Prompt: "inspect", TimeoutSec: 15},
+		&config.NodeConfig{HubURL: "https://ahub.bobocai.win"},
+		config.AgentConfig{Command: fakePi},
+		Callbacks{
+			OnEvent: func(kind string, payload map[string]interface{}) {
+				mu.Lock()
+				events = append(events, capturedEvent{kind: kind, payload: payload})
+				mu.Unlock()
+			},
+		},
+	)
+
+	if res.Status != "done" {
+		t.Fatalf("expected status done, got %q (err=%s)", res.Status, res.ErrorMessage)
+	}
+	if res.NativeSessionID != "01a1da3b-test-uuid" {
+		t.Fatalf("expected session.id extracted as 01a1da3b-test-uuid, got %q", res.NativeSessionID)
+	}
+	if res.ResolvedModel != "openai-codex/gpt-5.4" {
+		t.Fatalf("expected ResolvedModel=openai-codex/gpt-5.4, got %q", res.ResolvedModel)
+	}
+	if res.OutputMD != "Hello **world**\nDone." {
+		t.Fatalf("expected clean assistant OutputMD, got %q", res.OutputMD)
+	}
+	if len(events) > 6 {
+		t.Fatalf("expected streaming noise filtered (<=6 events), got %d events: %+v", len(events), events)
+	}
+
+	var sawToolUse, sawTurnEnd bool
+	for _, ev := range events {
+		if rawType, _ := ev.payload["type"].(string); rawType == "message_update" || rawType == "tool_execution_update" || rawType == "turn_start" || rawType == "agent_start" {
+			t.Fatalf("unexpected unfiltered streaming event %q: %+v", rawType, ev.payload)
+		}
+		if ev.kind == "tool_use" {
+			sawToolUse = true
+			if ev.payload["tool"] != "bash" || ev.payload["command"] != "git status --short" || ev.payload["tool_call_id"] != "call_1" {
+				t.Fatalf("unexpected compact tool_use payload: %+v", ev.payload)
+			}
+		}
+		if ev.kind == "turn_end" {
+			sawTurnEnd = true
+			if _, exists := ev.payload["toolResults"]; exists {
+				t.Fatalf("expected turn_end toolResults stripped: %+v", ev.payload)
+			}
+			if _, exists := ev.payload["message"]; exists {
+				t.Fatalf("expected turn_end message body stripped: %+v", ev.payload)
+			}
+		}
+	}
+	if !sawToolUse || !sawTurnEnd {
+		t.Fatalf("expected both tool_use and turn_end events, got %+v", events)
+	}
+}
+
+func TestExecuteRunPiCancelledMidStreamDoesNotDumpNDJSON(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test skipped on windows")
+	}
+
+	t.Run("cancelled_during_thinking_has_empty_output", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		fakePi := filepath.Join(tmpDir, "fake-pi")
+		script := `#!/usr/bin/env bash
+printf '{"type":"session","version":3,"id":"sess-cancel-1","cwd":"/tmp"}\n'
+printf '{"type":"agent_start"}\n'
+for i in $(seq 1 30); do
+  printf '{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"thinking step %d"}}\n' "$i"
+done
+printf '{"type":"tool_execution_start","toolCallId":"call_hold","toolName":"bash","args":{"command":"sleep 10"}}\n'
+sleep 10
+`
+		if err := os.WriteFile(fakePi, []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		readyToCancel := make(chan struct{}, 1)
+		resCh := make(chan Result, 1)
+		go func() {
+			resCh <- ExecuteRun(
+				ctx,
+				api.RunRecord{ID: "run_cancel_think", Agent: "pi", Workdir: tmpDir, Prompt: "hi", TimeoutSec: 15},
+				&config.NodeConfig{HubURL: "https://ahub.bobocai.win"},
+				config.AgentConfig{Command: fakePi},
+				Callbacks{
+					OnEvent: func(kind string, payload map[string]interface{}) {
+						if kind == "tool_use" {
+							select {
+							case readyToCancel <- struct{}{}:
+							default:
+							}
+						}
+					},
+				},
+			)
+		}()
+
+		select {
+		case <-readyToCancel:
+			cancel()
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for fake-pi events")
+		}
+
+		res := <-resCh
+		if res.Status != "cancelled" {
+			t.Fatalf("expected status cancelled, got %q (err=%s)", res.Status, res.ErrorMessage)
+		}
+		if res.NativeSessionID != "sess-cancel-1" {
+			t.Fatalf("expected NativeSessionID=sess-cancel-1, got %q", res.NativeSessionID)
+		}
+		if res.OutputMD != "" {
+			t.Fatalf("expected empty OutputMD when cancelled without assistant text (must not dump NDJSON), got %q", res.OutputMD)
+		}
+		if res.Summary != "Cancelled by user" {
+			t.Fatalf("expected summary 'Cancelled by user', got %q", res.Summary)
+		}
+	})
+
+	t.Run("cancelled_mid_text_delta_preserves_streamed_text", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		fakePi := filepath.Join(tmpDir, "fake-pi")
+		script := `#!/usr/bin/env bash
+printf '{"type":"session","version":3,"id":"sess-cancel-2","cwd":"/tmp"}\n'
+printf '{"type":"message_start","message":{"role":"assistant","content":[]}}\n'
+printf '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"Partial "}}\n'
+printf '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"answer"}}\n'
+printf '{"type":"tool_execution_start","toolCallId":"call_hold","toolName":"bash","args":{"command":"sleep 10"}}\n'
+sleep 10
+`
+		if err := os.WriteFile(fakePi, []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		readyToCancel := make(chan struct{}, 1)
+		resCh := make(chan Result, 1)
+		go func() {
+			resCh <- ExecuteRun(
+				ctx,
+				api.RunRecord{ID: "run_cancel_text", Agent: "pi", Workdir: tmpDir, Prompt: "hi", TimeoutSec: 15},
+				&config.NodeConfig{HubURL: "https://ahub.bobocai.win"},
+				config.AgentConfig{Command: fakePi},
+				Callbacks{
+					OnEvent: func(kind string, payload map[string]interface{}) {
+						if kind == "tool_use" {
+							select {
+							case readyToCancel <- struct{}{}:
+							default:
+							}
+						}
+					},
+				},
+			)
+		}()
+
+		select {
+		case <-readyToCancel:
+			cancel()
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for fake-pi events")
+		}
+
+		res := <-resCh
+		if res.Status != "cancelled" {
+			t.Fatalf("expected status cancelled, got %q", res.Status)
+		}
+		if res.OutputMD != "Partial answer" {
+			t.Fatalf("expected streamed partial text 'Partial answer', got %q", res.OutputMD)
+		}
+	})
+}
+
+func TestExecuteRunCodexJSONStream(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test skipped on windows")
+	}
+	tmpDir := t.TempDir()
+	fakeCodex := filepath.Join(tmpDir, "fake-codex")
+	var lines []string
+	marshalLine := func(v interface{}) string {
+		b, _ := json.Marshal(v)
+		return string(b)
+	}
+	lines = append(lines, marshalLine(map[string]interface{}{"type": "thread.started", "thread_id": "019c-codex"}))
+	lines = append(lines, `{"type":"turn.started"}`)
+	lines = append(lines, marshalLine(map[string]interface{}{
+		"type": "item.started",
+		"item": map[string]interface{}{
+			"id":      "item_1",
+			"type":    "command_execution",
+			"command": "go test ./...",
+		},
+	}))
+	for i := 0; i < 20; i++ {
+		lines = append(lines, marshalLine(map[string]interface{}{
+			"type": "item.updated",
+			"item": map[string]interface{}{
+				"id":                "item_1",
+				"type":              "command_execution",
+				"aggregated_output": fmt.Sprintf("chunk %d", i),
+			},
+		}))
+	}
+	lines = append(lines, marshalLine(map[string]interface{}{
+		"type": "item.completed",
+		"item": map[string]interface{}{
+			"id":   "item_2",
+			"type": "agent_message",
+			"text": "All tests pass.",
+		},
+	}))
+	lines = append(lines, marshalLine(map[string]interface{}{
+		"type":  "turn.completed",
+		"usage": map[string]interface{}{"input_tokens": 50, "output_tokens": 10},
+	}))
+
+	ndjsonPath := filepath.Join(tmpDir, "codex.jsonl")
+	if err := os.WriteFile(ndjsonPath, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/usr/bin/env bash\ncat >/dev/null\ncat \"" + ndjsonPath + "\"\n"
+	if err := os.WriteFile(fakeCodex, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	var events []capturedEvent
+	res := ExecuteRun(
+		context.Background(),
+		api.RunRecord{ID: "run_codex_1", Agent: "codex", Workdir: tmpDir, Prompt: "test", TimeoutSec: 15},
+		&config.NodeConfig{HubURL: "https://ahub.bobocai.win"},
+		config.AgentConfig{Command: fakeCodex},
+		Callbacks{
+			OnEvent: func(kind string, payload map[string]interface{}) {
+				mu.Lock()
+				events = append(events, capturedEvent{kind: kind, payload: payload})
+				mu.Unlock()
+			},
+		},
+	)
+
+	if res.Status != "done" {
+		t.Fatalf("expected status done, got %q (err=%s)", res.Status, res.ErrorMessage)
+	}
+	if res.NativeSessionID != "019c-codex" {
+		t.Fatalf("expected NativeSessionID=019c-codex, got %q", res.NativeSessionID)
+	}
+	if res.OutputMD != "All tests pass." {
+		t.Fatalf("expected OutputMD 'All tests pass.', got %q", res.OutputMD)
+	}
+	if len(events) != 3 {
+		t.Fatalf("expected exactly 3 events (session, tool_use, turn_end), got %d: %+v", len(events), events)
+	}
+	if events[1].kind != "tool_use" || events[1].payload["tool"] != "bash" || events[1].payload["command"] != "go test ./..." {
+		t.Fatalf("unexpected codex tool_use event: %+v", events[1])
 	}
 }

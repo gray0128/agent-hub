@@ -96,7 +96,7 @@
 
 1. `node.hello`（建连首帧必发，后台异步目录探测就绪后可增量重发刷新）：上报 `conn_nonce`、`version`、`os`、`arch`、`max_concurrency`、`capabilities`（含 `agents.<agent>` 下的 `enabled`、`available`、`default_model`、`default_effort`、`catalog_status` (`pending` | `ready` | `fallback`) 与 `models: [{id, label, efforts, default_effort}]` 结构化目录及兼容 `aliases`）以及 `workspaces`（扫描到的项目短名与规范绝对路径列表）。
 2. `node.ping`：每 `25s` 发送一次，附带当前本机活跃任务 ID 列表 `active_run_ids`，同时续期节点 `last_seen_at` 及活跃任务租约。
-3. `run.event` / `run.events`：实时转发 Agent 执行事件。单条帧 `run.event` 含 `run_id`、`seq`（单调递增）、`kind`（`status` | `tool_use` | `turn_end` | `approval_needed` | `stderr_warn` | `system`）、`payload` 与 `ts`；节点守护端每 `250ms`（或积满 `100` 条、或遇 `status`/`approval_needed` 立即刷新）可打包发送批量帧 `run.events`（`{type: "run.events", run_id, events: [{seq, kind, payload, ts}]}`）。`NodeHub` 将事件批量落入 D1 `run_events`（`INSERT OR IGNORE`）并原样广播给订阅该任务的 `/ws/stream` 客户端。
+3. `run.event` / `run.events`：实时转发 Agent 执行事件。单条帧 `run.event` 含 `run_id`、`seq`（单调递增）、`kind`（`status` | `tool_use` | `turn_end` | `approval_needed` | `stderr_warn` | `system`）、`payload` 与 `ts`；节点守护端每 `250ms` 或积满 `100` 条打包发送批量帧 `run.events`（`{type: "run.events", run_id, events: [{seq, kind, payload, ts}]}`），其中 `approval_needed` 恒定立即刷新（`0ms`），`status` 仅在单任务 `250ms` 窗口前沿立即刷新（窗口期内连续突发的 `status` 自动并入 `250ms` 批量帧，防止高频状态刷屏绕过聚合冲击 `NodeHub` DO 与 D1）。`NodeHub` 将事件批量落入 D1 `run_events`（`INSERT OR IGNORE`）并原样广播给订阅该任务的 `/ws/stream` 客户端。
 4. `run.state`：即时同步 `claimed -> running` 或 `running -> needs_approval`（附 `remote_control_url`）状态切换。
 
 **Hub -> Node 帧**：

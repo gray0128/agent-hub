@@ -10,14 +10,15 @@ import (
 type BatchSendFunc func(runID string, events []api.RunEventItem)
 
 type EventBatcher struct {
-	mu       sync.Mutex
-	seqByRun map[string]int
-	bufByRun map[string][]api.RunEventItem
-	send     BatchSendFunc
-	interval time.Duration
-	maxBatch int
-	stopCh   chan struct{}
-	doneCh   chan struct{}
+	mu              sync.Mutex
+	seqByRun        map[string]int
+	bufByRun        map[string][]api.RunEventItem
+	lastStatusFlush map[string]time.Time
+	send            BatchSendFunc
+	interval        time.Duration
+	maxBatch        int
+	stopCh          chan struct{}
+	doneCh          chan struct{}
 }
 
 func NewEventBatcher(interval time.Duration, maxBatch int, send BatchSendFunc) *EventBatcher {
@@ -28,13 +29,14 @@ func NewEventBatcher(interval time.Duration, maxBatch int, send BatchSendFunc) *
 		maxBatch = 100
 	}
 	b := &EventBatcher{
-		seqByRun: make(map[string]int),
-		bufByRun: make(map[string][]api.RunEventItem),
-		send:     send,
-		interval: interval,
-		maxBatch: maxBatch,
-		stopCh:   make(chan struct{}),
-		doneCh:   make(chan struct{}),
+		seqByRun:        make(map[string]int),
+		bufByRun:        make(map[string][]api.RunEventItem),
+		lastStatusFlush: make(map[string]time.Time),
+		send:            send,
+		interval:        interval,
+		maxBatch:        maxBatch,
+		stopCh:          make(chan struct{}),
+		doneCh:          make(chan struct{}),
 	}
 	go b.loop()
 	return b
@@ -56,6 +58,7 @@ func (b *EventBatcher) loop() {
 }
 
 func (b *EventBatcher) Add(runID, kind string, payload map[string]interface{}) {
+	now := time.Now()
 	b.mu.Lock()
 	b.seqByRun[runID]++
 	seq := b.seqByRun[runID]
@@ -63,11 +66,17 @@ func (b *EventBatcher) Add(runID, kind string, payload map[string]interface{}) {
 		Seq:     seq,
 		Kind:    kind,
 		Payload: payload,
-		TS:      time.Now().UTC().Format(time.RFC3339Nano),
+		TS:      now.UTC().Format(time.RFC3339Nano),
 	}
 	b.bufByRun[runID] = append(b.bufByRun[runID], item)
 
-	immediate := kind == "status" || kind == "approval_needed" || len(b.bufByRun[runID]) >= b.maxBatch
+	immediate := kind == "approval_needed" || len(b.bufByRun[runID]) >= b.maxBatch
+	if kind == "status" {
+		if last, ok := b.lastStatusFlush[runID]; !ok || now.Sub(last) >= b.interval {
+			immediate = true
+			b.lastStatusFlush[runID] = now
+		}
+	}
 	var toSend []api.RunEventItem
 	if immediate {
 		toSend = b.bufByRun[runID]
@@ -85,6 +94,7 @@ func (b *EventBatcher) FlushRun(runID string) {
 	items := b.bufByRun[runID]
 	delete(b.bufByRun, runID)
 	delete(b.seqByRun, runID)
+	delete(b.lastStatusFlush, runID)
 	b.mu.Unlock()
 	if len(items) > 0 && b.send != nil {
 		b.send(runID, items)
