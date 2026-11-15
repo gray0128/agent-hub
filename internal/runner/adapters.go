@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -236,6 +238,7 @@ func ExecuteRun(
 	var resolvedModel string
 	var resolvedEffort string
 	var remoteControlURL string
+	var remoteControlUnavailableReason string
 	var agyStatus string
 	var agyError string
 	inApproval := false
@@ -312,9 +315,19 @@ func ExecuteRun(
 		case "approval_needed":
 			inApproval = true
 			if remoteControlURL == "" {
-				remoteControlURL = ensureRemoteControlURL(ctx, agentCfg)
+				remoteControlURL, remoteControlUnavailableReason = probeRemoteControlURL(ctx, agentCfg)
 			}
-			payload := map[string]interface{}{"remote_control_url": remoteControlURL}
+			payload := map[string]interface{}{
+				"remote_control_url":       remoteControlURL,
+				"remote_control_available": remoteControlURL != "",
+			}
+			if remoteControlURL == "" && remoteControlUnavailableReason != "" {
+				payload["reason"] = remoteControlUnavailableReason
+				emitEvent("system", map[string]interface{}{
+					"stage":  "remote_control_unavailable",
+					"reason": remoteControlUnavailableReason,
+				})
+			}
 			emitEvent("approval_needed", payload)
 			if callbacks.OnState != nil {
 				callbacks.OnState("needs_approval", remoteControlURL, resolvedModel, resolvedEffort)
@@ -437,7 +450,15 @@ func ExecuteRun(
 
 	if strings.EqualFold(agyStatus, "NEEDS_HUMAN_APPROVAL") {
 		if remoteControlURL == "" {
-			remoteControlURL = ensureRemoteControlURL(ctx, agentCfg)
+			remoteControlURL, remoteControlUnavailableReason = probeRemoteControlURL(ctx, agentCfg)
+		}
+		summary := buildSummary(parsedOutputText.String(), "Waiting for human approval via remote-control")
+		if remoteControlURL == "" && remoteControlUnavailableReason != "" {
+			if strings.TrimSpace(parsedOutputText.String()) == "" {
+				summary = fmt.Sprintf("Waiting for human approval (remote-control unavailable: %s)", remoteControlUnavailableReason)
+			} else {
+				summary = truncateStr(fmt.Sprintf("%s (remote-control unavailable: %s)", summary, remoteControlUnavailableReason), 280)
+			}
 		}
 		return Result{
 			Status:           "needs_approval",
@@ -445,7 +466,7 @@ func ExecuteRun(
 			ResolvedModel:    resolvedModel,
 			ResolvedEffort:   resolvedEffort,
 			RemoteControlURL: remoteControlURL,
-			Summary:          buildSummary(outputMD, "Waiting for human approval via remote-control"),
+			Summary:          summary,
 			OutputMD:         outputMD,
 			OutputBytes:      len(outputMD),
 			DurationMs:       durationMs,
@@ -507,25 +528,81 @@ func ExecuteRun(
 	}
 }
 
+type localAuthHealthSnapshot struct {
+	Status       string `json:"status"`
+	CircuitState string `json:"circuit_state"`
+	RemainingSec int64  `json:"remaining_seconds"`
+	ZombieUnauth bool   `json:"zombie_unauthenticated_detected"`
+}
+
 func ensureRemoteControlURL(ctx context.Context, agentCfg config.AgentConfig) string {
+	url, _ := probeRemoteControlURL(ctx, agentCfg)
+	return url
+}
+
+// probeRemoteControlURL inspects local auth-health snapshot and `agy remote-control status` in read-only mode.
+// It never invokes `agy remote-control start`, preventing LaunchAgent plist overwrites.
+func probeRemoteControlURL(ctx context.Context, agentCfg config.AgentConfig) (string, string) {
+	return probeRemoteControlURLWithHealthPath(ctx, agentCfg, "")
+}
+
+func probeRemoteControlURLWithHealthPath(ctx context.Context, agentCfg config.AgentConfig, healthOverride string) (string, string) {
+	if reason := checkLocalAuthHealthSnapshot(healthOverride); reason != "" {
+		return "", reason
+	}
 	bin := strings.TrimSpace(agentCfg.Command)
 	if bin == "" {
 		bin = "agy"
 	}
 	bin = config.ExpandPath(bin)
-	checkCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	checkCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(checkCtx, bin, "remote-control", "status").CombinedOutput()
-	if err == nil {
-		if match := urlRegex.FindString(string(out)); match != "" {
-			return match
+	text := strings.TrimSpace(string(out))
+	if err != nil {
+		if errors.Is(checkCtx.Err(), context.DeadlineExceeded) {
+			return "", "status_probe_timeout"
+		}
+		return "", "daemon_not_running"
+	}
+	lower := strings.ToLower(text)
+	if strings.Contains(lower, "not running") || strings.Contains(lower, "stopped") || strings.Contains(lower, "not signed in") {
+		return "", "daemon_not_running"
+	}
+	if match := urlRegex.FindString(text); match != "" {
+		cleaned := strings.TrimRight(match, ").,:;]>")
+		if cleaned != "" {
+			return cleaned, ""
 		}
 	}
-	out, err = exec.CommandContext(checkCtx, bin, "remote-control", "start").CombinedOutput()
-	if err == nil {
-		if match := urlRegex.FindString(string(out)); match != "" {
-			return match
+	return "", "url_not_reported"
+}
+
+func checkLocalAuthHealthSnapshot(overridePath string) string {
+	healthPath := overridePath
+	if healthPath == "" {
+		home, err := os.UserHomeDir()
+		if err != nil || home == "" {
+			return ""
 		}
+		healthPath = filepath.Join(home, ".gemini", "antigravity-cli", "auth-health.json")
+	}
+	raw, err := os.ReadFile(healthPath)
+	if err != nil {
+		return ""
+	}
+	var snap localAuthHealthSnapshot
+	if json.Unmarshal(raw, &snap) != nil {
+		return ""
+	}
+	if strings.EqualFold(snap.CircuitState, "OPEN") {
+		return "auth_circuit_open"
+	}
+	if snap.Status == "expired" || snap.RemainingSec < -60 {
+		return "oauth_token_expired"
+	}
+	if snap.ZombieUnauth {
+		return "daemon_auth_lost"
 	}
 	return ""
 }

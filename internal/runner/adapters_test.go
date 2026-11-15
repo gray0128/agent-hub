@@ -1,6 +1,10 @@
 package runner
 
 import (
+	"context"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -147,5 +151,183 @@ func TestBuildCommandSpecAdapters(t *testing.T) {
 	}
 	if strings.Contains(orchJoined, "--effort") || strings.Contains(orchJoined, "-high") {
 		t.Fatalf("expected orchestrator to omit suffix and --effort flag, got %q", orchJoined)
+	}
+}
+
+func writeFakeAgyScript(t *testing.T, dir string, sentinelPath string, modePath string) string {
+	t.Helper()
+	scriptPath := filepath.Join(dir, "fake-agy")
+	script := `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "remote-control" && "${2:-}" == "start" ]]; then
+  echo "start_invoked" > "` + sentinelPath + `"
+  exit 99
+fi
+mode="$(cat "` + modePath + `" 2>/dev/null || echo "running")"
+if [[ "${1:-}" == "remote-control" && "${2:-}" == "status" ]]; then
+  case "$mode" in
+    running)
+      printf 'Daemon state = running\nDaemon pid = 4442\nInstance name: macmini (find it at https://antigravity.google.com)\n'
+      exit 0
+      ;;
+    not_running_with_url)
+      printf 'Daemon state = not running\nInstance name: macmini (find it at https://antigravity.google.com)\n'
+      exit 0
+      ;;
+    exit_err)
+      echo "not signed in" >&2
+      exit 1
+      ;;
+    no_url)
+      printf 'Daemon state = running\nDaemon pid = 4442\n'
+      exit 0
+      ;;
+  esac
+fi
+printf '{"type":"approval_needed"}\n'
+printf '{"status":"NEEDS_HUMAN_APPROVAL"}\n'
+`
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake-agy failed: %v", err)
+	}
+	return scriptPath
+}
+
+func TestProbeRemoteControlURLNeverCallsStart(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test skipped on windows")
+	}
+	tmpDir := t.TempDir()
+	sentinel := filepath.Join(tmpDir, "start-called.sentinel")
+	modeFile := filepath.Join(tmpDir, "mode.txt")
+	healthFile := filepath.Join(tmpDir, "auth-health.json")
+	fakeBin := writeFakeAgyScript(t, tmpDir, sentinel, modeFile)
+	agentCfg := config.AgentConfig{Command: fakeBin}
+	ctx := context.Background()
+
+	// 1. Healthy running daemon strips trailing ')' from URL
+	if err := os.WriteFile(modeFile, []byte("running"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	url, reason := probeRemoteControlURLWithHealthPath(ctx, agentCfg, healthFile)
+	if url != "https://antigravity.google.com" || reason != "" {
+		t.Fatalf("expected clean URL and empty reason, got url=%q reason=%q", url, reason)
+	}
+
+	// 2. 'not running' output containing static '(find it at https://...)' must NOT return stale URL or call start
+	if err := os.WriteFile(modeFile, []byte("not_running_with_url"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	url, reason = probeRemoteControlURLWithHealthPath(ctx, agentCfg, healthFile)
+	if url != "" || reason != "daemon_not_running" {
+		t.Fatalf("expected empty URL and daemon_not_running, got url=%q reason=%q", url, reason)
+	}
+
+	// 3. Non-zero exit from status must NOT call start
+	if err := os.WriteFile(modeFile, []byte("exit_err"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	url, reason = probeRemoteControlURLWithHealthPath(ctx, agentCfg, healthFile)
+	if url != "" || reason != "daemon_not_running" {
+		t.Fatalf("expected daemon_not_running on non-zero exit, got url=%q reason=%q", url, reason)
+	}
+
+	// 4. Circuit breaker OPEN short-circuits before invoking status/start
+	if err := os.WriteFile(modeFile, []byte("running"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(healthFile, []byte(`{"status":"unhealthy","circuit_state":"OPEN","remaining_seconds":3600}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	url, reason = probeRemoteControlURLWithHealthPath(ctx, agentCfg, healthFile)
+	if url != "" || reason != "auth_circuit_open" {
+		t.Fatalf("expected auth_circuit_open, got url=%q reason=%q", url, reason)
+	}
+
+	// 5. Expired token snapshot short-circuits
+	if err := os.WriteFile(healthFile, []byte(`{"status":"expired","circuit_state":"CLOSED","remaining_seconds":-120}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	url, reason = probeRemoteControlURLWithHealthPath(ctx, agentCfg, healthFile)
+	if url != "" || reason != "oauth_token_expired" {
+		t.Fatalf("expected oauth_token_expired, got url=%q reason=%q", url, reason)
+	}
+
+	// 6. Zombie unauthenticated daemon snapshot short-circuits
+	if err := os.WriteFile(healthFile, []byte(`{"status":"degraded","circuit_state":"CLOSED","remaining_seconds":3000,"zombie_unauthenticated_detected":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	url, reason = probeRemoteControlURLWithHealthPath(ctx, agentCfg, healthFile)
+	if url != "" || reason != "daemon_auth_lost" {
+		t.Fatalf("expected daemon_auth_lost, got url=%q reason=%q", url, reason)
+	}
+
+	if _, err := os.Stat(sentinel); !os.IsNotExist(err) {
+		t.Fatalf("CRITICAL: agy remote-control start was invoked (sentinel exists)")
+	}
+}
+
+func TestExecuteRunApprovalNeededReadOnlyDegradation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test skipped on windows")
+	}
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+	sentinel := filepath.Join(tmpDir, "start-called.sentinel")
+	modeFile := filepath.Join(tmpDir, "mode.txt")
+	if err := os.WriteFile(modeFile, []byte("not_running_with_url"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fakeBin := writeFakeAgyScript(t, tmpDir, sentinel, modeFile)
+
+	var events []struct {
+		kind    string
+		payload map[string]interface{}
+	}
+	res := ExecuteRun(
+		context.Background(),
+		api.RunRecord{
+			ID:         "run_test123",
+			Agent:      "agy",
+			Workdir:    tmpDir,
+			Prompt:     "test approval",
+			TimeoutSec: 15,
+		},
+		&config.NodeConfig{HubURL: "https://ahub.bobocai.win"},
+		config.AgentConfig{Command: fakeBin},
+		Callbacks{
+			OnEvent: func(kind string, payload map[string]interface{}) {
+				events = append(events, struct {
+					kind    string
+					payload map[string]interface{}
+				}{kind: kind, payload: payload})
+			},
+		},
+	)
+
+	if res.Status != "needs_approval" {
+		t.Fatalf("expected status needs_approval, got %q (err=%s)", res.Status, res.ErrorMessage)
+	}
+	if res.RemoteControlURL != "" {
+		t.Fatalf("expected empty RemoteControlURL when daemon not running, got %q", res.RemoteControlURL)
+	}
+	if !strings.Contains(res.Summary, "remote-control unavailable: daemon_not_running") {
+		t.Fatalf("expected diagnostic summary, got %q", res.Summary)
+	}
+	foundSystem := false
+	foundApproval := false
+	for _, ev := range events {
+		if ev.kind == "system" && ev.payload["stage"] == "remote_control_unavailable" && ev.payload["reason"] == "daemon_not_running" {
+			foundSystem = true
+		}
+		if ev.kind == "approval_needed" && ev.payload["remote_control_available"] == false && ev.payload["reason"] == "daemon_not_running" {
+			foundApproval = true
+		}
+	}
+	if !foundSystem || !foundApproval {
+		t.Fatalf("expected both system and approval_needed degradation events, got %+v", events)
+	}
+	if _, err := os.Stat(sentinel); !os.IsNotExist(err) {
+		t.Fatalf("CRITICAL: ExecuteRun invoked remote-control start")
 	}
 }

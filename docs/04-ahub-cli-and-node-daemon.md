@@ -128,7 +128,7 @@ skills/ahub/SKILL.md             # 通过 go:embed 内嵌于二进制中
 
 | Agent | 无头调用命令模板 | 会话续接参数 | 输出解析规则 |
 | --- | --- | --- | --- |
-| `agy` | `agy --output-format json [--sandbox] [--project <project_id>] [--model <m>] [--effort <e>] [--print-timeout <t>] -p=<prompt>` | `--conversation <native_session_id>` | 解析单对象 JSON 提取 `status`、`conversation_id`、`response`、`error`；**严禁采信返回的累计耗时，必须由 Go 守护端 `time.Since(startedAt)` 单调计时**；当 `status == "NEEDS_HUMAN_APPROVAL"` 时自动巡检/拉起远控守护并回填 `remote_control_url` |
+| `agy` | `agy --output-format json [--sandbox] [--project <project_id>] [--model <m>] [--effort <e>] [--print-timeout <t>] -p=<prompt>` | `--conversation <native_session_id>` | 解析单对象 JSON 提取 `status`、`conversation_id`、`response`、`error`；**严禁采信返回的累计耗时，必须由 Go 守护端 `time.Since(startedAt)` 单调计时**；当 `status == "NEEDS_HUMAN_APPROVAL"` 时只读探测远控守护状态（严禁调用 `start` 覆写系统守护配置）并回填 `remote_control_url`，不可达时保持空串并在结果摘要与诊断事件中注明原因 |
 | `pi` | `pi --mode json -p --approve [--model <m>] [--thinking <e>] <prompt>` | `--session <native_session_id>` | 逐行解析 v3 NDJSON 事件流：从 `session` 帧提取会话 ID，从 `turn_end` 提取实际命中 `provider/model` 与思考等级，从 `agent_end` 提取最终文本输出，并将关键工具事件实时映射为 `run.event` 推往云端 |
 | `omp` | `omp --mode=json -p --auto-approve --max-time=<t> [--model=<m>] [--thinking=<e>] <prompt>` | `--resume=<native_session_id>` | 同上，逐行解析 v3 NDJSON 事件流并实时推送 `run.event` |
 | `codex` / `claude` | `codex exec --json [-m <m>] [-c model_reasoning_effort="<e>"]` / `claude -p --output-format json [--model <m>]` | `codex exec resume --json [-m <m>] [-c model_reasoning_effort="<e>"] <native_session_id> -` / `--session-id <id>` | 提取标准输出文本与会话 ID，实现多引擎统一抽象 |
