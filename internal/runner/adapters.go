@@ -50,8 +50,12 @@ func BuildCommandSpec(run api.RunRecord, agentCfg config.AgentConfig) (string, [
 	args = append(args, agentCfg.Args...)
 
 	model, effort := SplitModelAndEffort(run.Model, run.Effort)
-	if model == "" && agentCfg.DefaultModel != "" {
-		model, effort = SplitModelAndEffort(agentCfg.DefaultModel, effort)
+	defaultModel := agentCfg.DefaultModel
+	if run.Agent == "agy" && strings.TrimSpace(defaultModel) == "" {
+		defaultModel = config.DefaultAgyModel
+	}
+	if model == "" && defaultModel != "" {
+		model, effort = SplitModelAndEffort(defaultModel, effort)
 	}
 
 	nativeSession := ""
@@ -154,6 +158,9 @@ func BuildCommandSpec(run api.RunRecord, agentCfg config.AgentConfig) (string, [
 		}
 		if model != "" {
 			args = append(args, "--model", model)
+		}
+		if effort != "" && effort != "auto" && effort != "off" && !hasClaudeEffortOverride(agentCfg.Args) {
+			args = append(args, "--effort", effort)
 		}
 		if nativeSession != "" {
 			args = append(args, "--session-id", nativeSession)
@@ -1087,6 +1094,16 @@ func hasCodexReasoningEffortOverride(args []string) bool {
 			if strings.HasPrefix(val, "model_reasoning_effort") {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+func hasClaudeEffortOverride(args []string) bool {
+	for _, raw := range args {
+		arg := strings.TrimSpace(raw)
+		if arg == "--effort" || strings.HasPrefix(arg, "--effort=") {
+			return true
 		}
 	}
 	return false

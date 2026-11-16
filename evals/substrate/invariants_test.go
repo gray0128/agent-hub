@@ -409,6 +409,7 @@ func TestInvariantSuite(t *testing.T) {
 	wsRootMac := filepath.Join(h.tmpDir, "workspaces", "mac-root")
 	alphaDir := h.makeWorkspaceDir(filepath.Join("mac-root", "proj-alpha"))
 	betaDir := h.makeWorkspaceDir(filepath.Join("mac-root", "proj-beta"))
+	approvalDir := h.makeWorkspaceDir(filepath.Join("mac-root", "proj-approval"))
 
 	wsRootMbp := filepath.Join(h.tmpDir, "workspaces", "mbp-root")
 	mbpDir := h.makeWorkspaceDir(filepath.Join("mbp-root", "proj-mbp"))
@@ -1083,5 +1084,317 @@ func TestInvariantSuite(t *testing.T) {
 				time.Sleep(100 * time.Millisecond)
 			}
 		}
+	})
+
+	t.Run("Gotcha01_ExitedNeedsApprovalCheckpointResolveAndLeaseReap", func(t *testing.T) {
+		approvePrompt := `{"session_id":"sess_exit_app_01","directives":[{"op":"exit_approval","url":"https://ahub.bobocai.win/rc/exit01","message":"Needs production deploy approval"}]}`
+		code, stdout, stderr := h.runCLI(approvePrompt, "--json", "run", "--node", "macmini", "--dir", approvalDir, "--agent", "agy", "--wait", "12s", "-")
+		if code != api.ExitNeedsApproval {
+			t.Fatalf("expected ExitNeedsApproval (%d), got %d\nstdout: %s\nstderr: %s", api.ExitNeedsApproval, code, stdout, stderr)
+		}
+		var run1 api.RunRecord
+		if err := json.Unmarshal([]byte(stdout), &run1); err != nil {
+			t.Fatalf("decode run1 JSON: %v (%s)", err, stdout)
+		}
+		if run1.Status != "needs_approval" {
+			t.Fatalf("expected run1 status needs_approval, got %q", run1.Status)
+		}
+		if run1.RemoteControlURL != "https://ahub.bobocai.win/rc/exit01" {
+			t.Fatalf("expected checkpointed remote_control_url, got %q", run1.RemoteControlURL)
+		}
+		if run1.NativeSessionID == nil || *run1.NativeSessionID != "sess_exit_app_01" {
+			t.Fatalf("expected checkpointed native_session_id=sess_exit_app_01, got %v", run1.NativeSessionID)
+		}
+		if !strings.Contains(run1.OutputPreview, "Needs production deploy approval") {
+			t.Fatalf("expected output_preview populated from checkpoint, got %q", run1.OutputPreview)
+		}
+
+		// Queue a second run on the same (node_id, workdir); must stay queued while run1 holds needs_approval lock
+		run2 := h.mustRunCLIJSON(`{"directives":[{"op":"sleep","ms":30}]}`,
+			"run", "--node", "macmini", "--dir", approvalDir, "--agent", "agy", "--wait", "0s", "-")
+		time.Sleep(350 * time.Millisecond)
+		cur2, err := client.GetRun(context.Background(), run2.ID, false, 1024)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cur2.Status != "queued" {
+			t.Fatalf("expected run2 to stay queued while run1 parked in needs_approval, got %q", cur2.Status)
+		}
+
+		// Settle run1 via `ahub resolve` and verify lock releases so run2 automatically executes & completes
+		resCode, resOut, resErr := h.runCLI("Approved in remote-control UI\n", "--json", "resolve", run1.ID, "--summary", "-")
+		if resCode != api.ExitOK {
+			t.Fatalf("ahub resolve failed (%d)\nstdout: %s\nstderr: %s", resCode, resOut, resErr)
+		}
+		var resEnv struct {
+			OK  bool          `json:"ok"`
+			Run api.RunRecord `json:"run"`
+		}
+		if err := json.Unmarshal([]byte(resOut), &resEnv); err != nil {
+			t.Fatalf("decode resolve output: %v (%s)", err, resOut)
+		}
+		if !resEnv.OK || resEnv.Run.Status != "done" {
+			t.Fatalf("expected resolved run status done, got %+v", resEnv)
+		}
+
+		run2Deadline := time.Now().Add(8 * time.Second)
+		for {
+			cur, err := client.GetRun(context.Background(), run2.ID, false, 1024)
+			if err == nil && cur.Status == "done" {
+				break
+			}
+			if time.Now().After(run2Deadline) {
+				t.Fatalf("queued run2 did not complete after run1 resolved: %+v", cur)
+			}
+			time.Sleep(60 * time.Millisecond)
+		}
+
+		// Ephemeral node crash during needs_approval must be reaped by reapExpiredLeases as NODE_LEASE_EXPIRED
+		reapRoot := filepath.Join(h.tmpDir, "workspaces", "reap-app-root")
+		reapDir := h.makeWorkspaceDir(filepath.Join("reap-app-root", "proj"))
+		reapTok := h.createKey("reap-app-node", "node", "reap-app-node", []string{"reap-app-node"}, 0)
+		reapCmd := h.startDaemon("reap-app-node", reapTok, "", reapRoot, 1)
+		defer h.stopDaemon(reapCmd, syscall.SIGKILL)
+
+		reapPrompt := `{"session_id":"sess_exit_reap","directives":[{"op":"exit_approval","url":"https://ahub.bobocai.win/rc/reap","message":"Abandoned approval"}]}`
+		rCode, rOut, rErr := h.runCLI(reapPrompt, "--json", "run", "--node", "reap-app-node", "--dir", reapDir, "--agent", "agy", "--wait", "10s", "-")
+		if rCode != api.ExitNeedsApproval {
+			t.Fatalf("expected ExitNeedsApproval on reap-app-node, got %d (%s / %s)", rCode, rOut, rErr)
+		}
+		var reapRun api.RunRecord
+		if err := json.Unmarshal([]byte(rOut), &reapRun); err != nil {
+			t.Fatalf("decode reapRun JSON: %v", err)
+		}
+
+		h.stopDaemon(reapCmd, syscall.SIGKILL)
+		time.Sleep(3500 * time.Millisecond)
+
+		reapReq, _ := http.NewRequest(http.MethodPost, h.hubURL+"/api/v1/admin/reap-leases", nil)
+		reapReq.Header.Set("Authorization", "Bearer "+h.adminToken)
+		reapResp, err := http.DefaultClient.Do(reapReq)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reapResp.Body.Close()
+
+		reaped, err := client.GetRun(context.Background(), reapRun.ID, false, 1024)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reaped.Status != "failed" || reaped.ErrorCode != "NODE_LEASE_EXPIRED" {
+			t.Fatalf("expected abandoned needs_approval run to reap as failed NODE_LEASE_EXPIRED, got status=%s code=%s", reaped.Status, reaped.ErrorCode)
+		}
+	})
+
+	t.Run("Gotcha03_ClientPrincipalScopeOwnershipAndPatchGuards", func(t *testing.T) {
+		nodes, err := client.ListNodes(context.Background(), true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mbpOnline := false
+		for _, n := range nodes {
+			if n.ID == "mbp" && n.Status == "online" {
+				mbpOnline = true
+				break
+			}
+		}
+		if !mbpOnline {
+			mbpCmd := h.startDaemon("mbp", mbpTok, "", wsRootMbp, 1)
+			defer h.stopDaemon(mbpCmd, syscall.SIGKILL)
+		}
+
+		doHTTPJSON := func(method, reqPath, tok string, payload interface{}) (int, []byte) {
+			t.Helper()
+			var bodyReader io.Reader
+			if payload != nil {
+				raw, _ := json.Marshal(payload)
+				bodyReader = bytes.NewReader(raw)
+			}
+			req, err := http.NewRequest(method, h.hubURL+reqPath, bodyReader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Authorization", "Bearer "+tok)
+			if payload != nil {
+				req.Header.Set("Content-Type", "application/json")
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			raw, _ := io.ReadAll(resp.Body)
+			return resp.StatusCode, raw
+		}
+
+		// bound_node_id = macmini intersects allowed_nodes = [macmini, mbp] -> denies mbp
+		clientBoundMac := h.createKey("client-bound-mac", "client", "macmini", []string{"macmini", "mbp"}, 1)
+		clientOther := h.createKey("client-other", "client", "", []string{"macmini"}, 1)
+
+		st, raw := doHTTPJSON(http.MethodPost, "/api/v1/runs?wait_ms=0", clientBoundMac, map[string]interface{}{
+			"node_id": "mbp",
+			"workdir": mbpDir,
+			"agent":   "agy",
+			"prompt":  "should be blocked by bound_node_id",
+		})
+		if st != http.StatusForbidden || !strings.Contains(string(raw), "FORBIDDEN_SCOPE") {
+			t.Fatalf("expected 403 FORBIDDEN_SCOPE creating run on mbp with macmini-bound client key, got %d: %s", st, string(raw))
+		}
+
+		// /ws/stream & CLI wait must enforce bound_node_id and propagate ExitPolicyDenied (78), not ExitWaitTimeout (24)
+		mbpRun := h.mustRunCLIJSON(`{"directives":[{"op":"sleep","ms":150}]}`,
+			"run", "--node", "mbp", "--dir", mbpDir, "--agent", "agy", "--wait", "0s", "-")
+		waitCmd := exec.Command(h.ahubBin, "--url", h.hubURL, "--token", clientBoundMac, "--json", "wait", mbpRun.ID, "--timeout", "3s")
+		waitOut, waitErr := waitCmd.CombinedOutput()
+		waitCode := 0
+		if waitErr != nil {
+			var ee *exec.ExitError
+			if errors.As(waitErr, &ee) {
+				waitCode = ee.ExitCode()
+			} else {
+				waitCode = 1
+			}
+		}
+		if waitCode != api.ExitPolicyDenied || !strings.Contains(string(waitOut), "FORBIDDEN_SCOPE") {
+			t.Fatalf("expected wait to fail with ExitPolicyDenied (%d) FORBIDDEN_SCOPE, got %d: %s", api.ExitPolicyDenied, waitCode, string(waitOut))
+		}
+		h.mustRunCLIJSON("", "wait", mbpRun.ID, "--timeout", "10s")
+
+		// clientOther creates a thread on macmini; clientBoundMac must get 403 on PATCH /threads/:id & POST /threads/:id/fork
+		st, raw = doHTTPJSON(http.MethodPost, "/api/v1/runs?wait_ms=0", clientOther, map[string]interface{}{
+			"node_id": "macmini",
+			"workdir": alphaDir,
+			"agent":   "agy",
+			"prompt":  `{"directives":[{"op":"sleep","ms":20}]}`,
+		})
+		if st != http.StatusCreated && st != http.StatusOK && st != http.StatusAccepted {
+			t.Fatalf("clientOther createRun failed %d: %s", st, string(raw))
+		}
+		var createdEnv struct {
+			Run api.RunRecord `json:"run"`
+		}
+		_ = json.Unmarshal(raw, &createdEnv)
+		h.mustRunCLIJSON("", "wait", createdEnv.Run.ID, "--timeout", "10s")
+
+		st, raw = doHTTPJSON(http.MethodPatch, "/api/v1/threads/"+createdEnv.Run.ThreadID, clientBoundMac, map[string]interface{}{
+			"title": "hijacked title",
+		})
+		if st != http.StatusForbidden || !strings.Contains(string(raw), "FORBIDDEN_SCOPE") {
+			t.Fatalf("expected 403 FORBIDDEN_SCOPE on cross-client PATCH thread, got %d: %s", st, string(raw))
+		}
+
+		st, raw = doHTTPJSON(http.MethodPost, "/api/v1/threads/"+createdEnv.Run.ThreadID+"/fork", clientBoundMac, map[string]interface{}{
+			"node_id": "macmini",
+			"workdir": alphaDir,
+		})
+		if st != http.StatusForbidden || !strings.Contains(string(raw), "FORBIDDEN_SCOPE") {
+			t.Fatalf("expected 403 FORBIDDEN_SCOPE on cross-client fork thread, got %d: %s", st, string(raw))
+		}
+
+		// PATCH /api/v1/runs/:id: register patch-node workspaces then terminate its daemon cleanly so runs stay in queued reliably
+		patchRoot := filepath.Join(h.tmpDir, "workspaces", "patch-root")
+		patchDirA := h.makeWorkspaceDir(filepath.Join("patch-root", "proj-a"))
+		patchDirB := h.makeWorkspaceDir(filepath.Join("patch-root", "proj-b"))
+		patchTok := h.createKey("patch-node", "node", "patch-node", []string{"patch-node"}, 0)
+		patchCmd := h.startDaemon("patch-node", patchTok, "", patchRoot, 1)
+		h.stopDaemon(patchCmd, syscall.SIGTERM)
+
+		st, raw = doHTTPJSON(http.MethodPost, "/api/v1/runs?wait_ms=0", h.adminToken, map[string]interface{}{
+			"node_id": "patch-node",
+			"workdir": patchDirA,
+			"agent":   "agy",
+			"prompt":  "single queued reassign",
+		})
+		if st != http.StatusCreated && st != http.StatusAccepted {
+			t.Fatalf("create queued singleRun failed %d: %s", st, string(raw))
+		}
+		var singleEnv struct {
+			Run api.RunRecord `json:"run"`
+		}
+		_ = json.Unmarshal(raw, &singleEnv)
+
+		// Single-run fresh thread allows PATCH node_id/workdir and syncs thread metadata
+		st, raw = doHTTPJSON(http.MethodPatch, "/api/v1/runs/"+singleEnv.Run.ID, h.adminToken, map[string]interface{}{
+			"node_id": "patch-node",
+			"workdir": patchDirB,
+		})
+		if st != http.StatusOK {
+			t.Fatalf("expected single-run queued PATCH workdir to succeed, got %d: %s", st, string(raw))
+		}
+		threads, err := client.ListThreads(context.Background(), "patch-node", "", 50)
+		if err != nil {
+			t.Fatal(err)
+		}
+		synced := false
+		for _, th := range threads {
+			if th.ID == singleEnv.Run.ThreadID && th.Workdir == patchDirB && th.ProjectKey == "proj-b" {
+				synced = true
+				break
+			}
+		}
+		if !synced {
+			t.Fatalf("expected thread %s synced to workdir=%s project_key=proj-b", singleEnv.Run.ThreadID, patchDirB)
+		}
+
+		// Adding a second run to the same thread forbids node/workdir reassignment (409 INVALID_STATE_TRANSITION)
+		st, raw = doHTTPJSON(http.MethodPost, "/api/v1/runs?wait_ms=0", h.adminToken, map[string]interface{}{
+			"thread_id": singleEnv.Run.ThreadID,
+			"prompt":    "second run in same thread",
+		})
+		if st != http.StatusCreated && st != http.StatusAccepted {
+			t.Fatalf("create second queued run failed %d: %s", st, string(raw))
+		}
+		var secondEnv struct {
+			Run api.RunRecord `json:"run"`
+		}
+		_ = json.Unmarshal(raw, &secondEnv)
+		st, raw = doHTTPJSON(http.MethodPatch, "/api/v1/runs/"+secondEnv.Run.ID, h.adminToken, map[string]interface{}{
+			"workdir": patchDirA,
+		})
+		if st != http.StatusConflict || !strings.Contains(string(raw), "INVALID_STATE_TRANSITION") {
+			t.Fatalf("expected 409 INVALID_STATE_TRANSITION reassigning multi-run thread, got %d: %s", st, string(raw))
+		}
+
+		// Delegation cycle check on PATCH /api/v1/runs/:id (I-3)
+		st, raw = doHTTPJSON(http.MethodPost, "/api/v1/runs?wait_ms=0", h.adminToken, map[string]interface{}{
+			"node_id": "patch-node",
+			"workdir": patchDirA,
+			"agent":   "agy",
+			"prompt":  "parent for patch cycle check",
+		})
+		if st != http.StatusCreated && st != http.StatusAccepted {
+			t.Fatalf("create parentRun failed %d: %s", st, string(raw))
+		}
+		var parentEnv struct {
+			Run api.RunRecord `json:"run"`
+		}
+		_ = json.Unmarshal(raw, &parentEnv)
+		st, raw = doHTTPJSON(http.MethodPost, "/api/v1/runs?wait_ms=0", h.adminToken, map[string]interface{}{
+			"node_id":       "patch-node",
+			"workdir":       patchDirB,
+			"agent":         "agy",
+			"parent_run_id": parentEnv.Run.ID,
+			"prompt":        "child queued on patchDirB",
+		})
+		if st != http.StatusCreated && st != http.StatusAccepted {
+			t.Fatalf("create childRun failed %d: %s", st, string(raw))
+		}
+		var childEnv struct {
+			Run api.RunRecord `json:"run"`
+		}
+		_ = json.Unmarshal(raw, &childEnv)
+
+		st, raw = doHTTPJSON(http.MethodPatch, "/api/v1/runs/"+childEnv.Run.ID, h.adminToken, map[string]interface{}{
+			"node_id": "patch-node",
+			"workdir": patchDirA,
+		})
+		if st != http.StatusConflict || !strings.Contains(string(raw), "DELEGATION_CYCLE_DETECTED") {
+			t.Fatalf("expected 409 DELEGATION_CYCLE_DETECTED reassigning child into ancestor workdir, got %d: %s", st, string(raw))
+		}
+
+		_, _ = client.CancelRun(context.Background(), secondEnv.Run.ID, false, "cleanup")
+		_, _ = client.CancelRun(context.Background(), singleEnv.Run.ID, false, "cleanup")
+		_, _ = client.CancelRun(context.Background(), childEnv.Run.ID, false, "cleanup")
+		_, _ = client.CancelRun(context.Background(), parentEnv.Run.ID, false, "cleanup")
 	})
 }

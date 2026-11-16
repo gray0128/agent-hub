@@ -494,6 +494,7 @@ func (d *Daemon) trySpawnRun(parentCtx context.Context, run api.RunRecord) {
 }
 
 func (d *Daemon) executeClaimedRun(runCtx, parentCtx context.Context, run api.RunRecord) {
+	runStartedAt := time.Now()
 	leaseOwner := run.LeaseOwner
 	if leaseOwner == "" {
 		d.mu.Lock()
@@ -521,7 +522,12 @@ func (d *Daemon) executeClaimedRun(runCtx, parentCtx context.Context, run api.Ru
 				reqCtx, cancelReq := context.WithTimeout(parentCtx, 8*time.Second)
 				resp, err := d.client.HeartbeatRun(reqCtx, run.ID, leaseOwner)
 				cancelReq()
-				if err == nil && resp.ShouldAbort {
+				if err == nil && (resp.ShouldAbort || resp.Status == "done" || resp.Status == "cancelled" || resp.Status == "failed") {
+					d.abortRun(run.ID)
+					return
+				}
+				var apiErr *api.APIError
+				if errors.As(err, &apiErr) && (apiErr.HTTPStatus == 404 || apiErr.HTTPStatus == 409) {
 					d.abortRun(run.ID)
 					return
 				}
@@ -550,11 +556,91 @@ func (d *Daemon) executeClaimedRun(runCtx, parentCtx context.Context, run api.Ru
 	d.batcher.FlushRun(run.ID)
 
 	if res.Status == "needs_approval" {
-		d.sendRunState(run.ID, leaseOwner, "needs_approval", res.RemoteControlURL, res.ResolvedModel, res.ResolvedEffort)
-		return
+		if !d.checkpointNeedsApproval(runCtx, run.ID, leaseOwner, res) {
+			return
+		}
+		totalBudget := time.Duration(run.TimeoutSec) * time.Second
+		if totalBudget <= 0 {
+			totalBudget = 3600 * time.Second
+		}
+		remaining := totalBudget - time.Since(runStartedAt)
+		if remaining <= 0 {
+			d.finishRun(parentCtx, run.ID, leaseOwner, buildApprovalTimeoutResult(res, time.Since(runStartedAt), run.TimeoutSec))
+			return
+		}
+		timer := time.NewTimer(remaining)
+		defer timer.Stop()
+		select {
+		case <-runCtx.Done():
+			// Hub already transitioned the run (resolve/cancel) or daemon is shutting down; keep checkpointed/settled state intact.
+			return
+		case <-timer.C:
+			d.finishRun(parentCtx, run.ID, leaseOwner, buildApprovalTimeoutResult(res, time.Since(runStartedAt), run.TimeoutSec))
+			return
+		}
 	}
 
 	d.finishRun(parentCtx, run.ID, leaseOwner, res)
+}
+
+func (d *Daemon) checkpointNeedsApproval(runCtx context.Context, runID, leaseOwner string, res runner.Result) bool {
+	for attempt := 0; attempt < 5; attempt++ {
+		if runCtx.Err() != nil {
+			return false
+		}
+		reqCtx, cancel := context.WithTimeout(runCtx, 8*time.Second)
+		_, err := d.client.CheckpointApproval(reqCtx, runID, api.ApprovalCheckpointRequest{
+			LeaseOwner:       leaseOwner,
+			RemoteControlURL: res.RemoteControlURL,
+			NativeSessionID:  res.NativeSessionID,
+			ResolvedModel:    res.ResolvedModel,
+			ResolvedEffort:   res.ResolvedEffort,
+			Summary:          res.Summary,
+			OutputMD:         res.OutputMD,
+			OutputBytes:      res.OutputBytes,
+			DurationMs:       res.DurationMs,
+		})
+		cancel()
+		if err == nil {
+			return true
+		}
+		var apiErr *api.APIError
+		if errors.As(err, &apiErr) && (apiErr.HTTPStatus == 400 || apiErr.HTTPStatus == 404 || apiErr.HTTPStatus == 409) {
+			fmt.Fprintf(os.Stderr, "[ahub node] checkpoint approval %s stopped (%d): %v\n", runID, apiErr.HTTPStatus, err)
+			return false
+		}
+		fmt.Fprintf(os.Stderr, "[ahub node] checkpoint approval %s retry %d/5: %v\n", runID, attempt+1, err)
+		backoff := time.Duration(attempt+1) * 500 * time.Millisecond
+		select {
+		case <-runCtx.Done():
+			return false
+		case <-time.After(backoff):
+		}
+	}
+	return false
+}
+
+func buildApprovalTimeoutResult(res runner.Result, totalElapsed time.Duration, timeoutSec int) runner.Result {
+	durMs := totalElapsed.Milliseconds()
+	if durMs < res.DurationMs {
+		durMs = res.DurationMs
+	}
+	if timeoutSec <= 0 {
+		timeoutSec = 3600
+	}
+	return runner.Result{
+		Status:           "failed",
+		NativeSessionID:  res.NativeSessionID,
+		ResolvedModel:    res.ResolvedModel,
+		ResolvedEffort:   res.ResolvedEffort,
+		RemoteControlURL: res.RemoteControlURL,
+		Summary:          res.Summary,
+		OutputMD:         res.OutputMD,
+		OutputBytes:      res.OutputBytes,
+		DurationMs:       durMs,
+		ErrorCode:        "APPROVAL_TIMEOUT",
+		ErrorMessage:     fmt.Sprintf("Human approval exceeded timeout (%ds)", timeoutSec),
+	}
 }
 
 func (d *Daemon) finishRun(parentCtx context.Context, runID, leaseOwner string, res runner.Result) {

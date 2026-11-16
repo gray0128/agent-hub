@@ -522,6 +522,16 @@ export function App() {
     }
   }
 
+  async function handleResolveRun(runId: string) {
+    if (!hasSession) return;
+    try {
+      const res = await apiClient.resolveRun(token, runId, "Resolved from web console");
+      upsertRun(res.run);
+    } catch (err) {
+      setErrorBanner(err instanceof ApiClientError ? err.message : "放行确认失败");
+    }
+  }
+
   async function handleToggleNodeDrain(node: NodeRecord) {
     if (!hasSession) return;
     try {
@@ -740,6 +750,7 @@ export function App() {
       onSelectRun={selectRun}
       onLoadFullOutput={handleLoadFullOutput}
       onCancelRun={handleCancelRun}
+      onResolveRun={handleResolveRun}
       onForkThread={handleForkThread}
       onOpenLineage={() => {
         setActiveTab("lineage");

@@ -493,7 +493,7 @@ try {
     path.join(tmpDir, "workspaces"),
     1,
     {
-      agy: { enabled: true, command: fakeAgentBin, default_model: "carbon" },
+      agy: { enabled: true, command: fakeAgentBin },
       codex: { enabled: true, command: fakeAgentBin }
     },
     { CODEX_HOME: tmpCodexHome }
@@ -798,6 +798,22 @@ try {
   }
   await cdpClient.clickSelector('[data-testid="composer-agent-option-agy"]');
   await sleep(150);
+  const agyDefaultState = await cdpClient.evalJS(`({
+    model: window.__AHUB_EVAL__.getState().composer.model,
+    effort: window.__AHUB_EVAL__.getState().composer.effort,
+    modelText: document.querySelector('#composer-model')?.textContent?.trim() ?? "",
+    effortText: document.querySelector('#composer-effort')?.textContent?.trim() ?? ""
+  })`);
+  if (
+    agyDefaultState.model !== "" ||
+    agyDefaultState.effort !== "" ||
+    agyDefaultState.modelText !== "跟随默认 (gemini-4-hydrogen)" ||
+    agyDefaultState.effortText !== "跟随默认 (high)"
+  ) {
+    throw new Error(
+      `Expected follow-default agy state (gemini-4-hydrogen / high), got ${JSON.stringify(agyDefaultState)}`
+    );
+  }
 
   await cdpClient.clickSelector("#composer-model");
   await sleep(150);
@@ -842,6 +858,20 @@ try {
   await sleep(150);
   await cdpClient.clickSelector('[data-testid="composer-node-option-macmini"]');
   await sleep(200);
+  const switchedAgyState = await cdpClient.evalJS(`({
+    agent: window.__AHUB_EVAL__.getState().composer.agent,
+    model: window.__AHUB_EVAL__.getState().composer.model,
+    effort: window.__AHUB_EVAL__.getState().composer.effort
+  })`);
+  if (
+    switchedAgyState.agent !== "agy" ||
+    switchedAgyState.model !== "gemini-4-hydrogen" ||
+    switchedAgyState.effort !== "high"
+  ) {
+    throw new Error(
+      `Expected macmini switch to select agy gemini-4-hydrogen high, got ${JSON.stringify(switchedAgyState)}`
+    );
+  }
   await cdpClient.clickSelector("#composer-agent");
   await sleep(150);
   await cdpClient.clickSelector('[data-testid="composer-agent-option-codex"]');

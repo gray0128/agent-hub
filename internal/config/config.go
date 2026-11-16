@@ -9,7 +9,10 @@ import (
 	"strings"
 )
 
-const DefaultHubURL = "https://ahub.bobocai.win"
+const (
+	DefaultHubURL   = "https://ahub.bobocai.win"
+	DefaultAgyModel = "gemini-4-hydrogen-high"
+)
 
 type Credentials struct {
 	URL   string `json:"url"`
@@ -281,7 +284,7 @@ func DetectAgents(existing map[string]AgentConfig, lookPath func(string) (string
 		prev.Command = cmd
 		prev.Enabled = prev.Enabled || found
 		if name == "agy" && strings.TrimSpace(prev.DefaultModel) == "" {
-			prev.DefaultModel = "gemini-3.8-flash-high"
+			prev.DefaultModel = DefaultAgyModel
 		}
 		out[name] = prev
 	}

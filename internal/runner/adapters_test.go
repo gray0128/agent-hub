@@ -156,6 +156,31 @@ func TestBuildCommandSpecAdapters(t *testing.T) {
 	if strings.Contains(orchJoined, "--effort") || strings.Contains(orchJoined, "-high") {
 		t.Fatalf("expected orchestrator to omit suffix and --effort flag, got %q", orchJoined)
 	}
+
+	_, defaultAgyArgs, _, err := BuildCommandSpec(api.RunRecord{
+		Agent:  "agy",
+		Prompt: "default model task",
+	}, config.AgentConfig{Command: "agy"})
+	if err != nil {
+		t.Fatalf("agy default model err: %v", err)
+	}
+	defaultAgyJoined := strings.Join(defaultAgyArgs, " ")
+	if !strings.Contains(defaultAgyJoined, "--model gemini-4-hydrogen-high") {
+		t.Fatalf("expected default agy model gemini-4-hydrogen-high, got %q", defaultAgyJoined)
+	}
+
+	_, xhighAgyArgs, _, err := BuildCommandSpec(api.RunRecord{
+		Agent:  "agy",
+		Effort: "xhigh",
+		Prompt: "xhigh model task",
+	}, config.AgentConfig{Command: "agy"})
+	if err != nil {
+		t.Fatalf("agy xhigh default model err: %v", err)
+	}
+	xhighAgyJoined := strings.Join(xhighAgyArgs, " ")
+	if !strings.Contains(xhighAgyJoined, "--model gemini-4-hydrogen-xhigh --effort xhigh") {
+		t.Fatalf("expected agy xhigh default expansion, got %q", xhighAgyJoined)
+	}
 }
 
 func writeFakeAgyScript(t *testing.T, dir string, sentinelPath string, modePath string) string {
@@ -738,5 +763,88 @@ func TestExecuteRunCodexJSONStream(t *testing.T) {
 	}
 	if events[1].kind != "tool_use" || events[1].payload["tool"] != "bash" || events[1].payload["command"] != "go test ./..." {
 		t.Fatalf("unexpected codex tool_use event: %+v", events[1])
+	}
+}
+
+func TestBuildCommandSpecClaudeEffort(t *testing.T) {
+	cases := []struct {
+		name         string
+		effort       string
+		cfgArgs      []string
+		wantContains []string
+		wantAbsent   []string
+	}{
+		{
+			name:         "passes explicit high effort",
+			effort:       "high",
+			wantContains: []string{"--effort", "high"},
+		},
+		{
+			name:         "passes max effort",
+			effort:       "max",
+			wantContains: []string{"--effort", "max"},
+		},
+		{
+			name:       "omits auto effort",
+			effort:     "auto",
+			wantAbsent: []string{"--effort"},
+		},
+		{
+			name:       "omits off effort",
+			effort:     "off",
+			wantAbsent: []string{"--effort"},
+		},
+		{
+			name:       "omits empty effort",
+			effort:     "",
+			wantAbsent: []string{"--effort"},
+		},
+		{
+			name:         "respects explicit --effort override in config args",
+			effort:       "high",
+			cfgArgs:      []string{"--effort", "low"},
+			wantContains: []string{"--effort", "low"},
+			wantAbsent:   []string{"high"},
+		},
+		{
+			name:         "respects --effort= override in config args",
+			effort:       "high",
+			cfgArgs:      []string{"--effort=medium"},
+			wantContains: []string{"--effort=medium"},
+			wantAbsent:   []string{"high"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			run := api.RunRecord{
+				ID:      "run_claude_effort",
+				Agent:   "claude",
+				Model:   "sonnet",
+				Effort:  tc.effort,
+				Sandbox: true,
+				Prompt:  "hello",
+			}
+			agentCfg := config.AgentConfig{
+				Enabled: true,
+				Command: "claude",
+				Args:    tc.cfgArgs,
+			}
+			spec, args, _, err := BuildCommandSpec(run, agentCfg)
+			if err != nil {
+				t.Fatalf("BuildCommandSpec failed: %v (bin=%s)", err, spec)
+			}
+			joined := " " + strings.Join(args, " ") + " "
+			for _, want := range tc.wantContains {
+				if !strings.Contains(joined, " "+want+" ") {
+					t.Fatalf("expected %q in args %v", want, args)
+				}
+			}
+			for _, absent := range tc.wantAbsent {
+				if strings.Contains(joined, " "+absent+" ") {
+					t.Fatalf("did not expect %q in args %v", absent, args)
+				}
+			}
+		})
 	}
 }

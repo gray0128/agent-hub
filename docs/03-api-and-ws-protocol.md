@@ -9,7 +9,7 @@
 | 入口范围 | 认证头 / 凭证 | 说明 |
 | --- | --- | --- |
 | Web 浏览器控制台与管理接口 | `Cf-Access-Jwt-Assertion` 请求头、同源 `Cookie: CF_Authorization` 或 `Authorization: Bearer ahub_adm_<secret>` | 生产环境由 Cloudflare Access 拦截验证并注入 JWT；单域名部署下 `/api/*` 与 `/ws/*` 对机器路径配置 `Bypass` 后，浏览器同源携 `CF_Authorization` Cookie 发起请求，Worker 强制校验同源 `Origin` / `Sec-Fetch-Site` 并对 JWT 执行 RS256 JWKS、`exp` 与 `CF_ACCESS_AUD` 验签；本地联调可开启 `admin` Token 回退 |
-| 调用端 CLI（`client` / `admin`） | `Authorization: Bearer ahub_cli_<secret>` | 受限于 `api_keys` 绑定的节点白名单、`allow_unsandboxed` 与 `max_depth_limit` |
+| 调用端 CLI（`client` / `admin`） | `Authorization: Bearer ahub_cli_<secret>` | `client` Key 同时受 `bound_node_id` 与 `allowed_nodes_json` 交集节点范围（覆盖全量 REST 接口与 `/ws/stream` 帧过滤）、创建者归属（`created_by_key_id`）、`allow_unsandboxed` 与 `max_depth_limit` 约束 |
 | 节点守护端（`node`） | `Authorization: Bearer ahub_nod_<secret>` | 仅可操作 `bound_node_id` 对应的连接、认领与上报接口 |
 
 ### 1.2 幂等与血统透传请求头
@@ -43,19 +43,20 @@
 
 | 方法与路径 | 允许 Scope | 功能说明 | 关键请求/响应约定 |
 | --- | --- | --- | --- |
-| `GET /api/v1/nodes` | `admin`, `client` | 列出所有已注册节点及其在线态、可用 Agent、模型简称和已上报工作区 | 响应 `nodes[]`（按 `client` Key 的 `allowed_nodes_json` 自动过滤可见范围） |
+| `GET /api/v1/nodes` | `admin`, `client` | 列出所有已注册节点及其在线态、可用 Agent、模型简称和已上报工作区 | 响应 `nodes[]`（按 `client` Key 的 `bound_node_id` 与 `allowed_nodes_json` 自动过滤可见范围） |
 | `PATCH /api/v1/nodes/:id` | `admin` | 修改节点显示名、`status`（如设为 `draining` 停止派发新任务）或 `max_concurrency` | 请求体 `{display_name?, status?, max_concurrency?}` |
 | `POST /api/v1/nodes/:id/claim` | `node` | 节点认领待执行任务（WS `hub.wake` 后及重连握手后必调） | 请求 `{conn_nonce, busy_workdirs?}`；返回 `claimed_runs[]`（已加租约锁定的完整任务列表） |
 | `POST /api/v1/runs/:id/heartbeat` | `node` | 为运行中的任务续期 `90s` 租约，并检查是否已被取消 | 请求 `{lease_owner}`；返回 `{ok: true, status, should_abort: boolean, lease_expires_at}` |
+| `POST /api/v1/runs/:id/approval` | `node` | 上报 `needs_approval` 持久检查点（尤其用于子进程退出型的远控审批） | 请求 `{lease_owner, remote_control_url?, native_session_id?, resolved_model?, resolved_effort?, summary?, output_md?, output_bytes?, duration_ms?}`；原子持久化字段、回填 `threads.native_session_id` 并续期租约 |
 | `POST /api/v1/runs/:id/complete` | `node` | 上报任务终态（`done` / `failed` / `cancelled`）与完整输出 | 请求 `{lease_owner, status, native_session_id?, resolved_model?, resolved_effort?, summary, output_md, output_bytes, duration_ms, error_code?, error_message?}` |
 
 ### 2.2 会话线程（Threads）
 
 | 方法与路径 | 允许 Scope | 功能说明 | 关键请求/响应约定 |
 | --- | --- | --- | --- |
-| `GET /api/v1/threads` | `admin`, `client` | 分页查询会话列表，支持 `?node_id=&status=active|archived&q=&limit=50&cursor=` | 按 `pinned DESC, sort_order ASC, updated_at DESC` 排序 |
-| `PATCH /api/v1/threads/:id` | `admin`, `client` | 更新会话标题、归档状态或置顶顺序 | 请求 `{title?, status?, pinned?, sort_order?}` |
-| `POST /api/v1/threads/:id/fork` | `admin`, `client` | 将已有会话分叉到新节点或新工作区，建立独立 `Thread` | 请求 `{node_id, workdir, agent?, title?}`；携带原会话最新一轮摘要作为首条上下文提示 |
+| `GET /api/v1/threads` | `admin`, `client` | 分页查询会话列表，支持 `?node_id=&status=active|archived&q=&limit=50&cursor=` | 按 `pinned DESC, sort_order ASC, updated_at DESC` 排序（`client` Key 仅见本人创建且在允许节点内的线程） |
+| `PATCH /api/v1/threads/:id` | `admin`, `client` | 更新会话标题、归档状态或置顶顺序 | 请求 `{title?, status?, pinned?, sort_order?}`（`client` Key 强制校验节点权限与线程归属） |
+| `POST /api/v1/threads/:id/fork` | `admin`, `client` | 将已有会话分叉到新节点或新工作区，建立独立 `Thread` | 请求 `{node_id, workdir, agent?, title?}`；校验源/目标节点权限与线程归属，携带原会话最新一轮摘要作为首条上下文提示 |
 
 ### 2.3 任务执行与编排（Runs）
 
@@ -65,8 +66,9 @@
 | `GET /api/v1/runs` | `admin`, `client` | 按条件筛选任务列表，支持 `?node_id=&thread_id=&status=&root_run_id=&limit=50` | 返回 `runs[]` 摘要列表（不含大体积 `output_md`） |
 | `GET /api/v1/runs/:id` | `admin`, `client` | 查询单条任务详情与输出，支持 `?view=summary|full&tail_bytes=16384` | `view=summary` 时按 `tail_bytes` 截断返回 `output_preview` 与 `truncated: true` |
 | `GET /api/v1/runs/:id/events` | `admin`, `client` | 增量拉取过程事件，支持 `?after_seq=0&limit=200` | 返回 `events[]` 与 `next_seq` |
-| `PATCH /api/v1/runs/:id` | `admin`, `client` | 仅限任务仍处于 `queued` 时调整目标 `node_id`、`workdir`、`model`、`effort` 或 `priority_order` | 若任务已被认领离开 `queued`，返回 `409 INVALID_STATE_TRANSITION` |
-| `POST /api/v1/runs/reorder` | `admin`, `client` | 批量重排同节点待执行队列的 `priority_order`（供前端 `@dnd-kit` 拖拽排序） | 请求 `{node_id, ordered_run_ids: string[]}` |
+| `PATCH /api/v1/runs/:id` | `admin`, `client` | 仅限任务仍处于 `queued` 时调整目标 `node_id`、`workdir`、`model`、`effort` 或 `priority_order` | 若任务已被认领离开 `queued` 返回 `409 INVALID_STATE_TRANSITION`；改派 `node_id`/`workdir` 仅限尚未建连的单轮新会话（已建连或多轮会话须走 `/fork`，否则返回 `409 INVALID_STATE_TRANSITION`），并同步校验委派环路（`409 DELEGATION_CYCLE_DETECTED`）与同步更新 `threads(node_id, workdir, project_key)` |
+| `POST /api/v1/runs/reorder` | `admin`, `client` | 批量重排同节点待执行队列的 `priority_order`（供前端 `@dnd-kit` 拖拽排序） | 请求 `{node_id, ordered_run_ids: string[]}`（`client` Key 校检节点权限与队列条目归属） |
+| `POST /api/v1/runs/:id/resolve` | `admin`, `client` | 人工在远控完成审批后手动放行结算处于 `needs_approval` 的任务 | 可选请求 `{summary?}`；CAS 置 `status='done'`、释放租约、向 `NodeHub` 发 `hub.abort(approval_resolved)` 解锁本地 `workdir` 并广播 `run.updated` |
 | `POST /api/v1/runs/:id/cancel` | `admin`, `client` | 取消单个任务或整棵衍生任务树 | 请求 `{cascade?: boolean, reason?: string}`；`queued` 直接变 `cancelled`，运行中任务立即经 DO 下发 `hub.abort` |
 
 ### 2.4 凭证管理与自举分发
@@ -187,6 +189,8 @@ Queue Consumer 从 D1 按 `runs.created_by_key_id` 关联查询签发该任务�
 | `DEPTH_LIMIT_EXCEEDED` | `409` | 跨机衍生调用深度超过 `max_depth` | 停止继续委派，在当前上下文汇总结果返回上级 |
 | `DELEGATION_CYCLE_DETECTED` | `409` | 同一 `root_run_id` 祖先链试图回环调用已持锁的 `(node_id, workdir)` | 禁止循环派单，直接由当前节点处理或返回 |
 | `IDEMPOTENCY_CONFLICT` | `409` | 重复的 `Idempotency-Key` 携带了不一致的参数 | 更换新的幂等键或复用原请求参数 |
-| `INVALID_STATE_TRANSITION` | `409` | 操作与当前 `status` 冲突（如试图修改已认领任务或覆盖终态） | 重新查询 `GET /api/v1/runs/:id` 对齐状态 |
+| `INVALID_STATE_TRANSITION` | `409` | 操作与当前 `status` 冲突（如试图修改已认领任务、改派多轮已建连会话或覆盖终态） | 重新查询 `GET /api/v1/runs/:id` 对齐状态；多轮会话改派请改用 `/fork` |
+| `LEASE_CONFLICT` | `409` | 节点心跳、审批检查点或完成上报携带的 `lease_owner` 与云端当前租约不匹配 | 立即停止本地目录占用等待下次认领 |
+| `APPROVAL_TIMEOUT` | `—`（任务 `error_code`） | 处于 `needs_approval` 状态的任务超过单轮 `timeout_sec` 上限仍未获批放行 | 检查远控或工作区变更后视需要重派新任务 |
 | `NODE_LEASE_EXPIRED` | `410` | 节点心跳租约超时未续期，任务已被回收标为失败 | 检查节点在线状态与本地工作区后决定是否重发 |
 | `INTERNAL_ERROR` | `500` | 服务端配置缺失（如未注入 `WEBHOOK_ENCRYPTION_KEY`）或加解密异常 | 检查 Worker Secret 与服务端日志并修复配置后重试 |

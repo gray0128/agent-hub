@@ -140,6 +140,22 @@ type CompleteRunRequest struct {
 	ErrorMessage     string `json:"error_message,omitempty"`
 }
 
+type ApprovalCheckpointRequest struct {
+	LeaseOwner       string `json:"lease_owner"`
+	RemoteControlURL string `json:"remote_control_url,omitempty"`
+	NativeSessionID  string `json:"native_session_id,omitempty"`
+	ResolvedModel    string `json:"resolved_model,omitempty"`
+	ResolvedEffort   string `json:"resolved_effort,omitempty"`
+	Summary          string `json:"summary,omitempty"`
+	OutputMD         string `json:"output_md,omitempty"`
+	OutputBytes      int    `json:"output_bytes,omitempty"`
+	DurationMs       int64  `json:"duration_ms,omitempty"`
+}
+
+type ResolveRunRequest struct {
+	Summary string `json:"summary,omitempty"`
+}
+
 type VersionAsset struct {
 	URL    string `json:"url"`
 	SHA256 string `json:"sha256"`

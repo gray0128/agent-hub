@@ -303,6 +303,73 @@ export function parseHeartbeatRequest(raw: unknown): { leaseOwner: string } {
   return { leaseOwner: asRequiredString(obj, "lease_owner", 4, 256) };
 }
 
+export interface ApprovalCheckpointInput {
+  leaseOwner: string;
+  remoteControlUrl: string;
+  nativeSessionId?: string;
+  resolvedModel: string;
+  resolvedEffort: string;
+  summary: string;
+  outputMd: string;
+  outputBytes: number;
+  durationMs: number;
+}
+
+export function parseApprovalCheckpointRequest(raw: unknown): ApprovalCheckpointInput {
+  const obj = asRecord(raw, "ApprovalCheckpointRequest");
+  rejectUnknownKeys(
+    obj,
+    [
+      "lease_owner",
+      "remote_control_url",
+      "native_session_id",
+      "resolved_model",
+      "resolved_effort",
+      "summary",
+      "output_md",
+      "output_bytes",
+      "duration_ms"
+    ],
+    "ApprovalCheckpointRequest"
+  );
+  const leaseOwner = asRequiredString(obj, "lease_owner", 1, 256);
+  const remoteControlUrl = asOptionalString(obj, "remote_control_url", 2048) ?? "";
+  const nativeSessionId = asOptionalString(obj, "native_session_id", 256);
+  const resolvedModel = asOptionalString(obj, "resolved_model", 256) ?? "";
+  const resolvedEffort = asOptionalString(obj, "resolved_effort", 64) ?? "";
+  const summary = asOptionalString(obj, "summary", 16384) ?? "";
+  const outputMd = asOptionalString(obj, "output_md") ?? "";
+  const outputBytes =
+    asOptionalInt(obj, "output_bytes", 0, 100_000_000) ??
+    new TextEncoder().encode(outputMd).length;
+  const durationMs = asOptionalInt(obj, "duration_ms", 0, 86_400_000) ?? 0;
+  return {
+    leaseOwner,
+    remoteControlUrl,
+    nativeSessionId,
+    resolvedModel,
+    resolvedEffort,
+    summary,
+    outputMd,
+    outputBytes,
+    durationMs
+  };
+}
+
+export interface ResolveRunInput {
+  summary?: string;
+}
+
+export function parseResolveRunRequest(raw: unknown): ResolveRunInput {
+  if (raw === undefined || raw === null) {
+    return {};
+  }
+  const obj = asRecord(raw, "ResolveRunRequest");
+  rejectUnknownKeys(obj, ["summary"], "ResolveRunRequest");
+  const summary = asOptionalString(obj, "summary", 4096);
+  return { summary };
+}
+
 export function parseCompleteRequest(raw: unknown): {
   leaseOwner: string;
   status: "done" | "failed" | "cancelled";

@@ -235,6 +235,22 @@ func main() {
 					"session_id": sessionID,
 				})
 			}
+		case "exit_approval":
+			url := d.URL
+			if url == "" {
+				url = "https://ahub.bobocai.win/rc/fake_exit_approval"
+			}
+			msg := d.Message
+			if msg == "" {
+				msg = "Waiting for manual approval on exited agy process"
+			}
+			writeJSONLine(map[string]interface{}{
+				"status":             "NEEDS_HUMAN_APPROVAL",
+				"conversation_id":    sessionID,
+				"remote_control_url": url,
+				"response":           msg,
+			})
+			os.Exit(0)
 		case "recurse_run":
 			ahubBin := d.AhubBin
 			if ahubBin == "" {

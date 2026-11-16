@@ -2,6 +2,8 @@ import type { ComposerDraft } from "@/stores/workbench-store";
 import type { AgentCapability, AgentName, EffortLevel, ModelCapability, NodeRecord } from "@/types";
 
 export const ALL_AGENTS: AgentName[] = ["agy", "pi", "omp", "codex", "claude"];
+export const DEFAULT_AGY_MODEL = "gemini-4-hydrogen";
+export const DEFAULT_AGY_EFFORT: EffortLevel = "high";
 
 const FALLBACK_EFFORTS_BY_AGENT: Record<AgentName, EffortLevel[]> = {
   agy: ["low", "medium", "high", "xhigh"],
@@ -62,8 +64,10 @@ export function resolveAgentCatalog(
   const cap: AgentCapability | undefined = node?.capabilities?.agents?.[agent];
   const models = Array.isArray(cap?.models) ? cap.models : [];
   const status = cap?.catalog_status ?? (models.length > 0 ? "ready" : "fallback");
-  const defaultModel = cap?.default_model?.trim() ?? "";
-  const defaultEffort = (cap?.default_effort ?? "") as EffortLevel;
+  const rawDefaultModel = cap?.default_model?.trim() ?? "";
+  const rawDefaultEffort = (cap?.default_effort ?? "") as EffortLevel;
+  const defaultModel = rawDefaultModel || (agent === "agy" ? DEFAULT_AGY_MODEL : "");
+  const defaultEffort = rawDefaultEffort || (agent === "agy" ? DEFAULT_AGY_EFFORT : "");
   const allowManual = !node || node.status === "offline" || status !== "ready" || models.length === 0;
 
   return {
@@ -72,6 +76,25 @@ export function resolveAgentCatalog(
     defaultModel,
     defaultEffort,
     allowManual
+  };
+}
+
+export function resolveInitialComposerModelAndEffort(
+  node: NodeRecord | null | undefined,
+  agent: AgentName
+): { model: string; effort: EffortLevel } {
+  const catalog = resolveAgentCatalog(node, agent);
+  if (catalog.models.length === 0) {
+    return { model: "", effort: "" };
+  }
+  const normalizedDefault = normalizeModelLookupId(agent, catalog.defaultModel, catalog.models);
+  const model = catalog.models.some((m) => m.id === normalizedDefault)
+    ? normalizedDefault
+    : (catalog.models[0]?.id ?? "");
+  const effortState = resolveEffortState(node, agent, model);
+  return {
+    model,
+    effort: effortState.supportsEffort ? (effortState.defaultEffort || "") : ""
   };
 }
 
@@ -151,9 +174,9 @@ export function reconcileComposerDraft(
     const availableAgents = getAvailableAgents(node);
     if (!availableAgents.includes(nextAgent)) {
       nextAgent = availableAgents[0] ?? nextAgent;
-      const switchedCatalog = resolveAgentCatalog(node, nextAgent);
-      nextModel = switchedCatalog.defaultModel || switchedCatalog.models[0]?.id || "";
-      nextEffort = switchedCatalog.defaultEffort || "";
+      const initial = resolveInitialComposerModelAndEffort(node, nextAgent);
+      nextModel = initial.model;
+      nextEffort = initial.effort;
     }
   }
 

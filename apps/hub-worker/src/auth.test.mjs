@@ -23,7 +23,12 @@ registerHooks({
   }
 });
 
-const { authenticateRequest } = await import("./auth.ts");
+const {
+  authenticateRequest,
+  ensureNodeAllowedForClient,
+  ensureRunAccessible,
+  isNodeVisibleToPrincipal
+} = await import("./auth.ts");
 const { sha256Hex } = await import("./ulid.ts");
 
 function toBase64Url(bytes) {
@@ -244,4 +249,39 @@ test("authenticateRequest validates Cf-Access-Jwt-Assertion, same-origin CF_Auth
   );
   assert.equal(bearerPrincipal.kind, "bootstrap_admin");
   assert.equal(bearerPrincipal.scope, "admin");
+});
+
+test("isNodeVisibleToPrincipal, ensureNodeAllowedForClient, and ensureRunAccessible enforce boundNodeId intersection for client keys", () => {
+  const clientBoundOnly = {
+    kind: "api_key",
+    keyId: "key_c1",
+    scope: "client",
+    boundNodeId: "macmini",
+    allowedNodes: [],
+    allowUnsandboxed: false,
+    maxDepthLimit: 1
+  };
+  assert.equal(isNodeVisibleToPrincipal(clientBoundOnly, "macmini"), true);
+  assert.equal(isNodeVisibleToPrincipal(clientBoundOnly, "mbp"), false);
+  assert.throws(
+    () => ensureNodeAllowedForClient(clientBoundOnly, "mbp"),
+    (err) => err?.status === 403 && err?.code === "FORBIDDEN_SCOPE"
+  );
+
+  const clientIntersection = {
+    ...clientBoundOnly,
+    boundNodeId: "macmini",
+    allowedNodes: ["macmini", "mbp"]
+  };
+  assert.equal(isNodeVisibleToPrincipal(clientIntersection, "macmini"), true);
+  assert.equal(isNodeVisibleToPrincipal(clientIntersection, "mbp"), false);
+  assert.throws(
+    () => ensureRunAccessible(clientIntersection, { node_id: "mbp", created_by_key_id: "key_c1" }),
+    (err) => err?.status === 403 && err?.code === "FORBIDDEN_SCOPE"
+  );
+  assert.throws(
+    () => ensureRunAccessible(clientIntersection, { node_id: "macmini", created_by_key_id: "key_other" }),
+    (err) => err?.status === 403 && err?.code === "FORBIDDEN_SCOPE"
+  );
+  ensureRunAccessible(clientIntersection, { node_id: "macmini", created_by_key_id: "key_c1" });
 });

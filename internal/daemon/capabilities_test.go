@@ -267,3 +267,20 @@ func TestNonBlockingHandshakeAndBoundedCapabilityRefresh(t *testing.T) {
 		t.Fatalf("expected fallback catalog_status after timed-out CLI probe, got %v", secondAgy["catalog_status"])
 	}
 }
+
+func TestAgyDefaultCapabilitiesFallback(t *testing.T) {
+	defModel, defEffort := resolveConfiguredDefaults("agy", config.AgentConfig{})
+	if defModel != "gemini-4-hydrogen" || defEffort != "high" {
+		t.Fatalf("expected agy defaults (gemini-4-hydrogen, high), got (%q, %q)", defModel, defEffort)
+	}
+
+	explicitModel, explicitEffort := resolveConfiguredDefaults("agy", config.AgentConfig{DefaultModel: "carbon"})
+	if explicitModel != "gemini-4-carbon" || explicitEffort != "high" {
+		t.Fatalf("expected explicit agy defaults (gemini-4-carbon, high), got (%q, %q)", explicitModel, explicitEffort)
+	}
+
+	fallback := fallbackModelsForAgent("agy", "")
+	if len(fallback) == 0 || fallback[0].ID != "gemini-4-hydrogen" {
+		t.Fatalf("expected first fallback agy model gemini-4-hydrogen, got %+v", fallback)
+	}
+}

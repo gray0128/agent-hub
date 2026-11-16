@@ -4,9 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -100,17 +98,5 @@ func readPIDRecord(path string) (PIDRecord, error) {
 }
 
 func looksLikeAhubProcess(pid int) bool {
-	if runtime.GOOS == "windows" {
-		return false
-	}
-	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=").Output()
-	if err != nil {
-		// If ps fails cleanly without output, process may have exited or ps unavailable; be conservative only if ps succeeded.
-		return false
-	}
-	cmd := strings.ToLower(strings.TrimSpace(string(out)))
-	if cmd == "" {
-		return false
-	}
-	return strings.Contains(cmd, "ahub") || strings.Contains(cmd, "ahubdaemon")
+	return processLooksLikeAhub(pid)
 }

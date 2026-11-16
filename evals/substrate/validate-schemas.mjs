@@ -151,14 +151,14 @@ const cases = [
           agy: {
             enabled: true,
             available: true,
-            default_model: "gemini-3.8-flash-high",
+            default_model: "gemini-4-hydrogen",
             default_effort: "high",
             catalog_status: "ready",
             models: [
               {
-                id: "gemini-3.8-flash",
-                label: "Gemini 3.8 Flash",
-                efforts: ["low", "medium", "high"],
+                id: "gemini-4-hydrogen",
+                label: "Gemini 4 Hydrogen",
+                efforts: ["low", "medium", "high", "xhigh"],
                 default_effort: "high"
               },
               {

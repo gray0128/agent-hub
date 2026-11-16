@@ -8,6 +8,7 @@ import {
   ChevronUp,
   ExternalLink,
   FileText,
+  CheckCircle2,
   GitBranch,
   GitFork,
   Lock,
@@ -29,7 +30,8 @@ import {
   getAvailableAgents,
   reconcileComposerDraft,
   resolveAgentCatalog,
-  resolveEffortState
+  resolveEffortState,
+  resolveInitialComposerModelAndEffort
 } from "@/lib/capabilities";
 import {
   buildRunCliPreview,
@@ -66,6 +68,7 @@ export interface ConversationPaneProps {
   onSelectRun: (runId: string) => void;
   onLoadFullOutput: (runId: string) => void;
   onCancelRun: (runId: string, cascade: boolean) => void;
+  onResolveRun?: (runId: string) => void;
   onForkThread: (thread: ThreadRecord) => void;
   onOpenLineage?: () => void;
   onSubmitPrompt: () => void;
@@ -85,6 +88,7 @@ export function ConversationPane({
   onSelectRun,
   onLoadFullOutput,
   onCancelRun,
+  onResolveRun,
   onForkThread,
   onOpenLineage,
   onSubmitPrompt
@@ -257,19 +261,34 @@ export function ConversationPane({
               </div>
             </div>
           </div>
-          {approvalRun.remote_control_url ? (
-            <Button asChild size="sm" variant="outline" className="border-[var(--status-approval)]/50">
-              <a
-                href={approvalRun.remote_control_url}
-                target="_blank"
-                rel="noreferrer"
-                data-testid="open-remote-approval-link"
+          <div className="flex shrink-0 items-center gap-1.5">
+            {approvalRun.remote_control_url ? (
+              <Button asChild size="sm" variant="outline" className="border-[var(--status-approval)]/50">
+                <a
+                  href={approvalRun.remote_control_url}
+                  target="_blank"
+                  rel="noreferrer"
+                  data-testid="open-remote-approval-link"
+                >
+                  <ExternalLink className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
+                  打开远程审批
+                </a>
+              </Button>
+            ) : null}
+            {onResolveRun ? (
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                data-testid="resolve-approval-btn"
+                onClick={() => onResolveRun(approvalRun.id)}
+                className="border-[var(--status-approval)]/50"
               >
-                <ExternalLink className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
-                打开远程审批
-              </a>
-            </Button>
-          ) : null}
+                <CheckCircle2 className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
+                标记已放行
+              </Button>
+            ) : null}
+          </div>
         </div>
       ) : null}
 
@@ -549,12 +568,8 @@ export function ConversationPane({
                     const nextAgent = nextAgents.includes(composer.agent)
                       ? composer.agent
                       : (nextAgents[0] ?? composer.agent);
-                    const nextCatalog = resolveAgentCatalog(n, nextAgent);
-                    const nextModel = nextCatalog.defaultModel || nextCatalog.models[0]?.id || "";
-                    const nextEffState = resolveEffortState(n, nextAgent, nextModel);
-                    const nextEffort = nextEffState.supportsEffort
-                      ? nextEffState.defaultEffort || ""
-                      : "";
+                    const { model: nextModel, effort: nextEffort } =
+                      resolveInitialComposerModelAndEffort(n, nextAgent);
                     setCustomModelMode(false);
                     onPatchComposer({
                       mode: "new",
@@ -609,7 +624,8 @@ export function ConversationPane({
         {/* Mobile compact parameter toggle (< 640px) */}
         <div className="mb-2 flex items-center justify-between gap-2 sm:hidden">
           <span className="truncate font-mono text-[11px] text-muted-foreground">
-            {composer.agent} · {composer.model || "default"} · {composer.effort || "auto"} ·{" "}
+            {composer.agent} · {composer.model || catalog.defaultModel || "default"} ·{" "}
+            {composer.effort || effortState.defaultEffort || "auto"} ·{" "}
             {NOTIFY_LABELS[composer.notifyTarget]}
           </span>
           <button
@@ -639,12 +655,8 @@ export function ConversationPane({
               value={composer.agent}
               onValueChange={(v) => {
                 const nextAgent = v as AgentName;
-                const nextCatalog = resolveAgentCatalog(targetNode, nextAgent);
-                const nextModel = nextCatalog.defaultModel || nextCatalog.models[0]?.id || "";
-                const nextEffState = resolveEffortState(targetNode, nextAgent, nextModel);
-                const nextEffort = nextEffState.supportsEffort
-                  ? nextEffState.defaultEffort || ""
-                  : "";
+                const { model: nextModel, effort: nextEffort } =
+                  resolveInitialComposerModelAndEffort(targetNode, nextAgent);
                 setCustomModelMode(false);
                 onPatchComposer({
                   agent: nextAgent,

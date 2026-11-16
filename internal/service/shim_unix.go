@@ -134,11 +134,3 @@ func RunShim(binPath, cfgPath string) int {
 		backoff = nextBackoff(backoff)
 	}
 }
-
-func nextBackoff(cur time.Duration) time.Duration {
-	cur *= 2
-	if cur > 15*time.Second {
-		return 15 * time.Second
-	}
-	return cur
-}

@@ -159,7 +159,11 @@ func lookupAgentAvailable(name string, cfg config.AgentConfig) bool {
 }
 
 func resolveConfiguredDefaults(agent string, cfg config.AgentConfig) (string, string) {
-	model, effort := runner.SplitModelAndEffort(cfg.DefaultModel, "")
+	rawDefault := cfg.DefaultModel
+	if agent == "agy" && strings.TrimSpace(rawDefault) == "" {
+		rawDefault = config.DefaultAgyModel
+	}
+	model, effort := runner.SplitModelAndEffort(rawDefault, "")
 	if model == "" {
 		return "", effort
 	}
@@ -744,7 +748,7 @@ func fallbackModelsForAgent(agent, defaultModel string) []api.ModelCapability {
 	}
 	switch agent {
 	case "agy":
-		for _, id := range []string{"gemini-4-carbon", "gemini-4-hydrogen", "gemini-3.8-flash", "gemini-pro-orchestrator"} {
+		for _, id := range []string{"gemini-4-hydrogen", "gemini-4-carbon", "gemini-3.8-flash", "gemini-pro-orchestrator"} {
 			if !sliceContains(candidates, id) {
 				candidates = append(candidates, id)
 			}

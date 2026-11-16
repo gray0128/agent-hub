@@ -82,6 +82,8 @@ func Execute(args []string, version string) int {
 		return runThreads(g, subArgs)
 	case "cancel":
 		return runCancel(g, subArgs)
+	case "resolve":
+		return runResolve(g, subArgs)
 	case "skill":
 		return runSkill(g, subArgs)
 	case "update":
@@ -346,7 +348,10 @@ func runRun(g globalOpts, args []string) int {
 	remaining := waitDur - time.Since(started)
 	if waitDur > 0 && remaining > 0 {
 		waitedRun, err := waitViaStream(client, run.ID, remaining)
-		if err == nil && waitedRun != nil {
+		if err != nil {
+			return failErr(g.JSON, err)
+		}
+		if waitedRun != nil {
 			run = waitedRun
 		}
 	}
@@ -387,38 +392,65 @@ func runWait(g globalOpts, args []string) int {
 	return api.ExitWaitTimeout
 }
 
+func fetchRunSummaryBounded(client *api.Client, runID string) (*api.RunRecord, error) {
+	fetchCtx, fetchCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer fetchCancel()
+	return client.GetRun(fetchCtx, runID, false, 16384)
+}
+
+func isFatalWaitAPIError(err error) bool {
+	var apiErr *api.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return apiErr.HTTPStatus == 401 || apiErr.HTTPStatus == 403 || apiErr.HTTPStatus == 404
+}
+
 func waitViaStream(client *api.Client, runID string, timeout time.Duration) (*api.RunRecord, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	var latest *api.RunRecord
+	var lastErr error
 	for {
 		if ctx.Err() != nil {
 			break
 		}
 		conn, err := client.DialWebSocket(ctx, "/ws/stream?run_id="+runID)
 		if err != nil {
+			lastErr = err
 			if ctx.Err() != nil {
 				break
 			}
-			// Fallback check via GET in case run already finished
+			if isFatalWaitAPIError(err) {
+				return nil, err
+			}
+			// Fallback check via GET in case run already finished or returns structured API error
 			if r, getErr := client.GetRun(ctx, runID, false, 16384); getErr == nil {
 				latest = r
+				lastErr = nil
 				if isWaitStopState(r.Status) {
 					return r, nil
+				}
+			} else {
+				lastErr = getErr
+				if isFatalWaitAPIError(getErr) {
+					return nil, getErr
 				}
 			}
 			select {
 			case <-ctx.Done():
-				return latest, nil
+				goto done
 			case <-time.After(500 * time.Millisecond):
 				continue
 			}
 		}
 
+		lastErr = nil
 		for {
 			_, data, readErr := conn.Read(ctx)
 			if readErr != nil {
+				lastErr = readErr
 				_ = conn.CloseNow()
 				break
 			}
@@ -438,10 +470,7 @@ func waitViaStream(client *api.Client, runID string, timeout time.Duration) (*ap
 						latest = &cp
 						if isWaitStopState(cp.Status) {
 							_ = conn.CloseNow()
-							if cp.Status == "needs_approval" {
-								return latest, nil
-							}
-							if fullR, gErr := client.GetRun(context.Background(), runID, false, 16384); gErr == nil {
+							if fullR, gErr := fetchRunSummaryBounded(client, runID); gErr == nil {
 								return fullR, nil
 							}
 							return latest, nil
@@ -453,10 +482,7 @@ func waitViaStream(client *api.Client, runID string, timeout time.Duration) (*ap
 					latest = envelope.Run
 					if isWaitStopState(latest.Status) {
 						_ = conn.CloseNow()
-						if latest.Status == "needs_approval" {
-							return latest, nil
-						}
-						if fullR, gErr := client.GetRun(context.Background(), runID, false, 16384); gErr == nil {
+						if fullR, gErr := fetchRunSummaryBounded(client, runID); gErr == nil {
 							return fullR, nil
 						}
 						return latest, nil
@@ -466,11 +492,20 @@ func waitViaStream(client *api.Client, runID string, timeout time.Duration) (*ap
 		}
 	}
 
-	// Final fetch on timeout
-	fetchCtx, fetchCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer fetchCancel()
-	if r, err := client.GetRun(fetchCtx, runID, false, 16384); err == nil {
+done:
+	// Final bounded fetch on wait expiration
+	r, err := fetchRunSummaryBounded(client, runID)
+	if err == nil {
 		return r, nil
+	}
+	if isFatalWaitAPIError(err) {
+		return nil, err
+	}
+	if latest == nil {
+		if lastErr != nil {
+			return nil, lastErr
+		}
+		return nil, err
 	}
 	return latest, nil
 }
@@ -600,6 +635,45 @@ func runCancel(g globalOpts, args []string) int {
 		for _, r := range cancelled {
 			fmt.Printf("Cancelled %s (%s)\n", r.ID, r.Status)
 		}
+	}
+	return api.ExitOK
+}
+
+func runResolve(g globalOpts, args []string) int {
+	fs := flag.NewFlagSet("resolve", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	var summary string
+	fs.StringVar(&summary, "summary", "", "resolution summary (or '-' to read from stdin)")
+	if err := parseFlagsFlexible(fs, args, map[string]bool{"--summary": true}); err != nil {
+		return api.ExitBadUsageOrInput
+	}
+	if fs.NArg() < 1 {
+		return failUsage(g.JSON, "usage: ahub resolve <run_id> [--summary <text>|-] [--json]")
+	}
+	runID := fs.Arg(0)
+
+	if strings.TrimSpace(summary) == "-" {
+		raw, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return failErr(g.JSON, err)
+		}
+		summary = strings.TrimSpace(string(raw))
+	}
+
+	client, err := newClient(g)
+	if err != nil {
+		return failErr(g.JSON, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	run, err := client.ResolveRun(ctx, runID, summary)
+	if err != nil {
+		return failErr(g.JSON, err)
+	}
+	if g.JSON {
+		writeJSON(map[string]interface{}{"ok": true, "run": run})
+	} else {
+		fmt.Printf("Resolved %s (%s)\n", run.ID, run.Status)
 	}
 	return api.ExitOK
 }
@@ -740,6 +814,7 @@ func runNode(g globalOpts, args []string, version string) int {
 		defer stop()
 
 		d := daemon.New(cfg, resolvedToken, version)
+		daemon.ClearReloadSentinel(cfgResolved)
 		reloadCh := make(chan os.Signal, 1)
 		daemon.NotifyReloadSignal(reloadCh)
 		defer daemon.StopReloadSignal(reloadCh)
@@ -750,6 +825,7 @@ func runNode(g globalOpts, args []string, version string) int {
 			case <-ctx.Done():
 			}
 		}()
+		go daemon.WatchReloadSentinel(ctx, cfgResolved, time.Second, d.RequestReload)
 
 		if err := d.Run(ctx); err != nil {
 			if errors.Is(err, daemon.ErrReloadRequested) {
@@ -1170,11 +1246,12 @@ Commands:
   runs            List recent runs
   threads         List threads
   cancel          Cancel a run (or entire tree with --cascade)
+  resolve         Mark a needs_approval run resolved and release locks
   skill           Print or install embedded SKILL.md
   update          Check or apply atomic self-update (auto-reloads daemon unless --no-restart)
   node init       Idempotently create or update node.json (supports --token-stdin)
   node status     Inspect redacted node config, daemon PID, and service/app status
   node serve      Run node daemon over outbound WebSocket
-  node shim       Supervise target ahub binary for TCC wrapper (macOS AhubDaemon.app)
-  node service    Install/uninstall/status for LaunchAgent or systemd --user`)
+  node shim       Supervise target ahub binary for wrapper app (macOS/Windows)
+  node service    Install/uninstall/status for LaunchAgent, systemd --user, or Windows Task Scheduler`)
 }

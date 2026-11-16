@@ -151,8 +151,36 @@ export const useTaskStore = create<TaskState>((set) => ({
         idx >= 0
           ? state.runs.map((r, i) => (i === idx ? mergeRunRecord(r, run) : r))
           : [run, ...state.runs];
+      const nextSorted = sortRuns(next);
+      let nextThreads = state.threads;
+      if (run.thread_id) {
+        const targetThread = state.threads.find((t) => t.id === run.thread_id);
+        if (
+          targetThread &&
+          !targetThread.native_session_id &&
+          (targetThread.node_id !== run.node_id || targetThread.workdir !== run.workdir)
+        ) {
+          const threadRunCount = next.reduce((acc, r) => (r.thread_id === run.thread_id ? acc + 1 : acc), 0);
+          if (threadRunCount <= 1) {
+            const cleanedDir = run.workdir.replace(/[\\/]+$/, "");
+            const sepIdx = Math.max(cleanedDir.lastIndexOf("/"), cleanedDir.lastIndexOf("\\"));
+            const projectKey = sepIdx >= 0 ? cleanedDir.slice(sepIdx + 1) : cleanedDir;
+            nextThreads = state.threads.map((t) =>
+              t.id === run.thread_id
+                ? {
+                    ...t,
+                    node_id: run.node_id,
+                    workdir: run.workdir,
+                    project_key: projectKey || t.project_key
+                  }
+                : t
+            );
+          }
+        }
+      }
       return {
-        runs: sortRuns(next),
+        runs: nextSorted,
+        threads: nextThreads,
         selectedRunId: state.selectedRunId ?? run.id
       };
     }),

@@ -92,8 +92,8 @@
    - **「节点」标签页**：全高展示机群节点列表（在线状态、`active_runs_count / max_concurrency`、可用 Agent 徽标与工作目录数），顶部提供集群目录汇总及一键全部收起/展开开关；每个节点均支持独立收起/展开其下的工作目录列表（点击目录切换为新建会话目标目录，或直接拖拽工作目录至中栏派发台）。
 2. **中栏：Thread Timeline & Task Composer**
    - 顶部栏展示当前 `Thread` 绑定的 `node_id`、`project_key`、`agent`、`native_session_id` 短 ID；若当前选中的 `Run` 存在父任务或子任务，显示可点击切换的血统面包屑及「级联取消整棵树」按钮。
-   - 中间消息流按时间正序排列该 `Thread` 下的所有 `Run`：展示 Prompt、实际命中模型与思考强度、独立计时耗时、`output_md` 渲染结果（超长自动折叠并支持一键展开/复制）。当 `status === 'needs_approval'` 时在顶部渲染高对比度琥珀色操作条，提供一键打开 `remote_control_url` 审批按钮。
-   - 底部「多机任务派发台（Composer）」：选择已有 `Thread` 时锁定物理绑定的 `node_id`、`workdir` 与 `agent`（同时提供「切换至新建会话」开关）；新建会话与续聊参数均基于所选节点实时上报的 `node.capabilities.agents` 驱动「`node` -> `agent` -> `model` -> `effort`」四级联动：仅展示目标节点已启用且可用的 Agent；模型列表来自所选 Agent 的实时目录 `models[]`，同时支持「跟随节点默认」及在离线或目录未知时手动输入模型 ID；推理强度依据当前模型声明的 `efforts[]` 过滤展示（含 `ultra`、`auto` 等节点档位），对于 `efforts` 为空的独立模型（如 `gemini-pro-orchestrator`）自动禁用强度选择并将 `effort` 置空；支持 `⌘Enter` / `Ctrl+Enter` 提交与草稿本地自动保存。
+   - 中间消息流按时间正序排列该 `Thread` 下的所有 `Run`：展示 Prompt、实际命中模型与思考强度、独立计时耗时、`output_md` 渲染结果（超长自动折叠并支持一键展开/复制）。当 `status === 'needs_approval'` 时在顶部渲染高对比度琥珀色操作条，提供一键打开 `remote_control_url` 审批按钮与「标记已放行」按钮（调用 `POST /api/v1/runs/:id/resolve` 解除工作目录租约并流转为 `done`）。
+   - 底部「多机任务派发台（Composer）」：选择已有 `Thread` 时锁定物理绑定的 `node_id`、`workdir` 与 `agent`（同时提供「切换至新建会话」开关）；新建会话与续聊参数均基于所选节点实时上报的 `node.capabilities.agents` 驱动「`node` -> `agent` -> `model` -> `effort`」四级联动：仅展示目标节点已启用且可用的 Agent；模型列表来自所选 Agent 的实时目录 `models[]`，同时支持「跟随节点默认」及在离线或目录未知时手动输入模型 ID（当所选 Agent 为 `agy` 且节点尚未返回显式默认模型或处于离线/兜底态时，派发台默认对齐 `gemini-4-hydrogen` 与 `high`）；推理强度依据当前模型声明的 `efforts[]` 过滤展示（含 `ultra`、`auto` 等节点档位），对于 `efforts` 为空的独立模型（如 `gemini-pro-orchestrator`）自动禁用强度选择并将 `effort` 置空；支持 `⌘Enter` / `Ctrl+Enter` 提交与草稿本地自动保存。
 3. **右栏：Live Inspector & Queue Deck**
    - **Tab 1 实时事件流**：订阅当前选中 `Run` 的 `run_events`，以等宽时间线展示 `status`、`tool_use`、`turn_end`、`stderr_warn`，并实时计算 `lease_expires_at` 剩余秒数。
    - **Tab 2 节点排队甲板**：按节点与 `workdir` 分组展示待执行的 `queued` 任务与当前持锁占用目录，支持直接拖拽排序或跨节点改派。
@@ -114,7 +114,7 @@
    - 交互结果：释放拖拽后先乐观更新 Zustand 队列顺序，再调用 `POST /api/v1/runs/reorder`；若请求失败或该任务在拖拽瞬间已被节点认领，回滚顺序并弹出 Toast 提示。
 2. **跨节点派单改派与会话分叉**
    - 作用域：将 `queued` 状态的 Run 卡片或 `Thread` 列表项拖入左栏另一台处于 `online` 状态的节点卡片。
-   - 交互结果：拖入 `queued` Run 时直接调用 `PATCH /api/v1/runs/:id` 改派目标节点（自动校验目标节点是否存在同名 `project_key`）；拖入已有 `Thread` 时弹出确认对话框，执行「Fork 到目标节点」（`POST /api/v1/threads/:id/fork`）。
+   - 交互结果：拖入 `queued` Run 时直接调用 `PATCH /api/v1/runs/:id` 改派目标节点（自动校验目标节点是否存在同名 `project_key`；仅允许未建连的单轮新会话改派并同步更新线程节点与目录，多轮历史会话改派返回 `409 INVALID_STATE_TRANSITION`）；拖入已有 `Thread` 时弹出确认对话框，执行「Fork 到目标节点」（`POST /api/v1/threads/:id/fork`）。
 3. **常用会话置顶排序**
    - 作用域：左栏置顶会话区（`pinned === true`），拖拽调整日常高频会话顺序并调用 `PATCH /api/v1/threads/:id` 持久化 `sort_order`。
 

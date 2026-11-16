@@ -1,3 +1,4 @@
+import { ensureNodeAllowedForClient, ensureRunAccessible, isNodeVisibleToPrincipal } from "./auth";
 import {
   type AgentName,
   type ApiKeyRecord,
@@ -22,7 +23,11 @@ import {
   type WorkspaceEntry
 } from "./types";
 import { newId, nowIso, sanitizeTailPreview, truncateUtf8Bytes } from "./ulid";
-import { type ParsedCreateRun } from "./validation";
+import {
+  type ApprovalCheckpointInput,
+  type ParsedCreateRun,
+  type ResolveRunInput
+} from "./validation";
 
 const MAX_OUTPUT_MD_BYTES = 900 * 1024;
 
@@ -353,11 +358,66 @@ export async function listNodes(
     .prepare(`SELECT * FROM nodes ORDER BY CASE status WHEN 'online' THEN 0 WHEN 'draining' THEN 1 ELSE 2 END, id ASC`)
     .all<NodeRow>();
   const rows = res.results ?? [];
-  const mapped = rows.map(mapNodeRow);
-  if (principal.scope === "client" && principal.allowedNodes.length > 0) {
-    return mapped.filter((n) => principal.allowedNodes.includes(n.id));
+  return rows.map(mapNodeRow).filter((n) => isNodeVisibleToPrincipal(principal, n.id));
+}
+
+function makeRecalcNodeActiveRunsStmt(db: D1Database, nodeId: string, now: string): D1PreparedStatement {
+  return db
+    .prepare(
+      `UPDATE nodes
+       SET active_runs_count = (
+             SELECT COUNT(*) FROM runs WHERE node_id = ?1 AND status IN ('claimed', 'running', 'needs_approval')
+           ),
+           updated_at = ?2
+       WHERE id = ?1`
+    )
+    .bind(nodeId, now);
+}
+
+async function assertNoDelegationCycle(
+  db: D1Database,
+  parentRunId: string,
+  targetNodeId: string,
+  targetWorkdir: string
+): Promise<void> {
+  const cycleHit = await db
+    .prepare(
+      `WITH RECURSIVE ancestors(id, parent_run_id, node_id, workdir) AS (
+         SELECT id, parent_run_id, node_id, workdir FROM runs WHERE id = ?1
+         UNION ALL
+         SELECT r.id, r.parent_run_id, r.node_id, r.workdir
+         FROM runs r JOIN ancestors a ON r.id = a.parent_run_id
+       )
+       SELECT id FROM ancestors WHERE node_id = ?2 AND workdir = ?3 LIMIT 1`
+    )
+    .bind(parentRunId, targetNodeId, targetWorkdir)
+    .first<{ id: string }>();
+
+  if (cycleHit) {
+    throw new HubError(
+      409,
+      "DELEGATION_CYCLE_DETECTED",
+      `Delegation to (${targetNodeId}, ${targetWorkdir}) forms a cycle with ancestor run '${cycleHit.id}'.`
+    );
   }
-  return mapped;
+}
+
+async function ensureThreadAccessible(
+  db: D1Database,
+  principal: AuthPrincipal,
+  thread: { id: string; node_id: string }
+): Promise<void> {
+  if (principal.scope === "admin") return;
+  ensureNodeAllowedForClient(principal, thread.node_id);
+  if (principal.keyId) {
+    const owned = await db
+      .prepare(`SELECT 1 AS ok FROM runs WHERE thread_id = ?1 AND created_by_key_id = ?2 LIMIT 1`)
+      .bind(thread.id, principal.keyId)
+      .first<{ ok: number }>();
+    if (!owned) {
+      throw new HubError(403, "FORBIDDEN_SCOPE", "Client key cannot access another key's thread.");
+    }
+  }
 }
 
 export async function getNodeById(db: D1Database, nodeId: string): Promise<NodeRecord | null> {
@@ -485,6 +545,7 @@ export async function createRun(
     if (!threadRow) {
       throw new HubError(404, "NOT_FOUND", `Thread '${input.threadId}' not found.`);
     }
+    await ensureThreadAccessible(db, principal, threadRow);
     targetNodeId = threadRow.node_id;
     resolvedWorkdir = threadRow.workdir;
     projectKey = threadRow.project_key;
@@ -492,6 +553,9 @@ export async function createRun(
   } else {
     targetNodeId = input.nodeId!;
     agent = input.agent!;
+    if (principal.scope === "client") {
+      ensureNodeAllowedForClient(principal, targetNodeId);
+    }
     const nodeRow = await db.prepare(`SELECT * FROM nodes WHERE id = ?1`).bind(targetNodeId).first<NodeRow>();
     if (!nodeRow) {
       throw new HubError(404, "NODE_NOT_FOUND", `Node '${targetNodeId}' not found.`);
@@ -504,8 +568,8 @@ export async function createRun(
     projectKey = resolved.projectKey;
   }
 
-  if (principal.scope === "client" && principal.allowedNodes.length > 0 && !principal.allowedNodes.includes(targetNodeId)) {
-    throw new HubError(403, "FORBIDDEN_SCOPE", `Client key cannot target node '${targetNodeId}'.`);
+  if (principal.scope === "client") {
+    ensureNodeAllowedForClient(principal, targetNodeId);
   }
 
   // Re-check node status when thread_id was supplied
@@ -578,26 +642,7 @@ export async function createRun(
       );
     }
 
-    const cycleHit = await db
-      .prepare(
-        `WITH RECURSIVE ancestors(id, parent_run_id, node_id, workdir) AS (
-           SELECT id, parent_run_id, node_id, workdir FROM runs WHERE id = ?1
-           UNION ALL
-           SELECT r.id, r.parent_run_id, r.node_id, r.workdir
-           FROM runs r JOIN ancestors a ON r.id = a.parent_run_id
-         )
-         SELECT id FROM ancestors WHERE node_id = ?2 AND workdir = ?3 LIMIT 1`
-      )
-      .bind(parent.id, targetNodeId, resolvedWorkdir)
-      .first<{ id: string }>();
-
-    if (cycleHit) {
-      throw new HubError(
-        409,
-        "DELEGATION_CYCLE_DETECTED",
-        `Delegation to (${targetNodeId}, ${resolvedWorkdir}) forms a cycle with ancestor run '${cycleHit.id}'.`
-      );
-    }
+    await assertNoDelegationCycle(db, parent.id, targetNodeId, resolvedWorkdir);
   }
 
   const now = nowIso();
@@ -1069,6 +1114,194 @@ export async function completeRun(
   return (await db.prepare(`SELECT * FROM runs WHERE id = ?1`).bind(runId).first<RunRow>())!;
 }
 
+export async function checkpointRunApproval(
+  db: D1Database,
+  env: Env,
+  principal: AuthPrincipal,
+  runId: string,
+  leaseTtlSeconds: number,
+  input: ApprovalCheckpointInput
+): Promise<RunRow> {
+  if (principal.scope !== "node" || !principal.boundNodeId) {
+    throw new HubError(403, "FORBIDDEN_SCOPE", "Only node keys may checkpoint run approvals.");
+  }
+
+  const existing = await db.prepare(`SELECT * FROM runs WHERE id = ?1`).bind(runId).first<RunRow>();
+  if (!existing) {
+    throw new HubError(404, "NOT_FOUND", `Run '${runId}' not found.`);
+  }
+  if (existing.node_id !== principal.boundNodeId) {
+    throw new HubError(403, "FORBIDDEN_SCOPE", "Node key cannot checkpoint another node's run.");
+  }
+  if (existing.status === "done" || existing.status === "failed" || existing.status === "cancelled") {
+    throw new HubError(
+      409,
+      "INVALID_STATE_TRANSITION",
+      `Run '${runId}' is already terminal ('${existing.status}').`
+    );
+  }
+  if (existing.lease_owner !== input.leaseOwner) {
+    throw new HubError(
+      409,
+      "LEASE_CONFLICT",
+      `Lease owner mismatch while checkpointing approval for '${runId}'.`
+    );
+  }
+
+  const now = nowIso();
+  const nextExpiry = nowIso(leaseTtlSeconds * 1000);
+  const truncatedOut = truncateUtf8Bytes(input.outputMd, MAX_OUTPUT_MD_BYTES);
+  const storedBytes = input.outputMd ? Math.max(input.outputBytes, truncatedOut.originalBytes) : input.outputBytes;
+  const firstTransition = existing.status !== "needs_approval";
+
+  const res = await db
+    .prepare(
+      `UPDATE runs
+       SET status = 'needs_approval',
+           lease_expires_at = ?1,
+           remote_control_url = COALESCE(NULLIF(?2, ''), remote_control_url),
+           native_session_id = COALESCE(NULLIF(?3, ''), native_session_id),
+           resolved_model = COALESCE(NULLIF(?4, ''), resolved_model),
+           resolved_effort = COALESCE(NULLIF(?5, ''), resolved_effort),
+           summary = CASE WHEN ?6 != '' THEN ?6 ELSE summary END,
+           output_md = CASE WHEN ?7 != '' THEN ?7 ELSE output_md END,
+           output_bytes = CASE WHEN ?8 > 0 THEN ?8 ELSE output_bytes END,
+           duration_ms = CASE WHEN ?9 > 0 THEN ?9 ELSE duration_ms END,
+           started_at = COALESCE(started_at, ?10),
+           updated_at = ?10
+       WHERE id = ?11
+         AND node_id = ?12
+         AND lease_owner = ?13
+         AND status IN ('claimed', 'running', 'needs_approval')`
+    )
+    .bind(
+      nextExpiry,
+      input.remoteControlUrl,
+      input.nativeSessionId ?? "",
+      input.resolvedModel,
+      input.resolvedEffort,
+      input.summary,
+      truncatedOut.value,
+      storedBytes,
+      input.durationMs,
+      now,
+      runId,
+      principal.boundNodeId,
+      input.leaseOwner
+    )
+    .run();
+
+  if ((res.meta.changes ?? 0) === 0) {
+    const fresh = await db.prepare(`SELECT status, lease_owner FROM runs WHERE id = ?1`).bind(runId).first<{
+      status: RunStatus;
+      lease_owner: string | null;
+    }>();
+    if (!fresh) {
+      throw new HubError(404, "NOT_FOUND", `Run '${runId}' not found.`);
+    }
+    if (fresh.status === "done" || fresh.status === "failed" || fresh.status === "cancelled") {
+      throw new HubError(409, "INVALID_STATE_TRANSITION", `Run '${runId}' transitioned to '${fresh.status}'.`);
+    }
+    throw new HubError(409, "LEASE_CONFLICT", `Lease owner conflict while checkpointing '${runId}'.`);
+  }
+
+  const updated = (await db.prepare(`SELECT * FROM runs WHERE id = ?1`).bind(runId).first<RunRow>())!;
+  await db.batch([
+    db
+      .prepare(
+        `UPDATE threads
+         SET native_session_id = COALESCE(NULLIF(?1, ''), native_session_id),
+             last_run_id = ?2,
+             updated_at = ?3
+         WHERE id = ?4`
+      )
+      .bind(input.nativeSessionId ?? "", runId, now, updated.thread_id),
+    makeRecalcNodeActiveRunsStmt(db, principal.boundNodeId, now)
+  ]);
+
+  if (firstTransition) {
+    await enqueueRunNotificationIfNeeded(db, env, updated, "needs_approval");
+  }
+  return (await db.prepare(`SELECT * FROM runs WHERE id = ?1`).bind(runId).first<RunRow>())!;
+}
+
+export async function resolveRunApproval(
+  db: D1Database,
+  env: Env,
+  principal: AuthPrincipal,
+  runId: string,
+  input: ResolveRunInput
+): Promise<{ run: RunRow; alreadyTerminal: boolean }> {
+  if (principal.scope !== "admin" && principal.scope !== "client") {
+    throw new HubError(403, "FORBIDDEN_SCOPE", "Node keys cannot resolve approvals.");
+  }
+  const existing = await db.prepare(`SELECT * FROM runs WHERE id = ?1`).bind(runId).first<RunRow>();
+  if (!existing) {
+    throw new HubError(404, "NOT_FOUND", `Run '${runId}' not found.`);
+  }
+  ensureRunAccessible(principal, existing);
+
+  if (existing.status === "done") {
+    return { run: existing, alreadyTerminal: true };
+  }
+  if (existing.status !== "needs_approval") {
+    throw new HubError(
+      409,
+      "INVALID_STATE_TRANSITION",
+      `Run '${runId}' is '${existing.status}' and can only be resolved from 'needs_approval'.`
+    );
+  }
+
+  const now = nowIso();
+  const nextSummary = input.summary?.trim()
+    ? input.summary.trim()
+    : existing.summary || "远控审批已完成并放行";
+
+  const res = await db
+    .prepare(
+      `UPDATE runs
+       SET status = 'done',
+           lease_owner = NULL,
+           lease_expires_at = NULL,
+           summary = ?1,
+           finished_at = ?2,
+           updated_at = ?2
+       WHERE id = ?3 AND status = 'needs_approval'`
+    )
+    .bind(nextSummary, now, runId)
+    .run();
+
+  if ((res.meta.changes ?? 0) === 0) {
+    const fresh = await db.prepare(`SELECT * FROM runs WHERE id = ?1`).bind(runId).first<RunRow>();
+    if (!fresh) {
+      throw new HubError(404, "NOT_FOUND", `Run '${runId}' not found.`);
+    }
+    if (fresh.status === "done") {
+      return { run: fresh, alreadyTerminal: true };
+    }
+    throw new HubError(
+      409,
+      "INVALID_STATE_TRANSITION",
+      `Run '${runId}' transitioned to '${fresh.status}' before resolution.`
+    );
+  }
+
+  await db.batch([
+    db
+      .prepare(
+        `INSERT OR IGNORE INTO run_events (run_id, seq, kind, payload_json, created_at)
+         VALUES (?1, COALESCE((SELECT MAX(seq) FROM run_events WHERE run_id = ?1), 0) + 1, 'status', ?2, ?3)`
+      )
+      .bind(runId, JSON.stringify({ status: "done", reason: "approval_resolved" }), now),
+    makeRecalcNodeActiveRunsStmt(db, existing.node_id, now)
+  ]);
+
+  const updated = (await db.prepare(`SELECT * FROM runs WHERE id = ?1`).bind(runId).first<RunRow>())!;
+  await enqueueRunNotificationIfNeeded(db, env, updated, "done");
+  const finalRow = (await db.prepare(`SELECT * FROM runs WHERE id = ?1`).bind(runId).first<RunRow>())!;
+  return { run: finalRow, alreadyTerminal: false };
+}
+
 export async function cancelRun(
   db: D1Database,
   env: Env,
@@ -1080,9 +1313,7 @@ export async function cancelRun(
   if (!target) {
     throw new HubError(404, "NOT_FOUND", `Run '${runId}' not found.`);
   }
-  if (principal.scope === "client" && target.created_by_key_id !== principal.keyId) {
-    throw new HubError(403, "FORBIDDEN_SCOPE", "Client key cannot cancel another key's run.");
-  }
+  ensureRunAccessible(principal, target);
 
   const candidatesRes = options.cascade
     ? await db
@@ -1170,9 +1401,7 @@ export async function patchQueuedRun(
   if (!existing) {
     throw new HubError(404, "NOT_FOUND", `Run '${runId}' not found.`);
   }
-  if (principal.scope === "client" && existing.created_by_key_id !== principal.keyId) {
-    throw new HubError(403, "FORBIDDEN_SCOPE", "Client key cannot modify another key's run.");
-  }
+  ensureRunAccessible(principal, existing);
   if (existing.status !== "queued") {
     throw new HubError(
       409,
@@ -1183,8 +1412,13 @@ export async function patchQueuedRun(
 
   const nextNodeId = patch.nodeId ?? existing.node_id;
   let nextWorkdir = patch.workdir ?? existing.workdir;
+  let nextProjectKey: string | null = null;
+  let threadChanged = false;
 
   if (patch.nodeId !== undefined || patch.workdir !== undefined) {
+    if (principal.scope === "client") {
+      ensureNodeAllowedForClient(principal, nextNodeId);
+    }
     const node = await db.prepare(`SELECT * FROM nodes WHERE id = ?1`).bind(nextNodeId).first<NodeRow>();
     if (!node) {
       throw new HubError(404, "NODE_NOT_FOUND", `Node '${nextNodeId}' not found.`);
@@ -1192,13 +1426,33 @@ export async function patchQueuedRun(
     if (node.status === "draining") {
       throw new HubError(409, "NODE_DRAINING", `Node '${nextNodeId}' is draining.`);
     }
-    if (principal.scope === "client" && principal.allowedNodes.length > 0 && !principal.allowedNodes.includes(nextNodeId)) {
-      throw new HubError(403, "FORBIDDEN_SCOPE", `Client key cannot target node '${nextNodeId}'.`);
-    }
+    const threadRow = await db
+      .prepare(`SELECT * FROM threads WHERE id = ?1`)
+      .bind(existing.thread_id)
+      .first<ThreadRow>();
     const workspaces = parseWorkspaces(node.workspaces_json);
-    const lookupKey = patch.workdir ?? basenameOf(existing.workdir);
+    const lookupKey = patch.workdir ?? threadRow?.project_key ?? basenameOf(existing.workdir);
     const resolved = resolveWorkspace(workspaces, lookupKey);
     nextWorkdir = resolved.path;
+    nextProjectKey = resolved.projectKey;
+    threadChanged = nextNodeId !== existing.node_id || nextWorkdir !== existing.workdir;
+
+    if (threadChanged) {
+      const countRow = await db
+        .prepare(`SELECT COUNT(*) AS cnt FROM runs WHERE thread_id = ?1`)
+        .bind(existing.thread_id)
+        .first<{ cnt: number }>();
+      if ((threadRow && threadRow.native_session_id !== null) || (countRow?.cnt ?? 0) > 1) {
+        throw new HubError(
+          409,
+          "INVALID_STATE_TRANSITION",
+          "Cannot reassign node or workdir of an established thread; fork the thread instead."
+        );
+      }
+      if (existing.parent_run_id) {
+        await assertNoDelegationCycle(db, existing.parent_run_id, nextNodeId, nextWorkdir);
+      }
+    }
   }
 
   const now = nowIso();
@@ -1231,6 +1485,16 @@ export async function patchQueuedRun(
       `Run '${runId}' left 'queued' state during update.`
     );
   }
+  if (threadChanged && nextProjectKey !== null) {
+    await db
+      .prepare(
+        `UPDATE threads
+         SET node_id = ?1, workdir = ?2, project_key = ?3, updated_at = ?4
+         WHERE id = ?5`
+      )
+      .bind(nextNodeId, nextWorkdir, nextProjectKey, now, existing.thread_id)
+      .run();
+  }
   return (await db.prepare(`SELECT * FROM runs WHERE id = ?1`).bind(runId).first<RunRow>())!;
 }
 
@@ -1240,8 +1504,8 @@ export async function reorderQueuedRuns(
   nodeId: string,
   orderedRunIds: string[]
 ): Promise<RunRow[]> {
-  if (principal.scope === "client" && principal.allowedNodes.length > 0 && !principal.allowedNodes.includes(nodeId)) {
-    throw new HubError(403, "FORBIDDEN_SCOPE", `Client key cannot reorder runs for node '${nodeId}'.`);
+  if (principal.scope === "client") {
+    ensureNodeAllowedForClient(principal, nodeId);
   }
   if (orderedRunIds.length === 0) {
     return [];
@@ -1281,6 +1545,18 @@ export async function reorderQueuedRuns(
         `Run '${orderedRunIds[i]}' is no longer queued on '${nodeId}' or not owned by key.`
       );
     }
+  }
+
+  if (principal.scope === "client" && principal.keyId) {
+    const rowsRes = await db
+      .prepare(
+        `SELECT * FROM runs
+         WHERE node_id = ?1 AND status = 'queued' AND created_by_key_id = ?2
+         ORDER BY priority_order ASC, created_at ASC`
+      )
+      .bind(nodeId, principal.keyId)
+      .all<RunRow>();
+    return rowsRes.results ?? [];
   }
 
   const rowsRes = await db
@@ -1326,11 +1602,7 @@ export async function listThreads(
                LIMIT ?${binds.length}`;
   const res = await db.prepare(sql).bind(...binds).all<ThreadRow>();
   const rows = res.results ?? [];
-  const mapped = rows.map(mapThreadRow);
-  if (principal.scope === "client" && principal.allowedNodes.length > 0) {
-    return mapped.filter((t) => principal.allowedNodes.includes(t.node_id));
-  }
-  return mapped;
+  return rows.map(mapThreadRow).filter((t) => isNodeVisibleToPrincipal(principal, t.node_id));
 }
 
 export async function patchThread(
@@ -1343,9 +1615,7 @@ export async function patchThread(
   if (!existing) {
     throw new HubError(404, "NOT_FOUND", `Thread '${threadId}' not found.`);
   }
-  if (principal.scope === "client" && principal.allowedNodes.length > 0 && !principal.allowedNodes.includes(existing.node_id)) {
-    throw new HubError(403, "FORBIDDEN_SCOPE", "Client key cannot modify this thread.");
-  }
+  await ensureThreadAccessible(db, principal, existing);
 
   const now = nowIso();
   await db
@@ -1379,6 +1649,7 @@ export async function forkThread(
   if (!source) {
     throw new HubError(404, "NOT_FOUND", `Thread '${threadId}' not found.`);
   }
+  await ensureThreadAccessible(db, principal, source);
   const latestRun = await db
     .prepare(`SELECT summary, output_md, prompt FROM runs WHERE thread_id = ?1 ORDER BY created_at DESC LIMIT 1`)
     .bind(threadId)
@@ -1453,7 +1724,9 @@ export async function listRuns(
                ORDER BY created_at DESC
                LIMIT ?${binds.length}`;
   const res = await db.prepare(sql).bind(...binds).all<RunRow>();
-  return (res.results ?? []).map((r) => mapRunRow(r, { view: "list", includePrompt: true }));
+  return (res.results ?? [])
+    .filter((r) => isNodeVisibleToPrincipal(principal, r.node_id))
+    .map((r) => mapRunRow(r, { view: "list", includePrompt: true }));
 }
 
 export async function getRunById(
@@ -1467,12 +1740,7 @@ export async function getRunById(
   if (!row) {
     throw new HubError(404, "NOT_FOUND", `Run '${runId}' not found.`);
   }
-  if (principal.scope === "client" && row.created_by_key_id !== principal.keyId) {
-    throw new HubError(403, "FORBIDDEN_SCOPE", "Client key cannot access another key's run.");
-  }
-  if (principal.scope === "node" && row.node_id !== principal.boundNodeId) {
-    throw new HubError(403, "FORBIDDEN_SCOPE", "Node key cannot access another node's run.");
-  }
+  ensureRunAccessible(principal, row);
   return mapRunRow(row, { view, tailBytes, includePrompt: true });
 }
 
@@ -1490,9 +1758,7 @@ export async function listRunEvents(
   if (!runRow) {
     throw new HubError(404, "NOT_FOUND", `Run '${runId}' not found.`);
   }
-  if (principal.scope === "client" && runRow.created_by_key_id !== principal.keyId) {
-    throw new HubError(403, "FORBIDDEN_SCOPE", "Client key cannot access events for another key's run.");
-  }
+  ensureRunAccessible(principal, runRow);
 
   const res = await db
     .prepare(
@@ -1700,7 +1966,7 @@ export async function reapExpiredLeases(db: D1Database, env: Env): Promise<RunRo
   const expiredRes = await db
     .prepare(
       `SELECT * FROM runs
-       WHERE status IN ('claimed', 'running')
+       WHERE status IN ('claimed', 'running', 'needs_approval')
          AND lease_expires_at IS NOT NULL
          AND lease_expires_at < ?1`
     )
@@ -1722,7 +1988,7 @@ export async function reapExpiredLeases(db: D1Database, env: Env): Promise<RunRo
              updated_at = ?1,
              error_code = 'NODE_LEASE_EXPIRED',
              error_message = 'Node lease expired without heartbeat'
-         WHERE id = ?2 AND status IN ('claimed', 'running') AND lease_expires_at < ?1`
+         WHERE id = ?2 AND status IN ('claimed', 'running', 'needs_approval') AND lease_expires_at < ?1`
       )
       .bind(now, r.id)
       .run();

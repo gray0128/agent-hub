@@ -158,6 +158,17 @@ export const apiClient = {
     );
   },
 
+  resolveRun(token: string, runId: string, summary?: string) {
+    return requestJson<{ ok: true; run: RunRecord }>(
+      `/api/v1/runs/${encodeURIComponent(runId)}/resolve`,
+      token,
+      {
+        method: "POST",
+        body: JSON.stringify(summary ? { summary } : {})
+      }
+    );
+  },
+
   fetchKeys(token: string) {
     return requestJson<{ ok: true; keys: ApiKeyRecord[] }>("/api/v1/keys", token);
   },

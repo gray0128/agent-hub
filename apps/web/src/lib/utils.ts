@@ -157,7 +157,7 @@ export function buildRunCliPreview(
     const args: string[] = [run.agent];
     switch (run.agent) {
       case "agy": {
-        const expanded = expandAgyModel(model, effort);
+        const expanded = expandAgyModel(model || "gemini-4-hydrogen-high", effort);
         args.push("--output-format", "json");
         args.push(run.sandbox ? "--sandbox" : "--dangerously-skip-permissions");
         if (expanded.model) args.push("--model", expanded.model);
@@ -205,6 +205,7 @@ export function buildRunCliPreview(
         args.push("-p", "--output-format", "json");
         if (!run.sandbox) args.push("--dangerously-skip-permissions");
         if (model) args.push("--model", model);
+        if (effort && effort !== "auto" && effort !== "off") args.push("--effort", effort);
         if (nativeSession) args.push("--session-id", nativeSession);
         args.push(promptText);
         break;

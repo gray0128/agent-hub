@@ -23,7 +23,13 @@ registerHooks({
   }
 });
 
-const { parseCreateRunRequest, parseNodeWsFrame, parsePatchRunRequest } = await import("./validation.ts");
+const {
+  parseApprovalCheckpointRequest,
+  parseCreateRunRequest,
+  parseNodeWsFrame,
+  parsePatchRunRequest,
+  parseResolveRunRequest
+} = await import("./validation.ts");
 
 test("parseCreateRunRequest and parsePatchRunRequest accept ultra and auto effort levels", () => {
   const created = parseCreateRunRequest({
@@ -65,14 +71,14 @@ test("parseNodeWsFrame validates structured node.hello capabilities and rejects 
         agy: {
           enabled: true,
           available: true,
-          default_model: "gemini-3.8-flash-high",
+          default_model: "gemini-4-hydrogen",
           default_effort: "high",
           catalog_status: "ready",
           models: [
             {
-              id: "gemini-3.8-flash",
-              label: "Gemini 3.8 Flash",
-              efforts: ["low", "medium", "high"],
+              id: "gemini-4-hydrogen",
+              label: "Gemini 4 Hydrogen",
+              efforts: ["low", "medium", "high", "xhigh"],
               default_effort: "high"
             },
             {
@@ -131,4 +137,29 @@ test("parseNodeWsFrame validates structured node.hello capabilities and rejects 
       }),
     /efforts must be an array/
   );
+});
+
+test("parseApprovalCheckpointRequest and parseResolveRunRequest validate payloads cleanly", () => {
+  const cp = parseApprovalCheckpointRequest({
+    lease_owner: "macmini:nonce-1234",
+    remote_control_url: "https://ahub.bobocai.win/rc/abc",
+    native_session_id: "conv_123",
+    resolved_model: "gemini-4-carbon-high",
+    resolved_effort: "high",
+    summary: "Waiting for approval",
+    output_md: "Partial markdown",
+    duration_ms: 1200
+  });
+  assert.equal(cp.leaseOwner, "macmini:nonce-1234");
+  assert.equal(cp.outputBytes, Buffer.byteLength("Partial markdown"));
+  assert.throws(
+    () => parseApprovalCheckpointRequest({ lease_owner: "", summary: "missing" }),
+    /lease_owner/
+  );
+
+  assert.deepEqual(parseResolveRunRequest(undefined), {});
+  assert.deepEqual(parseResolveRunRequest({ summary: "Approved remotely" }), {
+    summary: "Approved remotely"
+  });
+  assert.throws(() => parseResolveRunRequest({ unknown: true }), /Unexpected field/);
 });

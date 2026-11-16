@@ -7,12 +7,12 @@
 ```text
 cmd/ahub/main.go                 # 根命令分发与全局标志解析（--url / --token / --json）
 internal/
-├── config/                      # 读取 ~/.config/ahub/{config.json,node.json,credentials}
+├── config/                      # 读取 ~/.config/ahub/{credentials,node.json}（支持 AHUB_CONFIG_DIR 覆盖）
 ├── api/                         # REST 客户端 + /ws/node 与 /ws/stream WebSocket 客户端
-├── cli/                         # 调用端命令（nodes / run / wait / result / cancel / threads / runs / skill / update）
-├── daemon/                      # node serve 主循环、断线抖动退避重连、heartbeat 续租、本地 workdir 互斥锁
+├── cli/                         # 调用端命令（nodes / run / wait / result / resolve / cancel / threads / runs / skill / update）
+├── daemon/                      # node serve 主循环、断线抖动退避重连、heartbeat 续租、needs_approval 租约驻留、本地 workdir 互斥锁、node.reload 哨兵监听
 ├── runner/                      # 进程组管控（Setpgid）、最小环境变量白名单、agy/pi/omp/codex/claude 适配器
-├── service/                     # macOS LaunchAgent plist 与 Linux systemd --user unit 生成与启停
+├── service/                     # macOS LaunchAgent plist、Linux systemd --user unit 与 Windows ahub-shim.exe + schtasks 生成与启停
 └── selfupdate/                  # /dl/version.json 校验、SHA-256 核对与跨平台原子自替换
 skills/ahub/SKILL.md             # 通过 go:embed 内嵌于二进制中
 ```
@@ -31,7 +31,7 @@ skills/ahub/SKILL.md             # 通过 go:embed 内嵌于二进制中
 
 1. 命令行标志：`--url`、`--token`
 2. 环境变量：`AHUB_URL`（默认 `https://ahub.bobocai.win`）、`AHUB_TOKEN`
-3. 凭据文件：`~/.config/ahub/credentials`（权限强制校验或写入为 `0600`，JSON 格式 `{ "url": "...", "token": "..." }`）
+3. 凭据文件：`~/.config/ahub/credentials`（可通过环境变量 `AHUB_CONFIG_DIR` 重定向配置目录，权限强制校验或写入为 `0600`，JSON 格式 `{ "url": "...", "token": "..." }`）；节点运行配置保存在同目录下的 `node.json`（仅此两文件，不存在 `config.json`）。
 
 ## 3. 调用端 CLI 命令与退出码契约
 
@@ -47,17 +47,18 @@ skills/ahub/SKILL.md             # 通过 go:embed 内嵌于二进制中
 | --- | --- |
 | `ahub auth login --url <url> --token <token>` | 校验并保存 `0600` 凭据至 `~/.config/ahub/credentials` |
 | `ahub nodes [--online] [--json]` | 从云端读取节点清单、在线态、可用 Agent、模型简称及项目短名列表 |
-| `ahub run -n <node> -d <dir> -a <agent> [-m <model@effort>] [--thread <thr_id>] [--no-sandbox] [--timeout 15m] [--wait 45s] [--notify grok] [--idempotency-key <k>] [--json] <prompt \| ->` | 创建任务并入队（未传 `--thread` 时新建会话）。CLI 自动读取环境中的 `AHUB_RUN_ID` 作为 `parent_run_id`。支持混合等待：若在 `--wait` 内完成直接返回终态；若超窗且配置了 `--notify`，则正常退出并标记 `"webhook_armed": true`；若未配置 `--notify`，CLI 内部无缝切入 WebSocket 监听直至终态或达到本地总等待上限 |
-| `ahub wait <run_id> [--timeout 15m] [--json]` | 连接 `/ws/stream?run_id=<id>` 零轮询阻塞等待任务到达终态或 `needs_approval` |
+| `ahub run -n <node> -d <dir> -a <agent> [-m <model@effort>] [--thread <thr_id>] [--no-sandbox] [--timeout 15m] [--wait 45s] [--notify grok] [--idempotency-key <k>] [--json] <prompt \| ->` | 创建任务并入队（未传 `--thread` 时新建会话）。CLI 自动读取环境中的 `AHUB_RUN_ID` 作为 `parent_run_id`。支持两阶段等待预算（默认 `--wait` 为 `45s`）：第一阶段使用 HTTP 长轮询 `?wait_ms=min(wait, 45000)`；若未设 `--notify` 且仍处于运行态且 `--wait > 45s`（或服务端提前返回 `202`），第二阶段以剩余预算无缝切入 `/ws/stream` 阻塞等待；若第二阶段发生鉴权/网络等真实传输错误则直接返回对应退出码（不误报 `24`），停机态（`done`/`failed`/`cancelled`/`needs_approval`）统一带 `5s` 有界超时拉取摘要预览 |
+| `ahub wait <run_id> [--timeout 15m] [--json]` | 连接 `/ws/stream?run_id=<id>` 零轮询阻塞等待任务到达终态或 `needs_approval`（停机态统一带 `5s` 超时拉取摘要预览） |
 | `ahub result <run_id> [--full] [--tail 16384] [--json]` | 读取指定任务的结果摘要、耗时、模型、`remote_control_url` 与输出正文 |
+| `ahub resolve <run_id> [--summary <text>] [--json]` | 人工在远控完成审批后，将处于 `needs_approval` 的子进程退出型任务放行结算为 `done`，释放 `(node_id, workdir)` 租约与本地目录锁并继续调度排队任务 |
 | `ahub runs [--node <n>] [--status <s>] [--limit 20] [--json]` | 查看任务队列与历史列表 |
 | `ahub threads [--node <n>] [--q <keyword>] [--json]` | 查询历史会话线程 ID 以便跨轮续接 |
 | `ahub cancel <run_id> [--cascade] [--reason <text>] [--json]` | 取消单个任务；加 `--cascade` 时级联终止整棵 `root_run_id` 任务树 |
 | `ahub skill print \| install [--dir <path>]` | 打印内嵌 `SKILL.md`，或将其安装到指定 Agent Skill 目录（如 `~/.agents/skills/ahub/SKILL.md`） |
-| `ahub update [--check] [--target <path>] [--no-restart] [--json]` | 查询 `/dl/version.json` 并校验 SHA-256 原子替换当前二进制；默认在更新本机活跃二进制后自动向运行中的 `ahub node serve` 发 `SIGHUP` 优雅排空重启，或在未运行进程间回退系统服务重载（`--no-restart` 或指定 `--target` 时跳过重启） |
+| `ahub update [--check] [--target <path>] [--no-restart] [--json]` | 查询 `/dl/version.json` 并校验 SHA-256 原子替换当前二进制；默认在更新本机活跃二进制后自动向运行中的 `ahub node serve` 触发优雅排空重启（Unix 发 `SIGHUP`，Windows 写 `node.reload` 哨兵），或在未运行进程间回退系统服务重载（`--no-restart` 或指定 `--target` 时跳过重启） |
 | `ahub node init [--id <node_id>] [--name <display_name>] [--url <hub_url>] [--token <token> \| --token-stdin] [--root <dir> ...] [--max-concurrency <n>] [--config <path>] [--force] [--json]` | 幂等创建或更新 `0600` 权限 `~/.config/ahub/node.json`，自动探测主机名、已有工作区根目录与本机已安装 Agent（`agy`/`pi`/`omp`/`codex`/`claude`），`--json` 输出脱敏（仅含布尔值 `has_token`） |
 | `ahub node status [--config <path>] [--target-dir <dir>] [--json]` | 零密钥泄露检查节点配置文件、工作区根、已启用 Agent、`has_token`、系统服务托管状态及 macOS `AhubDaemon.app` 签名与代码目录一致性，供 Agent 自举与巡检调用 |
-| `ahub node service install\|uninstall\|status [--bin <path>] [--config <path>] [--target-dir <dir>] [--recreate-app] [--activate] [--json]` | 生成、卸载或查询 macOS `LaunchAgent`（含冻结一次签名的 `~/Applications/AhubDaemon.app` 启动壳）与 Linux `systemd --user` 单元；指定 `--activate` 时加载并重启守护进程使新版本立即生效；指定 `--recreate-app` 时显式重建 `.app` 壳 |
+| `ahub node service install\|uninstall\|status [--bin <path>] [--config <path>] [--target-dir <dir>] [--recreate-app] [--activate] [--json]` | 生成、卸载或查询 macOS `LaunchAgent`（含冻结一次签名的 `~/Applications/AhubDaemon.app` 启动壳）、Linux `systemd --user` 单元与 Windows `ahub-node-runner.cmd` + `AhubNodeDaemon` 计划任务（配独立副本 `ahub-shim.exe`）；指定 `--activate` 时加载并重启守护进程使新版本立即生效；指定 `--recreate-app` 时显式重建 `.app` 壳 |
 
 ### 3.3 标准退出码
 
@@ -95,7 +96,7 @@ skills/ahub/SKILL.md             # 通过 go:embed 内嵌于二进制中
     "agy": {
       "enabled": true,
       "command": "agy",
-      "default_model": "gemini-3.8-flash-high"
+      "default_model": "gemini-4-hydrogen-high"
     },
     "pi": {
       "enabled": true,
@@ -131,7 +132,7 @@ skills/ahub/SKILL.md             # 通过 go:embed 内嵌于二进制中
 | `agy` | `agy --output-format json [--sandbox] [--project <project_id>] [--model <m>] [--effort <e>] [--print-timeout <t>] -p=<prompt>` | `--conversation <native_session_id>` | 解析单对象 JSON 提取 `status`、`conversation_id`、`response`、`error`；**严禁采信返回的累计耗时，必须由 Go 守护端 `time.Since(startedAt)` 单调计时**；当 `status == "NEEDS_HUMAN_APPROVAL"` 时只读探测远控守护状态（严禁调用 `start` 覆写系统守护配置）并回填 `remote_control_url`，不可达时保持空串并在结果摘要与诊断事件中注明原因 |
 | `pi` | `pi --mode json -p --approve [--model <m>] [--thinking <e>] <prompt>` | `--session <native_session_id>` | 按白名单逐行解析 v3 NDJSON 事件流：从 `session.id` 提取 `native_session_id`；将 `tool_execution_start` 映射为精简 `tool_use`（仅保留 `tool`、`tool_call_id` 与截断至 `512` 字符的 `command`/`path`/`file`/`summary`）；仅在 `tool_execution_end` 且 `isError == true` 时上报 `stderr_warn`；`turn_end` 提取 `provider/model` 与思考/用量摘要并剥离 `toolResults` 与完整消息体；静默丢弃 `message_update`、`tool_execution_update`、`agent_start`、`turn_start`、`message_start`、`message_end` 等高频流式增量（仅在内存缓冲 `text_delta` 供取消时恢复已生成正文）；从 `agent_end`/`message_end` 提取最终助手文本（仅限 `role == "assistant"` 且 `type == "text"` 分片），中途取消时严禁将原始 NDJSON `stdout` 落库为 `output_md` |
 | `omp` | `omp --mode=json -p --auto-approve --max-time=<t> [--model=<m>] [--thinking=<e>] <prompt>` | `--resume=<native_session_id>` | 同 `pi`，按白名单逐行解析 v3 NDJSON 事件流、静默过滤流式 delta 并实时映射精简工具/轮次事件 |
-| `codex` / `claude` | `codex exec --json [-m <m>] [-c model_reasoning_effort="<e>"]` / `claude -p --output-format json [--model <m>]` | `codex exec resume --json [-m <m>] [-c model_reasoning_effort="<e>"] <native_session_id> -` / `--session-id <id>` | `codex` 解析 `thread.started`（会话 ID）、`item.started`（`command_execution`/`mcp_tool_call`/`file_change`/`web_search` 映射为精简 `tool_use`）、丢弃 `item.updated`（仅在内存更新 `agent_message` 缓冲）、从 `item.completed`（`agent_message`）提取 `output_md`、`turn.completed` 映射精简 `turn_end`、`turn.failed`/`error` 标记失败；`claude` 解析 `result`（提取正文与 `session_id` 并处理 `is_error`），实现多引擎统一抽象 |
+| `codex` / `claude` | `codex exec --json [-m <m>] [-c model_reasoning_effort="<e>"]` / `claude -p --output-format json [--model <m>] [--effort <e>]` | `codex exec resume --json [-m <m>] [-c model_reasoning_effort="<e>"] <native_session_id> -` / `--session-id <id>`（`claude` 若传 `effort` 且非 `auto`/`off`，同样透传 `--effort <e>`） | `codex` 解析 `thread.started`（会话 ID）、`item.started`（`command_execution`/`mcp_tool_call`/`file_change`/`web_search` 映射为精简 `tool_use`）、丢弃 `item.updated`（仅在内存更新 `agent_message` 缓冲）、从 `item.completed`（`agent_message`）提取 `output_md`、`turn.completed` 映射精简 `turn_end`、`turn.failed`/`error` 标记失败；`claude` 解析 `result`（提取正文与 `session_id` 并处理 `is_error`），实现多引擎统一抽象 |
 
 #### `agy` 项目归属解析规则
 
@@ -140,13 +141,13 @@ skills/ahub/SKILL.md             # 通过 go:embed 内嵌于二进制中
 #### 模型简称、本地目录采集与思考强度映射表
 
 - 思考强度支持标准值：`off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`、`ultra`、`auto`（同步兼容 `carbon@high` 合写语法）。
-- `agy` 家族自动展开：支持短别名（`carbon` -> `gemini-4-carbon-<effort>`、`argon` -> `gemini-4-argon-<effort>`、`hydrogen` -> `gemini-4-hydrogen-<effort>`、`flash` -> `gemini-3.8-flash-<effort>`、`opus` -> `claude-opus-5-5-<effort>`、`sonnet` -> `claude-sonnet-5-5-<effort>`）以及完整基础模型 ID（如 `gemini-4-carbon`、`gpt-oss-120b`）按所选 `effort` 展开；若 `default_model` 自带 `-low`/`-medium`/`-high`/`-xhigh`/`-max` 后缀且调用显式指定 `effort`，则替换后缀并保留兼容档位夹逼（除 `gemini-4-hydrogen` 原生支持 `xhigh` 外，已知家族其余型号的 `xhigh`/`max` 自动对齐 `-high`）；对于 `gemini-pro-orchestrator*` 等无档位独立模型，保持原 ID 不追加后缀且不传递 `--effort`。
+- `agy` 家族自动展开：支持短别名（`carbon` -> `gemini-4-carbon-<effort>`、`argon` -> `gemini-4-argon-<effort>`、`hydrogen` -> `gemini-4-hydrogen-<effort>`、`flash` -> `gemini-3.8-flash-<effort>`、`opus` -> `claude-opus-5-5-<effort>`、`sonnet` -> `claude-sonnet-5-5-<effort>`）以及完整基础模型 ID（如 `gemini-4-carbon`、`gpt-oss-120b`）按所选 `effort` 展开；若 `default_model` 自带 `-low`/`-medium`/`-high`/`-xhigh`/`-max` 后缀且调用显式指定 `effort`，则替换后缀并保留兼容档位夹逼（除 `gemini-4-hydrogen` 原生支持 `xhigh` 外，已知家族其余型号的 `xhigh`/`max` 自动对齐 `-high`）；对于 `gemini-pro-orchestrator*` 等无档位独立模型，保持原 ID 不追加后缀且不传递 `--effort`。`ahub node init` 初始化及节点省略 `agents.agy.default_model` 时，`agy` 默认模型统一为 `gemini-4-hydrogen-high`（上报 `default_model: "gemini-4-hydrogen"`、`default_effort: "high"`）。
 - 节点侧各 Agent 模型目录采集路径：
   - `agy`：执行 `agy models` 解析账号实时可用型号与显示名，将同源 `-low`/`-medium`/`-high`/`-xhigh`/`-max` 条目聚合为基础模型 ID + 可选 `efforts[]`，保留 `gemini-pro-orchestrator*` 等独立模型（`efforts: []`）。
   - `omp`：执行 `omp models --json` 读取已配置 Provider 的 `selector`、`name` 与单模型 `thinking` 数组。
   - `pi`：执行 `pi --list-models` 解析 `<provider>/<model>` 与 `thinking` 标记（`yes` 对应 `off..max`）。
   - `codex`：读取 `~/.codex/config.toml`（`model`、`model_reasoning_effort`、`model_catalog_json` 与 `[model_providers.*]`）及 `~/.codex/models_cache.json`（过滤 `visibility == "list"` 条目，提取 `slug`、`display_name`、`default_reasoning_level` 与 `supported_reasoning_levels`），不向外上报任何密钥或鉴权 URL。
-  - `claude`：读取 `~/.claude/settings.json` 中的 `model` 与模型名称环境变量（`ANTHROPIC_MODEL`、`ANTHROPIC_REASONING_MODEL`、`ANTHROPIC_DEFAULT_*_MODEL`），合并 `node.json` 的可选 `agents.claude.models`、`default_model` 与 `opus`/`sonnet`/`haiku` 预设作为无档位模型列表兜底（`efforts: []`）。
+  - `claude`：读取 `~/.claude/settings.json` 中的 `model` 与模型名称环境变量（`ANTHROPIC_MODEL`、`ANTHROPIC_REASONING_MODEL`、`ANTHROPIC_DEFAULT_*_MODEL`），合并 `node.json` 的可选 `agents.claude.models`、`default_model` 与 `opus`/`sonnet`/`haiku` 预设；默认申报 `efforts: ["low", "medium", "high", "max"]`（`default_effort: "high"`），运行命令透传 `--effort <e>`（`auto` / `off` 或被 `agents.claude.args` 手动覆盖时省略）。
 - `pi` / `omp` 省略 `model` 时保持各自本机默认配置文件选择，也可传 `provider/model` 全称。
 
 ### 4.3 守护生命周期、进程组隔离与系统托管
@@ -160,9 +161,10 @@ skills/ahub/SKILL.md             # 通过 go:embed 内嵌于二进制中
 4. **独立进程组强杀**：Unix 平台设置 `SysProcAttr{Setpgid: true}`。收到 `hub.abort` 或超时时，向 `-pgid` 发送 `SIGTERM`，等待 `5 秒` 后未退出则向 `-pgid` 发送 `SIGKILL`，防止孤儿进程残留持锁。
 5. **系统托管、TCC 持久化与升级后自动平滑重载（`ahub node service install` / `ahub update`）**：
    - **macOS 固定签名壳 `AhubDaemon.app`**：首次执行 `ahub node service install` 时在 `~/Applications/AhubDaemon.app` 生成轻量静态可执行壳并执行一次 ad-hoc `codesign --identifier win.bobocai.ahub.daemon --force --deep --sign -`（默认幂等冻结，不再于日常 `ahub update` 时覆写 `.app` 主二进制与 `CDHash`，除非显式传入 `--recreate-app`）。`LaunchAgent` `~/Library/LaunchAgents/win.bobocai.ahub.node.plist` 通过 `<bin_in_app> node shim --bin <~/.local/bin/ahub> --config <node.json>` 启动守护进程，使系统只需对 `AhubDaemon.app` 授予一次「完全磁盘访问权限」，后续 `ahub update` 替换 `~/.local/bin/ahub` 时外置盘 TCC 授权持续有效。
-   - **升级后优雅排空重载（`SIGHUP` + Exit Code `42`）**：`ahub node serve` 写明自身 PID 到 `~/.config/ahub/node.pid` 并监听 `SIGHUP`；收到 `SIGHUP` 后立即停止接收新任务，等待当前活跃子进程全部完成并回传云端终态后，优雅关闭 WebSocket 并以退出码 `42`（`ExitReload`）退出；外层 `ahub node shim` 捕获退出码 `42` 后在 `200ms` 后立即重新 `exec` 磁盘上的新版本 `<bin> node serve`（macOS 原生 `spawn` 继承 `AhubDaemon.app` 进程树与 TCC 权限；若为直连 `LaunchAgent`/`systemd` 则回退由服务管理器按退出重启或 `launchctl kickstart -k` / `systemctl --user restart`）。
-   - **远程自更新防自杀保护**：当 `ahub update` 处于远程任务子进程环境（`AHUB_RUN_ID` 非空）触发时，仅向在线 `node.pid` 发送 `SIGHUP` 排空重启（确保当前报告完 `done` 再重启），严禁在任务执行途中直接 `launchctl kickstart -k` 强杀父守护进程。
+   - **升级后优雅排空重载（`SIGHUP` / `node.reload` 哨兵 + Exit Code `42`）**：`ahub node serve` 写明自身 PID 到 `~/.config/ahub/node.pid`（支持 Unix `SIGHUP` 与跨平台 `<config_dir>/node.reload` 哨兵文件）；收到排空信号后立即停止接收新任务，等待当前活跃子进程与已托管审批完成并回传云端终态后，优雅关闭 WebSocket 并以退出码 `42`（`ExitReload`）退出；外层 `ahub node shim` 捕获退出码 `42` 后在 `200ms` 后立即重新拉起磁盘上的新版本 `<bin> node serve`（macOS 原生 `spawn` 继承 `AhubDaemon.app` 进程树与 TCC 权限；若为直连 `LaunchAgent`/`systemd` 则回退由服务管理器按退出重启或 `launchctl kickstart -k` / `systemctl --user restart`）。
+   - **远程自更新防自杀保护**：当 `ahub update` 处于远程任务子进程环境（`AHUB_RUN_ID` 非空）触发时，仅向在线 `node.pid` 发送排空信号（Unix 发 `SIGHUP`，Windows 写 `node.reload`），确保当前任务报告完 `done` 再退出重启，严禁在任务执行途中强杀父守护进程。
    - **Linux**：写入 `~/.config/systemd/user/ahub-node.service`（开启 `Restart=always` 与 `loginctl enable-linger` 提示）；`ahub update` 时同样优先发 `SIGHUP` 排空退出或空闲状态下执行 `systemctl --user restart ahub-node.service`。
+   - **Windows**：`ahub node service install` 将当前二进制另存为独立监控副本 `ahub-shim.exe` 并生成 `<target_dir 或 config_dir>/ahub-node-runner.cmd`（经 `ahub-shim.exe node shim --bin <ahub.exe> --config <node.json>` 启动，避免监控父进程锁定主 `ahub.exe` 替换路径）；启用 `--activate` 时注册并运行登录触发计划任务 `AhubNodeDaemon`（`schtasks /Create /F /SC ONLOGON /TN "AhubNodeDaemon"`）。`node.pid` 存活探测通过 `tasklist /FI "PID eq <pid>" /FO CSV /NH` 解析进程名与 PID 防止假阳性；`ahub update` 通过写入 `<config_dir>/node.reload` 哨兵触发守护端排空后返回退出码 `42`，由 `ahub-shim.exe` 极速拉起新版 `ahub.exe`。
 
 ## 5. 配套 `skills/ahub/SKILL.md` 标准全文
 

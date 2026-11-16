@@ -34,6 +34,7 @@ interface StreamWsAttachment {
   runId: string | null;
   scope: ApiScope;
   keyId: string | null;
+  boundNodeId: string | null;
   allowedNodes: string[];
 }
 
@@ -77,6 +78,19 @@ export class NodeHub extends DurableObject<Env> {
     }
   }
 
+  private canStreamReceiveNode(att: StreamWsAttachment, nodeId?: string): boolean {
+    if (!nodeId || att.scope !== "client") {
+      return true;
+    }
+    if (att.boundNodeId && att.boundNodeId !== nodeId) {
+      return false;
+    }
+    if (att.allowedNodes.length > 0 && !att.allowedNodes.includes(nodeId)) {
+      return false;
+    }
+    return true;
+  }
+
   private broadcastToStream(
     payload: unknown,
     filter?: { runId?: string; nodeId?: string }
@@ -92,12 +106,7 @@ export class NodeHub extends DurableObject<Env> {
         // Single-run subscribers do not receive unrelated global node status frames
         continue;
       }
-      if (
-        filter?.nodeId &&
-        att.scope === "client" &&
-        att.allowedNodes.length > 0 &&
-        !att.allowedNodes.includes(filter.nodeId)
-      ) {
+      if (!this.canStreamReceiveNode(att, filter?.nodeId)) {
         continue;
       }
       try {
@@ -136,6 +145,7 @@ export class NodeHub extends DurableObject<Env> {
       const runId = url.searchParams.get("run_id") || null;
       const scope = (request.headers.get("x-ahub-scope") || "admin") as ApiScope;
       const keyId = request.headers.get("x-ahub-key-id") || null;
+      const boundNodeId = request.headers.get("x-ahub-bound-node-id") || null;
       const allowedNodesRaw = request.headers.get("x-ahub-allowed-nodes") || "[]";
       let allowedNodes: string[] = [];
       try {
@@ -149,7 +159,7 @@ export class NodeHub extends DurableObject<Env> {
         kind: "api_key",
         keyId,
         scope,
-        boundNodeId: null,
+        boundNodeId,
         allowedNodes,
         allowUnsandboxed: true,
         maxDepthLimit: 3
@@ -166,6 +176,7 @@ export class NodeHub extends DurableObject<Env> {
         runId,
         scope,
         keyId,
+        boundNodeId,
         allowedNodes
       };
       server.serializeAttachment(attachment);

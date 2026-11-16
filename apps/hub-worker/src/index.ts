@@ -1,6 +1,7 @@
 import { authenticateRequest, ensureNodeAllowedForClient, requireScope } from "./auth";
 import {
   cancelRun,
+  checkpointRunApproval,
   claimRunsForNode,
   completeRun,
   createApiKey,
@@ -21,6 +22,7 @@ import {
   patchThread,
   reapExpiredLeases,
   reorderQueuedRuns,
+  resolveRunApproval,
   revokeApiKey
 } from "./db";
 import {
@@ -44,6 +46,7 @@ import {
 } from "./types";
 import { randomToken, sha256Hex } from "./ulid";
 import {
+  parseApprovalCheckpointRequest,
   parseCancelRunRequest,
   parseClaimRequest,
   parseCompleteRequest,
@@ -56,6 +59,7 @@ import {
   parsePatchRunRequest,
   parsePatchThreadRequest,
   parseReorderRunsRequest,
+  parseResolveRunRequest,
   readJsonBody
 } from "./validation";
 import { decryptWebhookConfig, encryptWebhookConfig } from "./webhook-crypto";
@@ -105,6 +109,22 @@ function jsonError(err: unknown): Response {
     },
     { status: 500 }
   );
+}
+
+async function readOptionalJsonBody(request: Request, label: string): Promise<unknown> {
+  const contentLen = request.headers.get("Content-Length");
+  if (contentLen === "0") {
+    return undefined;
+  }
+  const text = await request.text();
+  if (!text.trim()) {
+    return undefined;
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new HubError(400, "BAD_REQUEST", `${label} request body must be valid JSON.`);
+  }
 }
 
 async function doPost(env: Env, path: string, body: unknown): Promise<void> {
@@ -191,6 +211,7 @@ export default {
         const headers = new Headers(request.headers);
         headers.set("x-ahub-scope", principal.scope);
         if (principal.keyId) headers.set("x-ahub-key-id", principal.keyId);
+        if (principal.boundNodeId) headers.set("x-ahub-bound-node-id", principal.boundNodeId);
         headers.set("x-ahub-allowed-nodes", JSON.stringify(principal.allowedNodes));
         const forwardUrl = new URL("https://node-hub/internal/ws/stream");
         if (runIdParam) forwardUrl.searchParams.set("run_id", runIdParam);
@@ -278,6 +299,27 @@ export default {
             should_abort: res.shouldAbort,
             lease_expires_at: res.leaseExpiresAt
           });
+        }
+
+        const approvalMatch = /^\/api\/v1\/runs\/([^/]+)\/approval$/.exec(pathname);
+        if (request.method === "POST" && approvalMatch) {
+          requireScope(principal, ["node"]);
+          if (!principal.boundNodeId) {
+            throw new HubError(403, "FORBIDDEN_SCOPE", "Missing bound_node_id on node key.");
+          }
+          const runId = decodeURIComponent(approvalMatch[1]!);
+          const body = parseApprovalCheckpointRequest(await readJsonBody(request));
+          const updatedRow = await checkpointRunApproval(
+            env.DB,
+            env,
+            principal,
+            runId,
+            getLeaseTtl(env),
+            body
+          );
+          const runRecord = mapRunRow(updatedRow, { view: "summary", tailBytes: 16384 });
+          await broadcastRun(env, runRecord);
+          return Response.json({ ok: true, run: runRecord });
         }
 
         const completeMatch = /^\/api\/v1\/runs\/([^/]+)\/complete$/.exec(pathname);
@@ -441,22 +483,29 @@ export default {
           return Response.json({ ok: true, events: res.events, next_seq: res.nextSeq });
         }
 
+        const runResolveMatch = /^\/api\/v1\/runs\/([^/]+)\/resolve$/.exec(pathname);
+        if (request.method === "POST" && runResolveMatch) {
+          requireScope(principal, ["admin", "client"]);
+          const runId = decodeURIComponent(runResolveMatch[1]!);
+          const rawBody = await readOptionalJsonBody(request, "Resolve");
+          const body = parseResolveRunRequest(rawBody);
+          const { run, alreadyTerminal } = await resolveRunApproval(env.DB, env, principal, runId, body);
+          if (!alreadyTerminal) {
+            await doPost(env, "/internal/abort", {
+              targets: [{ nodeId: run.node_id, runId: run.id }],
+              reason: "approval_resolved"
+            }).catch(() => undefined);
+          }
+          const runRecord = mapRunRow(run, { view: "summary", tailBytes: 16384 });
+          await broadcastRun(env, runRecord);
+          return Response.json({ ok: true, run: runRecord });
+        }
+
         const runCancelMatch = /^\/api\/v1\/runs\/([^/]+)\/cancel$/.exec(pathname);
         if (request.method === "POST" && runCancelMatch) {
           requireScope(principal, ["admin", "client"]);
           const runId = decodeURIComponent(runCancelMatch[1]!);
-          let rawBody: unknown = undefined;
-          const contentLen = request.headers.get("Content-Length");
-          if (contentLen !== "0") {
-            const text = await request.text();
-            if (text.trim()) {
-              try {
-                rawBody = JSON.parse(text);
-              } catch {
-                throw new HubError(400, "BAD_REQUEST", "Cancel request body must be valid JSON.");
-              }
-            }
-          }
+          const rawBody = await readOptionalJsonBody(request, "Cancel");
           const body = parseCancelRunRequest(rawBody);
           const { cancelledRuns, abortTargets } = await cancelRun(env.DB, env, principal, runId, body);
           if (abortTargets.length > 0) {

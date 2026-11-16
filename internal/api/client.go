@@ -246,6 +246,31 @@ func (c *Client) CompleteRun(ctx context.Context, runID string, req CompleteRunR
 	return &res.Run, nil
 }
 
+func (c *Client) CheckpointApproval(ctx context.Context, runID string, req ApprovalCheckpointRequest) (*RunRecord, error) {
+	var res struct {
+		OK  bool      `json:"ok"`
+		Run RunRecord `json:"run"`
+	}
+	_, err := c.doJSON(ctx, http.MethodPost, "/api/v1/runs/"+url.PathEscape(runID)+"/approval", req, &res, nil)
+	if err != nil {
+		return nil, err
+	}
+	return &res.Run, nil
+}
+
+func (c *Client) ResolveRun(ctx context.Context, runID, summary string) (*RunRecord, error) {
+	var res struct {
+		OK  bool      `json:"ok"`
+		Run RunRecord `json:"run"`
+	}
+	req := ResolveRunRequest{Summary: summary}
+	_, err := c.doJSON(ctx, http.MethodPost, "/api/v1/runs/"+url.PathEscape(runID)+"/resolve", req, &res, nil)
+	if err != nil {
+		return nil, err
+	}
+	return &res.Run, nil
+}
+
 func (c *Client) GetVersionManifest(ctx context.Context) (*VersionManifest, error) {
 	var res VersionManifest
 	_, err := c.doJSON(ctx, http.MethodGet, "/dl/version.json", nil, &res, nil)

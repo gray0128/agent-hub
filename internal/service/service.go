@@ -7,14 +7,18 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/gray0128/agent-hub/internal/config"
 	"github.com/gray0128/agent-hub/internal/daemon"
 )
 
 const (
-	LaunchdLabel = "win.bobocai.ahub.node"
-	SystemdUnit  = "ahub-node.service"
+	LaunchdLabel    = "win.bobocai.ahub.node"
+	SystemdUnit     = "ahub-node.service"
+	WindowsTaskName = "AhubNodeDaemon"
+	WindowsRunner   = "ahub-node-runner.cmd"
+	WindowsShimExe  = "ahub-shim.exe"
 )
 
 type InstallOptions struct {
@@ -26,26 +30,64 @@ type InstallOptions struct {
 }
 
 type InstallResult struct {
-	ServicePath string              `json:"path"`
-	DaemonApp   DarwinDaemonAppInfo `json:"daemon_app,omitempty"`
+	ServicePath     string              `json:"path"`
+	DaemonApp       DarwinDaemonAppInfo `json:"daemon_app,omitempty"`
+	WindowsShimPath string              `json:"windows_shim_path,omitempty"`
 }
 
 func ServiceFilePath(targetDir string) (string, error) {
+	if strings.TrimSpace(targetDir) == "" && runtime.GOOS == "windows" {
+		if cfgDir, err := config.ConfigDir(); err == nil && strings.TrimSpace(cfgDir) != "" {
+			return filepath.Join(cfgDir, WindowsRunner), nil
+		}
+	}
+	home := ""
+	if strings.TrimSpace(targetDir) == "" {
+		var err error
+		home, err = os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+	}
+	return ServiceFilePathForOS(runtime.GOOS, home, targetDir)
+}
+
+// ServiceFilePathForOS returns the platform service or runner definition path for a given OS.
+func ServiceFilePathForOS(goos, homeDir, targetDir string) (string, error) {
 	if strings.TrimSpace(targetDir) != "" {
 		dir := config.ExpandPath(targetDir)
-		if runtime.GOOS == "darwin" {
+		switch goos {
+		case "darwin":
 			return filepath.Join(dir, LaunchdLabel+".plist"), nil
+		case "windows":
+			return filepath.Join(dir, WindowsRunner), nil
+		default:
+			return filepath.Join(dir, SystemdUnit), nil
 		}
-		return filepath.Join(dir, SystemdUnit), nil
 	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
+	switch goos {
+	case "darwin":
+		return filepath.Join(homeDir, "Library", "LaunchAgents", LaunchdLabel+".plist"), nil
+	case "windows":
+		return filepath.Join(homeDir, ".config", "ahub", WindowsRunner), nil
+	default:
+		return filepath.Join(homeDir, ".config", "systemd", "user", SystemdUnit), nil
 	}
-	if runtime.GOOS == "darwin" {
-		return filepath.Join(home, "Library", "LaunchAgents", LaunchdLabel+".plist"), nil
+}
+
+func nextBackoff(cur time.Duration) time.Duration {
+	cur *= 2
+	if cur > 15*time.Second {
+		return 15 * time.Second
 	}
-	return filepath.Join(home, ".config", "systemd", "user", SystemdUnit), nil
+	return cur
+}
+
+// RenderWindowsRunnerScript returns the Windows batch wrapper that launches ahub-shim.exe.
+func RenderWindowsRunnerScript(shimExePath, binPath, cfgPath, logPath string) string {
+	logDir := filepath.Dir(logPath)
+	return fmt.Sprintf("@echo off\r\nsetlocal\r\nif not exist \"%s\" mkdir \"%s\"\r\n\"%s\" node shim --bin \"%s\" --config \"%s\" >> \"%s\" 2>&1\r\n",
+		logDir, logDir, shimExePath, binPath, cfgPath, logPath)
 }
 
 func RenderLaunchdPlist(binPath, cfgPath, logDir string) string {
@@ -201,6 +243,19 @@ func InstallWithOptions(opts InstallOptions) (InstallResult, error) {
 		}
 		res.DaemonApp = appInfo
 		content = RenderLaunchdPlistForShim(appInfo.ExecutablePath, binPath, cfgPath, logDir)
+	} else if runtime.GOOS == "windows" {
+		logDir := filepath.Join(filepath.Dir(cfgPath), "logs")
+		if opts.TargetDir != "" {
+			logDir = filepath.Join(config.ExpandPath(opts.TargetDir), "logs")
+		}
+		_ = os.MkdirAll(logDir, 0o755)
+
+		shimPath := filepath.Join(filepath.Dir(destPath), WindowsShimExe)
+		if err := copyFileAtomic(binPath, shimPath, 0o755); err != nil {
+			return res, fmt.Errorf("stage windows shim failed: %w", err)
+		}
+		res.WindowsShimPath = shimPath
+		content = RenderWindowsRunnerScript(shimPath, binPath, cfgPath, filepath.Join(logDir, "ahub-node.log"))
 	} else {
 		content = RenderSystemdUnit(binPath, cfgPath)
 	}
@@ -224,6 +279,15 @@ func InstallWithOptions(opts InstallOptions) (InstallResult, error) {
 			if out, err := exec.Command("systemctl", "--user", "restart", SystemdUnit).CombinedOutput(); err != nil {
 				return res, fmt.Errorf("systemctl restart failed: %w (%s)", err, strings.TrimSpace(string(out)))
 			}
+		} else if runtime.GOOS == "windows" {
+			_ = exec.Command("schtasks", "/End", "/TN", WindowsTaskName).Run()
+			taskRun := fmt.Sprintf(`"%s"`, destPath)
+			if out, err := exec.Command("schtasks", "/Create", "/TN", WindowsTaskName, "/SC", "ONLOGON", "/TR", taskRun, "/F").CombinedOutput(); err != nil {
+				return res, fmt.Errorf("schtasks create failed: %w (%s)", err, strings.TrimSpace(string(out)))
+			}
+			if out, err := exec.Command("schtasks", "/Run", "/TN", WindowsTaskName).CombinedOutput(); err != nil {
+				return res, fmt.Errorf("schtasks run failed: %w (%s)", err, strings.TrimSpace(string(out)))
+			}
 		}
 	}
 
@@ -234,14 +298,12 @@ func InstallWithOptions(opts InstallOptions) (InstallResult, error) {
 func RefreshAndReloadAfterUpdate() (bool, string) {
 	cfgPath, err := config.DefaultNodeConfigPath()
 	if err == nil {
-		if rec, live := daemon.ReadLiveDaemonPID(cfgPath); live {
-			if err := daemon.SendReloadSignal(rec.PID); err == nil {
-				return true, "sighup_drain"
-			}
+		if reloaded, mode := daemon.RequestDaemonReload(cfgPath); reloaded {
+			return true, mode
 		}
 	}
 
-	// Never hard-kickstart the parent launchd/systemd unit while running inside an active remote task.
+	// Never hard-kickstart the parent launchd/systemd/schtasks unit while running inside an active remote task.
 	if strings.TrimSpace(os.Getenv("AHUB_RUN_ID")) != "" {
 		return false, "skipped_inside_run"
 	}
@@ -279,7 +341,25 @@ func RefreshAndReloadAfterUpdate() (bool, string) {
 		}
 		return false, "systemd_restart_failed"
 	case "windows":
-		return false, "manual_restart_required"
+		svcPath, err := ServiceFilePath("")
+		if err != nil {
+			return false, "none"
+		}
+		if _, err := os.Stat(svcPath); err != nil {
+			return false, "not_installed"
+		}
+		out, err := exec.Command("schtasks", "/Query", "/TN", WindowsTaskName, "/FO", "LIST").CombinedOutput()
+		if err != nil {
+			return false, "not_installed"
+		}
+		if !strings.Contains(strings.ToLower(string(out)), "running") {
+			return false, "not_running"
+		}
+		_ = exec.Command("schtasks", "/End", "/TN", WindowsTaskName).Run()
+		if err := exec.Command("schtasks", "/Run", "/TN", WindowsTaskName).Run(); err == nil {
+			return true, "schtasks_restart"
+		}
+		return false, "schtasks_restart_failed"
 	default:
 		return false, "none"
 	}
@@ -296,7 +376,13 @@ func Uninstall(targetDir string, deactivate bool) (string, error) {
 			_ = exec.Command("launchctl", "bootout", uid, destPath).Run()
 		} else if runtime.GOOS == "linux" {
 			_ = exec.Command("systemctl", "--user", "disable", "--now", SystemdUnit).Run()
+		} else if runtime.GOOS == "windows" {
+			_ = exec.Command("schtasks", "/End", "/TN", WindowsTaskName).Run()
+			_ = exec.Command("schtasks", "/Delete", "/TN", WindowsTaskName, "/F").Run()
 		}
+	}
+	if runtime.GOOS == "windows" {
+		_ = os.Remove(filepath.Join(filepath.Dir(destPath), WindowsShimExe))
 	}
 	if err := os.Remove(destPath); err != nil && !os.IsNotExist(err) {
 		return destPath, err

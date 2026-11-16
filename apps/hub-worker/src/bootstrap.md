@@ -149,5 +149,6 @@ done
 若 `service_installed: true`，补验用户级服务运行状态：
 - **macOS**：`launchctl print "gui/$(id -u)/win.bobocai.ahub.node"`（确认 `state = running` 或 `pid` 存在）。
 - **Linux**：`systemctl --user is-active ahub-node.service`。
+- **Windows**：`schtasks /Query /TN "AhubNodeDaemon" /V /FO LIST`（确认计划任务已注册且最近状态为正在运行或已就绪）。
 
 最后用简明中文向用户汇报：`ahub` 当前版本号、`node_id`、`hub_url`、已启用 Agent 列表、`project_roots` 与系统托管服务状态（**严禁在汇报中出现任何 Token 原文**）。

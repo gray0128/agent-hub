@@ -286,23 +286,26 @@ export function requireScope(principal: AuthPrincipal, allowed: readonly ApiScop
   }
 }
 
+export function isNodeVisibleToPrincipal(principal: AuthPrincipal, nodeId: string): boolean {
+  if (principal.scope === "admin") return true;
+  if (principal.scope === "node") return principal.boundNodeId === nodeId;
+  if (principal.boundNodeId && principal.boundNodeId !== nodeId) return false;
+  if (principal.allowedNodes.length > 0 && !principal.allowedNodes.includes(nodeId)) return false;
+  return true;
+}
+
 export function ensureNodeAllowedForClient(principal: AuthPrincipal, nodeId: string): void {
   if (principal.scope === "admin") return;
   if (principal.scope !== "client") {
     throw new HubError(403, "FORBIDDEN_SCOPE", "Node token cannot perform client operations.");
   }
-  if (principal.boundNodeId && principal.boundNodeId !== nodeId) {
+  if (!isNodeVisibleToPrincipal(principal, nodeId)) {
     throw new HubError(
       403,
       "FORBIDDEN_SCOPE",
-      `Client key is bound to node '${principal.boundNodeId}' and cannot target '${nodeId}'.`
-    );
-  }
-  if (principal.allowedNodes.length > 0 && !principal.allowedNodes.includes(nodeId)) {
-    throw new HubError(
-      403,
-      "FORBIDDEN_SCOPE",
-      `Client key is not permitted to target node '${nodeId}'.`
+      principal.boundNodeId && principal.boundNodeId !== nodeId
+        ? `Client key is bound to node '${principal.boundNodeId}' and cannot target '${nodeId}'.`
+        : `Client key is not permitted to target node '${nodeId}'.`
     );
   }
 }
