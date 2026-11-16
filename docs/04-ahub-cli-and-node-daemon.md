@@ -40,12 +40,14 @@ skills/ahub/SKILL.md             # 通过 go:embed 内嵌于二进制中
 - **流分离原则**：传入 `--json` 时，`stdout` 仅允许输出一个合法的 JSON 对象；所有调试信息、等待心跳提示与错误堆栈统一写往 `stderr`。
 - **防 Shell 截断**：`ahub run` 必须支持在结尾传入 `-` 从 `stdin` 读取多行原始 Prompt，严禁要求调用方将长代码块转义后塞入命令行参数。
 - **上下文窗口保护**：`ahub result <run_id>` 默认只拉取 `summary` 与尾部最多 `16 KB` 预览（附带 `"truncated": true, "output_bytes": N`），只有显式指定 `--full` 时才拉取完整 `output_md`。
+- **共享宿主多 Bot 凭据隔离**：当多个外部助手（如同一账号下共享云端 Linux 计算机 `$HOME` 的多个 Grok Bot）共用同一宿主文件系统时，严禁将不同 Bot 的 `client` Token 混写进默认 `~/.config/ahub/credentials`；优先在各 Bot / Routine 独立环境变量中注入 `AHUB_TOKEN`，若使用本地文件登录则必须按 Bot 隔离 `AHUB_CONFIG_DIR`（如 `~/.config/ahub-bots/<bot_slug>`）并通过 `ahub auth login --token-stdin` 写入，防止节点白名单与加密 Webhook 串台。
 
 ### 3.2 核心子命令列表
 
 | 命令与常用参数 | 功能说明 |
 | --- | --- |
-| `ahub auth login --url <url> --token <token>` | 校验并保存 `0600` 凭据至 `~/.config/ahub/credentials` |
+| `ahub auth login [--url <url>] [--token <token> \| --token-stdin] [--json]` | 调用 `GET /api/v1/auth/me` 校验并写入 `0600` 凭据至 `<AHUB_CONFIG_DIR>/credentials`（默认 `~/.config/ahub/credentials`）；支持 `--token-stdin` 从标准输入安全读取 Token，`--json` 仅返回 `ok`、`url`、`credentials_path` 与 `principal`，绝不回显明文 Token |
+| `ahub auth status [--verify] [--json]` | 零密钥泄露检查当前调用端凭据状态（返回 `ok`、`url`、`config_dir`、`credentials_path`、`credentials_exists`、`has_token` 与 `token_source` (`flag` \| `env` \| `file` \| `none`)）；传入 `--verify` 时额外调用 `GET /api/v1/auth/me` 返回 `verified: true` 与 `principal` |
 | `ahub nodes [--online] [--json]` | 从云端读取节点清单、在线态、可用 Agent、模型简称及项目短名列表 |
 | `ahub run -n <node> -d <dir> -a <agent> [-m <model@effort>] [--thread <thr_id>] [--no-sandbox] [--timeout 15m] [--wait 45s] [--notify grok] [--idempotency-key <k>] [--json] <prompt \| ->` | 创建任务并入队（未传 `--thread` 时新建会话）。CLI 自动读取环境中的 `AHUB_RUN_ID` 作为 `parent_run_id`。支持两阶段等待预算（默认 `--wait` 为 `45s`）：第一阶段使用 HTTP 长轮询 `?wait_ms=min(wait, 45000)`；若未设 `--notify` 且仍处于运行态且 `--wait > 45s`（或服务端提前返回 `202`），第二阶段以剩余预算无缝切入 `/ws/stream` 阻塞等待；若第二阶段发生鉴权/网络等真实传输错误则直接返回对应退出码（不误报 `24`），停机态（`done`/`failed`/`cancelled`/`needs_approval`）统一带 `5s` 有界超时拉取摘要预览 |
 | `ahub wait <run_id> [--timeout 15m] [--json]` | 连接 `/ws/stream?run_id=<id>` 零轮询阻塞等待任务到达终态或 `needs_approval`（停机态统一带 `5s` 超时拉取摘要预览） |

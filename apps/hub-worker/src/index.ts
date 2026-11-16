@@ -28,6 +28,7 @@ import {
 import {
   handleBinaryDownload,
   handleBootstrapMd,
+  handleClientBootstrapMd,
   handleInstallSh,
   handleSkillMd,
   handleVersionJson
@@ -156,6 +157,9 @@ export default {
       }
       if (request.method === "GET" && pathname === "/dl/bootstrap.md") {
         return handleBootstrapMd(request, env);
+      }
+      if (request.method === "GET" && pathname === "/dl/client-bootstrap.md") {
+        return handleClientBootstrapMd(request, env);
       }
       if (request.method === "GET" && pathname === "/dl/install.sh") {
         return handleInstallSh(request, env);

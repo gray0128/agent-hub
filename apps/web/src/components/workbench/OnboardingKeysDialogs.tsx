@@ -41,6 +41,80 @@ const BINARY_DOWNLOADS = [
   { label: "Windows x64", href: "/dl/ahub-windows-amd64.exe" }
 ];
 
+function resolveHubOrigin(): string {
+  return typeof window !== "undefined" ? window.location.origin : "https://ahub.bobocai.win";
+}
+
+function toBotSlug(rawName: string): string {
+  const clean = rawName
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return clean || "grok-bot";
+}
+
+function buildClientBootstrapEnvPrompt(hubOrigin: string, botName?: string): string {
+  const botTag = botName?.trim() ? `（Bot 标识：${botName.trim()}）` : "";
+  return `请读取 ${hubOrigin}/dl/client-bootstrap.md 中的最新调用端自举说明，直接代我完成本环境 ahub CLI 与配套 SKILL.md 的安装或升级（注意传入 --no-restart 跳过节点守护重启）${botTag}；校验当前 AHUB_TOKEN 连通性与可访问节点列表，并将该跨机调度规范保存为当前平台的「ahub」技能以便后续持续复用（全程严禁执行 ahub node 守护命令，也严禁在日志或回执中输出任何密钥原文）。`;
+}
+
+function buildClientBootstrapTokenPrompt(
+  hubOrigin: string,
+  botName: string,
+  clientToken: string
+): string {
+  const slug = toBotSlug(botName);
+  return `请读取 ${hubOrigin}/dl/client-bootstrap.md 中的最新调用端自举说明，将本环境配置为独立 Bot 调用端（Bot 标识：${slug}，Hub 地址：${hubOrigin}，专属隔离配置目录：~/.config/ahub-bots/${slug}，调用端 Token：${clientToken}）；请先 export AHUB_CONFIG_DIR="$HOME/.config/ahub-bots/${slug}" 并通过 printf '%s' ... | ahub auth login --url ${hubOrigin} --token-stdin 完成隔离落盘，绝不覆盖默认 ~/.config/ahub/credentials，同步完成 SKILL.md 安装与平台原生「ahub」技能持久化（全程严禁执行 ahub node 守护命令，也严禁在日志或回复中复述明文 Token）。`;
+}
+
+function buildGrokRoutinePrompt(hubOrigin: string, isolatedSlug?: string): string {
+  const cfgPrefix = isolatedSlug
+    ? `export AHUB_CONFIG_DIR="$HOME/.config/ahub-bots/${toBotSlug(isolatedSlug)}"; `
+    : "";
+  return `收到 agent-hub 的 \`ahub_run_completed\` Webhook 事件后，按以下规则处理并回复用户：
+1. 若云端环境冷重建导致 \`$HOME/.local/bin/ahub\` 不存在，先执行：\`export PATH="$HOME/.local/bin:$PATH"; ${cfgPrefix}test -x "$HOME/.local/bin/ahub" || (curl -fsSL ${hubOrigin}/dl/install.sh | AHUB_URL=${hubOrigin} sh && "$HOME/.local/bin/ahub" skill install >/dev/null)\`。
+2. 当 \`status\` 为 \`needs_approval\`：立即把事件中的 \`remote_control_url\` 原样发给用户，引导人工审批放行。
+3. 当 \`status\` 为 \`done\`：向用户汇报 \`summary\` 与可续聊的 \`thread_id\`；若事件预览被截断且确需完整正文，调用 \`${cfgPrefix}ahub --url ${hubOrigin} result <run_id> --full --json\` 读取完整输出后再总结。
+4. 当 \`status\` 为 \`failed\` 或 \`cancelled\`：清晰说明 \`error_code\` / \`error_message\` 与 \`run_id\`。
+5. 回调处理轮内禁止循环重试或嵌套发起新的 \`ahub run\`。`;
+}
+
+interface PromptCopyBoxProps {
+  title: string;
+  text: string;
+  testId?: string;
+  mono?: boolean;
+  copyLabel?: string;
+}
+
+function PromptCopyBox({
+  title,
+  text,
+  testId,
+  mono = false,
+  copyLabel = "复制"
+}: PromptCopyBoxProps) {
+  return (
+    <div className="min-w-0 space-y-1.5 rounded-[8px] border border-border bg-card p-2">
+      <div className="flex items-center justify-between gap-2 px-1">
+        <span className="min-w-0 text-[11px] font-medium text-muted-foreground">{title}</span>
+        <CopyButton text={text} label={copyLabel} copiedLabel="已复制" />
+      </div>
+      <pre
+        data-testid={testId}
+        className={
+          mono
+            ? "max-w-full overflow-x-auto rounded-[4px] bg-muted/60 p-2.5 font-mono text-[11px] leading-relaxed text-foreground"
+            : "whitespace-pre-wrap [overflow-wrap:anywhere] rounded-[4px] bg-muted/60 p-2.5 font-sans text-xs leading-relaxed text-foreground"
+        }
+      >
+        {text}
+      </pre>
+    </div>
+  );
+}
+
 export function OnboardingDialog({
   open,
   onOpenChange,
@@ -60,13 +134,14 @@ export function OnboardingDialog({
     setTokenInput(token);
   }, [token]);
 
-  const hubOrigin =
-    typeof window !== "undefined" ? window.location.origin : "https://ahub.bobocai.win";
+  const hubOrigin = resolveHubOrigin();
   const effectiveNodeToken = issuedToken || "<NODE_TOKEN>";
   const safeNodeName = nodeName.trim() || "macmini";
   const agentPrompt = issuedToken
     ? `请读取 ${hubOrigin}/dl/bootstrap.md 中的最新节点自举说明，直接将本机配置并启动为 agent-hub 节点（Hub 地址：${hubOrigin}，节点 ID：${safeNodeName}，节点专属 Token：${issuedToken}），完成二进制安装或升级、配套技能同步、0600 权限节点配置落盘与系统级用户服务激活，全程不要在终端日志或回执中明文复述该 Token。`
     : `请读取 ${hubOrigin}/dl/bootstrap.md 中的最新节点自举说明，直接代我完成本机 ahub 程序与配套技能的检测、下载安装或版本更新；若本机已配置节点守护则重启服务使新版本生效，若首次接入则自动完成基础初始化并引导我补齐节点 Token 启动系统托管服务。`;
+  const clientBootstrapPrompt = buildClientBootstrapEnvPrompt(hubOrigin);
+  const grokRoutinePrompt = buildGrokRoutinePrompt(hubOrigin);
   const installCmd = `curl -fsSL ${hubOrigin}/dl/install.sh | AHUB_URL=${hubOrigin} sh && ~/.local/bin/ahub skill install && printf '%s' '${effectiveNodeToken}' | ~/.local/bin/ahub node init --id ${safeNodeName} --url ${hubOrigin} --token-stdin && ~/.local/bin/ahub node service install --activate`;
   const skillCmd = `mkdir -p ~/.agents/skills/ahub && curl -fsSL ${hubOrigin}/skill/SKILL.md -o ~/.agents/skills/ahub/SKILL.md`;
 
@@ -110,9 +185,19 @@ export function OnboardingDialog({
 
         <Tabs defaultValue="node" className="w-full">
           <TabsList className="grid w-full grid-cols-3">
-            <TabsTrigger value="node">一键接入节点</TabsTrigger>
-            <TabsTrigger value="skill">Agent Skill</TabsTrigger>
-            <TabsTrigger value="auth">Token 登录</TabsTrigger>
+            <TabsTrigger value="node" className="px-1.5 text-[11px] sm:px-2.5 sm:text-xs">
+              一键接入节点
+            </TabsTrigger>
+            <TabsTrigger
+              value="skill"
+              data-testid="onboarding-tab-skill"
+              className="px-1.5 text-[11px] sm:px-2.5 sm:text-xs"
+            >
+              接入 Bot / Skill
+            </TabsTrigger>
+            <TabsTrigger value="auth" className="px-1.5 text-[11px] sm:px-2.5 sm:text-xs">
+              Token 登录
+            </TabsTrigger>
           </TabsList>
 
           <TabsContent value="node" className="space-y-3 pt-1">
@@ -140,32 +225,17 @@ export function OnboardingDialog({
               </div>
             )}
 
-            <div className="space-y-1.5 rounded-[8px] border border-border bg-card p-2">
-              <div className="flex items-center justify-between px-1">
-                <span className="text-[11px] font-medium text-muted-foreground">
-                  发给节点本地 Agent 自动安装/更新（推荐）
-                </span>
-                <CopyButton text={agentPrompt} label="复制" copiedLabel="已复制" />
-              </div>
-              <pre
-                data-testid="onboarding-agent-prompt"
-                className="whitespace-pre-wrap break-words rounded-[4px] bg-muted/60 p-2.5 font-sans text-xs leading-relaxed text-foreground"
-              >
-                {agentPrompt}
-              </pre>
-            </div>
+            <PromptCopyBox
+              title="发给节点本地 Agent 自动安装/更新（推荐）"
+              text={agentPrompt}
+              testId="onboarding-agent-prompt"
+            />
 
-            <div className="space-y-1.5 rounded-[8px] border border-border bg-card p-2">
-              <div className="flex items-center justify-between px-1">
-                <span className="text-[11px] font-medium text-muted-foreground">
-                  终端手工执行安装并启动服务（兜底）
-                </span>
-                <CopyButton text={installCmd} label="复制" copiedLabel="已复制" />
-              </div>
-              <pre className="overflow-x-auto rounded-[4px] bg-muted/60 p-2.5 font-mono text-[11px] leading-relaxed text-foreground">
-                {installCmd}
-              </pre>
-            </div>
+            <PromptCopyBox
+              title="终端手工执行安装并启动服务（兜底）"
+              text={installCmd}
+              mono
+            />
 
             <div className="space-y-1.5">
               <div className="text-[11px] font-medium text-muted-foreground">
@@ -187,19 +257,25 @@ export function OnboardingDialog({
           </TabsContent>
 
           <TabsContent value="skill" className="space-y-3 pt-1">
-            <div className="space-y-1.5 rounded-[8px] border border-border bg-card p-2">
-              <div className="flex items-center justify-between px-1">
-                <span className="text-[11px] font-medium text-muted-foreground">
-                  安装内置跨机调度 Skill 文档
-                </span>
-                <CopyButton text={skillCmd} label="复制" copiedLabel="已复制" />
-              </div>
-              <pre className="overflow-x-auto rounded-[4px] bg-muted/60 p-2.5 font-mono text-[11px] leading-relaxed text-foreground">
-                {skillCmd}
-              </pre>
-            </div>
+            <PromptCopyBox
+              title="发给 Grok Bot / 纯调用端 Agent 自动自举（推荐，配合 AHUB_TOKEN Secret）"
+              text={clientBootstrapPrompt}
+              testId="onboarding-client-prompt"
+            />
+
+            <PromptCopyBox
+              title="Grok Bot Webhook Routine 异步回调指令（粘贴至 Routine Prompt）"
+              text={grokRoutinePrompt}
+              testId="onboarding-routine-prompt"
+            />
+
+            <PromptCopyBox
+              title="终端手工拉取跨机调度 SKILL.md"
+              text={skillCmd}
+              mono
+            />
             <p className="text-xs text-muted-foreground">
-              安装后，本机 Coding Agent 可直接通过 `ahub nodes`、`ahub run`、`ahub wait` 调度远端节点。
+              多 Bot 共用同一账号云端宿主目录时，建议在「密钥管理」按 Bot 单独签发 `client` Key（支持按 `AHUB_TOKEN` 环境变量或 `AHUB_CONFIG_DIR` 隔离落盘，避免跨 Bot 串台）。
             </p>
           </TabsContent>
 
@@ -281,6 +357,12 @@ function toggleNodeInList(raw: string, nodeId: string): string {
   return [...list, nodeId].join(", ");
 }
 
+interface FreshCreatedKey {
+  token: string;
+  name: string;
+  scope: "client" | "node" | "admin";
+}
+
 export function KeysDialog({
   open,
   onOpenChange,
@@ -290,6 +372,7 @@ export function KeysDialog({
   const hasSession = Boolean(authenticated || token);
   const fleetNodes = useFleetStore((s) => s.nodes);
   const nodeIds = fleetNodes.map((n) => n.id);
+  const hubOrigin = resolveHubOrigin();
   const [keys, setKeys] = useState<ApiKeyRecord[]>([]);
   const [loading, setLoading] = useState(false);
   const [name, setName] = useState("");
@@ -298,7 +381,7 @@ export function KeysDialog({
   const [allowedNodesText, setAllowedNodesText] = useState("");
   const [webhookUrl, setWebhookUrl] = useState("");
   const [webhookKey, setWebhookKey] = useState("");
-  const [freshSecret, setFreshSecret] = useState<string | null>(null);
+  const [freshCreated, setFreshCreated] = useState<FreshCreatedKey | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [confirmRevokeId, setConfirmRevokeId] = useState<string | null>(null);
 
@@ -325,7 +408,7 @@ export function KeysDialog({
 
   useEffect(() => {
     if (open) {
-      setFreshSecret(null);
+      setFreshCreated(null);
       setEditingKeyId(null);
       setConfirmRevokeId(null);
       void loadKeys();
@@ -359,7 +442,11 @@ export function KeysDialog({
         }
       }
       const created = await apiClient.createKey(token, payload);
-      setFreshSecret(created.token ?? null);
+      setFreshCreated(
+        created.token
+          ? { token: created.token, name: payload.name, scope: payload.scope }
+          : null
+      );
       setName("");
       setBoundNodeId("");
       setAllowedNodesText("");
@@ -533,19 +620,57 @@ export function KeysDialog({
                     data-testid="key-webhook-key-input"
                   />
                 </div>
+                <p className="text-[11px] text-muted-foreground">
+                  若 Grok Bot 中文桌面端 Routine 面板未显示 Webhook 字段，可用同一账号访问{" "}
+                  <a
+                    href="https://cursor.com/automations"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="underline hover:text-foreground"
+                  >
+                    cursor.com/automations
+                  </a>{" "}
+                  复制 Webhook URL 与 Bearer Key。
+                </p>
               </div>
             )}
           </div>
 
-          {freshSecret && (
-            <div className="rounded-[8px] border border-[var(--status-done)]/40 bg-[var(--status-done)]/10 p-2.5">
-              <div className="mb-1 flex items-center justify-between text-xs font-medium text-[var(--status-done)]">
-                <span>请立即保存新生成的明文密钥（关闭后不再显示）</span>
-                <CopyButton text={freshSecret} label="复制" copiedLabel="已复制" />
+          {freshCreated && (
+            <div className="space-y-2 rounded-[8px] border border-[var(--status-done)]/40 bg-[var(--status-done)]/10 p-2.5">
+              <div>
+                <div className="mb-1 flex items-center justify-between text-xs font-medium text-[var(--status-done)]">
+                  <span>请立即保存新生成的明文密钥（关闭后不再显示）</span>
+                  <CopyButton text={freshCreated.token} label="复制" copiedLabel="已复制" />
+                </div>
+                <code className="block overflow-x-auto rounded-[4px] bg-background/40 px-2 py-1 font-mono text-[11px] text-foreground">
+                  {freshCreated.token}
+                </code>
               </div>
-              <code className="block overflow-x-auto rounded-[4px] bg-background/40 px-2 py-1 font-mono text-[11px] text-foreground">
-                {freshSecret}
-              </code>
+
+              {freshCreated.scope === "client" && (
+                <div className="space-y-2 border-t border-[var(--status-done)]/25 pt-2">
+                  <PromptCopyBox
+                    title="无密自举提示词（推荐：先将上方密钥填入 Bot Secrets AHUB_TOKEN）"
+                    text={buildClientBootstrapEnvPrompt(hubOrigin, freshCreated.name)}
+                    testId="fresh-client-bootstrap-env"
+                  />
+                  <PromptCopyBox
+                    title={`一步带密钥隔离自举提示词（写入 ~/.config/ahub-bots/${toBotSlug(freshCreated.name)}）`}
+                    text={buildClientBootstrapTokenPrompt(
+                      hubOrigin,
+                      freshCreated.name,
+                      freshCreated.token
+                    )}
+                    testId="fresh-client-bootstrap-token"
+                  />
+                  <PromptCopyBox
+                    title="Webhook Routine 回调处理指令（处理 ahub_run_completed）"
+                    text={buildGrokRoutinePrompt(hubOrigin, freshCreated.name)}
+                    testId="fresh-client-routine-prompt"
+                  />
+                </div>
+              )}
             </div>
           )}
 
@@ -727,7 +852,7 @@ export function KeysDialog({
                               data-testid={`edit-webhook-key-${item.id}`}
                             />
                           </div>
-                          <div className="flex items-center justify-between gap-2">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
                             {item.has_webhook ? (
                               <label className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
                                 <input
@@ -740,7 +865,19 @@ export function KeysDialog({
                             ) : (
                               <span />
                             )}
-                            <div className="flex items-center gap-1.5">
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <CopyButton
+                                variant="outline"
+                                label="复制 Bot 自举更新词"
+                                copiedLabel="已复制自举词"
+                                text={buildClientBootstrapEnvPrompt(hubOrigin, item.name)}
+                              />
+                              <CopyButton
+                                variant="outline"
+                                label="复制 Routine 回调词"
+                                copiedLabel="已复制回调词"
+                                text={buildGrokRoutinePrompt(hubOrigin, item.name)}
+                              />
                               <Button
                                 type="button"
                                 size="sm"

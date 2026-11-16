@@ -7,6 +7,7 @@ import (
 	"flag"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -221,5 +222,143 @@ func TestNodeInitAndStatusRedactedIdempotent(t *testing.T) {
 	}
 	if shimRes["ok"] != true || shimRes["shim"] != true {
 		t.Fatalf("unexpected shim self-test payload: %+v", shimRes)
+	}
+}
+
+func TestAuthLoginTokenStdinIsolationAndRedactedStatus(t *testing.T) {
+	const alphaTok = "ahub_cli_alpha_secret_token_1111"
+	const betaTok = "ahub_cli_beta_secret_token_2222"
+	const envTok = "ahub_cli_env_override_secret_3333"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/auth/me" {
+			http.NotFound(w, r)
+			return
+		}
+		auth := r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		switch auth {
+		case "Bearer " + alphaTok:
+			_, _ = w.Write([]byte(`{"ok":true,"principal":{"kind":"api_key","scope":"client","allowed_nodes":["macmini"]}}`))
+		case "Bearer " + betaTok:
+			_, _ = w.Write([]byte(`{"ok":true,"principal":{"kind":"api_key","scope":"client","allowed_nodes":["mbp"]}}`))
+		case "Bearer " + envTok:
+			_, _ = w.Write([]byte(`{"ok":true,"principal":{"kind":"api_key","scope":"client","allowed_nodes":[]}}`))
+		default:
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"ok":false,"error":{"code":"UNAUTHORIZED","message":"Invalid token"}}`))
+		}
+	}))
+	defer srv.Close()
+
+	baseDir := t.TempDir()
+	botAlphaDir := filepath.Join(baseDir, "bot-alpha")
+	botBetaDir := filepath.Join(baseDir, "bot-beta")
+
+	t.Setenv("AHUB_CONFIG_DIR", botAlphaDir)
+	t.Setenv("AHUB_TOKEN", "")
+	t.Setenv("AHUB_URL", "")
+
+	// Mutually exclusive --token and --token-stdin returns ExitBadUsageOrInput (64)
+	conflictCode, _ := captureExecute(t, []string{
+		"--json", "auth", "login", "--url", srv.URL, "--token", alphaTok, "--token-stdin",
+	}, alphaTok+"\n")
+	if conflictCode != api.ExitBadUsageOrInput {
+		t.Fatalf("expected ExitBadUsageOrInput on conflicting flags, got %d", conflictCode)
+	}
+
+	// Empty stdin with --token-stdin returns ExitBadUsageOrInput (64)
+	emptyCode, _ := captureExecute(t, []string{
+		"--json", "auth", "login", "--url", srv.URL, "--token-stdin",
+	}, "   \n")
+	if emptyCode != api.ExitBadUsageOrInput {
+		t.Fatalf("expected ExitBadUsageOrInput on empty stdin, got %d", emptyCode)
+	}
+
+	// Valid --token-stdin writes 0600 credentials under botAlphaDir without leaking secret
+	code, out := captureExecute(t, []string{
+		"--json", "auth", "login", "--url", srv.URL, "--token-stdin",
+	}, alphaTok+"\n")
+	if code != 0 {
+		t.Fatalf("auth login alpha exit=%d out=%s", code, out)
+	}
+	if strings.Contains(out, alphaTok) {
+		t.Fatalf("auth login leaked plaintext token in stdout: %s", out)
+	}
+	var loginRes map[string]interface{}
+	if err := json.Unmarshal([]byte(out), &loginRes); err != nil {
+		t.Fatalf("invalid auth login json: %v (%s)", err, out)
+	}
+	expectedAlphaCreds := filepath.Join(botAlphaDir, "credentials")
+	if loginRes["ok"] != true || loginRes["credentials_path"] != expectedAlphaCreds {
+		t.Fatalf("unexpected auth login payload: %+v", loginRes)
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(expectedAlphaCreds)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Fatalf("expected 0600 credentials perms, got %o", info.Mode().Perm())
+		}
+	}
+
+	// Second bot uses isolated AHUB_CONFIG_DIR without clobbering botAlphaDir
+	t.Setenv("AHUB_CONFIG_DIR", botBetaDir)
+	codeBeta, outBeta := captureExecute(t, []string{
+		"--json", "auth", "login", "--url", srv.URL, "--token-stdin",
+	}, betaTok+"\n")
+	if codeBeta != 0 {
+		t.Fatalf("auth login beta exit=%d out=%s", codeBeta, outBeta)
+	}
+	if strings.Contains(outBeta, betaTok) {
+		t.Fatalf("auth login beta leaked plaintext token: %s", outBeta)
+	}
+
+	alphaRaw, err := os.ReadFile(expectedAlphaCreds)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(alphaRaw), alphaTok) || strings.Contains(string(alphaRaw), betaTok) {
+		t.Fatalf("expected botAlphaDir credentials to remain intact after botBetaDir login")
+	}
+
+	// Verify redacted auth status + --verify from isolated file
+	t.Setenv("AHUB_CONFIG_DIR", botAlphaDir)
+	codeStatus, outStatus := captureExecute(t, []string{"--json", "auth", "status", "--verify"}, "")
+	if codeStatus != 0 {
+		t.Fatalf("auth status --verify exit=%d out=%s", codeStatus, outStatus)
+	}
+	if strings.Contains(outStatus, alphaTok) {
+		t.Fatalf("auth status leaked plaintext token in stdout: %s", outStatus)
+	}
+	var statusRes map[string]interface{}
+	if err := json.Unmarshal([]byte(outStatus), &statusRes); err != nil {
+		t.Fatalf("invalid auth status json: %v (%s)", err, outStatus)
+	}
+	if statusRes["ok"] != true ||
+		statusRes["has_token"] != true ||
+		statusRes["token_source"] != "file" ||
+		statusRes["credentials_exists"] != true ||
+		statusRes["verified"] != true ||
+		statusRes["credentials_path"] != expectedAlphaCreds {
+		t.Fatalf("unexpected auth status payload: %+v", statusRes)
+	}
+
+	// Verify AHUB_TOKEN env override takes precedence cleanly without leaking
+	t.Setenv("AHUB_TOKEN", envTok)
+	codeEnv, outEnv := captureExecute(t, []string{"--json", "auth", "status", "--verify"}, "")
+	if codeEnv != 0 {
+		t.Fatalf("auth status env exit=%d out=%s", codeEnv, outEnv)
+	}
+	if strings.Contains(outEnv, envTok) || strings.Contains(outEnv, alphaTok) {
+		t.Fatalf("auth status leaked env/file token: %s", outEnv)
+	}
+	var envRes map[string]interface{}
+	if err := json.Unmarshal([]byte(outEnv), &envRes); err != nil {
+		t.Fatalf("invalid auth status env json: %v (%s)", err, outEnv)
+	}
+	if envRes["token_source"] != "env" || envRes["verified"] != true {
+		t.Fatalf("expected token_source=env and verified=true, got %+v", envRes)
 	}
 }

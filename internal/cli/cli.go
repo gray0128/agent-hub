@@ -163,21 +163,49 @@ func newClient(g globalOpts) (*api.Client, error) {
 }
 
 func runAuth(g globalOpts, args []string) int {
-	if len(args) == 0 || args[0] != "login" {
-		return failUsage(g.JSON, "usage: ahub auth login --url <url> --token <token>")
+	if len(args) == 0 {
+		return failUsage(g.JSON, "usage: ahub auth login|status ...")
 	}
+	switch args[0] {
+	case "login":
+		return runAuthLogin(g, args[1:])
+	case "status":
+		return runAuthStatus(g, args[1:])
+	default:
+		return failUsage(g.JSON, "usage: ahub auth login|status ...")
+	}
+}
+
+func runAuthLogin(g globalOpts, args []string) int {
 	fs := flag.NewFlagSet("auth login", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	var urlFlag, tokenFlag string
+	var tokenStdin bool
 	fs.StringVar(&urlFlag, "url", "", "hub url")
 	fs.StringVar(&tokenFlag, "token", "", "api token")
-	if err := parseFlagsFlexible(fs, args[1:], map[string]bool{"--url": true, "--token": true}); err != nil {
+	fs.BoolVar(&tokenStdin, "token-stdin", false, "read api token from stdin")
+	if err := parseFlagsFlexible(fs, args, map[string]bool{"--url": true, "--token": true}); err != nil {
 		return api.ExitBadUsageOrInput
 	}
-	hubURL := firstNonEmpty(urlFlag, g.URL, os.Getenv("AHUB_URL"), config.DefaultHubURL)
+	if tokenStdin {
+		if strings.TrimSpace(tokenFlag) != "" || strings.TrimSpace(g.Token) != "" {
+			return failUsage(g.JSON, "cannot specify both --token and --token-stdin")
+		}
+		raw, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return failErr(g.JSON, err)
+		}
+		stdinTok := strings.TrimSpace(string(raw))
+		if stdinTok == "" {
+			return failUsage(g.JSON, "token read from stdin is empty")
+		}
+		tokenFlag = stdinTok
+	}
+
+	hubURL := strings.TrimRight(firstNonEmpty(urlFlag, g.URL, os.Getenv("AHUB_URL"), config.DefaultHubURL), "/")
 	token := firstNonEmpty(tokenFlag, g.Token, os.Getenv("AHUB_TOKEN"))
 	if token == "" {
-		return failUsage(g.JSON, "--token is required")
+		return failUsage(g.JSON, "--token or --token-stdin is required")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -190,10 +218,94 @@ func runAuth(g globalOpts, args []string) int {
 	if err := config.SaveCredentials(hubURL, token); err != nil {
 		return failErr(g.JSON, err)
 	}
+	credPath, _ := config.CredentialsPath()
 	if g.JSON {
-		writeJSON(map[string]interface{}{"ok": true, "url": hubURL, "principal": me["principal"]})
+		writeJSON(map[string]interface{}{
+			"ok":               true,
+			"url":              hubURL,
+			"credentials_path": credPath,
+			"principal":        me["principal"],
+		})
 	} else {
-		fmt.Printf("Authenticated against %s\n", hubURL)
+		fmt.Printf("Authenticated against %s (%s)\n", hubURL, credPath)
+	}
+	return api.ExitOK
+}
+
+func runAuthStatus(g globalOpts, args []string) int {
+	fs := flag.NewFlagSet("auth status", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	var verify bool
+	fs.BoolVar(&verify, "verify", false, "verify connectivity against /api/v1/auth/me")
+	if err := parseFlagsFlexible(fs, args, map[string]bool{}); err != nil {
+		return api.ExitBadUsageOrInput
+	}
+
+	cfgDir, err := config.ConfigDir()
+	if err != nil {
+		return failErr(g.JSON, err)
+	}
+	credPath, err := config.CredentialsPath()
+	if err != nil {
+		return failErr(g.JSON, err)
+	}
+	_, statErr := os.Stat(credPath)
+	credExists := statErr == nil
+	fileCreds, loadErr := config.LoadCredentialsFile()
+	if credExists && loadErr != nil {
+		return failErr(g.JSON, loadErr)
+	}
+
+	tokenSource := "none"
+	resolvedToken := ""
+	switch {
+	case strings.TrimSpace(g.Token) != "":
+		tokenSource = "flag"
+		resolvedToken = strings.TrimSpace(g.Token)
+	case strings.TrimSpace(os.Getenv("AHUB_TOKEN")) != "":
+		tokenSource = "env"
+		resolvedToken = strings.TrimSpace(os.Getenv("AHUB_TOKEN"))
+	case strings.TrimSpace(fileCreds.Token) != "":
+		tokenSource = "file"
+		resolvedToken = strings.TrimSpace(fileCreds.Token)
+	}
+
+	hubURL := strings.TrimRight(firstNonEmpty(g.URL, os.Getenv("AHUB_URL"), fileCreds.URL, config.DefaultHubURL), "/")
+	hasToken := resolvedToken != ""
+
+	payload := map[string]interface{}{
+		"ok":                 true,
+		"url":                hubURL,
+		"config_dir":         cfgDir,
+		"credentials_path":   credPath,
+		"credentials_exists": credExists,
+		"has_token":          hasToken,
+		"token_source":       tokenSource,
+	}
+
+	if verify {
+		if !hasToken {
+			return failUsage(g.JSON, "no authentication token configured (set AHUB_TOKEN or run ahub auth login)")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		me, err := api.NewClient(hubURL, resolvedToken).AuthMe(ctx)
+		if err != nil {
+			return failErr(g.JSON, err)
+		}
+		payload["verified"] = true
+		payload["principal"] = me["principal"]
+	}
+
+	if g.JSON {
+		writeJSON(payload)
+	} else {
+		verifiedSuffix := ""
+		if verified, ok := payload["verified"].(bool); ok && verified {
+			verifiedSuffix = " verified=true"
+		}
+		fmt.Printf("url=%s config_dir=%s credentials=%s exists=%v has_token=%v token_source=%s%s\n",
+			hubURL, cfgDir, credPath, credExists, hasToken, tokenSource, verifiedSuffix)
 	}
 	return api.ExitOK
 }
@@ -1238,7 +1350,8 @@ Usage:
   ahub [--url <url>] [--token <token>] [--json] <command> [args]
 
 Commands:
-  auth login      Validate and save credentials (0600)
+  auth login      Validate and save client credentials (0600, supports --token-stdin)
+  auth status     Inspect redacted client credentials and optional --verify connectivity
   nodes           List registered nodes and workspaces
   run             Create and dispatch a run (pass '-' to read prompt from stdin)
   wait            Wait for a run over WebSocket until terminal or needs_approval

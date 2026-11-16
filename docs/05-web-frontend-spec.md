@@ -97,7 +97,9 @@
 3. **右栏：Live Inspector & Queue Deck**
    - **Tab 1 实时事件流**：订阅当前选中 `Run` 的 `run_events`，以等宽时间线展示 `status`、`tool_use`、`turn_end`、`stderr_warn`，并实时计算 `lease_expires_at` 剩余秒数。
    - **Tab 2 节点排队甲板**：按节点与 `workdir` 分组展示待执行的 `queued` 任务与当前持锁占用目录，支持直接拖拽排序或跨节点改派。
-   - **Tab 3 凭证与接入设置（及顶部「接入节点」弹窗）**：仅当当前用户具备 `admin` 权限时支持签发与编辑 `api_keys`（选 `client`、`node` 或 `admin` Scope）；其中 `client` Key 支持多选或留空设置「允许调度节点（`allowed_nodes`）」以及配置该 Bot 专属的「Webhook URL」与「Webhook Key」（支持 `1 Node <-> 1 Bot`、`N Nodes -> 1 Bot` 与 `M Bots <-> N Nodes` 组合映射，列表中脱敏展示已绑定节点列表及 `Webhook: <host>` 徽标并支持在线编辑）；弹窗提供一键复制发给节点本地 Agent 的一句话自举提示词（指向 `${HUB_URL}/dl/bootstrap.md`，签发节点 Token 后自动预填）、终端兜底安装命令（`${HUB_URL}/dl/install.sh` 配合 `ahub node init --token-stdin` 与 `ahub node service install --activate`）及各平台零依赖二进制直链（`/dl/ahub-<os>-<arch>`）。
+   - **Tab 3 凭证与接入设置（及顶部「接入节点」弹窗）**：仅当当前用户具备 `admin` 权限时支持签发与编辑 `api_keys`（选 `client`、`node` 或 `admin` Scope）；其中 `client` Key 支持多选或留空设置「允许调度节点（`allowed_nodes`）」以及配置该 Bot 专属的「Webhook URL」与「Webhook Key」（支持 `1 Node <-> 1 Bot`、`N Nodes -> 1 Bot` 与 `M Bots <-> N Nodes` 组合映射，列表中脱敏展示已绑定节点列表及 `Webhook: <host>` 徽标并支持在线编辑）；「接入节点与客户端配置」弹窗与 Key 管理弹窗同时支持两类自举体验：
+     - **节点接入（`node`）**：一键复制发给节点本地 Agent 的一句话自举提示词（指向 `${HUB_URL}/dl/bootstrap.md`，签发节点 Token 后自动预填）、终端兜底安装命令（`${HUB_URL}/dl/install.sh` 配合 `ahub node init --token-stdin` 与 `ahub node service install --activate`）及各平台零依赖二进制直链（`/dl/ahub-<os>-<arch>`）。
+     - **Bot / 纯调用端接入（`client`）**：在顶部弹窗「`接入 Bot / Skill`」标签页与 Key 管理弹窗（新签发 `client` Key 后及既有有效 `client` Key 编辑面板中）提供一键复制「无密版 Bot 自举提示词（配合 `AHUB_TOKEN` Secret，指向 `${HUB_URL}/dl/client-bootstrap.md`）」、「一步带密钥隔离自举提示词（基于 `AHUB_CONFIG_DIR=~/.config/ahub-bots/<slug>` + `--token-stdin`）」与「Grok Bot Webhook Routine 异步回调指令（处理 `ahub_run_completed`）」；任何已保存 Key 视图与弹窗提示词均**严禁**暴露 Webhook URL 路径或 Bearer Key 原文。
 
 ### 3.2 移动端响应式降级（`< 768px`）
 

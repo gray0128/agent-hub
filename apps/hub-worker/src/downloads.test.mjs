@@ -36,7 +36,8 @@ registerHooks({
   }
 });
 
-const { handleBinaryDownload, handleBootstrapMd, handleInstallSh } = await import("./downloads.ts");
+const { handleBinaryDownload, handleBootstrapMd, handleClientBootstrapMd, handleInstallSh } =
+  await import("./downloads.ts");
 
 test("handleBootstrapMd injects HUB_PUBLIC_URL across all placeholders", async () => {
   const req = new Request("https://ignored.example/dl/bootstrap.md");
@@ -49,6 +50,26 @@ test("handleBootstrapMd injects HUB_PUBLIC_URL across all placeholders", async (
   assert.equal(text.includes("https://hub.custom.example/dl/install.sh"), true);
   assert.equal(text.includes("ahub node init"), true);
   assert.equal(text.includes("--token-stdin"), true);
+  assert.equal(text.includes(".grok/skills"), true);
+});
+
+test("handleClientBootstrapMd injects HUB_PUBLIC_URL and enforces client isolation rules", async () => {
+  const req = new Request("https://ignored.example/dl/client-bootstrap.md");
+  const resp = handleClientBootstrapMd(req, { HUB_PUBLIC_URL: "https://hub.custom.example/" });
+  assert.equal(resp.status, 200);
+  assert.equal(resp.headers.get("Content-Type"), "text/markdown; charset=utf-8");
+  assert.equal(resp.headers.get("Cache-Control"), "no-store");
+
+  const text = await resp.text();
+  assert.equal(text.includes("__HUB_URL__"), false, "no raw __HUB_URL__ placeholder should remain");
+  assert.equal(text.includes("https://hub.custom.example/dl/install.sh"), true);
+  assert.equal(text.includes("update --no-restart --json"), true);
+  assert.equal(text.includes("auth status --json"), true);
+  assert.equal(text.includes("auth login --url https://hub.custom.example --token-stdin"), true);
+  assert.equal(text.includes("AHUB_CONFIG_DIR"), true);
+  assert.equal(text.includes(".grok/skills"), true);
+  assert.equal(text.includes("严禁执行"), true);
+  assert.equal(text.includes("ahub node init"), true);
 });
 
 test("handleInstallSh injects HUB_PUBLIC_URL cleanly", async () => {

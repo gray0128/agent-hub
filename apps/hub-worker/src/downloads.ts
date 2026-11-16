@@ -1,5 +1,6 @@
 import skillMd from "../../../skills/ahub/SKILL.md";
 import bootstrapMdTemplate from "./bootstrap.md";
+import clientBootstrapMdTemplate from "./client-bootstrap.md";
 import installShTemplate from "./install.sh";
 import { type Env, HubError } from "./types";
 import { nowIso } from "./ulid";
@@ -9,6 +10,18 @@ const DEFAULT_RELEASE_BASE = "https://github.com/gray0128/agent-hub/releases/lat
 function resolveHubUrl(request: Request, env: Env): string {
   const origin = new URL(request.url).origin;
   return (env.HUB_PUBLIC_URL?.trim() || origin || "https://ahub.bobocai.win").replace(/\/+$/, "");
+}
+
+function renderBootstrapMarkdown(request: Request, env: Env, template: string): Response {
+  const hubUrl = resolveHubUrl(request, env);
+  const body = template.replaceAll("__HUB_URL__", hubUrl);
+  return new Response(body, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/markdown; charset=utf-8",
+      "Cache-Control": "no-store"
+    }
+  });
 }
 
 export function handleSkillMd(): Response {
@@ -22,15 +35,11 @@ export function handleSkillMd(): Response {
 }
 
 export function handleBootstrapMd(request: Request, env: Env): Response {
-  const hubUrl = resolveHubUrl(request, env);
-  const body = bootstrapMdTemplate.replaceAll("__HUB_URL__", hubUrl);
-  return new Response(body, {
-    status: 200,
-    headers: {
-      "Content-Type": "text/markdown; charset=utf-8",
-      "Cache-Control": "no-store"
-    }
-  });
+  return renderBootstrapMarkdown(request, env, bootstrapMdTemplate);
+}
+
+export function handleClientBootstrapMd(request: Request, env: Env): Response {
+  return renderBootstrapMarkdown(request, env, clientBootstrapMdTemplate);
 }
 
 export function handleInstallSh(request: Request, env: Env): Response {

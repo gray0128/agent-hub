@@ -43,8 +43,41 @@
   ```sh
   curl -fsSL https://ahub.bobocai.win/dl/install.sh | sh
   ahub skill install
-  ahub auth login --url https://ahub.bobocai.win --token <CLIENT_OR_ADMIN_TOKEN>
+  printf '%s' '<CLIENT_OR_ADMIN_TOKEN>' | ahub auth login --url https://ahub.bobocai.win --token-stdin
   ```
+
+## 外部助手接入（Grok Bot / 纯调用端自举）
+
+云端助手（如 Grok Bot）或无节点守护职责的纯调用端环境，必须使用面向 `client` 角色的专属自举指南 `/dl/client-bootstrap.md`（而非节点端 `/dl/bootstrap.md`）：
+
+- **角色与守护隔离**：严禁在云端 Bot 容器内执行 `ahub node init`、`ahub node serve` 或 `ahub node service`，统一使用 `ahub --url <HUB_URL> update --no-restart` 原地升级。
+- **多 Bot 共享计算机 `$HOME` 防串台**：同一账号下的多个 Grok Bot 共享同一台持久云端 Linux `$HOME`。推荐为每个 Bot 独立配置平台环境变量 Secret `AHUB_TOKEN`；若使用本地文件登录，务必先导出 `AHUB_CONFIG_DIR="$HOME/.config/ahub-bots/<bot_slug>"` 再通过 `--token-stdin` 写入，避免不同 Bot 的节点白名单与加密 Webhook 互相覆盖。
+- **容器冷重建自愈**：将跨机调度规范保存为 Grok Bot 平台原生 `ahub` Skill 时，自举指南会自动内置 `test -x "$HOME/.local/bin/ahub" || (curl -fsSL ... | sh && ...)` 探测头，容灾重建后首次触发即可自动恢复 CLI。
+
+### 一句话交给 Grok Bot 自动接入（推荐）
+
+若已在 Grok Bot Secrets 中填入该 Bot 专属的 `AHUB_TOKEN`（推荐无密模式），直接向 Bot 发送：
+
+```text
+请读取 https://ahub.bobocai.win/dl/client-bootstrap.md 中的最新调用端自举说明，直接代我完成本环境 ahub CLI 与配套 SKILL.md 的安装或升级（注意跳过节点守护重启）；校验 AHUB_TOKEN 连通性与可访问节点列表，并将该跨机调度规范保存为当前平台的「ahub」技能以便后续持续复用（全程严禁输出任何密钥原文）。
+```
+
+也可在 Web 控制台「密钥与 Webhook 管理」签发或查看 `client` Key，或点击顶部「接入节点 -> 接入 Bot / Skill」，一键复制已预填当前 `HUB_URL` 与隔离目录的一步自举提示词。
+
+### 配套 Grok Bot Webhook Routine 回调指令
+
+为 Bot 配置异步 Webhook 通知（配合 `ahub run --notify grok`）后，在对应 Routine Prompt 中填入以下处理规范：
+
+```text
+收到 agent-hub 的 `ahub_run_completed` Webhook 事件后，按以下规则处理并回复用户：
+1. 若环境重建导致 `$HOME/.local/bin/ahub` 不存在，先执行：`export PATH="$HOME/.local/bin:$PATH"; test -x "$HOME/.local/bin/ahub" || (curl -fsSL https://ahub.bobocai.win/dl/install.sh | AHUB_URL=https://ahub.bobocai.win sh)`。
+2. 当 `status` 为 `needs_approval`：立即把事件中的 `remote_control_url` 原样发给用户，引导其打开放行或人工审批。
+3. 当 `status` 为 `done`：汇报结果 `summary` 与可续聊的 `thread_id`；若事件正文被截断且确需完整细节，调用 `ahub result <run_id> --full --json` 拉取完整输出后再总结。
+4. 当 `status` 为 `failed` 或 `cancelled`：清晰说明失败原因（`error_code` / `error_message`）并附上 `run_id`。
+5. 回调轮内禁止擅自循环重试或嵌套调用 `ahub run`。
+```
+
+> **提示**：若 Grok Bot 中文桌面端在 Routine 详情面板未显示 Webhook URL 与 Bearer Key 字段，可使用同一账号访问 [`cursor.com/automations`](https://cursor.com/automations) 获取对应的 Webhook URL 与 Bearer Key，再填入 Web 控制台「API Keys 与 Bot Webhook 管理」。
 
 ## 仓库结构
 
@@ -54,7 +87,7 @@ agent-hub/
 ├── README.md                         # 项目入口、节点自举指南与文档索引
 ├── TODO.md                           # 项目待办与完成记录
 ├── apps/
-│   ├── hub-worker/                   # Cloudflare Worker API、D1 迁移、DO NodeHub、Queue 消费者与 /dl/bootstrap.md
+│   ├── hub-worker/                   # Cloudflare Worker API、D1 迁移、DO NodeHub、Queue 消费者与 /dl/{bootstrap,client-bootstrap}.md
 │   └── web/                          # React 19 + Vite + shadcn/ui (radix-nova) 控制台
 ├── cmd/
 │   └── ahub/                         # Go CLI 与守护进程统一入口

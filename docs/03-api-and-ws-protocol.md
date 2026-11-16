@@ -82,6 +82,7 @@
 | `DELETE /api/v1/keys/:id` | `admin` | 吊销指定凭证（立即写入 `revoked_at` 并踢掉关联在线节点 WS） | 响应 `{ok: true, revoked_at}` |
 | `GET /dl/install.sh` | 公开 | 一键安装脚本（供新机器与外部助手沙箱拉取 `ahub`） | 返回 `text/x-sh` |
 | `GET /dl/bootstrap.md` | 公开 | 面向本地 Coding Agent 的节点安装、升级、配置初始化与系统服务托管二合一自举指南 | 返回 `text/markdown; charset=utf-8`（自动注入当前 `HUB_PUBLIC_URL`） |
+| `GET /dl/client-bootstrap.md` | 公开 | 面向外部助手（如 Grok Bot）与纯 `client` 调用端 Agent 的 CLI/Skill 安装、原地升级（`--no-restart`）、同机多 Bot 凭据隔离（`AHUB_TOKEN` / `AHUB_CONFIG_DIR`）与沙箱冷重建自愈指南 | 返回 `text/markdown; charset=utf-8`（自动注入当前 `HUB_PUBLIC_URL`，严禁引导执行 `ahub node` 守护子命令） |
 | `GET /dl/version.json` | 公开 | 最新版本及各平台 SHA-256 校验表（供 `ahub update` 使用） | 返回 `{version, released_at, assets: {darwin_arm64: {url, sha256}, ...}}` |
 | `GET /dl/ahub-<os>-<arch>` | 公开 | 分发编译好的静态 Go 二进制或重定向至 Release 资产 | 二进制流或 `302` |
 | `GET /skill/SKILL.md` | 公开 | 返回最新配套 Agent Skill 文档 | 返回 `text/markdown; charset=utf-8` |

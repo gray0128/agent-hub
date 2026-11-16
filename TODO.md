@@ -13,6 +13,7 @@
 - [x] 修复 `agy` 会话默认落入 `CLI Project`（`default-cli-project`）导致归类错位与项目级权限失效的问题（交付 [internal/runner/agy_project.go](./internal/runner/agy_project.go) `ResolveAgyProjectID`、在 [internal/runner/adapters.go](./internal/runner/adapters.go) `BuildCommandSpec` 自动注入 `--project <project_id>`、[internal/runner/agy_project_test.go](./internal/runner/agy_project_test.go)、更新 `docs/04-ahub-cli-and-node-daemon.md` §4.2，并完成 Mutation Gate 与本机真实 `agy` `project_id` 实测）
 
 - [x] Web 任务中心桌面端 UI/UX 审查与优化：补齐下发任务完整 CLI 命令预览/复制与通知通道配置及状态徽章；重构「节点控制 -> 已上报工作区」完整路径展示、关键词筛选、一键复制路径与直接派发；修复 `.ahub-markdown` 排版、多工作区折叠、结构化过程事件展开与 WebSocket 状态单调合并（[apps/web](./apps/web)）
+- [x] 交付 Grok Bot 与纯调用端一句话自举指南及产品化接入改造（新增公开端点 `GET /dl/client-bootstrap.md`、Go CLI `ahub auth login --token-stdin` 与脱敏 `ahub auth status [--verify]`、同机多 Bot `AHUB_CONFIG_DIR` 隔离规范、Web「接入 Bot / Skill」与 `client` Key 自举词/Routine 回调词一键生成，以及 `docs/03`–`05` 与 `README.md` 文档同步，通过 Mutation Gate、`make eval-fast` 与 `make eval-ui` 实测）
 - [x] 将节点上的安装/更新过程包装成一段可直接丢给 Agent 完成的自举 Prompt（交付 `GET /dl/bootstrap.md` 自举指南、`ahub node init` / `ahub node status` 幂等脱敏原语、Linux 服务升级重启与 macOS 隔离属性清理、Web「接入节点」弹窗修复与 Prompt 复制，以及 [README.md](./README.md) 入口文档更新）
 - [x] 多 Bot 独立加密 Webhook 投递与 `client` API Key 节点亲和绑定（`0002_multi_bot_webhooks.sql`、AES-256-GCM 密文存储、队列按触发 Key 路由）
 - [x] Cloudflare Access 单域名零口令鉴权（同源 `CF_Authorization` Cookie 自动提取、RS256 JWKS 验签、非幂等请求与 WebSocket 升级跨站防护、前端 `/api/v1/auth/me` 自动探活）

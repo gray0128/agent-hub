@@ -656,7 +656,7 @@ try {
   // Screenshot 1: desktop-dark-active.png
   await cdpClient.screenshot(path.join(screenshotDir, "desktop-dark-active.png"));
 
-  // Verify /dl/bootstrap.md endpoint and OnboardingDialog Agent prompt
+  // Verify /dl/bootstrap.md and /dl/client-bootstrap.md endpoints and OnboardingDialog Agent/Bot prompts
   const bootstrapResp = await fetch(`${hubUrl}/dl/bootstrap.md`);
   if (bootstrapResp.status !== 200) {
     throw new Error(`Expected GET /dl/bootstrap.md 200, got ${bootstrapResp.status}`);
@@ -666,6 +666,20 @@ try {
     throw new Error("/dl/bootstrap.md failed hub URL substitution check");
   }
 
+  const clientBootstrapResp = await fetch(`${hubUrl}/dl/client-bootstrap.md`);
+  if (clientBootstrapResp.status !== 200) {
+    throw new Error(`Expected GET /dl/client-bootstrap.md 200, got ${clientBootstrapResp.status}`);
+  }
+  const clientBootstrapText = await clientBootstrapResp.text();
+  if (
+    !clientBootstrapText.includes(`${hubUrl}/dl/install.sh`) ||
+    clientBootstrapText.includes("__HUB_URL__") ||
+    !clientBootstrapText.includes("AHUB_CONFIG_DIR") ||
+    !clientBootstrapText.includes("update --no-restart")
+  ) {
+    throw new Error("/dl/client-bootstrap.md failed hub URL substitution or client isolation check");
+  }
+
   await cdpClient.clickSelector('[data-testid="open-onboarding-btn"]');
   await sleep(250);
   const agentPromptText = await cdpClient.evalJS(
@@ -673,6 +687,22 @@ try {
   );
   if (!agentPromptText.includes(`${hubUrl}/dl/bootstrap.md`)) {
     throw new Error(`OnboardingDialog Agent prompt missing bootstrap URL: ${agentPromptText}`);
+  }
+  await cdpClient.clickSelector('[data-testid="onboarding-tab-skill"]');
+  await sleep(200);
+  const clientPromptText = await cdpClient.evalJS(
+    `document.querySelector('[data-testid="onboarding-client-prompt"]')?.textContent ?? ""`
+  );
+  const onboardingRoutineText = await cdpClient.evalJS(
+    `document.querySelector('[data-testid="onboarding-routine-prompt"]')?.textContent ?? ""`
+  );
+  if (
+    !clientPromptText.includes(`${hubUrl}/dl/client-bootstrap.md`) ||
+    !onboardingRoutineText.includes("ahub_run_completed")
+  ) {
+    throw new Error(
+      `OnboardingDialog client/routine prompt check failed: client=${clientPromptText} routine=${onboardingRoutineText}`
+    );
   }
   await cdpClient.clickSelector('[data-testid="onboarding-dialog"] button[aria-label="关闭"]');
   await sleep(250);
@@ -714,6 +744,24 @@ try {
   );
   if (keysDialogText.includes("wh_ui_secret_key_99") || keysDialogText.includes("bot-ui-secret-path")) {
     throw new Error("KeysDialog leaked plaintext webhook secret or full webhook path into DOM");
+  }
+  const freshEnvPrompt = await cdpClient.evalJS(
+    `document.querySelector('[data-testid="fresh-client-bootstrap-env"]')?.textContent ?? ""`
+  );
+  const freshTokenPrompt = await cdpClient.evalJS(
+    `document.querySelector('[data-testid="fresh-client-bootstrap-token"]')?.textContent ?? ""`
+  );
+  const freshRoutinePrompt = await cdpClient.evalJS(
+    `document.querySelector('[data-testid="fresh-client-routine-prompt"]')?.textContent ?? ""`
+  );
+  if (
+    !freshEnvPrompt.includes(`${hubUrl}/dl/client-bootstrap.md`) ||
+    !freshTokenPrompt.includes("AHUB_CONFIG_DIR") ||
+    !freshRoutinePrompt.includes("ahub_run_completed")
+  ) {
+    throw new Error(
+      `KeysDialog client bootstrap/routine prompt check failed: env=${freshEnvPrompt} token=${freshTokenPrompt} routine=${freshRoutinePrompt}`
+    );
   }
   const keysApi = await apiJson(hubUrl, adminToken, "/api/v1/keys");
   const uiCreatedKey = keysApi.keys.find((k) => k.name === "ui-multi-bot");

@@ -54,9 +54,11 @@ jobs:
             }
           }
           EOF
-      - name: Prepare Agent bootstrap guide (bootstrap.md)
+      - name: Prepare Agent bootstrap guides (bootstrap.md & client-bootstrap.md)
         shell: bash
-        run: sed "s|__HUB_URL__|https://ahub.bobocai.win|g" apps/hub-worker/src/bootstrap.md > bin/dist/bootstrap.md
+        run: |
+          sed "s|__HUB_URL__|https://ahub.bobocai.win|g" apps/hub-worker/src/bootstrap.md > bin/dist/bootstrap.md
+          sed "s|__HUB_URL__|https://ahub.bobocai.win|g" apps/hub-worker/src/client-bootstrap.md > bin/dist/client-bootstrap.md
       - uses: softprops/action-gh-release@v2
         with:
           files: |
@@ -67,3 +69,4 @@ jobs:
             bin/dist/ahub-windows-amd64.exe
             bin/dist/version.json
             bin/dist/bootstrap.md
+            bin/dist/client-bootstrap.md

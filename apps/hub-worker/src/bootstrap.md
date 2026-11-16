@@ -87,7 +87,7 @@ $AHUB_BIN = if ($Cmd) { $Cmd.Source } elseif (Test-Path (Join-Path $env:LOCALAPP
 
 ```sh
 "$AHUB_BIN" skill install --json
-for host_dir in "$HOME/.claude/skills" "$HOME/.codebuddy/skills" "$HOME/.cursor/skills" "$HOME/.trae/skills"; do
+for host_dir in "$HOME/.grok/skills" "$HOME/.claude/skills" "$HOME/.codebuddy/skills" "$HOME/.cursor/skills" "$HOME/.trae/skills"; do
   if [ -d "$(dirname "$host_dir")" ] && [ ! -L "$host_dir" ]; then
     mkdir -p "$host_dir/ahub"
     cp "$HOME/.agents/skills/ahub/SKILL.md" "$host_dir/ahub/SKILL.md"
