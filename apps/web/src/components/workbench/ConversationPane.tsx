@@ -167,7 +167,7 @@ export function ConversationPane({
   return (
     <section
       data-testid="conversation-pane"
-      className="flex h-full min-w-0 flex-col bg-background overflow-hidden"
+      className="relative flex h-full min-w-0 flex-col bg-background overflow-hidden"
     >
       {/* Active Thread Bar */}
       <div className="flex min-h-11 shrink-0 flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-1.5">
@@ -293,7 +293,7 @@ export function ConversationPane({
       ) : null}
 
       {/* Run Timeline Feed */}
-      <div className="min-h-0 flex-1 overflow-y-auto divide-y divide-border">
+      <div className="relative min-h-0 flex-1 overflow-y-auto divide-y divide-border">
         {threadRuns.length === 0 ? (
           <div className="flex h-full flex-col items-center justify-center gap-1.5 px-6 text-center">
             <p className="text-sm font-medium text-foreground text-balance">
@@ -499,7 +499,7 @@ export function ConversationPane({
         }}
         data-testid="prompt-composer"
         className={cn(
-          "shrink-0 border-t border-border bg-surface-elevated p-3 transition-colors duration-150",
+          "relative shrink-0 border-t border-border bg-surface-elevated p-3 transition-colors duration-150",
           isOver && "bg-[var(--status-running)]/10 border-[var(--status-running)]"
         )}
       >

@@ -338,6 +338,48 @@ async function createAccessTestServer(expectedAud) {
   };
 }
 
+async function assertViewportContainment(cdp, label) {
+  const metrics = await cdp.evalJS(`
+    (() => {
+      const de = document.documentElement;
+      const b = document.body;
+      const root = document.getElementById("root");
+      const vOverflow = de.scrollHeight - de.clientHeight;
+      const hOverflow = de.scrollWidth - de.clientWidth;
+      const bodyVOverflow = b.scrollHeight - b.clientHeight;
+      const escaped = [];
+      if (root) {
+        for (const el of root.querySelectorAll("*")) {
+          if (!(el instanceof HTMLElement)) continue;
+          if (el.getClientRects().length === 0) continue;
+          const cs = getComputedStyle(el);
+          if (cs.position !== "absolute") continue;
+          const op = el.offsetParent;
+          if (!op || !root.contains(op)) {
+            escaped.push({
+              tag: el.tagName,
+              cls: el.className,
+              role: el.getAttribute("role"),
+              offsetParent: op ? op.tagName : null
+            });
+          }
+        }
+      }
+      return { vOverflow, hOverflow, bodyVOverflow, escaped };
+    })()
+  `);
+  if (
+    metrics.vOverflow > 0 ||
+    metrics.hOverflow > 0 ||
+    metrics.bodyVOverflow > 0 ||
+    metrics.escaped.length > 0
+  ) {
+    throw new Error(
+      `Viewport containment failed (${label}): vOverflow=${metrics.vOverflow}px hOverflow=${metrics.hOverflow}px bodyVOverflow=${metrics.bodyVOverflow}px escaped=${JSON.stringify(metrics.escaped.slice(0, 5))}`
+    );
+  }
+}
+
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ahub-cdp-eval-"));
 const children = [];
 let cdpClient = null;
@@ -655,6 +697,7 @@ try {
 
   // Screenshot 1: desktop-dark-active.png
   await cdpClient.screenshot(path.join(screenshotDir, "desktop-dark-active.png"));
+  await assertViewportContainment(cdpClient, "desktop-1440x900-active");
 
   // Verify /dl/bootstrap.md and /dl/client-bootstrap.md endpoints and OnboardingDialog Agent/Bot prompts
   const bootstrapResp = await fetch(`${hubUrl}/dl/bootstrap.md`);
@@ -1067,6 +1110,15 @@ try {
     throw new Error("Failed to switch back to fleet-tab-threads");
   }
 
+  await cdpClient.clickSelector('[data-testid="inspector-pane"] [role="tab"]:nth-of-type(4)');
+  await sleep(200);
+  await cdpClient.setViewport(1440, 420, false);
+  await sleep(200);
+  await assertViewportContainment(cdpClient, "desktop-1440x420-overflowing-panes");
+  await cdpClient.setViewport(1440, 900, false);
+  await cdpClient.clickSelector('[data-testid="inspector-pane"] [role="tab"]:nth-of-type(1)');
+  await sleep(200);
+
   // Seed blocking soft_approval run + 2 queued runs for approval & DnD reorder tests
   const approvalRes = await apiJson(hubUrl, adminToken, "/api/v1/runs?wait_ms=0", {
     method: "POST",
@@ -1174,6 +1226,7 @@ try {
   // Mobile 390x844 responsiveness + tap target check + drawer screenshot 5
   await cdpClient.setViewport(390, 844, true);
   await sleep(300);
+  await assertViewportContainment(cdpClient, "mobile-390x844");
   const mobileMetrics = await cdpClient.evalJS(`
     (() => {
       const overflow = document.documentElement.scrollWidth - document.documentElement.clientWidth;

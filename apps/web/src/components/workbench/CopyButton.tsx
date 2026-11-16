@@ -93,7 +93,7 @@ export function CopyButton({
     label !== undefined ? (status === "copied" ? copiedLabel : status === "failed" ? "复制失败" : label) : undefined;
 
   return (
-    <span className="inline-flex items-center">
+    <span className="relative inline-flex items-center">
       <button
         type="button"
         onClick={handleCopy}

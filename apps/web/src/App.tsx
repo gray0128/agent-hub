@@ -767,7 +767,7 @@ export function App() {
       onDragCancel={() => setDragLabel(null)}
       onDragEnd={handleDragEnd}
     >
-      <div className="flex h-dvh w-screen flex-col overflow-hidden bg-background text-foreground">
+      <div className="relative flex h-dvh w-full flex-col overflow-hidden bg-background text-foreground">
         {/* Global slim header bar */}
         <header className="flex h-12 shrink-0 items-center justify-between gap-2 border-b border-border bg-card px-2 sm:px-3">
           <div className="flex min-w-0 items-center gap-1.5 sm:gap-2">
@@ -912,7 +912,7 @@ export function App() {
         )}
 
         {/* Single <main> landmark: 3-pane resizable on desktop, focused timeline on mobile */}
-        <main className="min-h-0 flex-1 overflow-hidden">
+        <main className="relative min-h-0 flex-1 overflow-hidden">
           {isDesktop ? (
             <Group orientation="horizontal" className="h-full w-full">
               <Panel id="fleet" defaultSize="22%" minSize="16%" maxSize="34%" className="h-full overflow-hidden">

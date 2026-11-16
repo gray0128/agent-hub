@@ -188,7 +188,7 @@ export function InspectorPane({
     <aside
       aria-label="实时检视与节点控制"
       data-testid="inspector-pane"
-      className="flex h-full flex-col bg-surface-elevated overflow-hidden"
+      className="relative flex h-full flex-col bg-surface-elevated overflow-hidden"
     >
       <Tabs
         value={activeTab}
@@ -256,7 +256,7 @@ export function InspectorPane({
           <div
             data-testid="events-feed"
             data-event-count={events.length}
-            className="min-h-0 flex-1 overflow-y-auto divide-y divide-border font-mono text-[11px]"
+            className="relative min-h-0 flex-1 overflow-y-auto divide-y divide-border font-mono text-[11px]"
           >
             {events.length === 0 ? (
               <div className="px-3 py-6 text-center text-xs font-sans text-muted-foreground">
@@ -317,7 +317,7 @@ export function InspectorPane({
         </TabsContent>
 
         {/* 2. Queued Priority Reorder */}
-        <TabsContent value="queue" className="mt-0 min-h-0 flex-1 overflow-y-auto">
+        <TabsContent value="queue" className="relative mt-0 min-h-0 flex-1 overflow-y-auto">
           {queuedRuns.length === 0 ? (
             <div className="px-3 py-6 text-center text-xs text-muted-foreground">
               当前无待执行排队任务
@@ -339,7 +339,7 @@ export function InspectorPane({
         </TabsContent>
 
         {/* 3. Delegation Lineage Tree */}
-        <TabsContent value="lineage" className="mt-0 min-h-0 flex-1 overflow-y-auto divide-y divide-border">
+        <TabsContent value="lineage" className="relative mt-0 min-h-0 flex-1 overflow-y-auto divide-y divide-border">
           {lineageRuns.length === 0 ? (
             <div className="px-3 py-6 text-center text-xs text-muted-foreground">
               选择任务查看跨机委派拓扑树
@@ -391,7 +391,7 @@ export function InspectorPane({
         </TabsContent>
 
         {/* 4. Node Control */}
-        <TabsContent value="control" className="mt-0 min-h-0 flex-1 overflow-y-auto p-3">
+        <TabsContent value="control" className="relative mt-0 min-h-0 flex-1 overflow-y-auto p-3">
           {!selectedNode ? (
             <div className="py-6 text-center text-xs text-muted-foreground">请从左侧选择节点</div>
           ) : (

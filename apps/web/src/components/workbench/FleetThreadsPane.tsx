@@ -339,7 +339,7 @@ export function FleetThreadsPane({
     <aside
       aria-label="节点与会话列表"
       data-testid="fleet-threads-pane"
-      className="flex h-full flex-col bg-surface-elevated overflow-hidden"
+      className="relative flex h-full flex-col bg-surface-elevated overflow-hidden"
     >
       <Tabs
         value={leftTab}
@@ -461,7 +461,7 @@ export function FleetThreadsPane({
             </div>
           </div>
 
-          <div className="min-h-0 flex-1 overflow-y-auto">
+          <div className="relative min-h-0 flex-1 overflow-y-auto">
             {filteredThreads.length === 0 ? (
               <div className="space-y-2 px-3 py-6 text-center text-xs text-muted-foreground text-pretty">
                 <p>
@@ -541,7 +541,7 @@ export function FleetThreadsPane({
             </div>
           ) : null}
 
-          <div className="min-h-0 flex-1 overflow-y-auto divide-y divide-border">
+          <div className="relative min-h-0 flex-1 overflow-y-auto divide-y divide-border">
             {nodes.length === 0 ? (
               <div className="px-3 py-6 text-center text-xs text-muted-foreground">暂无在线或历史节点</div>
             ) : (
