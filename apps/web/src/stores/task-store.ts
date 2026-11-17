@@ -67,7 +67,10 @@ function isTerminalRunStatus(status: RunRecord["status"]): boolean {
   return status === "done" || status === "failed" || status === "cancelled";
 }
 
-function mergeRunRecord(existing: RunRecord, incoming: RunRecord): RunRecord {
+function mergeRunRecordWithMeta(
+  existing: RunRecord,
+  incoming: RunRecord
+): { run: RunRecord; outputInvalidated: boolean } {
   const existingTerminal = isTerminalRunStatus(existing.status);
   const incomingTerminal = isTerminalRunStatus(incoming.status);
   const existingTs = Date.parse(existing.updated_at || existing.created_at) || 0;
@@ -80,19 +83,42 @@ function mergeRunRecord(existing: RunRecord, incoming: RunRecord): RunRecord {
 
   if (incomingIsStale) {
     return {
-      ...existing,
-      prompt: existing.prompt ?? incoming.prompt,
-      output_preview: existing.output_preview ?? incoming.output_preview,
-      output_md: existing.output_md ?? incoming.output_md
+      run: {
+        ...existing,
+        prompt: existing.prompt ?? incoming.prompt,
+        output_preview: existing.output_preview ?? incoming.output_preview,
+        output_md: existing.output_md ?? incoming.output_md,
+        truncated: existing.truncated ?? incoming.truncated
+      },
+      outputInvalidated: false
     };
   }
 
+  const outputChanged =
+    incoming.output_bytes !== existing.output_bytes ||
+    (existing.status === "needs_approval" && incoming.status !== "needs_approval");
+
+  const nextOutputMd = outputChanged ? incoming.output_md : (incoming.output_md ?? existing.output_md);
+  const nextOutputPreview = outputChanged
+    ? incoming.output_preview
+    : (incoming.output_preview ?? existing.output_preview);
+  const nextTruncated =
+    nextOutputMd !== undefined
+      ? false
+      : outputChanged
+        ? incoming.truncated
+        : (incoming.truncated ?? existing.truncated);
+
   return {
-    ...existing,
-    ...incoming,
-    prompt: incoming.prompt ?? existing.prompt,
-    output_preview: incoming.output_preview ?? existing.output_preview,
-    output_md: incoming.output_md ?? existing.output_md
+    run: {
+      ...existing,
+      ...incoming,
+      prompt: incoming.prompt ?? existing.prompt,
+      output_preview: nextOutputPreview,
+      output_md: nextOutputMd,
+      truncated: nextTruncated
+    },
+    outputInvalidated: outputChanged && incoming.output_md === undefined
   };
 }
 
@@ -132,14 +158,34 @@ export const useTaskStore = create<TaskState>((set) => ({
   setRuns: (runs) =>
     set((state) => {
       const prevById = new Map(state.runs.map((r) => [r.id, r]));
+      const nextFullOutput = { ...state.fullOutputByRunId };
+      let fullChanged = false;
       const merged = runs.map((r) => {
         const prev = prevById.get(r.id);
-        return prev ? mergeRunRecord(prev, r) : r;
+        if (!prev) {
+          if (r.output_md !== undefined && nextFullOutput[r.id] !== r.output_md) {
+            nextFullOutput[r.id] = r.output_md;
+            fullChanged = true;
+          }
+          return r;
+        }
+        const res = mergeRunRecordWithMeta(prev, r);
+        if (res.run.output_md !== undefined) {
+          if (nextFullOutput[res.run.id] !== res.run.output_md) {
+            nextFullOutput[res.run.id] = res.run.output_md;
+            fullChanged = true;
+          }
+        } else if (res.outputInvalidated && res.run.id in nextFullOutput) {
+          delete nextFullOutput[res.run.id];
+          fullChanged = true;
+        }
+        return res.run;
       });
       const sorted = sortRuns(merged);
       const validRun = state.selectedRunId && sorted.some((r) => r.id === state.selectedRunId);
       return {
         runs: sorted,
+        ...(fullChanged ? { fullOutputByRunId: nextFullOutput } : {}),
         selectedRunId: validRun ? state.selectedRunId : (sorted[0]?.id ?? null)
       };
     }),
@@ -147,30 +193,50 @@ export const useTaskStore = create<TaskState>((set) => ({
   upsertRun: (run) =>
     set((state) => {
       const idx = state.runs.findIndex((r) => r.id === run.id);
+      const prev = idx >= 0 ? state.runs[idx] : undefined;
+      let mergedRun = run;
+      let outputInvalidated = false;
+      if (prev) {
+        const res = mergeRunRecordWithMeta(prev, run);
+        mergedRun = res.run;
+        outputInvalidated = res.outputInvalidated;
+      }
+
+      let nextFullOutput = state.fullOutputByRunId;
+      if (mergedRun.output_md !== undefined) {
+        if (nextFullOutput[mergedRun.id] !== mergedRun.output_md) {
+          nextFullOutput = { ...nextFullOutput, [mergedRun.id]: mergedRun.output_md };
+        }
+      } else if (outputInvalidated && mergedRun.id in nextFullOutput) {
+        const copy = { ...nextFullOutput };
+        delete copy[mergedRun.id];
+        nextFullOutput = copy;
+      }
+
       const next =
         idx >= 0
-          ? state.runs.map((r, i) => (i === idx ? mergeRunRecord(r, run) : r))
-          : [run, ...state.runs];
+          ? state.runs.map((r, i) => (i === idx ? mergedRun : r))
+          : [mergedRun, ...state.runs];
       const nextSorted = sortRuns(next);
       let nextThreads = state.threads;
-      if (run.thread_id) {
-        const targetThread = state.threads.find((t) => t.id === run.thread_id);
+      if (mergedRun.thread_id) {
+        const targetThread = state.threads.find((t) => t.id === mergedRun.thread_id);
         if (
           targetThread &&
           !targetThread.native_session_id &&
-          (targetThread.node_id !== run.node_id || targetThread.workdir !== run.workdir)
+          (targetThread.node_id !== mergedRun.node_id || targetThread.workdir !== mergedRun.workdir)
         ) {
-          const threadRunCount = next.reduce((acc, r) => (r.thread_id === run.thread_id ? acc + 1 : acc), 0);
+          const threadRunCount = next.reduce((acc, r) => (r.thread_id === mergedRun.thread_id ? acc + 1 : acc), 0);
           if (threadRunCount <= 1) {
-            const cleanedDir = run.workdir.replace(/[\\/]+$/, "");
+            const cleanedDir = mergedRun.workdir.replace(/[\\/]+$/, "");
             const sepIdx = Math.max(cleanedDir.lastIndexOf("/"), cleanedDir.lastIndexOf("\\"));
             const projectKey = sepIdx >= 0 ? cleanedDir.slice(sepIdx + 1) : cleanedDir;
             nextThreads = state.threads.map((t) =>
-              t.id === run.thread_id
+              t.id === mergedRun.thread_id
                 ? {
                     ...t,
-                    node_id: run.node_id,
-                    workdir: run.workdir,
+                    node_id: mergedRun.node_id,
+                    workdir: mergedRun.workdir,
                     project_key: projectKey || t.project_key
                   }
                 : t
@@ -180,8 +246,9 @@ export const useTaskStore = create<TaskState>((set) => ({
       }
       return {
         runs: nextSorted,
+        ...(nextFullOutput !== state.fullOutputByRunId ? { fullOutputByRunId: nextFullOutput } : {}),
         threads: nextThreads,
-        selectedRunId: state.selectedRunId ?? run.id
+        selectedRunId: state.selectedRunId ?? mergedRun.id
       };
     }),
 

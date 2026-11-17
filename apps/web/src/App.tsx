@@ -31,7 +31,7 @@ import {
   OnboardingDialog
 } from "@/components/workbench/OnboardingKeysDialogs";
 import { apiClient, ApiClientError } from "@/lib/api-client";
-import { cn } from "@/lib/utils";
+import { AUTO_FULL_OUTPUT_MAX_BYTES, cn } from "@/lib/utils";
 import { HubStreamClient } from "@/lib/ws-client";
 import { useFleetStore } from "@/stores/fleet-store";
 import { useTaskStore } from "@/stores/task-store";
@@ -132,7 +132,9 @@ export function App() {
   const [submitting, setSubmitting] = useState(false);
   const [dragLabel, setDragLabel] = useState<string | null>(null);
   const wsClientRef = useRef<HubStreamClient | null>(null);
-  const fetchedDetailIdsRef = useRef<Set<string>>(new Set());
+  const hydrationGenRef = useRef<number>(0);
+  const inFlightHydrationRef = useRef<Set<string>>(new Set());
+  const completedHydrationRef = useRef<Set<string>>(new Set());
   const hasSession = authStatus === "authenticated" || Boolean(token);
 
   const sensors = useSensors(
@@ -207,7 +209,9 @@ export function App() {
   useEffect(() => {
     let cancelled = false;
     let client: HubStreamClient | null = null;
-    fetchedDetailIdsRef.current.clear();
+    hydrationGenRef.current += 1;
+    inFlightHydrationRef.current.clear();
+    completedHydrationRef.current.clear();
     setAuthState("checking", null);
     setStreamStatus("connecting");
 
@@ -294,6 +298,9 @@ export function App() {
 
     return () => {
       cancelled = true;
+      hydrationGenRef.current += 1;
+      inFlightHydrationRef.current.clear();
+      completedHydrationRef.current.clear();
       if (client) {
         client.stop();
       }
@@ -345,34 +352,61 @@ export function App() {
       .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at));
   }, [runs, selectedThreadId]);
 
-  // Hydrate markdown summary previews for terminal runs in active thread when loaded from list view
+  // Hydrate outputs for runs in active thread (auto full up to 128 KB, summary preview above 128 KB)
   useEffect(() => {
     if (!hasSession || threadRuns.length === 0) return;
-    let cancelled = false;
-    const missing = threadRuns
-      .slice(-8)
-      .filter(
-        (r) =>
-          (r.status === "done" || r.status === "failed" || r.status === "cancelled") &&
-          !r.output_preview &&
-          !r.output_md &&
-          !fetchedDetailIdsRef.current.has(r.id)
-      );
-    for (const run of missing) {
-      fetchedDetailIdsRef.current.add(run.id);
+    const gen = hydrationGenRef.current;
+
+    for (const run of [...threadRuns].reverse()) {
+      const canHaveOutput =
+        run.status === "done" ||
+        run.status === "failed" ||
+        run.status === "cancelled" ||
+        run.status === "needs_approval";
+      if (!canHaveOutput || run.output_bytes <= 0) {
+        continue;
+      }
+
+      const targetView: "full" | "summary" =
+        run.output_bytes <= AUTO_FULL_OUTPUT_MAX_BYTES ? "full" : "summary";
+
+      const alreadyHydrated =
+        targetView === "full"
+          ? fullOutputByRunId[run.id] !== undefined ||
+            run.output_md !== undefined ||
+            (run.output_preview !== undefined && run.truncated === false)
+          : fullOutputByRunId[run.id] !== undefined ||
+            run.output_md !== undefined ||
+            run.output_preview !== undefined;
+
+      if (alreadyHydrated) {
+        continue;
+      }
+
+      const key = `${run.id}:${run.status}:${run.output_bytes}:${targetView}`;
+      if (inFlightHydrationRef.current.has(key) || completedHydrationRef.current.has(key)) {
+        continue;
+      }
+
+      inFlightHydrationRef.current.add(key);
       void apiClient
-        .fetchRunDetail(token, run.id, "summary")
+        .fetchRunDetail(token, run.id, targetView)
         .then((res) => {
-          if (!cancelled) upsertRun(res.run);
+          if (hydrationGenRef.current !== gen) return;
+          completedHydrationRef.current.add(key);
+          upsertRun(res.run);
+          if (res.run.output_md !== undefined) {
+            setFullOutput(run.id, res.run.output_md);
+          }
         })
         .catch(() => {
-          // non-fatal background sync
+          // non-fatal background sync; keeping key out of completedHydrationRef allows retry
+        })
+        .finally(() => {
+          inFlightHydrationRef.current.delete(key);
         });
     }
-    return () => {
-      cancelled = true;
-    };
-  }, [hasSession, threadRuns, token, upsertRun]);
+  }, [fullOutputByRunId, hasSession, setFullOutput, threadRuns, token, upsertRun]);
 
   const selectedRun = useMemo(() => {
     if (selectedRunId) {
@@ -504,7 +538,7 @@ export function App() {
     try {
       const res = await apiClient.fetchRunDetail(token, runId, "full");
       upsertRun(res.run);
-      if (res.run.output_md) {
+      if (res.run.output_md !== undefined) {
         setFullOutput(runId, res.run.output_md);
       }
     } catch (err) {

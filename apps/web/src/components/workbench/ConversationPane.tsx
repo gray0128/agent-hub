@@ -48,6 +48,8 @@ import { RunStatusBadge } from "./StatusBadge";
 
 const DEFAULT_OPTION_VALUE = "__default__";
 const CUSTOM_OPTION_VALUE = "__custom__";
+const LONG_OUTPUT_CHARS = 4000;
+const LONG_OUTPUT_LINES = 60;
 const NOTIFY_LABELS: Record<ComposerDraft["notifyTarget"], string> = {
   none: "不通知",
   webhook: "Bot Webhook",
@@ -101,6 +103,7 @@ export function ConversationPane({
   const [composing, setComposing] = useState(false);
   const [expandedCmdRuns, setExpandedCmdRuns] = useState<Record<string, boolean>>({});
   const [expandedPrompts, setExpandedPrompts] = useState<Record<string, boolean>>({});
+  const [expandedOutputs, setExpandedOutputs] = useState<Record<string, boolean>>({});
   const [mobileParamsOpen, setMobileParamsOpen] = useState(false);
   const [customModelMode, setCustomModelMode] = useState(false);
 
@@ -306,8 +309,19 @@ export function ConversationPane({
         ) : (
           threadRuns.map((run) => {
             const isSelected = selectedRunId === run.id;
-            const fullText = fullOutputByRunId[run.id];
-            const displayMarkdown = fullText ?? run.output_md ?? run.output_preview ?? run.summary;
+            const fullText =
+              fullOutputByRunId[run.id] ??
+              run.output_md ??
+              (run.truncated === false ? run.output_preview : undefined);
+            const hasFullOutput = fullText !== undefined && fullText !== "";
+            const previewText = !hasFullOutput ? run.output_preview : undefined;
+            const canHaveOutput =
+              run.status === "done" ||
+              run.status === "failed" ||
+              run.status === "cancelled" ||
+              run.status === "needs_approval";
+            const hasUnloadedOutput = canHaveOutput && run.output_bytes > 0 && !hasFullOutput;
+            const copyableText = (hasFullOutput ? fullText : undefined) ?? previewText ?? run.summary;
             const evCount = eventsByRunId[run.id]?.length ?? 0;
             const isActive =
               run.status === "queued" ||
@@ -320,6 +334,10 @@ export function ConversationPane({
             const rawPrompt = run.prompt ?? "";
             const isLongPrompt = rawPrompt.length > 260 || rawPrompt.split("\n").length > 5;
             const promptExpanded = Boolean(expandedPrompts[run.id]);
+            const lineCount = hasFullOutput ? fullText.split("\n").length : 0;
+            const isLongOutput =
+              hasFullOutput && (fullText.length > LONG_OUTPUT_CHARS || lineCount > LONG_OUTPUT_LINES);
+            const outputExpanded = Boolean(expandedOutputs[run.id]);
 
             return (
               <article
@@ -372,8 +390,8 @@ export function ConversationPane({
                     className="flex shrink-0 items-center gap-1"
                     onClick={(e) => e.stopPropagation()}
                   >
-                    {displayMarkdown ? (
-                      <CopyButton text={displayMarkdown} label="复制输出" copiedLabel="已复制" />
+                    {copyableText ? (
+                      <CopyButton text={copyableText} label="复制输出" copiedLabel="已复制" />
                     ) : null}
 
                     {isActive ? (
@@ -387,11 +405,12 @@ export function ConversationPane({
                         <Square className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
                         取消任务
                       </Button>
-                    ) : run.truncated && !fullText ? (
+                    ) : hasUnloadedOutput ? (
                       <Button
                         type="button"
                         size="sm"
                         variant="ghost"
+                        data-testid={`load-full-output-${run.id}`}
                         onClick={() => onLoadFullOutput(run.id)}
                         className="h-6 px-2 text-[11px]"
                       >
@@ -477,9 +496,104 @@ export function ConversationPane({
                   </div>
                 ) : null}
 
-                {displayMarkdown ? (
+                {hasFullOutput ? (
+                  <div className="mt-2.5">
+                    <div
+                      className={cn(
+                        "ahub-markdown relative",
+                        isLongOutput && !outputExpanded && "max-h-[30rem] overflow-hidden"
+                      )}
+                    >
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{fullText}</ReactMarkdown>
+                      {isLongOutput && !outputExpanded ? (
+                        <div
+                          aria-hidden="true"
+                          className={cn(
+                            "pointer-events-none absolute inset-x-0 bottom-0 h-14 bg-gradient-to-t to-transparent",
+                            isSelected ? "from-surface-elevated" : "from-background"
+                          )}
+                        />
+                      ) : null}
+                    </div>
+                    {isLongOutput ? (
+                      <div className="mt-2 flex items-center">
+                        <button
+                          type="button"
+                          data-testid={`toggle-output-${run.id}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setExpandedOutputs((prev) => ({ ...prev, [run.id]: !outputExpanded }));
+                          }}
+                          className="inline-flex items-center gap-1 rounded-[5px] border border-border bg-muted/40 px-2.5 py-1 text-[11px] font-medium text-foreground tabular-nums transition-colors duration-150 hover:bg-accent cursor-pointer"
+                        >
+                          {outputExpanded ? (
+                            <>
+                              <ChevronUp className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
+                              收起长输出
+                            </>
+                          ) : (
+                            <>
+                              <ChevronDown className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
+                              展开全文（{formatBytes(run.output_bytes || fullText.length)} · {lineCount} 行）
+                            </>
+                          )}
+                        </button>
+                      </div>
+                    ) : null}
+                  </div>
+                ) : previewText ? (
+                  <div className="mt-2.5 space-y-2">
+                    <div
+                      data-testid={`run-truncated-notice-${run.id}`}
+                      onClick={(e) => e.stopPropagation()}
+                      className="flex flex-wrap items-center justify-between gap-2 rounded-[6px] border border-[var(--status-approval)]/40 bg-[var(--status-approval)]/10 px-3 py-1.5 text-[11px] text-foreground tabular-nums"
+                    >
+                      <span>当前仅展示尾部预览 · 完整输出 {formatBytes(run.output_bytes)}</span>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        data-testid={`load-full-output-banner-${run.id}`}
+                        onClick={() => onLoadFullOutput(run.id)}
+                        className="h-6 px-2 text-[11px]"
+                      >
+                        <FileText className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
+                        加载完整输出
+                      </Button>
+                    </div>
+                    <div className="ahub-markdown">
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{previewText}</ReactMarkdown>
+                    </div>
+                  </div>
+                ) : hasUnloadedOutput ? (
+                  <div
+                    data-testid={`run-unloaded-notice-${run.id}`}
+                    onClick={(e) => e.stopPropagation()}
+                    className="mt-2.5 space-y-1.5 rounded-[6px] border border-border bg-muted/25 px-3 py-2 text-xs"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-muted-foreground tabular-nums">
+                      <span>完整输出加载中（{formatBytes(run.output_bytes)}）...</span>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        data-testid={`load-full-output-banner-${run.id}`}
+                        onClick={() => onLoadFullOutput(run.id)}
+                        className="h-6 px-2 text-[11px]"
+                      >
+                        <FileText className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
+                        加载完整输出
+                      </Button>
+                    </div>
+                    {run.summary ? (
+                      <p className="line-clamp-2 text-xs text-muted-foreground text-pretty">
+                        末行摘要：{run.summary}
+                      </p>
+                    ) : null}
+                  </div>
+                ) : run.summary ? (
                   <div className="ahub-markdown mt-2.5">
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{displayMarkdown}</ReactMarkdown>
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{run.summary}</ReactMarkdown>
                   </div>
                 ) : null}
               </article>

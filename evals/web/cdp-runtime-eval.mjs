@@ -561,6 +561,18 @@ try {
     await sleep(250);
   }
 
+  async function waitForSeedRunDone(runId, label) {
+    for (let i = 0; i < 40; i++) {
+      const r = await apiJson(hubUrl, adminToken, `/api/v1/runs/${runId}`);
+      if (r.run.status === "done") return r.run;
+      if (r.run.status === "failed" || r.run.status === "cancelled") {
+        throw new Error(`${label} terminated unexpectedly: ${JSON.stringify(r.run)}`);
+      }
+      await sleep(200);
+    }
+    throw new Error(`${label} did not finish in time`);
+  }
+
   // Seed thread 1 on macmini (events + Markdown output)
   const doneRunRes = await apiJson(hubUrl, adminToken, "/api/v1/runs?wait_ms=0", {
     method: "POST",
@@ -577,15 +589,10 @@ try {
     })
   });
   const doneRunId = doneRunRes.run.id;
-  for (let i = 0; i < 40; i++) {
-    const r = await apiJson(hubUrl, adminToken, `/api/v1/runs/${doneRunId}`);
-    if (r.run.status === "done") break;
-    if (i === 39) throw new Error("Seeded done run did not finish");
-    await sleep(200);
-  }
+  await waitForSeedRunDone(doneRunId, "Seeded done run");
 
   // Seed thread 2 on mbp
-  await apiJson(hubUrl, adminToken, "/api/v1/runs?wait_ms=0", {
+  const thread2Res = await apiJson(hubUrl, adminToken, "/api/v1/runs?wait_ms=0", {
     method: "POST",
     body: JSON.stringify({
       node_id: "mbp",
@@ -599,6 +606,81 @@ try {
       })
     })
   });
+  await waitForSeedRunDone(thread2Res.run.id, "Seed thread 2");
+
+  // Seed thread 3 on mbp: 4-turn regression thread (>16KB multi-turn hydration, long-output collapse, >128KB explicit truncation)
+  const h1Res = await apiJson(hubUrl, adminToken, "/api/v1/runs?wait_ms=0", {
+    method: "POST",
+    body: JSON.stringify({
+      node_id: "mbp",
+      workdir: wsMbp,
+      agent: "pi",
+      title: "多轮长报告水合回归线程",
+      prompt: JSON.stringify({
+        summary: "1. 第一轮末尾总结行",
+        response:
+          "## 第一轮核心结论\n\n" +
+          "- 链路延迟基线稳定 (`120ms`)\n".repeat(650) +
+          "\n1. 第一轮末尾总结行",
+        directives: [{ op: "sleep", ms: 5 }]
+      })
+    })
+  });
+  const h1Done = await waitForSeedRunDone(h1Res.run.id, "Hydration turn 1");
+  const hydrationThreadId = h1Done.thread_id;
+
+  const h2Res = await apiJson(hubUrl, adminToken, "/api/v1/runs?wait_ms=0", {
+    method: "POST",
+    body: JSON.stringify({
+      thread_id: hydrationThreadId,
+      node_id: "mbp",
+      workdir: wsMbp,
+      agent: "pi",
+      prompt: JSON.stringify({
+        summary: "2. 第二轮末尾总结行",
+        response:
+          "## 第二轮核心结论\n\n" +
+          "- 双跳对照采样数据完整\n".repeat(600) +
+          "\n2. 第二轮末尾总结行",
+        directives: [{ op: "sleep", ms: 5 }]
+      })
+    })
+  });
+  const h2Done = await waitForSeedRunDone(h2Res.run.id, "Hydration turn 2");
+
+  const h3Res = await apiJson(hubUrl, adminToken, "/api/v1/runs?wait_ms=0", {
+    method: "POST",
+    body: JSON.stringify({
+      thread_id: hydrationThreadId,
+      node_id: "mbp",
+      workdir: wsMbp,
+      agent: "pi",
+      prompt: JSON.stringify({
+        summary: "3. 第三轮末尾总结行",
+        response:
+          "## 第三轮核心结论\n\n" +
+          "- 晚高峰基线对照组验证通过\n".repeat(180) +
+          "\n3. 第三轮末尾总结行",
+        directives: [{ op: "sleep", ms: 5 }]
+      })
+    })
+  });
+  const h3Done = await waitForSeedRunDone(h3Res.run.id, "Hydration turn 3");
+
+  const h4Res = await apiJson(hubUrl, adminToken, "/api/v1/runs?wait_ms=0", {
+    method: "POST",
+    body: JSON.stringify({
+      thread_id: hydrationThreadId,
+      node_id: "mbp",
+      workdir: wsMbp,
+      agent: "pi",
+      prompt: JSON.stringify({
+        summary: "4. 超大产物末行摘要",
+        directives: [{ op: "big_output", bytes: 140000 }]
+      })
+    })
+  });
+  const h4Done = await waitForSeedRunDone(h4Res.run.id, "Hydration turn 4");
 
   const chromeProc = spawn(
     chromeBin,
@@ -656,6 +738,96 @@ try {
     await sleep(250);
   }
   if (!state) throw new Error("UI did not hydrate and connect WebSocket in time");
+
+  // Verify 4-turn regression thread: multi-turn >16KB full hydration without self-cancellation, long-output fold/expand, and >128KB explicit truncation
+  if (state.selectedThreadId !== hydrationThreadId) {
+    await cdpClient.clickSelector(`[data-testid="thread-item-${hydrationThreadId}"] button:nth-of-type(2)`);
+    await sleep(200);
+  }
+  const expectedFullHydration = [
+    { id: h1Done.id, bytes: h1Done.output_bytes, heading: "第一轮核心结论" },
+    { id: h2Done.id, bytes: h2Done.output_bytes, heading: "第二轮核心结论" },
+    { id: h3Done.id, bytes: h3Done.output_bytes, heading: "第三轮核心结论" }
+  ];
+  let hydrationReady = false;
+  let lastHydrationDbg = null;
+  for (let i = 0; i < 30; i++) {
+    const check = await cdpClient.evalJS(`
+      (() => {
+        const enc = new TextEncoder();
+        const runs = window.__AHUB_EVAL__.getState().runs;
+        const expected = ${JSON.stringify(expectedFullHydration)};
+        const fullChecks = expected.map((item) => {
+          const r = runs.find((x) => x.id === item.id);
+          const md = r?.output_md ?? "";
+          const mdBytes = enc.encode(md).length;
+          const domText = document.querySelector('[data-testid="run-row-' + item.id + '"] .ahub-markdown')?.textContent ?? "";
+          return {
+            id: item.id,
+            expectedBytes: item.bytes,
+            mdBytes,
+            hasHeading: domText.includes(item.heading),
+            domHead: domText.slice(0, 60)
+          };
+        });
+        const h4 = runs.find((x) => x.id === ${JSON.stringify(h4Done.id)});
+        const h4PreviewBytes = enc.encode(h4?.output_preview ?? "").length;
+        const hasTruncNotice = Boolean(document.querySelector('[data-testid="run-truncated-notice-${h4Done.id}"]'));
+        const hasLoadBtn = Boolean(document.querySelector('[data-testid="load-full-output-${h4Done.id}"]'));
+        const ok =
+          fullChecks.every((c) => c.mdBytes === c.expectedBytes && c.hasHeading) &&
+          h4?.truncated === true &&
+          !h4?.output_md &&
+          h4PreviewBytes === 16384 &&
+          hasTruncNotice &&
+          hasLoadBtn;
+        return { ok, fullChecks, h4Status: { truncated: h4?.truncated, previewBytes: h4PreviewBytes, hasMd: Boolean(h4?.output_md), hasTruncNotice, hasLoadBtn } };
+      })()
+    `);
+    lastHydrationDbg = check;
+    if (check.ok) {
+      hydrationReady = true;
+      break;
+    }
+    await sleep(200);
+  }
+  if (!hydrationReady) {
+    throw new Error(`Multi-turn hydration regression check failed: ${JSON.stringify(lastHydrationDbg)}`);
+  }
+
+  const toggleBtnSel = `[data-testid="toggle-output-${h1Done.id}"]`;
+  const toggleBefore = await cdpClient.evalJS(`document.querySelector(${JSON.stringify(toggleBtnSel)})?.textContent?.trim() ?? ""`);
+  if (!toggleBefore.includes("展开全文")) {
+    throw new Error(`Expected collapsed long-output toggle button for ${h1Done.id}, got ${JSON.stringify(toggleBefore)}`);
+  }
+  await cdpClient.clickSelector(toggleBtnSel);
+  await sleep(150);
+  const toggleAfter = await cdpClient.evalJS(`document.querySelector(${JSON.stringify(toggleBtnSel)})?.textContent?.trim() ?? ""`);
+  if (!toggleAfter.includes("收起长输出")) {
+    throw new Error(`Expected expanded toggle label '收起长输出' after click, got ${JSON.stringify(toggleAfter)}`);
+  }
+
+  await cdpClient.clickSelector(`[data-testid="load-full-output-${h4Done.id}"]`);
+  let h4FullLoaded = false;
+  for (let i = 0; i < 25; i++) {
+    const h4FullCheck = await cdpClient.evalJS(`
+      (() => {
+        const enc = new TextEncoder();
+        const r = window.__AHUB_EVAL__.getState().runs.find((x) => x.id === ${JSON.stringify(h4Done.id)});
+        const mdBytes = enc.encode(r?.output_md ?? "").length;
+        const noticeGone = !document.querySelector('[data-testid="run-truncated-notice-${h4Done.id}"]');
+        return { mdBytes, truncated: r?.truncated, noticeGone };
+      })()
+    `);
+    if (h4FullCheck.mdBytes === h4Done.output_bytes && h4FullCheck.truncated === false && h4FullCheck.noticeGone) {
+      h4FullLoaded = true;
+      break;
+    }
+    await sleep(200);
+  }
+  if (!h4FullLoaded) {
+    throw new Error(`Expected clicking load-full-output on >128KB run ${h4Done.id} to hydrate full ${h4Done.output_bytes}B output`);
+  }
 
   // Select doneRunRes thread via real user mouse click
   await cdpClient.clickSelector(`[data-testid="thread-item-${doneRunRes.run.thread_id}"] button:nth-of-type(2)`);

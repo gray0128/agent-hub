@@ -2,6 +2,8 @@ import { type ClassValue, clsx } from "clsx";
 import { twMerge } from "tailwind-merge";
 import type { RunEventItem, RunRecord } from "@/types";
 
+export const AUTO_FULL_OUTPUT_MAX_BYTES = 128 * 1024;
+
 export function cn(...inputs: ClassValue[]): string {
   return twMerge(clsx(inputs));
 }
