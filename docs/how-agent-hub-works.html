@@ -794,11 +794,11 @@
         <div>
           <div class="doc-kicker">
             <span class="doc-kicker-dot" aria-hidden="true"></span>
-            <span>AGENT-HUB ARCHITECTURE MONOGRAPH / V0.1.2</span>
+            <span>AGENT-HUB ARCHITECTURE MONOGRAPH / V0.1.6</span>
           </div>
           <h1><code>agent-hub</code> 架构与运作逻辑规格说明</h1>
           <p class="header-thesis">
-            核心架构取舍：<strong>「信令走 WebSocket、状态锁与结单走 HTTP + D1 CAS」</strong>——Durable Object 不充当持久化队列，任何断线或休眠唤醒都不会破坏互斥契约。
+            核心架构取舍：<strong>「信令扇出走 WebSocket，状态互斥与结单走 HTTP + D1 CAS，本地原生会话主动通知走独立 D1 + Queue Webhook 旁路」</strong>。Durable Object 不充当持久化队列，任何断线或休眠唤醒都不会破坏互斥契约。
           </p>
         </div>
         <button id="theme-toggle" type="button" class="theme-btn" aria-pressed="true">切换亮色主题</button>
@@ -813,7 +813,7 @@
         <div class="deliverable-item">
           <div class="deliverable-label">STATIC BINARY</div>
           <div class="deliverable-title"><code>ahub</code> 零依赖 Go 单二进制</div>
-          <div class="deliverable-desc"><code>CGO_ENABLED=0</code> 编译，合一承载调用端 CLI 与受控机守护进程 <code>ahub node serve</code>，内嵌 <code>SKILL.md</code>。</div>
+          <div class="deliverable-desc"><code>CGO_ENABLED=0</code> 编译，合一承载调用端 CLI、受控机守护进程 <code>ahub node serve</code> 与原生通知触发器 <code>ahub native-emit</code>，内嵌 <code>SKILL.md</code>。</div>
         </div>
         <div class="deliverable-item">
           <div class="deliverable-label">CONSOLE &amp; EVALS</div>
@@ -836,7 +836,8 @@
         <li><a class="toc-link sub" href="#sec-3-3"><span class="toc-num tabular-nums">3.3</span><span>混合调度闭环</span></a></li>
         <li><a class="toc-link sub" href="#sec-3-4"><span class="toc-num tabular-nums">3.4</span><span>本地执行与强杀</span></a></li>
         <li><a class="toc-link sub" href="#sec-3-5"><span class="toc-num tabular-nums">3.5</span><span>等待、通知与 Web</span></a></li>
-        <li><a class="toc-link sub" href="#sec-3-6"><span class="toc-num tabular-nums">3.6</span><span>形式化与变异门禁</span></a></li>
+        <li><a class="toc-link sub" href="#sec-3-6"><span class="toc-num tabular-nums">3.6</span><span>原生会话主动推送</span></a></li>
+        <li><a class="toc-link sub" href="#sec-3-7"><span class="toc-num tabular-nums">3.7</span><span>形式化与变异门禁</span></a></li>
         <li><a class="toc-link" href="#directory-map"><span class="toc-num tabular-nums">04</span><span>代码目录地图</span></a></li>
         <li><a class="toc-link" href="#gotchas"><span class="toc-num tabular-nums">05</span><span>隐性机制与工程防线</span></a></li>
       </ul>
@@ -849,10 +850,10 @@
           <div class="section-eyebrow tabular-nums">01 / OVERVIEW</div>
           <h2>总览（Overview）</h2>
           <p>
-            <code>agent-hub</code> 是一套跨主机 Coding Agent 统一调度与多轮会话编排系统。它让人类工程师、外部聊天机器人（Bot）或某台开发机上的主控 Agent，能够以统一协议向多台内网或异地受管节点（如 <code>macmini</code>、<code>mbp</code>、Linux 主机）安全派发、续聊、实时观测和强杀无头本地 Coding Agent（支持 <code>agy</code>、<code>pi</code>、<code>omp</code>、<code>codex</code>、<code>claude</code>）。
+            <code>agent-hub</code> 是一套跨主机 Coding Agent 统一调度与多轮会话编排系统。它让人类工程师、外部聊天机器人（Bot）或某台开发机上的主控 Agent，能够以统一协议向多台内网或异地受管节点（如 <code>macmini</code>、<code>mbp</code>、Linux 与 Windows 主机）安全派发、续聊、实时观测和强杀无头本地 Coding Agent（支持 <code>agy</code>、<code>pi</code>、<code>omp</code>、<code>codex</code>、<code>claude</code>）。同时支持纯调用端 Bot 通过专属引导模板 <code>/dl/client-bootstrap.md</code> 隔离接入。
           </p>
           <p>
-            目标节点无需开放任何公网入站端口。受管节点上的守护进程通过一条主动向云端（示例域名 <code>ahub.bobocai.win</code>，可通过 <code>AHUB_URL</code> 覆盖）发起的出站 WebSocket 长连接完成注册、目录/能力上报与唤醒接收；而所有存在并发竞争或数据完整性要求的操作（认领任务锁、续租心跳、回传最多 <code>900KB</code> 产物、级联取消）均走强一致性的 HTTP + D1 CAS 事务。
+            目标节点无需开放任何公网入站端口。受管节点上的守护进程通过一条主动向云端（示例域名 <code>ahub.bobocai.win</code>，可通过 <code>AHUB_URL</code> 覆盖）发起的出站 WebSocket 长连接完成注册、目录与能力上报和唤醒接收；所有存在并发竞争或数据完整性要求的操作（认领任务锁、续租心跳、回传最多 <span class="tabular-nums">900KB</span> 产物、级联取消）均走强一致性的 HTTP + D1 CAS 事务。此外，当开发者在节点本机直接交互运行 <code>agy</code>、<code>pi</code>、<code>omp</code>、<code>codex</code>、<code>claude</code> 或 <code>grok</code> 时，宿主 Hook 可调用 <code>ahub native-emit</code> 将「需要人工确认（<code>interaction_needed</code>）」与「回合总结（<code>turn_summary</code>）」经云端脱敏去重后异步推送至节点绑定的默认外部 Bot（如 Grok Bot）。
           </p>
         </div>
 
@@ -871,25 +872,25 @@
                 <tr>
                   <td class="nowrap-code"><strong>云端控制面</strong><br><code>apps/hub-worker/</code></td>
                   <td>Cloudflare Workers + D1 + Durable Object + Queues + Cron</td>
-                  <td>鉴权与边界校验、工作区消歧、深度与防环检查、CAS 认领锁、实时事件转发与 Webhook 异步回调。</td>
-                  <td>DO 仅托管内存 <code>Waiter</code> 与 WS 扇出，不存业务状态；Cron 每分钟回收超时的 <code>claimed</code>/<code>running</code>/<code>needs_approval</code> 僵尸租约。</td>
+                  <td>鉴权与边界校验、工作区消歧、深度与防环检查、CAS 认领锁、实时事件转发、<code>native_events</code> 去重脱敏与 Webhook 异步回调。</td>
+                  <td>DO 仅托管内存 <code>Waiter</code> 与 WS 扇出，不存业务状态也不转发原生事件；Cron 每分钟回收超时的 <code>claimed</code>/<code>running</code>/<code>needs_approval</code> 僵尸租约。</td>
                 </tr>
                 <tr>
                   <td class="nowrap-code"><strong>调用端 CLI</strong><br><code>internal/cli/</code></td>
                   <td><code>ahub</code> 单二进制（无框架，静态编译）</td>
-                  <td>节点发现、派单、多轮 <code>--thread</code> 续接、两阶段混合等待、拉取尾部摘要、级联取消与自更新。</td>
-                  <td>传入 <code>--json</code> 时 <code>stdout</code> 仅输出单个 JSON 对象；所有诊断/进度走 <code>stderr</code>；自动从 <code>stdin</code> 读取 <code>-</code> Prompt。</td>
+                  <td>节点发现、派单、多轮 <code>--thread</code> 续接、两阶段混合等待、拉取尾部摘要、级联取消、<code>auth login/status</code>、<code>native-emit</code> 六类宿主 Hook 适配与本地脱敏上报，以及自更新。</td>
+                  <td>传入 <code>--json</code> 时 <code>stdout</code> 仅输出单个 JSON 对象；所有诊断/进度走 <code>stderr</code>；自动从 <code>stdin</code> 读取 <code>-</code> Prompt；<code>native-emit</code> 仅读 <code>node.json</code> 隔离客户端凭据，支持 <code>AHUB_CONFIG_DIR</code> 多 Bot 隔离。</td>
                 </tr>
                 <tr>
                   <td class="nowrap-code"><strong>节点守护端</strong><br><code>internal/daemon/</code><br><code>internal/runner/</code></td>
                   <td><code>ahub node serve</code>（macOS 经 <code>AhubDaemon.app</code> 托管）</td>
                   <td>有界扫描工作区、异步采集本地模型目录、认领并按目录互斥拉起本地 Agent 进程组、过滤流式日志与两阶段强杀。</td>
-                  <td>环境白名单剥离节点 <code>ahub_nod_*</code> 凭据；仅可选注入低权限 <code>delegation_token</code> 与 4 项血统环境变量。</td>
+                  <td>环境白名单剥离节点 <code>ahub_nod_*</code> 凭据；仅可选注入低权限 <code>delegation_token</code> 与 <span class="tabular-nums">4</span> 项血统环境变量（顺带阻断子进程内误触发 <code>native-emit</code>）。</td>
                 </tr>
                 <tr>
                   <td class="nowrap-code"><strong>Web 工作台</strong><br><code>apps/web/</code></td>
                   <td>React + Zustand SPA（Worker <code>assets</code> 同源托管）</td>
-                  <td>三栏界面编排跨机队列、<code>node -> agent -> model -> effort</code> 四级联动、血统树可视化、节点接入与多 Bot 密钥管理。</td>
+                  <td>三栏界面编排跨机队列、<code>node -&gt; agent -&gt; model -&gt; effort</code> 四级联动、血统树可视化、节点接入、默认通知通道绑定与多 Bot 密钥管理。</td>
                   <td>依赖「每类职责唯一库」门禁；禁止 <code>transition: all</code>、卡片套卡片与绕过 <code>api-client.ts</code> 的裸 <code>fetch()</code>。</td>
                 </tr>
               </tbody>
@@ -904,7 +905,7 @@
           <div class="section-eyebrow tabular-nums">02 / KEY CONCEPTS</div>
           <h2>核心领域模型（Key Concepts）</h2>
           <p>
-            D1 数据库由 <code>apps/hub-worker/migrations/0001_init.sql</code> 与 <code>0002_multi_bot_webhooks.sql</code> 定义的 5 张核心表与 6 个索引构成。表结构本身内建了防越权与防并发写坏目录的硬约束。
+            D1 数据库由 <code>apps/hub-worker/migrations/0001_init.sql</code> 至 <code>0005_native_events_allow_grok.sql</code> 演进定义的 <span class="tabular-nums">6</span> 张核心表与 <span class="tabular-nums">7</span> 个索引构成。表结构本身内建了防越权与防并发写坏目录的硬约束。
           </p>
         </div>
 
@@ -923,8 +924,8 @@
                 <tr>
                   <td><code>nodes</code></td>
                   <td><code>id</code> (PK)</td>
-                  <td><code>status</code> (<code>online</code> / <code>offline</code> / <code>draining</code>), <code>max_concurrency</code> (<span class="tabular-nums">1..16</span>), <code>active_runs_count</code>, <code>capabilities_json</code>, <code>workspaces_json</code></td>
-                  <td><code>draining</code> 状态跨断线重连持久保留；<code>active_runs_count</code> 每次由活跃状态子查询重算对齐。</td>
+                  <td><code>status</code> (<code>online</code> / <code>offline</code> / <code>draining</code>), <code>max_concurrency</code> (<span class="tabular-nums">1..16</span>), <code>active_runs_count</code>, <code>default_notify_key_id</code> (外键 <code>ON DELETE SET NULL</code>), <code>capabilities_json</code>, <code>workspaces_json</code></td>
+                  <td><code>draining</code> 状态跨断线重连持久保留；<code>active_runs_count</code> 每次由活跃状态子查询重算对齐；<code>sanitizeNodeForScope</code> 对非 <code>admin</code> 剥离全部 <code>default_notify_*</code> 字段，修改或软吊销绑定 Key 时实时向 <code>/ws/stream</code> 广播 <code>node.status</code>。</td>
                 </tr>
                 <tr>
                   <td><code>threads</code></td>
@@ -935,8 +936,8 @@
                 <tr>
                   <td><code>runs</code></td>
                   <td><code>id</code> (PK, <code>run_*</code>)<br><code>idempotency_key</code> (UNIQUE)</td>
-                  <td><code>status</code> (7 态), <code>root_run_id</code>, <code>parent_run_id</code>, <code>depth</code> / <code>max_depth</code> (<span class="tabular-nums">0..3</span>), <code>lease_owner</code>, <code>lease_expires_at</code>, <code>output_md</code>, <code>output_bytes</code>, <code>notify_status</code></td>
-                  <td>同一 <code>(node_id, workdir)</code> 同一时刻最多只有 <span class="tabular-nums">1</span> 个活跃任务（<code>claimed</code> / <code>running</code> / <code>needs_approval</code>）；迁移 <code>0003</code> 重建部分索引 <code>idx_runs_active_lease</code> 同时覆盖这三类活跃状态。</td>
+                  <td><code>status</code> (<span class="tabular-nums">7</span> 态), <code>root_run_id</code>, <code>parent_run_id</code>, <code>depth</code> / <code>max_depth</code> (<span class="tabular-nums">0..3</span>), <code>lease_owner</code>, <code>lease_expires_at</code>, <code>output_md</code>, <code>output_bytes</code>, <code>notify_status</code></td>
+                  <td>同一 <code>(node_id, workdir)</code> 同一时刻最多只有 <span class="tabular-nums">1</span> 个活跃任务（<code>claimed</code> / <code>running</code> / <code>needs_approval</code>），由迁移 <code>0003</code> 部分索引 <code>idx_runs_active_lease</code> 强保护；控制面全链路执行对称 <code>prompt</code> 脱敏（仅 <code>POST /nodes/:id/claim</code> 返回明文，<code>?view=full</code> 保留 <code>$VAR</code> 引用）。</td>
                 </tr>
                 <tr>
                   <td><code>run_events</code></td>
@@ -948,7 +949,13 @@
                   <td><code>api_keys</code></td>
                   <td><code>id</code> (PK, <code>key_*</code>)<br><code>key_sha256</code> (UNIQUE)</td>
                   <td><code>scope</code> (<code>admin</code> / <code>client</code> / <code>node</code>), <code>bound_node_id</code>, <code>allowed_nodes_json</code>, <code>allow_unsandboxed</code>, <code>max_depth_limit</code>, <code>notify_webhook_ciphertext</code>, <code>notify_webhook_host</code>, <code>revoked_at</code></td>
-                  <td>仅存 SHA-256 摘要，绝不存明文；吊销时 <code>NodeHub</code> 按标签 <code>key:&lt;id&gt;</code> 即时发送 <code>4001</code> 踢断活跃 WS 连接。</td>
+                  <td>仅存 SHA-256 摘要，绝不存明文；吊销时软写 <code>revoked_at</code> 保留外键关联，同时 <code>NodeHub</code> 按标签 <code>key:&lt;id&gt;</code> 即时发送 <code>4001</code> 踢断活跃 WS 连接。</td>
+                </tr>
+                <tr>
+                  <td><code>native_events</code></td>
+                  <td><code>id</code> (PK, <code>evt_*</code>)<br><code>UNIQUE (node_id, event_id)</code><br><code>idx_native_events_node_created</code></td>
+                  <td><code>agent</code> (<span class="tabular-nums">6</span> 类，含 <code>grok</code>), <code>event_kind</code> (<code>interaction_needed</code> / <code>turn_summary</code>), <code>workdir</code>, <code>title</code>, <code>summary</code>, <code>notify_key_id</code>, <code>notify_status</code> (<code>none</code> / <code>queued</code> / <code>sent</code> / <code>failed</code> / <code>skipped</code>), <code>notify_error</code></td>
+                  <td>纯异步出站幂等账本，不经 <code>NodeHub</code> DO、无 <code>GET</code> 查询接口、无 <code>/ws/stream</code> 实时帧；入库与出站执行二次与三次脱敏；未绑定记 <code>skipped</code>，通道失效或排队期换绑按 Fail-Closed 记 <code>failed</code>。</td>
                 </tr>
               </tbody>
             </table>
@@ -982,9 +989,9 @@
 
         <div class="prose-measure">
           <ul>
-            <li><strong><code>admin</code> Scope</strong>：全量管控权限，可签发/吊销任意密钥、调整节点 <code>draining</code> 或并发度、强制重排队列及调用租约回收端点。</li>
-            <li><strong><code>node</code> Scope</strong>：必须绑定单一 <code>bound_node_id</code>，仅限接入 <code>/ws/node</code> 及调用本节点的 <code>/claim</code>、<code>/heartbeat</code>、<code>/approval</code>、<code>/complete</code>；节点 ID 由后端从 Token 权威读取，禁止客户端自报。</li>
-            <li><strong><code>client</code> Scope</strong>：面向外部 Bot 与低权限委派，在 REST 与 <code>/ws/stream</code> 上统一强制执行 <code>bound_node_id ∩ allowed_nodes_json</code> 节点交集校验与创建者（<code>created_by_key_id</code>）所有权隔离，受 <code>allow_unsandboxed</code> 沙箱豁免与 <code>max_depth_limit</code> 深度上限约束，并可绑定独立 <code>AES-256-GCM</code> 加密的 Bot Webhook（<code>notify_webhook_ciphertext</code>）。</li>
+            <li><strong><code>admin</code> Scope</strong>：全量管控权限，可签发/吊销任意密钥、绑定节点默认通知通道 <code>default_notify_key_id</code>、调整节点 <code>draining</code> 或并发度、强制重排队列及调用租约回收端点。</li>
+            <li><strong><code>node</code> Scope</strong>：必须绑定单一 <code>bound_node_id</code>，仅限接入 <code>/ws/node</code>、调用本节点的 <code>/claim</code>、<code>/heartbeat</code>、<code>/approval</code>、<code>/complete</code>，以及上报本节点的 <code>POST /api/v1/nodes/:id/native-events</code>；节点 ID 由后端从 Token 权威读取，禁止客户端自报或跨节点代报。</li>
+            <li><strong><code>client</code> Scope</strong>：面向外部 Bot 与低权限委派，在 REST 与 <code>/ws/stream</code>（强制要求携带 <code>?run_id=&lt;id&gt;</code> 单任务订阅）上统一强制执行 <code>bound_node_id ∩ allowed_nodes_json</code> 节点交集校验与创建者（<code>created_by_key_id</code>）所有权隔离，受 <code>allow_unsandboxed</code> 沙箱豁免与 <code>max_depth_limit</code> 深度上限约束，自动剥离节点 <code>default_notify_*</code> 元数据，并可绑定独立 <code>AES-256-GCM</code> 加密的 Bot Webhook（<code>notify_webhook_ciphertext</code>）。</li>
           </ul>
         </div>
       </section>
@@ -1301,7 +1308,7 @@
                   <td><code>agy</code></td>
                   <td><code>--output-format json</code>, <code>--sandbox</code> / <code>--dangerously-skip-permissions</code>, <code>--print-timeout &lt;N&gt;s</code>, <code>-p=&lt;prompt&gt;</code></td>
                   <td><code>--conversation &lt;id&gt;</code></td>
-                  <td><code>ResolveAgyProjectID</code> 扫描项目 JSON 注入 <code>--project</code>；<code>ExpandAgyModel</code> 展开别名；只读 <code>probeRemoteControlURL</code> 获取审批链接（禁调 <code>start</code>）。</td>
+                  <td>默认模型对齐 <code>gemini-4-hydrogen-high</code>；<code>ResolveAgyProjectID</code> 扫描项目 JSON 注入 <code>--project</code>；<code>ExpandAgyModel</code> 展开别名；只读 <code>probeRemoteControlURL</code> 获取审批链接（禁调 <code>start</code>）。</td>
                 </tr>
                 <tr>
                   <td><code>pi</code></td>
@@ -1345,9 +1352,9 @@
             调用端与控制面共同保护上游 Agent 的有限上下文窗口和同步等待超时边界：
           </p>
           <ul>
-            <li><strong>两阶段无缝等待</strong>：<code>ahub run --wait &lt;dur&gt;</code> 先将阶段一等待夹逼在 <span class="tabular-nums">[0, 45000ms]</span>（避开 Cloudflare <span class="tabular-nums">100s</span> 网关 <code>524</code> 超时），请求 <code>POST /api/v1/runs?wait_ms=...</code>。<code>NodeHub</code> DO 注册内存 <code>Waiter</code> 后立即二次查库防超快任务竞态；若指定了 <code>--notify grok|webhook</code> 且首段未完结，CLI 将 <code>webhook_armed</code> 置为 <code>true</code> 并立即返回退出码 <span class="tabular-nums">0</span> 交由云端异步回调；若未配通知且仍有剩余等待预算（例如 <code>--wait 10m</code>），则无缝切入阶段二 <code>waitViaStream</code> 订阅 <code>/ws/stream?run_id=...</code>，收到任一停止态（<code>done</code>/<code>failed</code>/<code>cancelled</code>/<code>needs_approval</code>）均执行限时长 <span class="tabular-nums">5s</span> 的 <code>GET /api/v1/runs/:id?tail_bytes=16384</code> 补全摘要与尾部 <span class="tabular-nums">16 KiB</span> 预览；若阶段二遇到 <code>401</code>/<code>403</code>/<code>404</code> 或持久传输错误，立即如实透传退出码（<code>78</code>/<code>64</code>/<code>75</code>）而非伪报超时 <span class="tabular-nums">24</span>，且序列化前显式清空 <code>Prompt</code> 与 <code>LeaseOwner</code> 以严守 <code>run-record.schema.json</code>。</li>
-            <li><strong>多 Bot 专属加密 Webhook（Fail-Closed）</strong>：任务入队 <code>ahub-outbound-notify</code> 队列后，<code>apps/hub-worker/src/notify-queue.ts</code> 按签发任务的 <code>created_by_key_id</code> 读取并解密 <code>notify_webhook_ciphertext</code>（<code>AES-256-GCM</code>，见 <code>webhook-crypto.ts</code>）。<strong>若签发 Key 已吊销或解密失败，严格执行 Fail-Closed 直接标 <code>failed</code> 并 <code>ack()</code>，绝不回退全局 Webhook</strong>，彻底防止多 Bot 间串信；外部接口异常按指数退避最多重试 <span class="tabular-nums">5</span> 次。</li>
-            <li><strong>Web 三栏工作台与单调状态合并</strong>：<code>apps/web/src/App.tsx</code> 协调左栏会话/节点（<code>FleetThreadsPane.tsx</code>）、中栏对话与四级能力联动派发台（<code>ConversationPane.tsx</code> + <code>capabilities.ts</code>）及右栏实时检视甲板（<code>InspectorPane.tsx</code>：事件流、<span class="tabular-nums">1s</span> 租约倒计时、同节点队列拖拽重排 <code>POST /api/v1/runs/reorder</code>、<code>root_run_id</code> 血统树与级联取消）。为解决 REST 补水与 <code>/ws/stream</code> 并发乱序，<code>apps/web/src/stores/task-store.ts</code> 的 <code>mergeRunRecord</code> 实施<strong>单调合并法则</strong>：终态不可被非终态覆盖，比较 <code>updated_at</code> 时间戳及状态秩（<code>queued:0 &lt; claimed:1 &lt; running|needs_approval:2 &lt; terminal:3</code>），并将每任务实时事件环形裁剪在 <span class="tabular-nums">500</span> 条上限内。</li>
+            <li><strong>两阶段无缝等待与指令脱敏边界</strong>：<code>ahub run --wait &lt;dur&gt;</code> 先将阶段一等待夹逼在 <span class="tabular-nums">[0, 45000ms]</span>（避开 Cloudflare <span class="tabular-nums">100s</span> 网关 <code>524</code> 超时），请求 <code>POST /api/v1/runs?wait_ms=...</code>。<code>NodeHub</code> DO 注册内存 <code>Waiter</code> 后立即二次查库防超快任务竞态；若指定了 <code>--notify grok|webhook</code> 且首段未完结，CLI 将 <code>webhook_armed</code> 置为 <code>true</code> 并立即返回退出码 <span class="tabular-nums">0</span> 交由云端异步回调；若未配通知且仍有剩余等待预算（例如 <code>--wait 10m</code>），则无缝切入阶段二 <code>waitViaStream</code> 订阅 <code>/ws/stream?run_id=...</code>，收到任一停止态（<code>done</code>/<code>failed</code>/<code>cancelled</code>/<code>needs_approval</code>）均执行限时长 <span class="tabular-nums">5s</span> 的 <code>GET /api/v1/runs/:id?tail_bytes=16384</code> 补全摘要与尾部 <span class="tabular-nums">16 KiB</span> 预览；若阶段二遇到 <code>401</code>/<code>403</code>/<code>404</code> 或持久传输错误，立即如实透传退出码（<code>78</code>/<code>64</code>/<code>75</code>）而非伪报超时 <span class="tabular-nums">24</span>。序列化输出前显式清空 <code>LeaseOwner</code>，并对 <code>Prompt</code> 执行对称凭据脱敏与默认 <span class="tabular-nums">1536</span> 字节截断（<code>--full</code> 保留完整脱敏文本与 <code>$VAR</code> 占位；全系统仅节点 <code>POST /api/v1/nodes/:id/claim</code> 返回原始明文 <code>prompt</code>；Grok Bot 按 <code>client-bootstrap.md</code> 在派单瞬间直接展示脱敏指令）。</li>
+            <li><strong>多 Bot 三路通知矩阵（Fail-Closed）</strong>：任务入队 <code>ahub-outbound-notify</code> 队列前，<code>enqueueRunNotificationIfNeeded</code>（<code>apps/hub-worker/src/db.ts</code>）在任务终态与首次进入 <code>needs_approval</code> 时按三条路由规则分流：① 当 <code>client</code> Key 显式传 <code>--notify</code> 时强制锁定 <code>route_mode = "key"</code>，仅使用该 Key 自身的 <code>AES-256-GCM</code> 加密 Webhook；② 当人工或 <code>admin</code> 发起根任务（<code>depth === 0</code> 且 <code>notify.target === "none"</code>）时，若目标节点绑定了有效的 <code>default_notify_key_id</code> 则自动升级为 <code>route_mode = "node_default"</code>（严禁 <code>client</code> 静默任务与 <code>depth &gt;= 1</code> 子任务落入 <code>node_default</code>，防止跨 Bot 串信与通知风暴）；③ 人工或 <code>admin</code> 显式传 <code>--notify</code> 且节点未绑定默认通道时，才退回全局环境变量 <code>global_legacy</code>。消费端 <code>apps/hub-worker/src/notify-queue.ts</code> 同时处理带脱敏 <code>prompt_preview</code>（上限 <span class="tabular-nums">1200</span> 字符）的 <code>ahub_run_completed</code> 与节点原生事件 <code>ahub_native_event</code>（固定标记 <code>action_required: "notify_user_only"</code>）；<strong>若绑定 Key 已吊销、权限变更或解密失败，严格 Fail-Closed 直接写 <code>failed</code> 并 <code>ack()</code>，绝不回退全局 Webhook</strong>；外部 HTTP 异常按指数退避（<span class="tabular-nums">2s</span>、<span class="tabular-nums">4s</span>、<span class="tabular-nums">8s</span>、<span class="tabular-nums">16s</span>）重试，第 <span class="tabular-nums">5</span> 次仍失败则落盘 <code>WEBHOOK_DELIVERY_FAILED</code> 并显式 <code>ack()</code>。</li>
+            <li><strong>Web 三栏工作台、多轮补水与单调状态合并</strong>：<code>apps/web/src/App.tsx</code> 协调左栏会话/节点（<code>FleetThreadsPane.tsx</code>）、中栏对话与四级能力联动派发台（<code>ConversationPane.tsx</code> + <code>capabilities.ts</code>）及右栏实时检视甲板（<code>InspectorPane.tsx</code>：事件流、<span class="tabular-nums">1s</span> 租约倒计时、同节点队列拖拽重排 <code>POST /api/v1/runs/reorder</code>、<code>root_run_id</code> 血统树、级联取消，以及仅对 <code>admin</code> 开放的节点 <code>default_notify_key_id</code> 默认通道绑定与「通道失效/已吊销」实时徽标）。中栏使用代次化水合集合对不超过 <span class="tabular-nums">128KB</span> 的完成任务自动拉取 <code>view=full</code>（超过 <span class="tabular-nums">4000</span> 字符或 <span class="tabular-nums">60</span> 行自动折叠并支持展开，超过 <span class="tabular-nums">128KB</span> 展示显式截断提示）；外壳与表单控件统一约束 <code>position: relative</code> 与 <code>overflow: hidden</code> 防止视口溢出。为解决 REST 补水与 <code>/ws/stream</code> 并发乱序，<code>apps/web/src/stores/task-store.ts</code> 的 <code>mergeRunRecord</code> 实施<strong>单调合并法则</strong>：终态不可被非终态覆盖，比较 <code>updated_at</code> 时间戳及状态秩（<code>queued:0 &lt; claimed:1 &lt; running|needs_approval:2 &lt; terminal:3</code>），并将每任务实时事件环形裁剪在 <span class="tabular-nums">500</span> 条上限内。</li>
           </ul>
         </div>
 
@@ -1412,15 +1419,133 @@
         </div>
 
         <div class="prose-measure">
-          <h3 id="sec-3-6"><span class="tabular-nums">3.6</span> 形式化模型与三平面变异门禁</h3>
+          <h3 id="sec-3-6"><span class="tabular-nums">3.6</span> 节点端本地原生会话主动推送（<code>ahub native-emit</code> 与双向防环）</h3>
           <p>
-            仓库通过 <code>Makefile</code> 与 <code>docs/07-eval-framework.md</code> 构建四层自动防线，且核心断言均在 <code>decisions.tsv</code> 记录了「注入真实源码缺陷验证评测变红（RED）-> 恢复后变绿（GREEN）」的变异门禁（Mutation Gate）实证：
+            当开发者在节点本机终端或 IDE 直接交互运行本地 Agent（不受控于云端 <code>Run</code>）时，节点侧主动推送消息走一条完全脱离 <code>NodeHub</code> DO 与 <code>/ws/stream</code> 的纯异步旁路：
+          </p>
+        </div>
+
+        <!-- Inline SVG Diagram C: Native Emit Proactive Push & Anti-Loop -->
+        <div class="wide-block">
+          <div class="diagram-frame">
+            <div class="diagram-caption">
+              <span><strong>图 C</strong> · 本地原生会话主动推送与双向防环旁路（不经 NodeHub DO）</span>
+              <span class="mono tabular-nums">NATIVE-EMIT + D1 + QUEUE</span>
+            </div>
+            <div class="diagram-scroll">
+              <svg viewBox="0 0 980 318" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="本地原生会话主动推送与双向防环架构图">
+                <defs>
+                  <marker id="ne-blue" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+                    <polygon points="0 0, 8 3, 0 6" fill="var(--status-running)" />
+                  </marker>
+                  <marker id="ne-green" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+                    <polygon points="0 0, 8 3, 0 6" fill="var(--status-done)" />
+                  </marker>
+                  <marker id="ne-amber" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+                    <polygon points="0 0, 8 3, 0 6" fill="var(--status-approval)" />
+                  </marker>
+                  <marker id="ne-muted" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+                    <polygon points="0 0, 8 3, 0 6" fill="var(--muted-foreground)" />
+                  </marker>
+                </defs>
+
+                <!-- Horizontal Flow Arrows -->
+                <line x1="182" y1="106" x2="206" y2="106" stroke="var(--status-running)" stroke-width="1.6" marker-end="url(#ne-blue)" />
+                <line x1="394" y1="106" x2="416" y2="106" stroke="var(--status-running)" stroke-width="1.6" marker-end="url(#ne-blue)" />
+                <line x1="604" y1="106" x2="626" y2="106" stroke="var(--status-approval)" stroke-width="1.6" marker-end="url(#ne-amber)" />
+                <line x1="810" y1="106" x2="832" y2="106" stroke="var(--status-done)" stroke-width="1.6" marker-end="url(#ne-green)" />
+
+                <!-- Connectors to Bottom Guard Callouts -->
+                <line x1="303" y1="176" x2="303" y2="208" stroke="var(--muted-foreground)" stroke-width="1.2" stroke-dasharray="4 3" />
+                <line x1="513" y1="176" x2="513" y2="208" stroke="var(--muted-foreground)" stroke-width="1.2" stroke-dasharray="4 3" />
+                <line x1="901" y1="176" x2="901" y2="192" stroke="var(--status-failed)" stroke-width="1.2" stroke-dasharray="4 3" />
+                <line x1="901" y1="192" x2="478" y2="192" stroke="var(--status-failed)" stroke-width="1.2" stroke-dasharray="4 3" />
+                <line x1="478" y1="192" x2="478" y2="208" stroke="var(--status-failed)" stroke-width="1.2" stroke-dasharray="4 3" />
+
+                <!-- Arrow Labels -->
+                <text x="197" y="94" text-anchor="middle" font-family="var(--font-mono)" font-size="9.5" fill="var(--muted-foreground)">Hook</text>
+                <text x="408" y="94" text-anchor="middle" font-family="var(--font-mono)" font-size="9.5" fill="var(--muted-foreground)">HTTPS</text>
+                <text x="618" y="94" text-anchor="middle" font-family="var(--font-mono)" font-size="9.5" fill="var(--status-approval)">202</text>
+                <text x="824" y="94" text-anchor="middle" font-family="var(--font-mono)" font-size="9.5" fill="var(--status-done)">POST</text>
+
+                <!-- Stage 1 -->
+                <rect x="18" y="34" width="164" height="142" rx="6" fill="var(--surface-elevated)" stroke="var(--border)" stroke-width="1.5" />
+                <text x="100" y="58" text-anchor="middle" font-family="var(--font-sans)" font-size="12" font-weight="650" fill="var(--foreground)">本地原生会话</text>
+                <text x="100" y="80" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--muted-foreground)">claude / grok / codex</text>
+                <text x="100" y="98" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--muted-foreground)">agy / pi / omp</text>
+                <text x="100" y="122" text-anchor="middle" font-family="var(--font-sans)" font-size="10.5" fill="var(--foreground)">Hook 或共享 TS 扩展</text>
+                <text x="100" y="142" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--status-done)">15s Fail-Open 包装</text>
+                <text x="100" y="160" text-anchor="middle" font-family="var(--font-sans)" font-size="10" fill="var(--muted-foreground)">不阻塞本地 IDE 与终端</text>
+
+                <!-- Stage 2 -->
+                <rect x="212" y="34" width="182" height="142" rx="6" fill="var(--surface-elevated)" stroke="var(--status-running)" stroke-width="1.5" />
+                <text x="303" y="58" text-anchor="middle" font-family="var(--font-mono)" font-size="12" font-weight="650" fill="var(--status-running)">ahub native-emit</text>
+                <text x="303" y="80" text-anchor="middle" font-family="var(--font-mono)" font-size="9.8" fill="var(--foreground)">AHUB_RUN_ID/DEPTH 短路</text>
+                <text x="303" y="98" text-anchor="middle" font-family="var(--font-sans)" font-size="10.2" fill="var(--foreground)">先验 effectiveRoots 白名单</text>
+                <text x="303" y="116" text-anchor="middle" font-family="var(--font-sans)" font-size="10.2" fill="var(--foreground)">流式解析 + 确定性 event_id</text>
+                <text x="303" y="134" text-anchor="middle" font-family="var(--font-mono)" font-size="9.8" fill="var(--foreground)">redact.Text 首轮脱敏</text>
+                <text x="303" y="156" text-anchor="middle" font-family="var(--font-mono)" font-size="9.8" fill="var(--status-running)">仅读 node.json (ahub_nod_*)</text>
+
+                <!-- Stage 3 -->
+                <rect x="422" y="34" width="182" height="142" rx="6" fill="var(--surface-elevated)" stroke="var(--status-running)" stroke-width="1.5" />
+                <text x="513" y="58" text-anchor="middle" font-family="var(--font-sans)" font-size="12" font-weight="650" fill="var(--foreground)">Hub Worker + D1</text>
+                <text x="513" y="79" text-anchor="middle" font-family="var(--font-mono)" font-size="9.5" fill="var(--foreground)">POST /nodes/:id/native-events</text>
+                <text x="513" y="98" text-anchor="middle" font-family="var(--font-sans)" font-size="10.2" fill="var(--foreground)">node Scope + UNIQUE 去重</text>
+                <text x="513" y="116" text-anchor="middle" font-family="var(--font-mono)" font-size="9.8" fill="var(--foreground)">redactSecrets 二次脱敏</text>
+                <text x="513" y="135" text-anchor="middle" font-family="var(--font-sans)" font-size="10.2" fill="var(--muted-foreground)">校核 default_notify_valid</text>
+                <text x="513" y="156" text-anchor="middle" font-family="var(--font-mono)" font-size="9.8" fill="var(--status-approval)">skipped | failed | queued</text>
+
+                <!-- Stage 4 -->
+                <rect x="632" y="34" width="178" height="142" rx="6" fill="var(--surface-elevated)" stroke="var(--status-approval)" stroke-width="1.5" />
+                <text x="721" y="58" text-anchor="middle" font-family="var(--font-mono)" font-size="11.5" font-weight="650" fill="var(--status-approval)">NOTIFY_QUEUE</text>
+                <text x="721" y="80" text-anchor="middle" font-family="var(--font-sans)" font-size="10.2" fill="var(--foreground)">联表重验 default_notify_key_id</text>
+                <text x="721" y="99" text-anchor="middle" font-family="var(--font-sans)" font-size="10.2" fill="var(--foreground)">校验未吊销且未中途换绑</text>
+                <text x="721" y="118" text-anchor="middle" font-family="var(--font-mono)" font-size="9.8" fill="var(--foreground)">AES-GCM 解密 + 三次脱敏</text>
+                <text x="721" y="137" text-anchor="middle" font-family="var(--font-sans)" font-size="10.2" fill="var(--muted-foreground)">指数退避 (2s..16s)</text>
+                <text x="721" y="156" text-anchor="middle" font-family="var(--font-mono)" font-size="9.8" fill="var(--status-approval)">第 5 次失败落盘后 ack()</text>
+
+                <!-- Stage 5 -->
+                <rect x="838" y="34" width="126" height="142" rx="6" fill="var(--surface-elevated)" stroke="var(--status-done)" stroke-width="1.5" />
+                <text x="901" y="58" text-anchor="middle" font-family="var(--font-sans)" font-size="12" font-weight="650" fill="var(--status-done)">外部 Bot</text>
+                <text x="901" y="81" text-anchor="middle" font-family="var(--font-mono)" font-size="10" fill="var(--foreground)">ahub_native_event</text>
+                <text x="901" y="102" text-anchor="middle" font-family="var(--font-mono)" font-size="9.5" fill="var(--muted-foreground)">action_required:</text>
+                <text x="901" y="118" text-anchor="middle" font-family="var(--font-mono)" font-size="9.5" fill="var(--status-failed)">notify_user_only</text>
+                <text x="901" y="140" text-anchor="middle" font-family="var(--font-sans)" font-size="10.2" fill="var(--foreground)">仅向人类只读转述</text>
+                <text x="901" y="158" text-anchor="middle" font-family="var(--font-sans)" font-size="10" fill="var(--status-failed)">禁调 ahub run</text>
+
+                <!-- Bottom Callout 1: Anti-Loop -->
+                <rect x="18" y="210" width="460" height="86" rx="6" fill="var(--surface)" stroke="var(--border)" stroke-width="1.2" />
+                <text x="34" y="233" font-family="var(--font-sans)" font-size="11.5" font-weight="650" fill="var(--foreground)">双向防环闭环（受控 Run 与原生会话互不触发）</text>
+                <text x="34" y="255" font-family="var(--font-sans)" font-size="10.5" fill="var(--muted-foreground)">1. 受控 Run 由 node serve 注入 AHUB_RUN_ID 与 AHUB_DEPTH，触发 native-emit 直接 exit 0 跳过。</text>
+                <text x="34" y="276" font-family="var(--font-sans)" font-size="10.5" fill="var(--muted-foreground)">2. 原生回调固定携带 notify_user_only，Bot 回调轮内禁止代答审批或反向派单 ahub run。</text>
+
+                <!-- Bottom Callout 2: Bypass Boundary -->
+                <rect x="502" y="210" width="460" height="86" rx="6" fill="var(--surface)" stroke="var(--border)" stroke-width="1.2" />
+                <text x="518" y="233" font-family="var(--font-sans)" font-size="11.5" font-weight="650" fill="var(--foreground)">纯异步旁路边界（与 NodeHub DO 物理隔离）</text>
+                <text x="518" y="255" font-family="var(--font-sans)" font-size="10.5" fill="var(--muted-foreground)">1. 完全不经过 NodeHub DO，不写 run_events，不向 /ws/stream 广播实时帧，无 GET 查询接口。</text>
+                <text x="518" y="276" font-family="var(--font-sans)" font-size="10.5" fill="var(--muted-foreground)">2. 不经本机 ahub node serve 守护进程；Web 仅 admin 可绑定 default_notify_key_id 并收 node.status。</text>
+              </svg>
+            </div>
+          </div>
+        </div>
+
+        <div class="prose-measure">
+          <ul>
+            <li><strong>双通道硬分界与双向防环</strong>：<code>ahub node serve</code> 拉起受控子进程时经 <code>BuildSanitizedEnv</code> 注入 <code>AHUB_RUN_ID</code> 与 <code>AHUB_DEPTH</code>（根任务为 <code>"0"</code>）。一旦受控任务内部触发宿主全局挂载的 Hook，<code>runNativeEmit</code>（<code>internal/cli/native_emit.go</code>）在读取 <code>node.json</code> 与 <code>stdin</code> 之前即返回 <code>inside_ahub_run</code> 并以退出码 <span class="tabular-nums">0</span> 静默退出；反向出站载荷强制附带 <code>action_required: "notify_user_only"</code>，配合 Routine 规范第 <span class="tabular-nums">6</span>、<span class="tabular-nums">7</span> 条禁令切断递归派单死循环。</li>
+            <li><strong>六类宿主适配、先验目录门禁与流式大文件解析</strong>：<code>claude</code>（<code>parseClaudeHookEvent</code>）与 <code>grok</code>（<code>parseGrokHookEvent</code>，兼容 <code>snake_case</code> 与 <code>camelCase</code>）过滤 <code>stop_hook_active</code> 与 <code>idle_prompt</code>，映射 <code>Notification</code> 为 <code>interaction_needed</code>、<code>Stop</code> 为 <code>turn_summary</code>；<code>codex</code> 读取末尾位置参数或 <code>stdin</code> 的 <code>agent-turn-complete</code>；<code>pi</code> 与 <code>omp</code> 通过共享扩展 <code>ahub-native-notify.ts</code> 过滤子代理与无头 <code>-p</code> 会话后以 <code>detached: true</code> 拉起 CLI；<code>claude</code>、<code>grok</code>、<code>agy</code> 均在打开 <code>transcriptPath</code> 前先调用 <code>isWorkdirAllowedForNativeNotify</code>（优先 <code>allowed_roots</code>，为空回退 <code>project_roots</code>，两者皆空或目录为空则 Fail-Closed 拦截）；<code>agy</code> 以 <span class="tabular-nums">64 KiB</span> 缓冲、<span class="tabular-nums">4 MiB</span> 单行上限流式扫尾，忽略 <code>USER_CANCELED</code>、<code>fullyIdle == false</code> 与 <code>exit_plan_mode</code>，并将末步 <code>ask_question</code> 自动升级为 <code>interaction_needed</code> 提取编号问题清单。</li>
+            <li><strong>确定性幂等键、凭据硬隔离与全链路三次脱敏</strong>：<code>deterministicEventID</code> 按 <code>&lt;prefix&gt;_&lt;sha256[:20]&gt;</code> 生成幂等键（优先组合 <code>promptId</code>、不超过 <span class="tabular-nums">32 MiB</span> 的 Transcript 行数 <code>lines:&lt;N&gt;</code>、<code>executionNum</code> 或 <code>step:&lt;S&gt;:lines:&lt;N&gt;</code>，缺少锚点时退回 <span class="tabular-nums">15s</span> 时间桶 <code>tb:&lt;unix/15&gt;</code>）。<code>ahub native-emit</code> 彻底绕过 <code>ResolveCredentials</code>，仅读取命令行标志或 <code>node.json</code> 中的 <code>hub_url</code> 与 <code>ahub_nod_*</code> 令牌，不依赖本机 <code>ahub node serve</code> 守护进程存活。标题（<span class="tabular-nums">&lt;= 200</span>）与摘要（<span class="tabular-nums">&lt;= 4000</span>）分别在「Node 出网前（<code>redact.Text</code>）」、「Worker 入库前（<code>redactSecrets</code>）」与「Queue 出站前（<code>redactSecrets</code>）」完成三次对称脱敏。</li>
+            <li><strong>云端三态分流与投递期换绑 Fail-Closed</strong>：控制面校验 <code>scope === "node"</code> 且 <code>boundNodeId === nodeId</code>，先按 <code>UNIQUE(node_id, event_id)</code> 幂等去重（重复上报返回 <code>200 OK { deduplicated: true }</code> 不再入队），再按节点默认通道状态写入 D1：未绑定记 <code>skipped</code>（<code>200</code>），绑定 Key 已吊销/无 Webhook/移除节点权限记 <code>failed</code>（<code>200</code>），有效则写入 <code>queued</code> 并入队（<code>202 Accepted</code>）。消费端 <code>resolveNodeDefaultWebhook</code> 额外核验当前 <code>nodes.default_notify_key_id</code> 是否仍等于入库快照 <code>e.notify_key_id</code>，若排队期间节点换绑了其他 Bot，同样按 Fail-Closed 终止投递，绝不跨 Bot 串台。</li>
+          </ul>
+
+          <h3 id="sec-3-7"><span class="tabular-nums">3.7</span> 形式化模型与三平面变异门禁</h3>
+          <p>
+            仓库通过 <code>Makefile</code> 与 <code>docs/07-eval-framework.md</code> 构建四层自动防线，且核心断言均在 <code>decisions.tsv</code> 记录了「注入真实源码缺陷验证评测变红（RED）-&gt; 恢复后变绿（GREEN）」的变异门禁（Mutation Gate）实证：
           </p>
           <ol>
             <li><strong>形式化状态机穷举（<code>evals/formal/</code>）</strong>：<code>RunLifecycle.tla</code> 定义状态空间与四条安全不变量；<code>statecheck_test.go</code> 以纯 Go 实现零依赖同构广度优先（BFS）模型检验器，随 <code>go test</code> 穷举所有可达状态与边。</li>
-            <li><strong>Plane 1 底座混沌不变量（<code>evals/substrate/</code>）</strong>：<code>validate-schemas.mjs</code> 校验 3 份 JSON Schema；<code>invariants_test.go</code> 拉起真实 <code>wrangler dev --local</code>（D1 + DO + Queues）与真实 <code>ahub node serve/shim</code>，驱动替身 <code>ahub-fakeagent</code>（<code>evals/substrate/fakeagent/main.go</code>）实测验证 <code>I-1</code>~<code>I-7</code>（目录互斥、会话亲和与分叉、深度防环、事件单调连续与大输出截断、孙进程组强杀、环境脱敏、<code>SIGKILL</code> 租约回收）以及 <code>SIGHUP</code> 无损重载、<code>.app</code> <code>CDHash</code> 幂等与多 Bot 加密 Webhook 隔离。</li>
+            <li><strong>Plane 1 底座混沌不变量（<code>evals/substrate/</code>）</strong>：<code>validate-schemas.mjs</code> 校验 <span class="tabular-nums">3</span> 份 JSON Schema；<code>invariants_test.go</code> 拉起真实 <code>wrangler dev --local</code>（D1 + DO + Queues）与真实 <code>ahub node serve/shim</code>，驱动替身 <code>ahub-fakeagent</code>（<code>evals/substrate/fakeagent/main.go</code>）实测验证 <code>I-1</code>~<code>I-7</code>（目录互斥、会话亲和与分叉、深度防环、事件单调连续与大输出截断、孙进程组强杀、环境脱敏、<code>SIGKILL</code> 租约回收）、<code>SIGHUP</code> 无损重载、<code>.app</code> <code>CDHash</code> 幂等、多 Bot 加密 Webhook 隔离，以及 <code>TestInvariant_NodeDefaultNotifyAndNativeEventsIsolation</code>（节点默认通道绑定、<code>target="none"</code> 越权隔离、原生事件去重与凭据脱敏）。</li>
             <li><strong>Plane 2 盲测 Agent-CLI 轨迹（<code>evals/agent-cli/</code>）</strong>：<code>harness.py</code> 在去暗示沙箱中植入 <code>ahub</code> 录制垫片与 <code>curl</code>/<code>sleep</code> 违规陷阱，评测 <code>E-01</code>~<code>E-08</code> 场景，强制要求 <code>Pass^3 == 100%</code>、<code>ProtocolViolations == 0</code>、<code>MeanWastedCalls &lt;= 0.2</code>、<code>MaxTokenTax &lt; 2500</code>。</li>
-            <li><strong>Plane 3 Web 三层门禁（<code>evals/web/</code>）</strong>：<code>L1</code> <code>lint-hygiene.mjs</code> 静态扫描依赖黑名单、<code>transition-all</code>、嵌套卡片、裸 <code>fetch()</code>、轮询定时器与 <code>tabular-nums</code> 纪律；<code>L2</code>/<code>L3</code> <code>cdp-runtime-eval.mjs</code> 驱动无头 Chrome CDP 执行点击、拖拽重排、模拟 JWKS 零口令 Cookie 登录，并在 <span class="tabular-nums">2,000</span> 条高频事件洪峰下验证布局偏移 <code>CLS &lt;= 0.001</code>。</li>
+            <li><strong>Plane 3 Web 三层门禁（<code>evals/web/</code>）</strong>：<code>L1</code> <code>lint-hygiene.mjs</code> 静态扫描依赖黑名单、<code>transition-all</code>、嵌套卡片、裸 <code>fetch()</code>、轮询定时器与 <code>tabular-nums</code> 纪律；<code>L2</code>/<code>L3</code> <code>cdp-runtime-eval.mjs</code> 驱动无头 Chrome CDP 执行点击、拖拽重排、模拟 JWKS 零口令 Cookie 登录、<span class="tabular-nums">4</span> 轮多任务自动补水折叠与视口防溢出断言、节点默认通道绑定交互，并在 <span class="tabular-nums">2,000</span> 条高频事件洪峰下验证布局偏移 <code>CLS &lt;= 0.001</code>。</li>
           </ol>
         </div>
       </section>
@@ -1447,7 +1572,7 @@
           </div>
           <div class="search-box">
             <input id="dir-search" class="search-input" type="search" placeholder="过滤路径或职责关键字..." aria-label="过滤文件目录">
-            <span id="dir-count" class="count-note tabular-nums">28 项</span>
+            <span id="dir-count" class="count-note tabular-nums">32 项</span>
           </div>
         </div>
 
@@ -1470,7 +1595,7 @@
                 <tr data-cat="contracts">
                   <td><span class="badge">契约</span></td>
                   <td><div class="path-cell"><code>docs/02-data-and-state-contracts.md</code><button type="button" class="copy-path-btn" data-copy="docs/02-data-and-state-contracts.md">复制路径</button></div></td>
-                  <td>D1 表结构（含 <code>0003</code> 审批租约索引）、状态机迁移约束、租约与幂等契约。</td>
+                  <td>D1 表结构（含 <code>0003</code> 审批租约索引、<code>0004</code>/<code>0005</code> 节点默认通道与 <code>native_events</code>）、状态机迁移约束、租约与幂等契约。</td>
                 </tr>
                 <tr data-cat="contracts">
                   <td><span class="badge">契约</span></td>
@@ -1514,8 +1639,18 @@
                 </tr>
                 <tr data-cat="worker">
                   <td><span class="badge running">控制面</span></td>
+                  <td><div class="path-cell"><code>apps/hub-worker/src/redact.ts</code><button type="button" class="copy-path-btn" data-copy="apps/hub-worker/src/redact.ts">复制路径</button></div></td>
+                  <td>与 Go 端对称的线性时间凭据脱敏器与 <span class="tabular-nums">1200</span> 字符 <code>buildPromptPreview</code>。</td>
+                </tr>
+                <tr data-cat="worker">
+                  <td><span class="badge running">控制面</span></td>
                   <td><div class="path-cell"><code>apps/hub-worker/src/downloads.ts</code><button type="button" class="copy-path-btn" data-copy="apps/hub-worker/src/downloads.ts">复制路径</button></div></td>
                   <td><code>/dl/bootstrap.md</code>、<code>install.sh</code>、<code>/skill/SKILL.md</code> 与 <code>/dl/ahub-*</code> 边缘流式反代。</td>
+                </tr>
+                <tr data-cat="worker">
+                  <td><span class="badge running">控制面</span></td>
+                  <td><div class="path-cell"><code>apps/hub-worker/src/client-bootstrap.md</code><button type="button" class="copy-path-btn" data-copy="apps/hub-worker/src/client-bootstrap.md">复制路径</button></div></td>
+                  <td>面向外部 Grok Bot 等纯 <code>client</code> 环境的自举规范与 <code>AHUB_CONFIG_DIR</code> 隔离指南。</td>
                 </tr>
                 <tr data-cat="cli">
                   <td><span class="badge done">CLI</span></td>
@@ -1526,6 +1661,16 @@
                   <td><span class="badge done">CLI</span></td>
                   <td><div class="path-cell"><code>internal/cli/cli.go</code><button type="button" class="copy-path-btn" data-copy="internal/cli/cli.go">复制路径</button></div></td>
                   <td>调用端与 <code>node</code> 命令分发（含 <code>resolve</code>）、灵活参数重排、两阶段等待与错误透传、<code>--json</code> 脱敏与流分离。</td>
+                </tr>
+                <tr data-cat="cli">
+                  <td><span class="badge done">CLI</span></td>
+                  <td><div class="path-cell"><code>internal/cli/native_emit.go</code><button type="button" class="copy-path-btn" data-copy="internal/cli/native_emit.go">复制路径</button></div></td>
+                  <td><code>ahub native-emit</code> 六类宿主 Hook 解析、先验白名单、流式 Transcript 提炼与凭据隔离上报。</td>
+                </tr>
+                <tr data-cat="cli">
+                  <td><span class="badge done">CLI</span></td>
+                  <td><div class="path-cell"><code>internal/redact/redact.go</code><button type="button" class="copy-path-btn" data-copy="internal/redact/redact.go">复制路径</button></div></td>
+                  <td>节点与 CLI 出站前 <span class="tabular-nums">12</span> 类凭据正则脱敏与 UTF-8 安全截断，保留 <code>$VAR</code> 占位。</td>
                 </tr>
                 <tr data-cat="cli">
                   <td><span class="badge done">CLI</span></td>
@@ -1614,7 +1759,7 @@
           <div class="section-eyebrow tabular-nums">05 / GOTCHAS &amp; SAFEGUARDS</div>
           <h2>关键隐性机制与工程防线（Gotchas &amp; Safeguards）</h2>
           <p>
-            以下 5 项曾是代码实现与契约之间的典型隐性差异与边界风险，现已通过状态持久化、权限交集收敛、错误透传及跨平台守护防线逐项闭合；二次开发或排障时仍需关注各自生效边界：
+            以下 <span class="tabular-nums">8</span> 项曾是代码实现与契约之间的典型隐性差异与边界风险，现已通过状态持久化、权限交集收敛、错误透传及跨平台守护防线逐项闭合；二次开发或排障时仍需关注各自生效边界：
           </p>
         </div>
 
@@ -1665,6 +1810,36 @@
           </div>
           <p>
             除 <code>windows/amd64</code> 静态交叉编译、<code>taskkill /T /F</code> 进程树强杀（<code>internal/runner/procgroup_windows.go</code>）与 <code>.old</code> 重命名自更新外，<code>internal/service</code> 已补齐 Windows 任务计划程序（<code>schtasks</code> 注册 <code>AhubNodeDaemon</code>）、<code>ahub-node-runner.cmd</code> 与 <code>ahub-shim.exe</code> 服务包装；<code>internal/daemon/reload_sentinel.go</code> 通过 <code>node.reload</code> 哨兵文件配合 <code>tasklist</code> CSV 进程镜像校验触发平滑排空退出 <span class="tabular-nums">42</span>，由外部守护包装拉起新版二进制（仅 macOS 特有的 <code>AhubDaemon.app</code> TCC 权限冻结机制在 Windows 下不适用）。
+          </p>
+        </div>
+
+        <div class="gotcha-item">
+          <div class="gotcha-head">
+            <span class="gotcha-idx tabular-nums">#06</span>
+            <span><code>native_events</code> 纯出站旁路属性、软吊销外键保留与入库顺序边界</span>
+          </div>
+          <p>
+            <code>native_events</code> 不经过 <code>NodeHub</code> DO、不向 <code>/ws/stream</code> 广播实时帧，也不暴露 <code>GET /api/v1/native-events</code> 读接口。调用 <code>DELETE /api/v1/keys/:id</code> 执行的是更新 <code>revoked_at</code> 的软删除而非物理 <code>DELETE</code>，因此 <code>nodes.default_notify_key_id</code> 不会被外键 <code>ON DELETE SET NULL</code> 清空，使 <code>default_notify_valid</code> 明确翻转为 <code>false</code> 并将后续事件精确记为 <code>failed</code>（<code>DEFAULT_CHANNEL_INVALID_OR_REVOKED</code>）而非静默 <code>skipped</code>。同时注意：<code>createNativeEvent</code> 先执行 <code>INSERT OR IGNORE</code> 写入 <code>notify_status = 'queued'</code> 再调 <code>env.NOTIFY_QUEUE.send</code>（若 <code>send</code> 瞬时失败且同 <code>event_id</code> 重试，幂等命中将返回 <code>deduplicated: true</code> 而不会补偿入队）；Queue 消费端在第 <span class="tabular-nums">5</span> 次投递失败时写入 <code>WEBHOOK_DELIVERY_FAILED</code> 并显式调用 <code>message.ack()</code>，仅未捕获异常才进入 <code>ahub-outbound-notify-dlq</code>。
+          </p>
+        </div>
+
+        <div class="gotcha-item">
+          <div class="gotcha-head">
+            <span class="gotcha-idx tabular-nums">#07</span>
+            <span><code>ahub native-emit</code> 与 <code>ahub node serve</code> 凭据解析差异及先验目录门禁</span>
+          </div>
+          <p>
+            <code>ahub native-emit</code>（<code>internal/cli/native_emit.go</code>）刻意绕过 <code>config.ResolveCredentials</code>，仅读取命令行 <code>--token</code> 或 <code>node.json</code> 中的 <code>ahub_nod_*</code> 令牌，防止交互终端内的 <code>client</code>/<code>admin</code> 凭据触发 <code>403 FORBIDDEN_SCOPE</code>；而 <code>ahub node serve</code>（<code>internal/cli/cli.go</code>）仍优先调用 <code>ResolveCredentials</code>（读取 <code>--token</code>、<code>AHUB_TOKEN</code>、<code>credentials</code>），为空时才回退 <code>node.json</code>，二者解析顺序不同。此外，<code>claude</code>、<code>grok</code> 与 <code>agy</code> 适配器均在打开磁盘 <code>transcriptPath</code> 之前先调用 <code>isWorkdirAllowedForNativeNotify</code>，阻断白名单外目录的阻塞管道（FIFO）或文件越权读取。
+          </p>
+        </div>
+
+        <div class="gotcha-item">
+          <div class="gotcha-head">
+            <span class="gotcha-idx tabular-nums">#08</span>
+            <span>控制面全链路 <code>prompt</code> 对称脱敏与 <code>target="none"</code> 跨 Bot 隔离门禁</span>
+          </div>
+          <p>
+            <code>internal/redact/redact.go</code> 与 <code>apps/hub-worker/src/redact.ts</code> 构成对称 <span class="tabular-nums">12</span> 类凭据脱敏防线（保留 <code>$VAR</code> 与 <code>&lt;PLACEHOLDER&gt;</code>）：全系统仅受管节点调用 <code>POST /api/v1/nodes/:id/claim</code> 时获取原始明文 <code>prompt</code>，所有 REST 列表/详情、<code>/ws/stream</code> 快照、CLI <code>--json</code>、以及 <code>ahub_run_completed</code>（上限 <span class="tabular-nums">1200</span> 字符）与 <code>ahub_native_event</code> Webhook 载荷均返回脱敏视图。同时，<code>enqueueRunNotificationIfNeeded</code> 规定未传 <code>--notify</code>（<code>target = "none"</code>）时自动走节点默认通道 <code>node_default</code> 严格限定于 <code>depth === 0</code> 且发起方为人工或 <code>admin</code> 的根任务，彻底拦截 <code>client</code> 密钥静默任务跨 Bot 串信。
           </p>
         </div>
       </section>
