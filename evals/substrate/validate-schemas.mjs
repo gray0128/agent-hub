@@ -67,6 +67,7 @@ const cases = [
       workdir: "/workspace/demo",
       agent: "agy",
       status: "done",
+      prompt: "Inspect repo without leaking ahub_cli_[REDACTED]",
       output_bytes: 120,
       truncated: false,
       webhook_armed: false,

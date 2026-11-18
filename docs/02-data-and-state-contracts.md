@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     CHECK (status IN ('online', 'offline', 'draining')),
   max_concurrency INTEGER NOT NULL DEFAULT 4 CHECK (max_concurrency >= 1 AND max_concurrency <= 16),
   active_runs_count INTEGER NOT NULL DEFAULT 0 CHECK (active_runs_count >= 0),
+  default_notify_key_id TEXT REFERENCES api_keys(id) ON DELETE SET NULL, -- 节点显式绑定的默认 Bot 通知 Key（migrations/0004）
   last_seen_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -138,6 +139,30 @@ CREATE INDEX IF NOT EXISTS idx_threads_node_updated
 CREATE INDEX IF NOT EXISTS idx_api_keys_scope_node
   ON api_keys (scope, bound_node_id)
   WHERE revoked_at IS NULL;
+
+-- 6. 节点原生 Agent 事件幂等记录表（migrations/0004_node_default_notify_and_native_events.sql）
+CREATE TABLE IF NOT EXISTS native_events (
+  id TEXT PRIMARY KEY,                              -- evt_<ulid>
+  node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+  event_id TEXT NOT NULL,                           -- 幂等去重键（由官方 Hook / 调用端生成）
+  agent TEXT NOT NULL CHECK (agent IN ('agy', 'pi', 'omp', 'codex', 'claude')),
+  event_kind TEXT NOT NULL CHECK (event_kind IN ('interaction_needed', 'turn_summary')),
+  native_session_id TEXT NOT NULL DEFAULT '',
+  workdir TEXT NOT NULL DEFAULT '',
+  title TEXT NOT NULL DEFAULT '',
+  summary TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT '',                  -- claude-hook / codex-notify / agy-hook / pi-ext / cli
+  notify_key_id TEXT REFERENCES api_keys(id) ON DELETE SET NULL,
+  notify_status TEXT NOT NULL DEFAULT 'none'
+    CHECK (notify_status IN ('none', 'queued', 'sent', 'failed', 'skipped')),
+  notify_error TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (node_id, event_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_native_events_node_created
+  ON native_events (node_id, created_at DESC);
 ```
 
 ### 字段语义与容量边界

@@ -913,7 +913,10 @@ try {
   );
   if (
     !clientPromptText.includes(`${hubUrl}/dl/client-bootstrap.md`) ||
-    !onboardingRoutineText.includes("ahub_run_completed")
+    !onboardingRoutineText.includes("ahub_run_completed") ||
+    !onboardingRoutineText.includes("ahub_native_event") ||
+    !onboardingRoutineText.includes("prompt_preview") ||
+    onboardingRoutineText.includes("读取 `prompt`")
   ) {
     throw new Error(
       `OnboardingDialog client/routine prompt check failed: client=${clientPromptText} routine=${onboardingRoutineText}`
@@ -972,7 +975,10 @@ try {
   if (
     !freshEnvPrompt.includes(`${hubUrl}/dl/client-bootstrap.md`) ||
     !freshTokenPrompt.includes("AHUB_CONFIG_DIR") ||
-    !freshRoutinePrompt.includes("ahub_run_completed")
+    !freshRoutinePrompt.includes("ahub_run_completed") ||
+    !freshRoutinePrompt.includes("ahub_native_event") ||
+    !freshRoutinePrompt.includes("prompt_preview") ||
+    freshRoutinePrompt.includes("读取 `prompt`")
   ) {
     throw new Error(
       `KeysDialog client bootstrap/routine prompt check failed: env=${freshEnvPrompt} token=${freshTokenPrompt} routine=${freshRoutinePrompt}`
@@ -996,6 +1002,75 @@ try {
   if (keysDialogStillOpen) {
     throw new Error("Expected KeysDialog to close cleanly");
   }
+
+  // Test InspectorPane node-bound default Bot channel bind -> revoke badge -> unbind lifecycle
+  await cdpClient.clickSelector('[data-testid="inspector-pane"] [role="tab"]:nth-of-type(4)');
+  for (let i = 0; i < 25; i++) {
+    if (await cdpClient.evalJS(`Boolean(document.querySelector('[data-testid="node-default-notify-select"]'))`)) {
+      break;
+    }
+    if (i === 24) {
+      throw new Error("Expected [data-testid='node-default-notify-select'] to appear for admin node control");
+    }
+    await sleep(150);
+  }
+  await cdpClient.clickSelector('[data-testid="node-default-notify-select"]');
+  await sleep(150);
+  await cdpClient.clickSelector(`[data-testid="node-notify-option-${uiCreatedKey.id}"]`);
+  for (let i = 0; i < 25; i++) {
+    const boundState = await cdpClient.evalJS(`({
+      badge: document.querySelector('[data-testid="node-notify-valid-badge"]')?.textContent?.trim() ?? ""
+    })`);
+    if (boundState.badge.includes("hooks.x.ai")) break;
+    if (i === 24) {
+      throw new Error(`Expected node-notify-valid-badge with hooks.x.ai after binding, got ${JSON.stringify(boundState)}`);
+    }
+    await sleep(150);
+  }
+  const macAfterBind = (await apiJson(hubUrl, adminToken, "/api/v1/nodes")).nodes.find((n) => n.id === "macmini");
+  if (macAfterBind?.default_notify_key_id !== uiCreatedKey.id || macAfterBind?.default_notify_valid !== true) {
+    throw new Error(`Expected macmini default_notify_key_id=${uiCreatedKey.id} & valid=true, got ${JSON.stringify(macAfterBind)}`);
+  }
+
+  // Revoke bound key -> backend broadcasts updated node.status in real time and invalid/revoked badge renders
+  await apiJson(hubUrl, adminToken, `/api/v1/keys/${uiCreatedKey.id}`, { method: "DELETE" });
+  for (let i = 0; i < 25; i++) {
+    if (await cdpClient.evalJS(`Boolean(document.querySelector('[data-testid="node-notify-invalid-badge"]'))`)) {
+      break;
+    }
+    if (i === 24) {
+      const dbgApi = await apiJson(hubUrl, adminToken, "/api/v1/nodes");
+      const dbgUi = await cdpClient.evalJS(`({
+        authScope: window.__AHUB_EVAL__?.getState()?.authScope,
+        mac: window.__AHUB_EVAL__?.getState()?.nodes?.find(n => n.id === "macmini")
+      })`);
+      throw new Error("Expected [data-testid='node-notify-invalid-badge'] after revoking bound key; ui=" + JSON.stringify(dbgUi) + " apiMac=" + JSON.stringify(dbgApi.nodes.find(n => n.id === "macmini")));
+    }
+    await sleep(150);
+  }
+
+  // Cleanly unbind macmini default Bot channel and verify D1 & DOM state
+  await cdpClient.clickSelector('[data-testid="node-default-notify-select"]');
+  await sleep(150);
+  await cdpClient.clickSelector('[data-testid="node-notify-option-unbound"]');
+  for (let i = 0; i < 25; i++) {
+    const badgesCleared = await cdpClient.evalJS(
+      `!document.querySelector('[data-testid="node-notify-valid-badge"]') && !document.querySelector('[data-testid="node-notify-invalid-badge"]')`
+    );
+    if (badgesCleared) break;
+    if (i === 24) {
+      throw new Error("Expected node notify badges to clear after unbinding");
+    }
+    await sleep(150);
+  }
+  const macAfterUnbind = (await apiJson(hubUrl, adminToken, "/api/v1/nodes")).nodes.find((n) => n.id === "macmini");
+  if (macAfterUnbind?.default_notify_key_id !== null) {
+    throw new Error(`Expected macmini default_notify_key_id=null after unbind, got ${JSON.stringify(macAfterUnbind)}`);
+  }
+
+  // Return Inspector to 过程事件 tab before 2000-event streaming flood check
+  await cdpClient.clickSelector('[data-testid="inspector-pane"] [role="tab"]:nth-of-type(1)');
+  await sleep(200);
 
   // Flood 2000 events and measure streaming CLS (must equal 0) + ring buffer cap (== 500)
   await cdpClient.evalJS(`window.__AHUB_CLS__ = 0; window.__AHUB_CLS_SOURCES__ = [];`);
@@ -1426,6 +1501,41 @@ try {
 
   // Screenshot 5: mobile-drawer-open.png
   await cdpClient.screenshot(path.join(screenshotDir, "mobile-drawer-open.png"));
+
+  // Verify client-scope UI login omits admin-only default Bot notify controls with zero console/HTTP errors
+  const clientScopeKey = await apiJson(hubUrl, adminToken, "/api/v1/keys", {
+    method: "POST",
+    body: JSON.stringify({ name: "cdp-client-scope", scope: "client", allowed_nodes: [] })
+  });
+  await cdpClient.setViewport(1440, 900, false);
+  await cdpClient.send("Page.navigate", { url: `${hubUrl}/?token=${clientScopeKey.token}` });
+  let clientState = null;
+  for (let i = 0; i < 40; i++) {
+    clientState = await cdpClient.evalJS(`
+      (() => {
+        const s = window.__AHUB_EVAL__?.getState();
+        if (!s || s.authStatus !== "authenticated" || s.authScope !== "client" || s.nodes.length < 2) return null;
+        return s;
+      })()
+    `);
+    if (clientState) break;
+    await sleep(200);
+  }
+  if (!clientState || clientState.streamStatus !== "disconnected") {
+    throw new Error(`Client-scoped token login did not hydrate cleanly with disconnected global stream: ${JSON.stringify(clientState)}`);
+  }
+  await cdpClient.clickSelector('[data-testid="inspector-pane"] [role="tab"]:nth-of-type(4)');
+  await sleep(200);
+  const clientInspectorCheck = await cdpClient.evalJS(`({
+    hasNotifySelect: Boolean(document.querySelector('[data-testid="node-default-notify-select"]')),
+    hasNotifyBadge: Boolean(document.querySelector('[data-testid="node-notify-valid-badge"]') || document.querySelector('[data-testid="node-notify-invalid-badge"]'))
+  })`);
+  if (clientInspectorCheck.hasNotifySelect || clientInspectorCheck.hasNotifyBadge) {
+    throw new Error(`Expected client scope InspectorPane to hide admin notify controls, got ${JSON.stringify(clientInspectorCheck)}`);
+  }
+  if (cdpClient.consoleErrors.length > 0) {
+    throw new Error(`Expected zero console errors in client-scoped UI, got ${JSON.stringify(cdpClient.consoleErrors)}`);
+  }
 
   // Zero-token Cloudflare Access cookie login verification in real Chromium
   await cdpClient.setViewport(1440, 900, false);

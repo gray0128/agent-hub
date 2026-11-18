@@ -7,7 +7,9 @@ import {
   listNodes,
   listRuns,
   listThreads,
+  mapRunRow,
   renewNodePingLeases,
+  sanitizeNodeForScope,
   setNodeOffline,
   upsertNodeHello
 } from "./db";
@@ -92,10 +94,11 @@ export class NodeHub extends DurableObject<Env> {
   }
 
   private broadcastToStream(
-    payload: unknown,
+    payload: { type: string; node?: NodeRecord } & Record<string, unknown>,
     filter?: { runId?: string; nodeId?: string }
   ): void {
-    const encoded = JSON.stringify(payload);
+    const adminEncoded = JSON.stringify(payload);
+    let clientEncoded: string | null = null;
     for (const ws of this.ctx.getWebSockets("stream")) {
       const att = ws.deserializeAttachment() as StreamWsAttachment | null;
       if (!att) continue;
@@ -108,6 +111,14 @@ export class NodeHub extends DurableObject<Env> {
       }
       if (!this.canStreamReceiveNode(att, filter?.nodeId)) {
         continue;
+      }
+      let encoded = adminEncoded;
+      if (att.scope !== "admin" && payload.type === "node.status" && payload.node) {
+        clientEncoded ??= JSON.stringify({
+          type: "node.status",
+          node: sanitizeNodeForScope(payload.node, att.scope)
+        });
+        encoded = clientEncoded;
       }
       try {
         ws.send(encoded);
@@ -422,38 +433,7 @@ export class NodeHub extends DurableObject<Env> {
           if (frame.status === "needs_approval") {
             await enqueueRunNotificationIfNeeded(this.env.DB, this.env, updated, "needs_approval");
           }
-          const runRecord: RunRecord = {
-            id: updated.id,
-            thread_id: updated.thread_id,
-            root_run_id: updated.root_run_id,
-            parent_run_id: updated.parent_run_id,
-            depth: updated.depth,
-            max_depth: updated.max_depth,
-            node_id: updated.node_id,
-            workdir: updated.workdir,
-            agent: updated.agent,
-            model: updated.model,
-            effort: updated.effort,
-            sandbox: updated.sandbox === 1,
-            timeout_sec: updated.timeout_sec,
-            status: updated.status,
-            priority_order: updated.priority_order,
-            resolved_model: updated.resolved_model,
-            resolved_effort: updated.resolved_effort,
-            native_session_id: updated.native_session_id,
-            remote_control_url: updated.remote_control_url,
-            summary: updated.summary,
-            output_bytes: updated.output_bytes,
-            error_code: updated.error_code,
-            error_message: updated.error_message,
-            notify_status: updated.notify_status,
-            lease_expires_at: updated.lease_expires_at,
-            started_at: updated.started_at,
-            finished_at: updated.finished_at,
-            duration_ms: updated.duration_ms,
-            created_at: updated.created_at,
-            updated_at: updated.updated_at
-          };
+          const runRecord = mapRunRow(updated, { view: "summary", tailBytes: 16384, promptMode: "preview" });
           this.broadcastToStream(
             { type: "run.updated", run: runRecord },
             { runId: runRecord.id, nodeId: runRecord.node_id }

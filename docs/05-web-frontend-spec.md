@@ -92,14 +92,14 @@
    - **「节点」标签页**：全高展示机群节点列表（在线状态、`active_runs_count / max_concurrency`、可用 Agent 徽标与工作目录数），顶部提供集群目录汇总及一键全部收起/展开开关；每个节点均支持独立收起/展开其下的工作目录列表（点击目录切换为新建会话目标目录，或直接拖拽工作目录至中栏派发台）。
 2. **中栏：Thread Timeline & Task Composer**
    - 顶部栏展示当前 `Thread` 绑定的 `node_id`、`project_key`、`agent`、`native_session_id` 短 ID；若当前选中的 `Run` 存在父任务或子任务，显示可点击切换的血统面包屑及「级联取消整棵树」按钮。
-   - 中间消息流按时间正序排列该 `Thread` 下的所有 `Run`：展示 Prompt、实际命中模型与思考强度、独立计时耗时与正文输出。其中常规体量输出（`output_bytes <= 128 KB`）自动水合完整 `output_md` 从头渲染，并在前端对超长正文（`> 4000` 字符或 `> 60` 行）默认折叠高度，支持一键「展开全文 / 收起长输出」与完整复制；超大输出（`> 128 KB`）先自动水合 `16 KB` 尾部预览，并在正文上方展示显式截断提示条与「加载完整输出」按钮按需拉取全文；在正文尚未水合就绪时显式标注加载态与「末行摘要：」，禁止将单行 `summary` 冒充完整输出。当 `status === 'needs_approval'` 时在顶部渲染高对比度琥珀色操作条，提供一键打开 `remote_control_url` 审批按钮与「标记已放行」按钮（调用 `POST /api/v1/runs/:id/resolve` 解除工作目录租约并流转为 `done`）。
+   - 中间消息流按时间正序排列该 `Thread` 下的所有 `Run`：展示经控制面脱敏与截断的 Prompt 预览（`<= 1200` 字符；绝不展示未脱敏凭据）、实际命中模型与思考强度、独立计时耗时与正文输出。其中常规体量输出（`output_bytes <= 128 KB`）自动水合完整 `output_md` 从头渲染，并在前端对超长正文（`> 4000` 字符或 `> 60` 行）默认折叠高度，支持一键「展开全文 / 收起长输出」与完整复制；超大输出（`> 128 KB`）先自动水合 `16 KB` 尾部预览，并在正文上方展示显式截断提示条与「加载完整输出」按钮按需拉取全文；在正文尚未水合就绪时显式标注加载态与「末行摘要：」，禁止将单行 `summary` 冒充完整输出。当 `status === 'needs_approval'` 时在顶部渲染高对比度琥珀色操作条，提供一键打开 `remote_control_url` 审批按钮与「标记已放行」按钮（调用 `POST /api/v1/runs/:id/resolve` 解除工作目录租约并流转为 `done`）。
    - 底部「多机任务派发台（Composer）」：选择已有 `Thread` 时锁定物理绑定的 `node_id`、`workdir` 与 `agent`（同时提供「切换至新建会话」开关）；新建会话与续聊参数均基于所选节点实时上报的 `node.capabilities.agents` 驱动「`node` -> `agent` -> `model` -> `effort`」四级联动：仅展示目标节点已启用且可用的 Agent；模型列表来自所选 Agent 的实时目录 `models[]`，同时支持「跟随节点默认」及在离线或目录未知时手动输入模型 ID（当所选 Agent 为 `agy` 且节点尚未返回显式默认模型或处于离线/兜底态时，派发台默认对齐 `gemini-4-hydrogen` 与 `high`）；推理强度依据当前模型声明的 `efforts[]` 过滤展示（含 `ultra`、`auto` 等节点档位），对于 `efforts` 为空的独立模型（如 `gemini-pro-orchestrator`）自动禁用强度选择并将 `effort` 置空；支持 `⌘Enter` / `Ctrl+Enter` 提交与草稿本地自动保存。
 3. **右栏：Live Inspector & Queue Deck**
    - **Tab 1 实时事件流**：订阅当前选中 `Run` 的 `run_events`，以等宽时间线展示 `status`、`tool_use`、`turn_end`、`stderr_warn`，并实时计算 `lease_expires_at` 剩余秒数。
-   - **Tab 2 节点排队甲板**：按节点与 `workdir` 分组展示待执行的 `queued` 任务与当前持锁占用目录，支持直接拖拽排序或跨节点改派。
-   - **Tab 3 凭证与接入设置（及顶部「接入节点」弹窗）**：仅当当前用户具备 `admin` 权限时支持签发与编辑 `api_keys`（选 `client`、`node` 或 `admin` Scope）；其中 `client` Key 支持多选或留空设置「允许调度节点（`allowed_nodes`）」以及配置该 Bot 专属的「Webhook URL」与「Webhook Key」（支持 `1 Node <-> 1 Bot`、`N Nodes -> 1 Bot` 与 `M Bots <-> N Nodes` 组合映射，列表中脱敏展示已绑定节点列表及 `Webhook: <host>` 徽标并支持在线编辑）；「接入节点与客户端配置」弹窗与 Key 管理弹窗同时支持两类自举体验：
+   - **Tab 2 节点排队甲板（及 Tab 4 节点控制）**：按节点与 `workdir` 分组展示待执行的 `queued` 任务与当前持锁占用目录，支持直接拖拽排序或跨节点改派；「节点控制」标签页展示节点在线态、并发上限调整、排空开关、**默认 Bot 通知通道绑定**（**仅当 `authScope === "admin"` 时**展示 `<Select>` 绑定/解绑任意有效且允许该节点的 `client` Key，并实时提示「通道失效/已吊销」徽标；`client` Scope 登录后隐藏该绑定控件且不请求 `GET /api/v1/keys`，服务端同步省略 `default_notify_*` 字段），以及已上报工作区筛选、路径复制与一键派发。
+   - **Tab 3 凭证与接入设置（及顶部「接入节点」弹窗）**：仅当当前用户具备 `admin` 权限（`authScope === "admin"`）时才调用 `GET /api/v1/keys` 并支持签发与编辑 `api_keys`（选 `client`、`node` 或 `admin` Scope）；其中 `client` Key 支持多选或留空设置「允许调度节点（`allowed_nodes`）」以及配置该 Bot 专属的「Webhook URL」与「Webhook Key」（支持 `1 Node <-> 1 Bot`、`N Nodes -> 1 Bot` 与 `M Bots <-> N Nodes` 组合映射，列表中脱敏展示已绑定节点列表及 `Webhook: <host>` 徽标并支持在线编辑）；「接入节点与客户端配置」弹窗与 Key 管理弹窗同时支持两类自举体验：
      - **节点接入（`node`）**：一键复制发给节点本地 Agent 的一句话自举提示词（指向 `${HUB_URL}/dl/bootstrap.md`，签发节点 Token 后自动预填）、终端兜底安装命令（`${HUB_URL}/dl/install.sh` 配合 `ahub node init --token-stdin` 与 `ahub node service install --activate`）及各平台零依赖二进制直链（`/dl/ahub-<os>-<arch>`）。
-     - **Bot / 纯调用端接入（`client`）**：在顶部弹窗「`接入 Bot / Skill`」标签页与 Key 管理弹窗（新签发 `client` Key 后及既有有效 `client` Key 编辑面板中）提供一键复制「无密版 Bot 自举提示词（配合 `AHUB_TOKEN` Secret，指向 `${HUB_URL}/dl/client-bootstrap.md`）」、「一步带密钥隔离自举提示词（基于 `AHUB_CONFIG_DIR=~/.config/ahub-bots/<slug>` + `--token-stdin`）」与「Grok Bot Webhook Routine 异步回调指令（处理 `ahub_run_completed`）」；任何已保存 Key 视图与弹窗提示词均**严禁**暴露 Webhook URL 路径或 Bearer Key 原文。
+     - **Bot / 纯调用端接入（`client`）**：在顶部弹窗「`接入 Bot / Skill`」标签页与 Key 管理弹窗（新签发 `client` Key 后及既有有效 `client` Key 编辑面板中）提供一键复制「无密版 Bot 自举提示词（配合 `AHUB_TOKEN` Secret，指向 `${HUB_URL}/dl/client-bootstrap.md`）」、「一步带密钥隔离自举提示词（基于 `AHUB_CONFIG_DIR=~/.config/ahub-bots/<slug>` + `--token-stdin`）」与「Grok Bot Webhook Routine 异步回调指令（要求 Bot 在下发任务时直接向用户展示指令原文，异步回调按需引用 `ahub_run_completed` 中的脱敏截断预览 `prompt_preview` / `prompt_truncated` 而不调 `ahub result` 回拉 `prompt`，并按只读通知规则处理节点原生事件 `ahub_native_event` 的 `event_kind`、`title`、`summary` 与 `action_required: "notify_user_only"`，严禁将原生事件视为自动审批放行或自动回复指令）」；任何已保存 Key 视图与弹窗提示词均**严禁**暴露 Webhook URL 路径或 Bearer Key 原文。
 
 ### 3.2 移动端响应式降级（`< 768px`）
 
@@ -161,12 +161,17 @@ export interface WorkbenchState {
   theme: "dark" | "light" | "system";
   authStatus: "checking" | "authenticated" | "unauthenticated";
   authKind: string | null;
+  authScope: "admin" | "client" | "node" | null;
   activeThreadId: string | null;
   activeRunId: string | null;
   selectedNodeFilter: string | null;
   inspectorTab: "events" | "queue" | "keys";
   composerDraftByThread: Record<string, string>;
-  setAuthState: (status: WorkbenchState["authStatus"], kind?: string | null) => void;
+  setAuthState: (
+    status: WorkbenchState["authStatus"],
+    kind?: string | null,
+    scope?: WorkbenchState["authScope"]
+  ) => void;
   setActiveThread: (threadId: string | null) => void;
   setActiveRun: (runId: string | null) => void;
   setInspectorTab: (tab: WorkbenchState["inspectorTab"]) => void;
@@ -176,7 +181,7 @@ export interface WorkbenchState {
 
 ### 无本地 Token 时的 Cloudflare Access 会话探测
 
-- 页面加载时即使 `localStorage` 中不存在 `ahub-token`，工作台也必须主动发起同源会话探测（`GET /api/v1/auth/me` 配合初始 REST 拉取，`credentials: "same-origin"`），以无缝激活 Cloudflare Access 登录态（同源 `CF_Authorization` Cookie）并建立 `/ws/stream` 连接。
+- 页面加载时即使 `localStorage` 中不存在 `ahub-token`，工作台也必须主动发起同源会话探测（`GET /api/v1/auth/me` 配合初始 REST 拉取，`credentials: "same-origin"`），以无缝激活 Cloudflare Access 登录态（同源 `CF_Authorization` Cookie）并建立 `/ws/stream` 连接；`GET /api/v1/auth/me` 同时回填 `authKind` 与 `authScope`（`principal.scope`），仅当 `authScope === "admin"` 时发起 `GET /api/v1/keys` 并开放节点默认 Bot 通知通道配置与 Key 管理界面。
 - 仅当后端明确返回 `401 UNAUTHORIZED` 时，将 `authStatus` 置为 `"unauthenticated"`、停止 WebSocket 自动重连循环，并提示用户在「接入节点 -> Token 登录」配置访问 Token。
 
 ### 增量同步与断线补偿规则

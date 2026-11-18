@@ -19,6 +19,7 @@ import (
 	"github.com/gray0128/agent-hub/internal/api"
 	"github.com/gray0128/agent-hub/internal/config"
 	"github.com/gray0128/agent-hub/internal/daemon"
+	"github.com/gray0128/agent-hub/internal/redact"
 	"github.com/gray0128/agent-hub/internal/runner"
 	"github.com/gray0128/agent-hub/internal/selfupdate"
 	"github.com/gray0128/agent-hub/internal/service"
@@ -84,6 +85,8 @@ func Execute(args []string, version string) int {
 		return runCancel(g, subArgs)
 	case "resolve":
 		return runResolve(g, subArgs)
+	case "native-emit":
+		return runNativeEmit(g, subArgs)
 	case "skill":
 		return runSkill(g, subArgs)
 	case "update":
@@ -446,14 +449,14 @@ func runRun(g globalOpts, args []string) int {
 	}
 
 	if isWaitStopState(run.Status) {
-		outputRunResult(g.JSON, run)
+		outputRunResult(g.JSON, run, false)
 		return api.ExitCodeForRunStatus(run.Status)
 	}
 
 	if notifyTarget != "" && notifyTarget != "none" {
 		armed := true
 		run.WebhookArmed = &armed
-		outputRunResult(g.JSON, run)
+		outputRunResult(g.JSON, run, false)
 		return api.ExitOK
 	}
 
@@ -468,7 +471,7 @@ func runRun(g globalOpts, args []string) int {
 		}
 	}
 
-	outputRunResult(g.JSON, run)
+	outputRunResult(g.JSON, run, false)
 	if isWaitStopState(run.Status) {
 		return api.ExitCodeForRunStatus(run.Status)
 	}
@@ -497,7 +500,7 @@ func runWait(g globalOpts, args []string) int {
 	if err != nil {
 		return failErr(g.JSON, err)
 	}
-	outputRunResult(g.JSON, run)
+	outputRunResult(g.JSON, run, false)
 	if isWaitStopState(run.Status) {
 		return api.ExitCodeForRunStatus(run.Status)
 	}
@@ -647,7 +650,7 @@ func runResult(g globalOpts, args []string) int {
 	if err != nil {
 		return failErr(g.JSON, err)
 	}
-	outputRunResult(g.JSON, run)
+	outputRunResult(g.JSON, run, full)
 	if isWaitStopState(run.Status) {
 		return api.ExitCodeForRunStatus(run.Status)
 	}
@@ -676,7 +679,11 @@ func runRuns(g globalOpts, args []string) int {
 		return failErr(g.JSON, err)
 	}
 	if g.JSON {
-		writeJSON(map[string]interface{}{"ok": true, "runs": runs})
+		outRuns := make([]api.RunRecord, 0, len(runs))
+		for _, r := range runs {
+			outRuns = append(outRuns, sanitizeRunRecord(r, false))
+		}
+		writeJSON(map[string]interface{}{"ok": true, "runs": outRuns})
 	} else {
 		for _, r := range runs {
 			fmt.Printf("%s  %-14s %-10s %-6s %s\n", r.ID, r.Status, r.NodeID, r.Agent, r.Summary)
@@ -742,7 +749,11 @@ func runCancel(g globalOpts, args []string) int {
 		return failErr(g.JSON, err)
 	}
 	if g.JSON {
-		writeJSON(map[string]interface{}{"ok": true, "cancelled_runs": cancelled})
+		outCancelled := make([]api.RunRecord, 0, len(cancelled))
+		for _, r := range cancelled {
+			outCancelled = append(outCancelled, sanitizeRunRecord(r, false))
+		}
+		writeJSON(map[string]interface{}{"ok": true, "cancelled_runs": outCancelled})
 	} else {
 		for _, r := range cancelled {
 			fmt.Printf("Cancelled %s (%s)\n", r.ID, r.Status)
@@ -783,7 +794,7 @@ func runResolve(g globalOpts, args []string) int {
 		return failErr(g.JSON, err)
 	}
 	if g.JSON {
-		writeJSON(map[string]interface{}{"ok": true, "run": run})
+		writeJSON(map[string]interface{}{"ok": true, "run": sanitizeRunRecord(*run, false)})
 	} else {
 		fmt.Printf("Resolved %s (%s)\n", run.ID, run.Status)
 	}
@@ -1155,6 +1166,7 @@ func runNodeInit(g globalOpts, args []string) int {
 		ProjectRoots:         projectRoots,
 		SkipDirs:             skipDirs,
 		RemoteControlName:    remoteControlName,
+		NativeNotify:         existing.NativeNotify,
 		Agents:               agents,
 	}
 
@@ -1263,19 +1275,29 @@ func isWaitStopState(status string) bool {
 	return status == "done" || status == "failed" || status == "cancelled" || status == "needs_approval"
 }
 
-func outputRunResult(asJSON bool, run *api.RunRecord) {
+func sanitizeRunRecord(r api.RunRecord, full bool) api.RunRecord {
+	r.LeaseOwner = ""
+	r.Prompt = redact.Text(r.Prompt)
+	if !full && r.Prompt != "" {
+		r.Prompt, _ = redact.TruncateUTF8(r.Prompt, 1536)
+	}
+	return r
+}
+
+func outputRunResult(asJSON bool, run *api.RunRecord, full bool) {
 	if run == nil {
 		return
 	}
+	sanitized := sanitizeRunRecord(*run, full)
 	if asJSON {
 		// Strip internal fields not listed in docs/schemas/run-record.schema.json (additionalProperties: false)
-		sanitized := *run
-		sanitized.Prompt = ""
-		sanitized.LeaseOwner = ""
 		writeJSON(sanitized)
 		return
 	}
 	fmt.Printf("Run %s [%s] node=%s agent=%s duration=%dms\n", run.ID, run.Status, run.NodeID, run.Agent, run.DurationMs)
+	if sanitized.Prompt != "" {
+		fmt.Printf("Prompt:\n%s\n", sanitized.Prompt)
+	}
 	if run.RemoteControlURL != "" {
 		fmt.Printf("Approval URL: %s\n", run.RemoteControlURL)
 	}
@@ -1360,6 +1382,7 @@ Commands:
   threads         List threads
   cancel          Cancel a run (or entire tree with --cascade)
   resolve         Mark a needs_approval run resolved and release locks
+  native-emit     Emit an official hook or CLI native Agent event for node default Bot notify
   skill           Print or install embedded SKILL.md
   update          Check or apply atomic self-update (auto-reloads daemon unless --no-restart)
   node init       Idempotently create or update node.json (supports --token-stdin)

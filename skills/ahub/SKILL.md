@@ -32,12 +32,18 @@ Use the `ahub` CLI as the sole interface to `agent-hub`. Do not hand-craft HTTP 
      EOF
      ```
    - When running inside an environment with a webhook callback (e.g. Grok Bot), add `--notify grok`.
+   - **Show prompt at dispatch time**: On `ahub run`, display the masked prompt with `run_id` / `thread_id`; never rely on `ahub result` post-completion for raw `prompt`.
 
 4. **Handle wait outcomes by exit code**:
    - Exit `0` with `status: "done"`: Read `summary` and `output_preview` directly. Use `ahub result <run_id> --full --json` only if full output is needed.
-   - Exit `0` with `status: "running"` and `webhook_armed: true`: Inform the user the task is queued/running asynchronously and you will report back upon webhook callback.
+   - Exit `0` with `status: "running"` and `webhook_armed: true`: Share `run_id` / `thread_id` and the masked prompt, note async execution, and stop until callback.
    - Exit `24` (local wait timed out without `--notify`): Call `ahub wait <run_id> --timeout 15m --json` to keep waiting over WebSocket.
    - Exit `20` (`status: "needs_approval"`): Immediately surface `remote_control_url` to the user for human approval.
    - Exit `64` (`WORKDIR_AMBIGUOUS`): Re-run using one of the exact paths returned in `error.details.candidates`.
    - Exit `10` (`status: "failed"`): Read `error_code` and `error_message` on the run record.
    - Exit `78`: Read `error.code` and `error.message`; do not blindly retry on `DEPTH_LIMIT_EXCEEDED`, `DELEGATION_CYCLE_DETECTED`, or `FORBIDDEN_SCOPE`.
+
+5. **Report results and protect prompt privacy**:
+   - On `done`, `failed`, `cancelled`, or `needs_approval`, report `thread_id` / `run_id` and `summary` (or `remote_control_url`).
+   - Do **not** call `ahub result` to fetch `prompt` post-completion; `ahub_run_completed` callbacks may reference redacted `prompt_preview` only as a fallback.
+   - **Mandatory redaction**: Never output raw tokens, passwords, bearer credentials, API keys, or webhook secrets when displaying any prompt or output; mask sensitive values before replying.

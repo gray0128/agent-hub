@@ -43,9 +43,10 @@
 
 | 方法与路径 | 允许 Scope | 功能说明 | 关键请求/响应约定 |
 | --- | --- | --- | --- |
-| `GET /api/v1/nodes` | `admin`, `client` | 列出所有已注册节点及其在线态、可用 Agent、模型简称和已上报工作区 | 响应 `nodes[]`（按 `client` Key 的 `bound_node_id` 与 `allowed_nodes_json` 自动过滤可见范围） |
-| `PATCH /api/v1/nodes/:id` | `admin` | 修改节点显示名、`status`（如设为 `draining` 停止派发新任务）或 `max_concurrency` | 请求体 `{display_name?, status?, max_concurrency?}` |
-| `POST /api/v1/nodes/:id/claim` | `node` | 节点认领待执行任务（WS `hub.wake` 后及重连握手后必调） | 请求 `{conn_nonce, busy_workdirs?}`；返回 `claimed_runs[]`（已加租约锁定的完整任务列表） |
+| `GET /api/v1/nodes` | `admin`, `client` | 列出所有已注册节点及其在线态、可用 Agent、模型简称及已上报工作区；仅 `admin` Scope 额外返回脱敏默认通知通道状态（`default_notify_key_id`、`default_notify_key_name`、`default_notify_webhook_host`、`default_notify_valid`） | 响应 `nodes[]`（按 `client` Key 的 `bound_node_id` 与 `allowed_nodes_json` 自动过滤可见范围；`client` Scope 一律省略上述 `default_notify_*` 字段） |
+| `PATCH /api/v1/nodes/:id` | `admin` | 修改节点显示名、`status`（如设为 `draining` 停止派发新任务）、`max_concurrency` 或节点默认通知通道 `default_notify_key_id` | 请求体 `{display_name?, status?, max_concurrency?, default_notify_key_id?}`；绑定非空 `default_notify_key_id` 时强制校验目标为未吊销、已配置 Webhook 且允许访问该节点的 `client` Key，传 `null` 或 `""` 解绑 |
+| `POST /api/v1/nodes/:id/native-events` | `node` | 节点上报脱离 `ahub` 运行的本地 Agent 官方 Hook/CLI 原生事件（`interaction_needed` / `turn_summary`） | 仅允许 `bound_node_id == :id` 的节点凭证调用；按 `(node_id, event_id)` 幂等去重，入库前二次脱敏；严格按 `nodes.default_notify_key_id` Fail-Closed 路由（未绑定记 `skipped`，失效/吊销记 `failed`，绝不回退其他 Bot 或全局 Webhook） |
+| `POST /api/v1/nodes/:id/claim` | `node` | 节点认领待执行任务（WS `hub.wake` 后及重连握手后必调） | 请求 `{conn_nonce, busy_workdirs?}`；返回 `claimed_runs[]`（**全系统唯一返回原始未脱敏 `prompt` 的接口**，供节点本地执行；伴随广播至 `/ws/stream` 的 `run.updated` 帧仍须对 `prompt` 脱敏并截断至 `<= 1200` 字符） |
 | `POST /api/v1/runs/:id/heartbeat` | `node` | 为运行中的任务续期 `90s` 租约，并检查是否已被取消 | 请求 `{lease_owner}`；返回 `{ok: true, status, should_abort: boolean, lease_expires_at}` |
 | `POST /api/v1/runs/:id/approval` | `node` | 上报 `needs_approval` 持久检查点（尤其用于子进程退出型的远控审批） | 请求 `{lease_owner, remote_control_url?, native_session_id?, resolved_model?, resolved_effort?, summary?, output_md?, output_bytes?, duration_ms?}`；原子持久化字段、回填 `threads.native_session_id` 并续期租约 |
 | `POST /api/v1/runs/:id/complete` | `node` | 上报任务终态（`done` / `failed` / `cancelled`）与完整输出 | 请求 `{lease_owner, status, native_session_id?, resolved_model?, resolved_effort?, summary, output_md, output_bytes, duration_ms, error_code?, error_message?}` |
@@ -63,13 +64,15 @@
 | 方法与路径 | 允许 Scope | 功能说明 | 关键请求/响应约定 |
 | --- | --- | --- | --- |
 | `POST /api/v1/runs` | `admin`, `client` | 创建并入队一个 `Run`（未传 `thread_id` 时自动新建 `Thread`）。见 [run-create.schema.json](schemas/run-create.schema.json) | 支持查询参数 `?wait_ms=0..45000`。若在 `wait_ms` 内到达终态或 `needs_approval` 直接返回 `200`；超时仍在跑返回 `202` 含 `run` 快照（绝不超过 `45000ms`，防止触发 Cloudflare 100s `524`） |
-| `GET /api/v1/runs` | `admin`, `client` | 按条件筛选任务列表，支持 `?node_id=&thread_id=&status=&root_run_id=&limit=50` | 返回 `runs[]` 摘要列表（不含大体积 `output_md`） |
-| `GET /api/v1/runs/:id` | `admin`, `client` | 查询单条任务详情与输出，支持 `?view=summary|full&tail_bytes=16384` | `view=summary` 时按 `tail_bytes` 截断返回 `output_preview` 与 `truncated: true` |
+| `GET /api/v1/runs` | `admin`, `client` | 按条件筛选任务列表，支持 `?node_id=&thread_id=&status=&root_run_id=&limit=50` | 返回 `runs[]` 摘要列表（不含大体积 `output_md`；`prompt` 统一经凭据脱敏并截断至 `<= 1200` 字符） |
+| `GET /api/v1/runs/:id` | `admin`, `client` | 查询单条任务详情与输出，支持 `?view=summary|full&tail_bytes=16384` | `view=summary`（默认）按 `tail_bytes` 截断返回 `output_preview` 与 `truncated: true`，同时将 `prompt` 脱敏并截断至 `<= 1200` 字符；`view=full` 返回完整 `output_md` 与完整脱敏后的 `prompt`（保留 `$VAR` / `<PLACEHOLDER>` 占位符，绝不回传未脱敏真实凭据） |
 | `GET /api/v1/runs/:id/events` | `admin`, `client` | 增量拉取过程事件，支持 `?after_seq=0&limit=200` | 返回 `events[]` 与 `next_seq` |
 | `PATCH /api/v1/runs/:id` | `admin`, `client` | 仅限任务仍处于 `queued` 时调整目标 `node_id`、`workdir`、`model`、`effort` 或 `priority_order` | 若任务已被认领离开 `queued` 返回 `409 INVALID_STATE_TRANSITION`；改派 `node_id`/`workdir` 仅限尚未建连的单轮新会话（已建连或多轮会话须走 `/fork`，否则返回 `409 INVALID_STATE_TRANSITION`），并同步校验委派环路（`409 DELEGATION_CYCLE_DETECTED`）与同步更新 `threads(node_id, workdir, project_key)` |
 | `POST /api/v1/runs/reorder` | `admin`, `client` | 批量重排同节点待执行队列的 `priority_order`（供前端 `@dnd-kit` 拖拽排序） | 请求 `{node_id, ordered_run_ids: string[]}`（`client` Key 校检节点权限与队列条目归属） |
 | `POST /api/v1/runs/:id/resolve` | `admin`, `client` | 人工在远控完成审批后手动放行结算处于 `needs_approval` 的任务 | 可选请求 `{summary?}`；CAS 置 `status='done'`、释放租约、向 `NodeHub` 发 `hub.abort(approval_resolved)` 解锁本地 `workdir` 并广播 `run.updated` |
 | `POST /api/v1/runs/:id/cancel` | `admin`, `client` | 取消单个任务或整棵衍生任务树 | 请求 `{cascade?: boolean, reason?: string}`；`queued` 直接变 `cancelled`，运行中任务立即经 DO 下发 `hub.abort` |
+
+> **`RunRecord.prompt` 控制面脱敏与截断边界**：除节点认领接口 `POST /api/v1/nodes/:id/claim`（`node` Scope）返回原始未脱敏 `prompt`、以及 `GET /api/v1/runs/:id?view=full` 返回完整脱敏 `prompt` 外，其余全部控制面 REST 接口（含 `POST /api/v1/runs` 及其 `wait_ms` 长轮询返回、`GET /api/v1/runs`、`GET /api/v1/runs/:id?view=summary`、`PATCH /api/v1/runs/:id`、`POST /api/v1/runs/reorder`、`POST /api/v1/runs/:id/resolve`、`POST /api/v1/runs/:id/cancel`、`POST /api/v1/threads/:id/fork`、`POST /api/v1/runs/:id/approval`、`POST /api/v1/runs/:id/complete`）与 `/ws/stream` 推送的 `RunRecord.prompt` 均统一经凭据脱敏并截断至最多 `1200` 字符（超出附加 `\n...[truncated]`），且不额外新增 `prompt_preview` 重复字段，以维持 [run-record.schema.json](schemas/run-record.schema.json) 紧凑契约。
 
 ### 2.4 凭证管理与自举分发
 
@@ -115,9 +118,9 @@
 - 单任务等待订阅（`ahub wait` / `client`）：传 `?run_id=run_xxx`（需有该任务读权限），接收 `run.event`、`run.updated`，并在任务到达终态或 `needs_approval` 时收到终结帧后由客户端主动断开。
 
 **Hub -> Client 帧**：
-- `snapshot`：建连瞬间下发当前最新快照（包含 `nodes`、可选 `threads` 与 `runs`，避免连接建立与首次 REST 拉取之间的竞态丢帧）。
-- `node.status`：节点状态变更增量。
-- `run.updated`：任意 `Run` 状态、耗时或摘要变更。
+- `snapshot`：建连瞬间下发当前最新快照（包含 `nodes`、可选 `threads` 与 `runs`，避免连接建立与首次 REST 拉取之间的竞态丢帧）；其中 `nodes[]` 按订阅方 `principal.scope` 过滤（`client` Scope 省略 `default_notify_*` 字段），`runs[]` 中的 `prompt` 统一脱敏并截断至 `<= 1200` 字符。
+- `node.status`：节点状态变更增量（推送给 `client` Scope 连接时同样省略 `default_notify_*` 字段）。
+- `run.updated`：任意 `Run` 状态、耗时或摘要变更（含 `NodeHub` 接收 `run.state` 后生成的增量帧，`run.prompt` 统一脱敏并截断至 `<= 1200` 字符）。
 - `run.event` / `run.events`：实时执行流事件增量（单条或批量）。
 - `error`：鉴权失效或订阅非法对象提示。
 
@@ -127,10 +130,16 @@
 
 ### 4.1 队列消息格式（入队条件与体量控制）
 
-仅当 `runs.notify_policy_json` 中指定了有效目标（如 `{"target":"grok"}`）且任务进入 `done`、`failed`、`cancelled` 或 `needs_approval` 时，Worker 才投递队列消息。消息体严格控制在 `4 KB` 以内：
+- **内部 `ahub` 任务通知**：
+  - 若 `runs.notify_policy_json` 显式指定有效目标（`target` 为 `"grok"` 或 `"webhook"` 且命中 `events` 过滤），任务进入 `done`、`failed`、`cancelled` 或首次进入 `needs_approval` 时投递队列消息。
+  - 若 `target == "none"`，**仅当**满足 `depth == 0` **且**任务发起方为人工控制面入口（`runs.created_by_key_id IS NULL`，如 Web 控制台 / Cloudflare Access / `bootstrap_admin`）或 `admin` Scope API Key 时，才可自动转入节点绑定的 `nodes.default_notify_key_id`（`route_mode = "node_default"`；若所绑通道已失效或吊销则将 `runs.notify_status` 置为 `'failed'` 并放弃入队）。凡由 `client` Scope API Key 创建且未显式指定 `--notify`（`target == "none"`）的任务，以及全部子派单（`depth >= 1`），均**严禁**触发 `node_default` 自动路由。
+- **节点原生 Agent 事件通知**：`POST /api/v1/nodes/:id/native-events` 写入新事件且节点存在有效的 `default_notify_key_id` 时投递 `{kind: "native_event", native_event_id, node_id, attempt}`。
+
+队列消息体严格控制在 `4 KB` 以内：
 
 ```json
 {
+  "kind": "run",
   "run_id": "run_01J...",
   "thread_id": "thr_01J...",
   "root_run_id": "run_01J...",
@@ -139,17 +148,39 @@
   "agent": "agy",
   "status": "done",
   "target": "grok",
+  "route_mode": "key",
   "attempt": 1
 }
 ```
 
-### 4.2 Grok Routine Webhook 回调格式与多 Bot 隔离路由
+### 4.2 Grok Routine Webhook 回调格式、节点绑定路由与 Fail-Closed 隔离
 
-Queue Consumer 从 D1 按 `runs.created_by_key_id` 关联查询签发该任务的 `api_keys` 路由配置（目标选路顺序如下），随后发送 `POST` JSON：
+Queue Consumer 从 D1 实时校验目标路由与 Key 状态（任何失效、解绑或解密失败均 **Fail-Closed**，严禁跨 Bot 或以全局 `GROK_WEBHOOK_URL` 绕过节点绑定）：
 
-1. **专属 Bot Webhook（优先）**：若 `runs.created_by_key_id` 关联到未吊销的 `client` 凭证且 `notify_webhook_ciphertext` 非空，则以 Worker Secret `WEBHOOK_ENCRYPTION_KEY` 解密得到该 Bot 专属 `webhook_url` 与可选 `webhook_key`。
-2. **Fail-Closed 隔离保护**：若 `created_by_key_id` 对应凭证已被吊销（`revoked_at IS NOT NULL`）或专属 Webhook 解密失败（如缺失/轮换错误的 `WEBHOOK_ENCRYPTION_KEY`），Consumer **严禁回退至全局 `GROK_WEBHOOK_URL`**，必须直接将 `runs.notify_status` 标记为 `'failed'` 并 `ack()` 防止跨 Bot 串信泄露。
-3. **全局环境变量兜底**：仅当任务由非独立 Bot 凭证创建或对应 Key 未配置专属密文时，才回退使用环境变量 `GROK_WEBHOOK_URL` / `GROK_WEBHOOK_KEY`（通用 `webhook` 目标优先 `WEBHOOK_URL`）。
+1. **任务发起方专属 Bot Webhook（`route_mode = "key"`）**：**仅当**发起方凭证为 `client` Scope API Key 且显式携带 `--notify` 时锁定 `route_mode = "key"`（即使队列消息缺省 `route_mode`，Consumer 亦依据 `api_keys.scope == 'client'` 判定为 `"key"`），Fail-Closed 仅使用 `runs.created_by_key_id` 对应的加密 Webhook（已吊销、未配置或解密失败直接标 `failed` 并 `ack()`，绝不回退 `node_default` 或全局 Webhook）。
+2. **节点显式绑定的默认 Bot 通道（`route_mode = "node_default"` 及全部 `native_event`）**：适用于人工控制面或 `admin` Key 发起的 `depth == 0` 无目标任务，以及显式指定 `--notify` 的人工/`admin` Key 请求在目标节点已绑定 `nodes.default_notify_key_id` 时的优先选路（加上全部 `native_event`）。投递瞬间必须从 `nodes.default_notify_key_id` 关联查询 `api_keys`，同时满足 `scope = 'client'`、`revoked_at IS NULL`、`notify_webhook_ciphertext != ''` 且 `allowed_nodes` 允许该 `node_id`；任一条件不满足或解绑，直接标 `failed` 并 `ack()`，**严禁改用其他节点/其他 Bot 的通道或全局 `GROK_WEBHOOK_URL`**。
+3. **人工 / `admin` 显式请求的兼容兜底（`route_mode = "global_legacy"`）**：当人工控制面入口（`created_by_key_id IS NULL`）或 `admin` Scope API Key 显式指定 `--notify grok` / `webhook` 且目标节点未绑定 `default_notify_key_id` 时（即遵循 `node_default -> global_legacy` 选路），使用环境变量 `GROK_WEBHOOK_URL` / `WEBHOOK_URL`。
+
+`ahub_native_event`（本地 Agent 原生会话互动或结束总结）回调载荷如下（仅作只读用户通知，不代表自动放行或自动回复）：
+
+```json
+{
+  "event": "ahub_native_event",
+  "hub_url": "https://ahub.bobocai.win",
+  "native_event_id": "evt_01J...",
+  "event_id": "claude:sess_1:Stop:9f8e7d6c5b4a",
+  "node_id": "macmini",
+  "agent": "claude",
+  "event_kind": "interaction_needed",
+  "native_session_id": "sess_1",
+  "workdir": "~/workspace/demo",
+  "title": "需要人工确认",
+  "summary": "请确认是否继续执行（敏感凭据已脱敏）。",
+  "source": "claude-hook",
+  "action_required": "notify_user_only",
+  "created_at": "2026-11-17T12:00:00.000Z"
+}
+```
 
 发送时若存在 `webhook_key` 附带认证头 `Authorization: Bearer <webhook_key>`，载荷结构如下：
 
@@ -169,11 +200,15 @@ Queue Consumer 从 D1 按 `runs.created_by_key_id` 关联查询签发该任务�
   "native_session_id": "9956aa05-c359-49b6-8462-30ee454ee29f",
   "duration_ms": 18420,
   "remote_control_url": "",
+  "prompt_preview": "请排查项目构建日志并给出根因摘要（其中敏感凭据已脱敏）。",
+  "prompt_truncated": false,
   "summary": "已完成模块边界梳理，详见完整输出。",
   "output_bytes": 4820,
   "fetch_full_cmd": "ahub result run_01J... --full --json"
 }
 ```
+
+> 说明：`prompt_preview` 为服务端按凭据脱敏规则截断后的下发指令预览（上限 `1200` 字符），仅作异步回调上下文提示；外部 Bot（如 Grok Bot）应在 `ahub run` 下发时直接向用户展示指令原文，严禁任务完成后再调用 `ahub result` 回拉原始明文 `prompt`；`ahub result <run_id> --full --json` 仅用于显式诊断排查时拉取完整脱敏输出（`output_md`）与完整脱敏 `prompt`。
 
 重试策略：HTTP 非 `2xx` 时抛出异常由 Cloudflare Queues 按指数退避自动重试，最多 `5` 次；超过 `5` 次转入 `ahub-outbound-notify-dlq` 并将 `runs.notify_status` 标为 `failed`。
 

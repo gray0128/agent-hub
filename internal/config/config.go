@@ -27,6 +27,12 @@ type AgentConfig struct {
 	Models       []string `json:"models,omitempty"`
 }
 
+type NativeNotifyConfig struct {
+	Enabled                  bool     `json:"enabled"`
+	AllowedRoots             []string `json:"allowed_roots,omitempty"`
+	IncludeTranscriptSummary bool     `json:"include_transcript_summary,omitempty"`
+}
+
 type NodeConfig struct {
 	NodeID               string                 `json:"node_id"`
 	DisplayName          string                 `json:"display_name"`
@@ -38,6 +44,7 @@ type NodeConfig struct {
 	ProjectRoots         []string               `json:"project_roots"`
 	SkipDirs             []string               `json:"skip_dirs"`
 	RemoteControlName    string                 `json:"remote_control_name,omitempty"`
+	NativeNotify         *NativeNotifyConfig    `json:"native_notify,omitempty"`
 	Agents               map[string]AgentConfig `json:"agents"`
 }
 

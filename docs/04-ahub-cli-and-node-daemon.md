@@ -33,6 +33,8 @@ skills/ahub/SKILL.md             # 通过 go:embed 内嵌于二进制中
 2. 环境变量：`AHUB_URL`（默认 `https://ahub.bobocai.win`）、`AHUB_TOKEN`
 3. 凭据文件：`~/.config/ahub/credentials`（可通过环境变量 `AHUB_CONFIG_DIR` 重定向配置目录，权限强制校验或写入为 `0600`，JSON 格式 `{ "url": "...", "token": "..." }`）；节点运行配置保存在同目录下的 `node.json`（仅此两文件，不存在 `config.json`）。
 
+> **节点守护端与原生 Hook 凭证隔离例外**：`ahub node serve` 与 `ahub native-emit` 除命令行显式传入 `--url` / `--token` 外，固定仅从 `node.json` 读取 `hub_url` 与 `token`，**显式忽略**环境变量 `AHUB_URL`、`AHUB_TOKEN` 与客户端 `credentials` 文件，防止本机同时配置了调用端 `client` 凭证时触发 `403 FORBIDDEN_SCOPE`。
+
 ## 3. 调用端 CLI 命令与退出码契约
 
 ### 3.1 全局约束
@@ -40,6 +42,7 @@ skills/ahub/SKILL.md             # 通过 go:embed 内嵌于二进制中
 - **流分离原则**：传入 `--json` 时，`stdout` 仅允许输出一个合法的 JSON 对象；所有调试信息、等待心跳提示与错误堆栈统一写往 `stderr`。
 - **防 Shell 截断**：`ahub run` 必须支持在结尾传入 `-` 从 `stdin` 读取多行原始 Prompt，严禁要求调用方将长代码块转义后塞入命令行参数。
 - **上下文窗口保护**：`ahub result <run_id>` 默认只拉取 `summary` 与尾部最多 `16 KB` 预览（附带 `"truncated": true, "output_bytes": N`），只有显式指定 `--full` 时才拉取完整 `output_md`。
+- **统一 `RunRecord` 脱敏与摘要截断边界**：所有返回 `RunRecord` 的调用端命令（`run`、`wait`、`result`、`runs`、`resolve`、`cancel`）均通过统一的本地净化函数处理：清空内部字段 `lease_owner`、对 `prompt` 执行 `redact` 凭据脱敏（保留 `$VAR` 与 `<PLACEHOLDER>` 占位符，并覆盖空格传参、`X-API-Key` 与带空格引号值），并在非 `--full` 模式下将 `prompt` 截断至不超过 `1536` UTF-8 字节；仅 `ahub result <run_id> --full` 请求服务端 `?view=full` 获取完整脱敏后的 `prompt` 与 `output_md`（仅作显式诊断排查用途，外部 Bot 应在 `ahub run` 下发时直接展示指令原文），调用端 CLI 绝不返回未脱敏凭据原文。
 - **共享宿主多 Bot 凭据隔离**：当多个外部助手（如同一账号下共享云端 Linux 计算机 `$HOME` 的多个 Grok Bot）共用同一宿主文件系统时，严禁将不同 Bot 的 `client` Token 混写进默认 `~/.config/ahub/credentials`；优先在各 Bot / Routine 独立环境变量中注入 `AHUB_TOKEN`，若使用本地文件登录则必须按 Bot 隔离 `AHUB_CONFIG_DIR`（如 `~/.config/ahub-bots/<bot_slug>`）并通过 `ahub auth login --token-stdin` 写入，防止节点白名单与加密 Webhook 串台。
 
 ### 3.2 核心子命令列表
@@ -49,13 +52,14 @@ skills/ahub/SKILL.md             # 通过 go:embed 内嵌于二进制中
 | `ahub auth login [--url <url>] [--token <token> \| --token-stdin] [--json]` | 调用 `GET /api/v1/auth/me` 校验并写入 `0600` 凭据至 `<AHUB_CONFIG_DIR>/credentials`（默认 `~/.config/ahub/credentials`）；支持 `--token-stdin` 从标准输入安全读取 Token，`--json` 仅返回 `ok`、`url`、`credentials_path` 与 `principal`，绝不回显明文 Token |
 | `ahub auth status [--verify] [--json]` | 零密钥泄露检查当前调用端凭据状态（返回 `ok`、`url`、`config_dir`、`credentials_path`、`credentials_exists`、`has_token` 与 `token_source` (`flag` \| `env` \| `file` \| `none`)）；传入 `--verify` 时额外调用 `GET /api/v1/auth/me` 返回 `verified: true` 与 `principal` |
 | `ahub nodes [--online] [--json]` | 从云端读取节点清单、在线态、可用 Agent、模型简称及项目短名列表 |
-| `ahub run -n <node> -d <dir> -a <agent> [-m <model@effort>] [--thread <thr_id>] [--no-sandbox] [--timeout 15m] [--wait 45s] [--notify grok] [--idempotency-key <k>] [--json] <prompt \| ->` | 创建任务并入队（未传 `--thread` 时新建会话）。CLI 自动读取环境中的 `AHUB_RUN_ID` 作为 `parent_run_id`。支持两阶段等待预算（默认 `--wait` 为 `45s`）：第一阶段使用 HTTP 长轮询 `?wait_ms=min(wait, 45000)`；若未设 `--notify` 且仍处于运行态且 `--wait > 45s`（或服务端提前返回 `202`），第二阶段以剩余预算无缝切入 `/ws/stream` 阻塞等待；若第二阶段发生鉴权/网络等真实传输错误则直接返回对应退出码（不误报 `24`），停机态（`done`/`failed`/`cancelled`/`needs_approval`）统一带 `5s` 有界超时拉取摘要预览 |
-| `ahub wait <run_id> [--timeout 15m] [--json]` | 连接 `/ws/stream?run_id=<id>` 零轮询阻塞等待任务到达终态或 `needs_approval`（停机态统一带 `5s` 超时拉取摘要预览） |
-| `ahub result <run_id> [--full] [--tail 16384] [--json]` | 读取指定任务的结果摘要、耗时、模型、`remote_control_url` 与输出正文 |
-| `ahub resolve <run_id> [--summary <text>] [--json]` | 人工在远控完成审批后，将处于 `needs_approval` 的子进程退出型任务放行结算为 `done`，释放 `(node_id, workdir)` 租约与本地目录锁并继续调度排队任务 |
-| `ahub runs [--node <n>] [--status <s>] [--limit 20] [--json]` | 查看任务队列与历史列表 |
+| `ahub run -n <node> -d <dir> -a <agent> [-m <model@effort>] [--thread <thr_id>] [--no-sandbox] [--timeout 15m] [--wait 45s] [--notify grok] [--idempotency-key <k>] [--json] <prompt \| ->` | 创建任务并入队（未传 `--thread` 时新建会话）。CLI 自动读取环境中的 `AHUB_RUN_ID` 作为 `parent_run_id`。支持两阶段等待预算（默认 `--wait` 为 `45s`）：第一阶段使用 HTTP 长轮询 `?wait_ms=min(wait, 45000)`；若未设 `--notify` 且仍处于运行态且 `--wait > 45s`（或服务端提前返回 `202`），第二阶段以剩余预算无缝切入 `/ws/stream` 阻塞等待；若第二阶段发生鉴权/网络等真实传输错误则直接返回对应退出码（不误报 `24`），停机态（`done`/`failed`/`cancelled`/`needs_approval`）统一带 `5s` 有界超时拉取摘要预览；输出 `RunRecord` 经统一脱敏、清空 `lease_owner` 并截断 `prompt` 至 `1536` UTF-8 字节 |
+| `ahub wait <run_id> [--timeout 15m] [--json]` | 连接 `/ws/stream?run_id=<id>` 零轮询阻塞等待任务到达终态或 `needs_approval`（停机态统一带 `5s` 超时拉取摘要预览，输出 `RunRecord` 经统一脱敏、清空 `lease_owner` 并截断 `prompt` 至 `1536` UTF-8 字节） |
+| `ahub result <run_id> [--full] [--tail 16384] [--json]` | 读取指定任务的结果摘要、脱敏后的指令元数据 `prompt`（默认摘要模式超出 `1536` 字节截断，传 `--full` 仅用于显式排查完整脱敏正文与 `output_md`，绝不返回未脱敏明文并清空内部 `lease_owner`）、耗时、模型、`remote_control_url` 与输出正文 |
+| `ahub resolve <run_id> [--summary <text>] [--json]` | 人工在远控完成审批后，将处于 `needs_approval` 的子进程退出型任务放行结算为 `done`，释放 `(node_id, workdir)` 租约与本地目录锁并继续调度排队任务（输出 `run` 经统一脱敏、清空 `lease_owner` 并截断 `prompt` 至 `1536` UTF-8 字节） |
+| `ahub runs [--node <n>] [--status <s>] [--limit 20] [--json]` | 查看任务队列与历史列表（每条 `RunRecord` 均清空 `lease_owner`、对 `prompt` 脱敏并截断至 `1536` UTF-8 字节） |
 | `ahub threads [--node <n>] [--q <keyword>] [--json]` | 查询历史会话线程 ID 以便跨轮续接 |
-| `ahub cancel <run_id> [--cascade] [--reason <text>] [--json]` | 取消单个任务；加 `--cascade` 时级联终止整棵 `root_run_id` 任务树 |
+| `ahub cancel <run_id> [--cascade] [--reason <text>] [--json]` | 取消单个任务；加 `--cascade` 时级联终止整棵 `root_run_id` 任务树（`cancelled_runs[]` 中每条 `RunRecord` 均经统一脱敏、清空 `lease_owner` 并截断 `prompt` 至 `1536` UTF-8 字节） |
+| `ahub native-emit [--from-hook claude\|codex\|agy\|pi\|cli] [--config <path>] [--agent <a>] [--kind interaction_needed\|turn_summary] [--event-id <id>] [--summary <text\|->] [--include-transcript-summary] [--json]` | 供本机 Agent 官方 Hook / 扩展调用：在 `node.json` 显式启用 `native_notify.enabled` 时，将脱离 `ahub` 运行的本地会话互动或结束总结脱敏上报至 `POST /api/v1/nodes/:id/native-events`；若检测到 `AHUB_RUN_ID`/`AHUB_DEPTH` 非空或 Hook 重入标记则立即静默跳过防双推与循环；凭证仅读取 `--url`/`--token` 或 `node.json`（忽略 `AHUB_TOKEN`/`AHUB_URL` 与客户端 `credentials`） |
 | `ahub skill print \| install [--dir <path>]` | 打印内嵌 `SKILL.md`，或将其安装到指定 Agent Skill 目录（如 `~/.agents/skills/ahub/SKILL.md`） |
 | `ahub update [--check] [--target <path>] [--no-restart] [--json]` | 查询 `/dl/version.json` 并校验 SHA-256 原子替换当前二进制；默认在更新本机活跃二进制后自动向运行中的 `ahub node serve` 触发优雅排空重启（Unix 发 `SIGHUP`，Windows 写 `node.reload` 哨兵），或在未运行进程间回退系统服务重载（`--no-restart` 或指定 `--target` 时跳过重启） |
 | `ahub node init [--id <node_id>] [--name <display_name>] [--url <hub_url>] [--token <token> \| --token-stdin] [--root <dir> ...] [--max-concurrency <n>] [--config <path>] [--force] [--json]` | 幂等创建或更新 `0600` 权限 `~/.config/ahub/node.json`，自动探测主机名、已有工作区根目录与本机已安装 Agent（`agy`/`pi`/`omp`/`codex`/`claude`），`--json` 输出脱敏（仅含布尔值 `has_token`） |
@@ -94,6 +98,14 @@ skills/ahub/SKILL.md             # 通过 go:embed 内嵌于二进制中
     "node_modules"
   ],
   "remote_control_name": "macmini",
+  "native_notify": {
+    "enabled": false,
+    "allowed_roots": [
+      "~/workspace",
+      "~/projects"
+    ],
+    "include_transcript_summary": false
+  },
   "agents": {
     "agy": {
       "enabled": true,
@@ -168,6 +180,26 @@ skills/ahub/SKILL.md             # 通过 go:embed 内嵌于二进制中
    - **Linux**：写入 `~/.config/systemd/user/ahub-node.service`（开启 `Restart=always` 与 `loginctl enable-linger` 提示）；`ahub update` 时同样优先发 `SIGHUP` 排空退出或空闲状态下执行 `systemctl --user restart ahub-node.service`。
    - **Windows**：`ahub node service install` 将当前二进制另存为独立监控副本 `ahub-shim.exe` 并生成 `<target_dir 或 config_dir>/ahub-node-runner.cmd`（经 `ahub-shim.exe node shim --bin <ahub.exe> --config <node.json>` 启动，避免监控父进程锁定主 `ahub.exe` 替换路径）；启用 `--activate` 时注册并运行登录触发计划任务 `AhubNodeDaemon`（`schtasks /Create /F /SC ONLOGON /TN "AhubNodeDaemon"`）。`node.pid` 存活探测通过 `tasklist /FI "PID eq <pid>" /FO CSV /NH` 解析进程名与 PID 防止假阳性；`ahub update` 通过写入 `<config_dir>/node.reload` 哨兵触发守护端排空后返回退出码 `42`，由 `ahub-shim.exe` 极速拉起新版 `ahub.exe`。
 
+### 4.4 本地 Agent 原生 Hook 适配矩阵与隐私边界（`ahub native-emit`）
+
+`ahub native-emit` 严格采用官方 Hook / 扩展事件推送机制，**默认关闭（`native_notify.enabled: false`）**，且**严禁扫描全盘会话或无关聊天/凭据文件**：
+
+| Agent | 官方接入方式 | 已覆盖事件 | 未覆盖 / 已知限制 |
+| --- | --- | --- | --- |
+| `claude` | `~/.claude/settings.json`（`Notification`、`Stop` Hook） | `interaction_needed`（`Notification`）、`turn_summary`（`Stop` `last_assistant_message`） | 未读外部全盘历史，依赖 Hook 传入 JSON |
+| `codex` | `~/.codex/config.toml`（`notify = [...]`） | `turn_summary`（`agent-turn-complete`） | Codex TUI 审批/互动提示不经 `notify` 触发 |
+| `agy` | `~/.gemini/config/hooks.json` 或 `.agents/hooks.json`（`Stop` Hook） | `turn_summary`（默认仅含终止原因与脱敏提问摘要；显式开启 `include_transcript_summary` 时才读取单次传入的 `transcriptPath` 末条响应） | 官方 `hooks.json` 无非阻塞互动通知 Hook，`ask_question`/UI 审批暂停未覆盖 |
+| `pi` | 官方 Extension `pi.on("agent_end", ...)` 调 `ahub native-emit --from-hook pi` | `turn_summary` | TUI 互动确认未覆盖 |
+| `omp` | 暂无内置自动 Hook 适配器 | 仅支持显式 `ahub native-emit --agent omp ...` 手工调用 | 扩展自动监听未验证覆盖 |
+
+`ahub native-emit` 强制执行以下安全与幂等边界：
+
+1. **凭证隔离**：除命令行显式传入 `--url` / `--token` 外，固定只读取 `node.json` 中的 `hub_url` 与 `token`，忽略环境变量 `AHUB_URL`、`AHUB_TOKEN` 与客户端 `credentials` 文件。
+2. **目录白名单回退与先校验后读盘**：`native_notify.allowed_roots` 为空时默认回退复用 `node.json` 的 `project_roots`（两者均为空时 Fail-Closed 跳过）；**必须在工作区白名单校验通过之后**才允许打开读取 `agy` 的 `transcriptPath`，禁止对未授权路径触发磁盘读取。
+3. **大体积 Transcript 流式读取**：扫描 `agy` 的 `transcriptPath` 时采用流式 `bufio.Reader` 逐行读取并跳过超过 `4 MB` 的超长非目标行（或尾部定位最新 `PLANNER_RESPONSE`），避免固定 `4 MB` 缓冲上限导致扫描提前中止并返回旧轮次内容。
+4. **无单调轮次 ID Hook 的幂等键**：对于缺乏原生单调轮次 ID 的 Hook（如 `claude` `Notification` 重复审批通知，或未传有效 `executionNum` 的 `agy` `Stop`），在未显式指定 `--event-id` 时将 Transcript 末尾 `step_index`/行号或短时间粒度桶纳入 `event_id` 哈希维度，避免同会话重复审批或第 2 轮起总结通知被 `(node_id, event_id)` 去重静默丢弃。
+5. **出站前脱敏与长度有界**：上报前在节点本地对 `title`（上限 `200` 字符）与 `summary`（上限 `4000` 字符）执行 `redact.Text` 脱敏，云端 `POST /api/v1/nodes/:id/native-events` 入库前再次执行二次脱敏。
+
 ## 5. 配套 `skills/ahub/SKILL.md` 标准全文
 
 `ahub skill print` 将直接输出如下规范供任意 Agent 或外部助手加载：
@@ -207,13 +239,19 @@ Use the `ahub` CLI as the sole interface to `agent-hub`. Do not hand-craft HTTP 
      EOF
      ```
    - When running inside an environment with a webhook callback (e.g. Grok Bot), add `--notify grok`.
+   - **Show prompt at dispatch time**: On `ahub run`, display the masked prompt with `run_id` / `thread_id`; never rely on `ahub result` post-completion for raw `prompt`.
 
 4. **Handle wait outcomes by exit code**:
    - Exit `0` with `status: "done"`: Read `summary` and `output_preview` directly. Use `ahub result <run_id> --full --json` only if full output is needed.
-   - Exit `0` with `status: "running"` and `webhook_armed: true`: Inform the user the task is queued/running asynchronously and you will report back upon webhook callback.
+   - Exit `0` with `status: "running"` and `webhook_armed: true`: Share `run_id` / `thread_id` and the masked prompt, note async execution, and stop until callback.
    - Exit `24` (local wait timed out without `--notify`): Call `ahub wait <run_id> --timeout 15m --json` to keep waiting over WebSocket.
    - Exit `20` (`status: "needs_approval"`): Immediately surface `remote_control_url` to the user for human approval.
    - Exit `64` (`WORKDIR_AMBIGUOUS`): Re-run using one of the exact paths returned in `error.details.candidates`.
    - Exit `10` (`status: "failed"`): Read `error_code` and `error_message` on the run record.
    - Exit `78`: Read `error.code` and `error.message`; do not blindly retry on `DEPTH_LIMIT_EXCEEDED`, `DELEGATION_CYCLE_DETECTED`, or `FORBIDDEN_SCOPE`.
+
+5. **Report results and protect prompt privacy**:
+   - On `done`, `failed`, `cancelled`, or `needs_approval`, report `thread_id` / `run_id` and `summary` (or `remote_control_url`).
+   - Do **not** call `ahub result` to fetch `prompt` post-completion; `ahub_run_completed` callbacks may reference redacted `prompt_preview` only as a fallback.
+   - **Mandatory redaction**: Never output raw tokens, passwords, bearer credentials, API keys, or webhook secrets when displaying any prompt or output; mask sensitive values before replying.
 ```

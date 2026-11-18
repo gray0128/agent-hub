@@ -53,6 +53,7 @@ declare global {
         streamStatus: string;
         authStatus: string;
         authKind: string | null;
+        authScope: string | null;
       };
     };
   }
@@ -106,6 +107,7 @@ export function App() {
   const token = useWorkbenchStore((s) => s.token);
   const authStatus = useWorkbenchStore((s) => s.authStatus);
   const authKind = useWorkbenchStore((s) => s.authKind);
+  const authScope = useWorkbenchStore((s) => s.authScope);
   const streamStatus = useWorkbenchStore((s) => s.streamStatus);
   const activeTab = useWorkbenchStore((s) => s.activeTab);
   const threadQuery = useWorkbenchStore((s) => s.threadQuery);
@@ -131,6 +133,7 @@ export function App() {
 
   const [submitting, setSubmitting] = useState(false);
   const [dragLabel, setDragLabel] = useState<string | null>(null);
+  const [botKeys, setBotKeys] = useState<import("@/types").ApiKeyRecord[]>([]);
   const wsClientRef = useRef<HubStreamClient | null>(null);
   const hydrationGenRef = useRef<number>(0);
   const inFlightHydrationRef = useRef<Set<string>>(new Set());
@@ -160,7 +163,8 @@ export function App() {
           theme: wb.theme,
           streamStatus: wb.streamStatus,
           authStatus: wb.authStatus,
-          authKind: wb.authKind
+          authKind: wb.authKind,
+          authScope: wb.authScope
         };
       }
     };
@@ -212,7 +216,7 @@ export function App() {
     hydrationGenRef.current += 1;
     inFlightHydrationRef.current.clear();
     completedHydrationRef.current.clear();
-    setAuthState("checking", null);
+    setAuthState("checking", null, null);
     setStreamStatus("connecting");
 
     async function hydrateAndConnect() {
@@ -224,63 +228,67 @@ export function App() {
           apiClient.fetchRuns(token, { limit: 200 })
         ]);
         if (cancelled) return;
-        setAuthState("authenticated", meRes.principal.kind);
+        setAuthState("authenticated", meRes.principal.kind, meRes.principal.scope);
         setNodes(nodesRes.nodes);
         setThreads(threadsRes.threads);
         setRuns(runsRes.runs);
         syncDefaultSelection();
         setErrorBanner(null);
 
-        client = new HubStreamClient(token, {
-          onStatusChange: (status) => {
-            if (!cancelled) setStreamStatus(status);
-          },
-          onFrame: (frame) => {
-            if (cancelled) return;
-            switch (frame.type) {
-              case "snapshot":
-                setNodes(frame.nodes ?? []);
-                if (frame.threads) setThreads(frame.threads);
-                setRuns(frame.runs ?? []);
-                syncDefaultSelection();
-                break;
-              case "node.status":
-                upsertNode(frame.node);
-                break;
-              case "run.updated":
-                upsertRun(frame.run);
-                if (!useTaskStore.getState().threads.some((t) => t.id === frame.run.thread_id)) {
-                  void apiClient
-                    .fetchThreads(token)
-                    .then((res) => {
-                      if (!cancelled) setThreads(res.threads);
-                    })
-                    .catch(() => {});
-                }
-                break;
-              case "run.event":
-                appendEvents(frame.run_id, [
-                  {
-                    seq: frame.seq,
-                    kind: frame.kind,
-                    payload: frame.payload,
-                    ts: frame.ts
+        if (meRes.principal.scope === "admin") {
+          client = new HubStreamClient(token, {
+            onStatusChange: (status) => {
+              if (!cancelled) setStreamStatus(status);
+            },
+            onFrame: (frame) => {
+              if (cancelled) return;
+              switch (frame.type) {
+                case "snapshot":
+                  setNodes(frame.nodes ?? []);
+                  if (frame.threads) setThreads(frame.threads);
+                  setRuns(frame.runs ?? []);
+                  syncDefaultSelection();
+                  break;
+                case "node.status":
+                  upsertNode(frame.node);
+                  break;
+                case "run.updated":
+                  upsertRun(frame.run);
+                  if (!useTaskStore.getState().threads.some((t) => t.id === frame.run.thread_id)) {
+                    void apiClient
+                      .fetchThreads(token)
+                      .then((res) => {
+                        if (!cancelled) setThreads(res.threads);
+                      })
+                      .catch(() => {});
                   }
-                ]);
-                break;
-              case "run.events":
-                appendEvents(frame.run_id, frame.events);
-                break;
+                  break;
+                case "run.event":
+                  appendEvents(frame.run_id, [
+                    {
+                      seq: frame.seq,
+                      kind: frame.kind,
+                      payload: frame.payload,
+                      ts: frame.ts
+                    }
+                  ]);
+                  break;
+                case "run.events":
+                  appendEvents(frame.run_id, frame.events);
+                  break;
+              }
             }
-          }
-        });
-        wsClientRef.current = client;
-        client.start();
+          });
+          wsClientRef.current = client;
+          client.start();
+        } else {
+          setStreamStatus("disconnected");
+        }
       } catch (err) {
         if (cancelled) return;
         setStreamStatus("disconnected");
         if (err instanceof ApiClientError && err.status === 401) {
-          setAuthState("unauthenticated", null);
+          setAuthState("unauthenticated", null, null);
           setErrorBanner(
             token
               ? "访问 Token 无效或已吊销，请重新输入。"
@@ -577,6 +585,42 @@ export function App() {
     }
   }
 
+  useEffect(() => {
+    if (!hasSession || authStatus !== "authenticated" || authScope !== "admin") {
+      setBotKeys([]);
+      return;
+    }
+    if (keysDialogOpen) {
+      return;
+    }
+    let cancelled = false;
+    void apiClient
+      .fetchKeys(token)
+      .then((res) => {
+        if (!cancelled) {
+          setBotKeys(res.keys);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setBotKeys([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [authScope, authStatus, hasSession, keysDialogOpen, token]);
+
+  async function handleUpdateNodeDefaultNotify(nodeId: string, keyId: string | null) {
+    if (!hasSession) return;
+    try {
+      const res = await apiClient.patchNode(token, nodeId, {
+        default_notify_key_id: keyId
+      });
+      upsertNode(res.node);
+    } catch (err) {
+      setErrorBanner(err instanceof ApiClientError ? err.message : "更新默认通知通道失败");
+    }
+  }
+
   async function handleUpdateNodeConcurrency(nodeId: string, maxConcurrency: number) {
     if (!hasSession) return;
     try {
@@ -614,10 +658,7 @@ export function App() {
       });
 
       if (res.run) {
-        upsertRun({
-          ...res.run,
-          prompt: res.run.prompt ?? promptText
-        });
+        upsertRun(res.run);
         selectThread(res.run.thread_id);
         selectRun(res.run.id);
         const threadsRes = await apiClient.fetchThreads(token);
@@ -761,11 +802,13 @@ export function App() {
     selectedRun,
     allRuns: runs,
     selectedNode: selectedNodeForInspector,
+    botKeys,
     events: selectedRunEvents,
     onSelectRun: selectRun,
     onCancelRun: handleCancelRun,
     onToggleNodeDrain: handleToggleNodeDrain,
     onUpdateNodeConcurrency: handleUpdateNodeConcurrency,
+    onUpdateNodeDefaultNotify: authScope === "admin" ? handleUpdateNodeDefaultNotify : undefined,
     onPickWorkspace: handlePickWorkspace
   };
 
@@ -992,7 +1035,15 @@ export function App() {
 
         <KeysDialog
           open={keysDialogOpen}
-          onOpenChange={setKeysDialogOpen}
+          onOpenChange={(open) => {
+            setKeysDialogOpen(open);
+            if (!open && hasSession && authScope === "admin") {
+              void apiClient
+                .fetchNodes(token)
+                .then((res) => setNodes(res.nodes))
+                .catch(() => undefined);
+            }
+          }}
           token={token}
           authenticated={authStatus === "authenticated"}
           authKind={authKind}

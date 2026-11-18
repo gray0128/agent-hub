@@ -2,9 +2,15 @@
 
 ## Todo
 
+- [ ] 优化 agent-hub Web 页面的移动端体验
+
 ## Doing
 
 ## Done
+
+- [x] 交付节点绑定默认 Grok Bot 通知通道与 Agent 原生事件实时推送（新增 [0004_node_default_notify_and_native_events.sql](./apps/hub-worker/migrations/0004_node_default_notify_and_native_events.sql)、`POST /api/v1/nodes/:id/native-events`、`ahub native-emit` 的 `claude`/`codex`/`agy`/`pi` 官方 Hook 适配器；实现 `admin` 与 `client` 作用域隔离通知路由、`client` 节点元数据最小权限裁剪、凭据隔离及 Web 节点默认通道绑定与吊销实时失效徽章，通过 Mutation Gate 1/2、`make eval-fast` 与 `make eval-ui` Chromium CDP 实测）
+
+- [x] 优化配套 skills 与控面边界，使 Grok Bot 在 `ahub run` 派发阶段即向用户脱敏展示下发指令正文、结束回调不拉取原始未脱敏 `prompt`，并在控制面 REST/WS/CLI 统一脱敏与限长（更新 [skills/ahub/SKILL.md](./skills/ahub/SKILL.md)、[client-bootstrap.md](./apps/hub-worker/src/client-bootstrap.md)、[OnboardingKeysDialogs.tsx](./apps/web/src/components/workbench/OnboardingKeysDialogs.tsx) 与 [README.md](./README.md)；扩展 [run-record.schema.json](./docs/schemas/run-record.schema.json) 与 `docs/02`–`05` 契约；收敛对称的 [redact.ts](./apps/hub-worker/src/redact.ts)（<=250 行）与 [redact.go](./internal/redact/redact.go)（<=250 行），保持 `POST /api/v1/nodes/:id/claim` 明文执行与 `$VAR` 占位符保留，通过 `make test-unit`、`make eval-fast`、`make eval-ui` 与 `make eval-agent` 验证）
 
 - [x] 重构 Web 左侧「节点与会话」面板（[apps/web/src/components/workbench/FleetThreadsPane.tsx](./apps/web/src/components/workbench/FleetThreadsPane.tsx)）：将上下分栏改为「会话」与「节点」双标签页切换模式（默认「会话」并保留拖拽排序、置顶、分叉及 `tab` 选择器隔离），「节点」页全高展示在线状态/并发/可用 Agent 与一键全部收起/展开控制，并支持按节点独立收起/展开工作目录列表；同步更新 [docs/05-web-frontend-spec.md](./docs/05-web-frontend-spec.md) 与 [evals/web/cdp-runtime-eval.mjs](./evals/web/cdp-runtime-eval.mjs) 评测断言并通过 Mutation Gate 与 Chromium CDP 实测
 

@@ -151,6 +151,15 @@ func (c *Client) GetRun(ctx context.Context, runID string, full bool, tailBytes 
 	return &res.Run, nil
 }
 
+func (c *Client) EmitNativeEvent(ctx context.Context, nodeID string, req NativeEventRequest) (*NativeEventResponse, error) {
+	var res NativeEventResponse
+	path := "/api/v1/nodes/" + url.PathEscape(nodeID) + "/native-events"
+	if _, err := c.doJSON(ctx, http.MethodPost, path, req, &res, nil); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 func (c *Client) ListRuns(ctx context.Context, nodeID, status string, limit int) ([]RunRecord, error) {
 	q := url.Values{}
 	if nodeID != "" {

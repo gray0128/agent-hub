@@ -53,6 +53,7 @@
 - **角色与守护隔离**：严禁在云端 Bot 容器内执行 `ahub node init`、`ahub node serve` 或 `ahub node service`，统一使用 `ahub --url <HUB_URL> update --no-restart` 原地升级。
 - **多 Bot 共享计算机 `$HOME` 防串台**：同一账号下的多个 Grok Bot 共享同一台持久云端 Linux `$HOME`。推荐为每个 Bot 独立配置平台环境变量 Secret `AHUB_TOKEN`；若使用本地文件登录，务必先导出 `AHUB_CONFIG_DIR="$HOME/.config/ahub-bots/<bot_slug>"` 再通过 `--token-stdin` 写入，避免不同 Bot 的节点白名单与加密 Webhook 互相覆盖。
 - **容器冷重建自愈**：将跨机调度规范保存为 Grok Bot 平台原生 `ahub` Skill 时，自举指南会自动内置 `test -x "$HOME/.local/bin/ahub" || (curl -fsSL ... | sh && ...)` 探测头，容灾重建后首次触发即可自动恢复 CLI。
+- **派单即展示指令原文**：`grok-bot` 应在调用 `ahub run` 下发任务时直接向用户展示脱敏后的下发指令正文，不再等待任务完成后由控制面或 `ahub result` 回传原始明文 `prompt`。
 
 ### 一句话交给 Grok Bot 自动接入（推荐）
 
@@ -69,12 +70,14 @@
 为 Bot 配置异步 Webhook 通知（配合 `ahub run --notify grok`）后，在对应 Routine Prompt 中填入以下处理规范：
 
 ```text
-收到 agent-hub 的 `ahub_run_completed` Webhook 事件后，按以下规则处理并回复用户：
+收到 agent-hub 的 `ahub_run_completed` 或 `ahub_native_event` Webhook 事件后，按以下规则处理并回复用户：
 1. 若环境重建导致 `$HOME/.local/bin/ahub` 不存在，先执行：`export PATH="$HOME/.local/bin:$PATH"; test -x "$HOME/.local/bin/ahub" || (curl -fsSL https://ahub.bobocai.win/dl/install.sh | AHUB_URL=https://ahub.bobocai.win sh)`。
-2. 当 `status` 为 `needs_approval`：立即把事件中的 `remote_control_url` 原样发给用户，引导其打开放行或人工审批。
-3. 当 `status` 为 `done`：汇报结果 `summary` 与可续聊的 `thread_id`；若事件正文被截断且确需完整细节，调用 `ahub result <run_id> --full --json` 拉取完整输出后再总结。
-4. 当 `status` 为 `failed` 或 `cancelled`：清晰说明失败原因（`error_code` / `error_message`）并附上 `run_id`。
-5. 回调轮内禁止擅自循环重试或嵌套调用 `ahub run`。
+2. 收到 `ahub_run_completed` 汇报任意状态时，严禁再调 `ahub result` 拉取原始 `prompt`（完整指令已在派单时向用户展示），可按需引用事件中的脱敏 `prompt_preview` 作为只读上下文提示，严禁包含令牌、密码或其他凭据。
+3. 当 `ahub_run_completed` 的 `status` 为 `needs_approval`：立即把事件中的 `remote_control_url` 原样发给用户，引导其打开放行或人工审批，并可附带事件中的脱敏 `prompt_preview` 提示。
+4. 当 `ahub_run_completed` 的 `status` 为 `done`：汇报结果 `summary`、可续聊的 `thread_id` 与必要时的脱敏 `prompt_preview` 提示；若事件输出被截断且确需完整细节，调用 `ahub result <run_id> --full --json` 拉取完整输出后再总结。
+5. 当 `ahub_run_completed` 的 `status` 为 `failed` 或 `cancelled`：清晰说明失败原因（`error_code` / `error_message`）、`run_id` 与必要时的脱敏 `prompt_preview` 提示。
+6. 当收到 `ahub_native_event`（本地 Agent 原生会话通知）：仅作只读转达，展示 `node_id`、`agent`、`event_kind`（`interaction_needed` / `turn_summary`）、`workdir` 与脱敏后的 `title` / `summary`，严禁代用户审批、自动回复或发起新任务。
+7. 回调轮内禁止擅自循环重试或嵌套调用 `ahub run`。
 ```
 
 > **提示**：若 Grok Bot 中文桌面端在 Routine 详情面板未显示 Webhook URL 与 Bearer Key 字段，可使用同一账号访问 [`cursor.com/automations`](https://cursor.com/automations) 获取对应的 Webhook URL 与 Bearer Key，再填入 Web 控制台「API Keys 与 Bot Webhook 管理」。

@@ -3,6 +3,7 @@ import {
   type ApiScope,
   type EffortLevel,
   HubError,
+  type NativeEventKind,
   type NodeInboundFrame,
   type NodeStatus,
   type NotifyEvent,
@@ -29,9 +30,12 @@ const EVENT_KINDS = new Set<RunEventKind>([
 ]);
 const NOTIFY_TARGETS = new Set<NotifyTarget>(["none", "grok", "webhook"]);
 const NOTIFY_EVENTS = new Set<NotifyEvent>(["done", "failed", "cancelled", "needs_approval"]);
+const NATIVE_EVENT_KINDS = new Set<NativeEventKind>(["interaction_needed", "turn_summary"]);
 const NODE_ID_RE = /^[a-z0-9][a-z0-9_-]*$/;
 const THREAD_ID_RE = /^thr_[A-Za-z0-9]+$/;
 const RUN_ID_RE = /^run_[A-Za-z0-9]+$/;
+const KEY_ID_RE = /^key_[A-Za-z0-9]{8,64}$/;
+const NATIVE_EVENT_ID_RE = /^[A-Za-z0-9_.:-]{8,128}$/;
 
 function asRecord(raw: unknown, context: string): Record<string, unknown> {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
@@ -259,9 +263,14 @@ export function parsePatchNodeRequest(raw: unknown): {
   displayName?: string;
   status?: NodeStatus;
   maxConcurrency?: number;
+  defaultNotifyKeyId?: string | null;
 } {
   const obj = asRecord(raw, "PatchNodeRequest");
-  rejectUnknownKeys(obj, ["display_name", "status", "max_concurrency"], "PatchNodeRequest");
+  rejectUnknownKeys(
+    obj,
+    ["display_name", "status", "max_concurrency", "default_notify_key_id"],
+    "PatchNodeRequest"
+  );
   const displayName = asOptionalString(obj, "display_name", 128);
   const statusRaw = asOptionalString(obj, "status");
   let status: NodeStatus | undefined;
@@ -272,7 +281,75 @@ export function parsePatchNodeRequest(raw: unknown): {
     status = statusRaw;
   }
   const maxConcurrency = asOptionalInt(obj, "max_concurrency", 1, 16);
-  return { displayName, status, maxConcurrency };
+
+  let defaultNotifyKeyId: string | null | undefined;
+  if (obj["default_notify_key_id"] !== undefined) {
+    const rawKey = obj["default_notify_key_id"];
+    if (rawKey === null) {
+      defaultNotifyKeyId = null;
+    } else if (typeof rawKey === "string") {
+      const trimmed = rawKey.trim();
+      if (trimmed === "") {
+        defaultNotifyKeyId = null;
+      } else {
+        if (!KEY_ID_RE.test(trimmed)) {
+          throw new HubError(400, "BAD_REQUEST", "Invalid default_notify_key_id format.");
+        }
+        defaultNotifyKeyId = trimmed;
+      }
+    } else {
+      throw new HubError(400, "BAD_REQUEST", "Field 'default_notify_key_id' must be a string or null.");
+    }
+  }
+
+  return { displayName, status, maxConcurrency, defaultNotifyKeyId };
+}
+
+export interface ParsedNativeEventCreate {
+  eventId: string;
+  agent: AgentName;
+  eventKind: NativeEventKind;
+  nativeSessionId: string;
+  workdir: string;
+  title: string;
+  summary: string;
+  source: string;
+}
+
+export function parseNativeEventCreateRequest(raw: unknown): ParsedNativeEventCreate {
+  const obj = asRecord(raw, "NativeEventCreateRequest");
+  rejectUnknownKeys(
+    obj,
+    ["event_id", "agent", "event_kind", "native_session_id", "workdir", "title", "summary", "source"],
+    "NativeEventCreateRequest"
+  );
+  const eventId = asRequiredString(obj, "event_id", 8, 128).trim();
+  if (!NATIVE_EVENT_ID_RE.test(eventId)) {
+    throw new HubError(400, "BAD_REQUEST", "Invalid event_id format.");
+  }
+  const agentRaw = asRequiredString(obj, "agent");
+  if (!AGENTS.has(agentRaw as AgentName)) {
+    throw new HubError(400, "BAD_REQUEST", `Unsupported agent '${agentRaw}'.`);
+  }
+  const kindRaw = asRequiredString(obj, "event_kind");
+  if (!NATIVE_EVENT_KINDS.has(kindRaw as NativeEventKind)) {
+    throw new HubError(400, "BAD_REQUEST", `Invalid event_kind '${kindRaw}'.`);
+  }
+  const nativeSessionId = asOptionalString(obj, "native_session_id", 256) ?? "";
+  const workdir = asOptionalString(obj, "workdir", 1024) ?? "";
+  const title = asOptionalString(obj, "title", 200) ?? "";
+  const summary = asRequiredString(obj, "summary", 1, 4000);
+  const source = asOptionalString(obj, "source", 64) ?? "cli";
+  return {
+    eventId,
+    agent: agentRaw as AgentName,
+    eventKind: kindRaw as NativeEventKind,
+    nativeSessionId,
+    workdir,
+    title,
+    summary,
+    source
+  };
 }
 
 export function parseClaimRequest(raw: unknown): {

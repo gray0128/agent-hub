@@ -71,6 +71,9 @@
       "minimum": 10,
       "maximum": 7200
     },
+    "prompt": {
+      "type": "string"
+    },
     "status": {
       "type": "string",
       "enum": [

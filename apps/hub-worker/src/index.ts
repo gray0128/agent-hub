@@ -5,6 +5,7 @@ import {
   claimRunsForNode,
   completeRun,
   createApiKey,
+  createNativeEvent,
   createRun,
   forkThread,
   getApiKeyRawById,
@@ -12,6 +13,7 @@ import {
   heartbeatRun,
   listApiKeys,
   listNodes,
+  listNodesBoundToNotifyKey,
   listRunEvents,
   listRuns,
   listThreads,
@@ -55,6 +57,7 @@ import {
   parseCreateRunRequest,
   parseForkThreadRequest,
   parseHeartbeatRequest,
+  parseNativeEventCreateRequest,
   parsePatchNodeRequest,
   parsePatchKeyRequest,
   parsePatchRunRequest,
@@ -260,6 +263,19 @@ export default {
           return Response.json({ ok: true, node });
         }
 
+        const nativeEventsMatch = /^\/api\/v1\/nodes\/([^/]+)\/native-events$/.exec(pathname);
+        if (request.method === "POST" && nativeEventsMatch) {
+          requireScope(principal, ["node"]);
+          const nodeId = decodeURIComponent(nativeEventsMatch[1]!);
+          if (principal.boundNodeId !== nodeId) {
+            throw new HubError(403, "FORBIDDEN_SCOPE", "Node key cannot emit native events for another node.");
+          }
+          const body = parseNativeEventCreateRequest(await readJsonBody(request));
+          const result = await createNativeEvent(env.DB, env, nodeId, body);
+          const status = result.deduplicated ? 200 : result.event.notify_status === "queued" ? 202 : 200;
+          return Response.json({ ok: true, ...result }, { status });
+        }
+
         const claimMatch = /^\/api\/v1\/nodes\/([^/]+)\/claim$/.exec(pathname);
         if (request.method === "POST" && claimMatch) {
           requireScope(principal, ["node"]);
@@ -275,9 +291,9 @@ export default {
             body.busyWorkdirs,
             getLeaseTtl(env)
           );
-          const claimedRuns = claimedRows.map((r) => mapRunRow(r, { view: "list", includePrompt: true }));
-          for (const run of claimedRuns) {
-            ctx.waitUntil(broadcastRun(env, run));
+          const claimedRuns = claimedRows.map((r) => mapRunRow(r, { view: "list", promptMode: "raw" }));
+          for (const row of claimedRows) {
+            ctx.waitUntil(broadcastRun(env, mapRunRow(row, { view: "list", promptMode: "preview" })));
           }
           return Response.json({ ok: true, claimed_runs: claimedRuns });
         }
@@ -368,7 +384,7 @@ export default {
           const body = parseForkThreadRequest(await readJsonBody(request));
           ensureNodeAllowedForClient(principal, body.nodeId);
           const { thread, seedRun } = await forkThread(env.DB, env, principal, threadId, body);
-          const runRecord = mapRunRow(seedRun, { view: "summary", includePrompt: true });
+          const runRecord = mapRunRow(seedRun, { view: "summary" });
           await doPost(env, "/internal/wake", {
             node_id: seedRun.node_id,
             reason: "run_queued",
@@ -467,7 +483,7 @@ export default {
           const runId = decodeURIComponent(runDetailMatch[1]!);
           const body = parsePatchRunRequest(await readJsonBody(request));
           const updated = await patchQueuedRun(env.DB, principal, runId, body);
-          const runRecord = mapRunRow(updated, { view: "summary", includePrompt: true });
+          const runRecord = mapRunRow(updated, { view: "summary" });
           await broadcastRun(env, runRecord);
           await doPost(env, "/internal/wake", {
             node_id: updated.node_id,
@@ -630,6 +646,10 @@ export default {
             notifyWebhookCiphertext,
             notifyWebhookHost
           });
+          const affectedNodes = await listNodesBoundToNotifyKey(env.DB, keyId);
+          for (const n of affectedNodes) {
+            await broadcastNode(env, n);
+          }
           return Response.json({ ok: true, key });
         }
 
@@ -641,6 +661,10 @@ export default {
             key_id: keyId,
             bound_node_id: res.boundNodeId
           });
+          const affectedNodes = await listNodesBoundToNotifyKey(env.DB, keyId);
+          for (const n of affectedNodes) {
+            await broadcastNode(env, n);
+          }
           return Response.json({ ok: true, revoked_at: res.revokedAt });
         }
 

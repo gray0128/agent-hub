@@ -21,6 +21,9 @@ export type RunEventKind =
 export type NotifyTarget = "none" | "grok" | "webhook";
 export type NotifyEvent = "done" | "failed" | "cancelled" | "needs_approval";
 export type NotifyStatus = "none" | "queued" | "sent" | "failed";
+export type NativeEventKind = "interaction_needed" | "turn_summary";
+export type NativeEventNotifyStatus = "none" | "queued" | "sent" | "failed" | "skipped";
+export type NotifyRouteMode = "key" | "node_default" | "global_legacy";
 
 export type ErrorCode =
   | "UNAUTHORIZED"
@@ -74,7 +77,29 @@ export interface NodeRecord {
   status: NodeStatus;
   max_concurrency: number;
   active_runs_count: number;
+  default_notify_key_id?: string | null;
+  default_notify_key_name?: string;
+  default_notify_webhook_host?: string;
+  default_notify_valid?: boolean;
   last_seen_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface NativeEventRecord {
+  id: string;
+  node_id: string;
+  event_id: string;
+  agent: AgentName;
+  event_kind: NativeEventKind;
+  native_session_id: string;
+  workdir: string;
+  title: string;
+  summary: string;
+  source: string;
+  notify_key_id: string | null;
+  notify_status: NativeEventNotifyStatus;
+  notify_error: string;
   created_at: string;
   updated_at: string;
 }
@@ -173,7 +198,8 @@ export interface NotifyPolicy {
   events?: NotifyEvent[];
 }
 
-export interface NotifyQueueMessage {
+export interface RunNotifyQueueMessage {
+  kind?: "run";
   run_id: string;
   thread_id: string;
   root_run_id: string;
@@ -182,8 +208,18 @@ export interface NotifyQueueMessage {
   agent: AgentName;
   status: RunStatus;
   target: NotifyTarget;
+  route_mode?: NotifyRouteMode;
   attempt: number;
 }
+
+export interface NativeEventNotifyQueueMessage {
+  kind: "native_event";
+  native_event_id: string;
+  node_id: string;
+  attempt: number;
+}
+
+export type NotifyQueueMessage = RunNotifyQueueMessage | NativeEventNotifyQueueMessage;
 
 export interface Env {
   ASSETS?: Fetcher;

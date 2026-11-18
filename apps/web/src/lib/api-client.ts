@@ -67,7 +67,12 @@ export const apiClient = {
   patchNode(
     token: string,
     nodeId: string,
-    patch: { display_name?: string; status?: NodeStatus; max_concurrency?: number }
+    patch: {
+      display_name?: string;
+      status?: NodeStatus;
+      max_concurrency?: number;
+      default_notify_key_id?: string | null;
+    }
   ) {
     return requestJson<{ ok: true; node: NodeRecord }>(`/api/v1/nodes/${encodeURIComponent(nodeId)}`, token, {
       method: "PATCH",

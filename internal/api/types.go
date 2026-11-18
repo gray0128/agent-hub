@@ -23,19 +23,58 @@ type AgentCapability struct {
 }
 
 type NodeRecord struct {
-	ID              string                 `json:"id"`
-	DisplayName     string                 `json:"display_name"`
-	OS              string                 `json:"os"`
-	Arch            string                 `json:"arch"`
-	Version         string                 `json:"version"`
-	Capabilities    map[string]interface{} `json:"capabilities"`
-	Workspaces      []WorkspaceEntry       `json:"workspaces"`
-	Status          string                 `json:"status"`
-	MaxConcurrency  int                    `json:"max_concurrency"`
-	ActiveRunsCount int                    `json:"active_runs_count"`
-	LastSeenAt      *string                `json:"last_seen_at"`
-	CreatedAt       string                 `json:"created_at"`
-	UpdatedAt       string                 `json:"updated_at"`
+	ID                       string                 `json:"id"`
+	DisplayName              string                 `json:"display_name"`
+	OS                       string                 `json:"os"`
+	Arch                     string                 `json:"arch"`
+	Version                  string                 `json:"version"`
+	Capabilities             map[string]interface{} `json:"capabilities"`
+	Workspaces               []WorkspaceEntry       `json:"workspaces"`
+	Status                   string                 `json:"status"`
+	MaxConcurrency           int                    `json:"max_concurrency"`
+	ActiveRunsCount          int                    `json:"active_runs_count"`
+	DefaultNotifyKeyID       *string                `json:"default_notify_key_id,omitempty"`
+	DefaultNotifyKeyName     string                 `json:"default_notify_key_name,omitempty"`
+	DefaultNotifyWebhookHost string                 `json:"default_notify_webhook_host,omitempty"`
+	DefaultNotifyValid       *bool                  `json:"default_notify_valid,omitempty"`
+	LastSeenAt               *string                `json:"last_seen_at"`
+	CreatedAt                string                 `json:"created_at"`
+	UpdatedAt                string                 `json:"updated_at"`
+}
+
+type NativeEventRequest struct {
+	EventID         string `json:"event_id"`
+	Agent           string `json:"agent"`
+	EventKind       string `json:"event_kind"`
+	NativeSessionID string `json:"native_session_id,omitempty"`
+	Workdir         string `json:"workdir,omitempty"`
+	Title           string `json:"title,omitempty"`
+	Summary         string `json:"summary"`
+	Source          string `json:"source,omitempty"`
+}
+
+type NativeEventRecord struct {
+	ID              string  `json:"id"`
+	NodeID          string  `json:"node_id"`
+	EventID         string  `json:"event_id"`
+	Agent           string  `json:"agent"`
+	EventKind       string  `json:"event_kind"`
+	NativeSessionID string  `json:"native_session_id"`
+	Workdir         string  `json:"workdir"`
+	Title           string  `json:"title"`
+	Summary         string  `json:"summary"`
+	Source          string  `json:"source"`
+	NotifyKeyID     *string `json:"notify_key_id"`
+	NotifyStatus    string  `json:"notify_status"`
+	NotifyError     string  `json:"notify_error"`
+	CreatedAt       string  `json:"created_at"`
+	UpdatedAt       string  `json:"updated_at"`
+}
+
+type NativeEventResponse struct {
+	OK           bool              `json:"ok"`
+	Event        NativeEventRecord `json:"event"`
+	Deduplicated bool              `json:"deduplicated"`
 }
 
 type ThreadRecord struct {

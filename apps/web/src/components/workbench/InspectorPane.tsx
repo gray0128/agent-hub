@@ -18,6 +18,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   cn,
@@ -27,7 +28,7 @@ import {
   summarizeRunEvent
 } from "@/lib/utils";
 import type { InspectorTab } from "@/stores/workbench-store";
-import type { NodeRecord, RunEventItem, RunRecord } from "@/types";
+import type { ApiKeyRecord, NodeRecord, RunEventItem, RunRecord } from "@/types";
 import { CopyButton } from "./CopyButton";
 import { NodeStatusDot, RunStatusBadge } from "./StatusBadge";
 
@@ -105,13 +106,17 @@ export interface InspectorPaneProps {
   selectedRun: RunRecord | null;
   allRuns: RunRecord[];
   selectedNode: NodeRecord | null;
+  botKeys?: ApiKeyRecord[];
   events: RunEventItem[];
   onSelectRun: (runId: string) => void;
   onCancelRun: (runId: string, cascade: boolean) => void;
   onToggleNodeDrain: (node: NodeRecord) => void;
   onUpdateNodeConcurrency: (nodeId: string, maxConcurrency: number) => void;
+  onUpdateNodeDefaultNotify?: (nodeId: string, keyId: string | null) => void;
   onPickWorkspace: (nodeId: string, workdir: string) => void;
 }
+
+const UNBOUND_NOTIFY_VALUE = "__unbound__";
 
 export function InspectorPane({
   activeTab,
@@ -119,11 +124,13 @@ export function InspectorPane({
   selectedRun,
   allRuns,
   selectedNode,
+  botKeys = [],
   events,
   onSelectRun,
   onCancelRun,
   onToggleNodeDrain,
   onUpdateNodeConcurrency,
+  onUpdateNodeDefaultNotify,
   onPickWorkspace
 }: InspectorPaneProps) {
   const [expandedEvents, setExpandedEvents] = useState<Record<string, boolean>>({});
@@ -183,6 +190,17 @@ export function InspectorPane({
     const map = selectedNode?.capabilities?.agents ?? {};
     return Object.entries(map).filter(([, cfg]) => cfg.enabled !== false && cfg.available !== false);
   }, [selectedNode?.capabilities?.agents]);
+
+  const eligibleBotKeys = useMemo(() => {
+    if (!selectedNode) return [];
+    return botKeys.filter(
+      (k) =>
+        k.scope === "client" &&
+        k.revoked_at === null &&
+        k.has_webhook &&
+        (k.allowed_nodes.length === 0 || k.allowed_nodes.includes(selectedNode.id))
+    );
+  }, [botKeys, selectedNode]);
 
   return (
     <aside
@@ -482,6 +500,67 @@ export function InspectorPane({
                   />
                 </div>
               </div>
+
+              {onUpdateNodeDefaultNotify ? (
+                <div className="space-y-1.5 border-b border-border pb-2.5 text-xs">
+                  <div className="flex items-center justify-between gap-2">
+                    <label htmlFor="node-default-notify" className="text-muted-foreground">
+                      默认 Bot 通知通道
+                    </label>
+                    {selectedNode.default_notify_key_id && selectedNode.default_notify_valid === false ? (
+                      <Badge variant="failed" data-testid="node-notify-invalid-badge" className="text-[10px]">
+                        通道失效/已吊销
+                      </Badge>
+                    ) : selectedNode.default_notify_key_id ? (
+                      <Badge variant="done" data-testid="node-notify-valid-badge" className="font-mono text-[10px]">
+                        {selectedNode.default_notify_webhook_host || "已绑定"}
+                      </Badge>
+                    ) : (
+                      <span className="text-[11px] text-muted-foreground">未绑定</span>
+                    )}
+                  </div>
+                  {eligibleBotKeys.length > 0 || selectedNode.default_notify_key_id ? (
+                    <Select
+                      value={selectedNode.default_notify_key_id ?? UNBOUND_NOTIFY_VALUE}
+                      onValueChange={(v) =>
+                        onUpdateNodeDefaultNotify(
+                          selectedNode.id,
+                          v === UNBOUND_NOTIFY_VALUE ? null : v
+                        )
+                      }
+                    >
+                      <SelectTrigger
+                        id="node-default-notify"
+                        aria-label="默认 Bot 通知通道"
+                        data-testid="node-default-notify-select"
+                      >
+                        <SelectValue placeholder="未绑定（不通知）" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value={UNBOUND_NOTIFY_VALUE} data-testid="node-notify-option-unbound">
+                          未绑定（不通知）
+                        </SelectItem>
+                        {eligibleBotKeys.map((k) => (
+                          <SelectItem key={k.id} value={k.id} data-testid={`node-notify-option-${k.id}`}>
+                            {k.name} ({k.notify_webhook_host || "webhook"})
+                          </SelectItem>
+                        ))}
+                        {selectedNode.default_notify_key_id &&
+                        !eligibleBotKeys.some((k) => k.id === selectedNode.default_notify_key_id) ? (
+                          <SelectItem value={selectedNode.default_notify_key_id}>
+                            {selectedNode.default_notify_key_name || selectedNode.default_notify_key_id}
+                            {selectedNode.default_notify_valid === false ? "（已失效）" : ""}
+                          </SelectItem>
+                        ) : null}
+                      </SelectContent>
+                    </Select>
+                  ) : (
+                    <div className="text-[11px] text-muted-foreground">
+                      可在「API Keys」为 client 凭证配置 Bot Webhook 后在此绑定
+                    </div>
+                  )}
+                </div>
+              ) : null}
 
               <div className="space-y-2">
                 <div className="flex items-center justify-between gap-2">

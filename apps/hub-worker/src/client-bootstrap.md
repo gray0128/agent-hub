@@ -120,8 +120,10 @@ printf '%s' "$CLIENT_TOKEN" | "$AHUB_BIN" auth login --url __HUB_URL__ --token-s
 2. **派单与续聊规范**：
    - 先用 `ahub nodes --online --json` 获取在线节点、`project_key` 与真实可用 Agent；
    - 长任务指令一律使用 `- <<'EOF'` 从 `stdin` 传入，绝不在命令行拼接未转义引号；
-   - 若本 Bot 已绑定 Routine Webhook，派单统一附带 `--notify grok --wait 45s --json`；当返回退出码 `0` 且包含 `"status": "running", "webhook_armed": true` 时，立即告知用户任务已转后台异步执行并返回 `run_id` / `thread_id`，随即结束本轮对话，**严禁循环 `sleep` 轮询或额外调用 `ahub wait`**；
+   - **派单时直接向用户展示下发指令正文（脱敏）**：调用 `ahub run` 下发任务时，必须在当前派单回复中直接向用户展示实际下发的指令原文（连同 `run_id` / `thread_id`；若含敏感凭据须先严格脱敏），不得等任务完成后再由控制面或 `ahub result` 回拉原始明文 `prompt`；
+   - 若本 Bot 已绑定 Routine Webhook，派单统一附带 `--notify grok --wait 45s --json`；当返回退出码 `0` 且包含 `"status": "running", "webhook_armed": true` 时，立即告知用户任务已转后台异步执行并返回 `run_id` / `thread_id` 与本次下发指令正文，随即结束本轮对话，**严禁循环 `sleep` 轮询或额外调用 `ahub wait`**；
    - 未绑定 Webhook 且返回退出码 `24` 时，调用 `ahub wait <run_id> --timeout 15m --json`；
-   - 任何时候返回退出码 `20`（`needs_approval`），立即向用户原样展示 `remote_control_url` 人工审批链接；待用户确认已完成远控放行后，调用 `ahub resolve <run_id> --json` 结算任务并释放工作区锁。
+   - 任何时候返回退出码 `20`（`needs_approval`），立即向用户原样展示 `remote_control_url` 人工审批链接；待用户确认已完成远控放行后，调用 `ahub resolve <run_id> --json` 结算任务并释放工作区锁；
+   - **汇报结果与脱敏边界**：任务完成（`done`）、失败/取消（`failed`/`cancelled`）或进入人工审批（`needs_approval`）向用户汇报时，严禁再调用 `ahub result` 或控制面接口拉取原始 `prompt`；异步回调轮仅可将 `ahub_run_completed` 事件中的脱敏 `prompt_preview` 作为只读上下文提示（展示前必须严格脱敏，绝不得包含任何令牌、密码、Bearer Key 或其他凭据原文）。
 
 最后用简明中文向用户汇报：`ahub` 当前版本号、`hub_url`、`token_source`、`config_dir`、当前可访问的在线节点与工作区列表，以及平台原生 `ahub` Skill 固化状态；若用户启用了 `--notify grok`，提示其可在对应 Webhook Routine Prompt 中粘贴 `__HUB_URL__` 控制台提供的 `ahub_run_completed` 回调处理指令（**全程严禁出现任何密钥原文**）。

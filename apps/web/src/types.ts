@@ -59,6 +59,10 @@ export interface NodeRecord {
   status: NodeStatus;
   max_concurrency: number;
   active_runs_count: number;
+  default_notify_key_id?: string | null;
+  default_notify_key_name?: string;
+  default_notify_webhook_host?: string;
+  default_notify_valid?: boolean;
   last_seen_at: string | null;
   created_at: string;
   updated_at: string;

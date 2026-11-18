@@ -160,6 +160,7 @@ func newTestHarness(t *testing.T) *testHarness {
 		"--var", "LEASE_TTL_SECONDS:3",
 		"--var", "HUB_PUBLIC_URL:"+hubURL,
 		"--var", "WEBHOOK_URL:"+webhookSrv.URL,
+		"--var", "GROK_WEBHOOK_URL:"+webhookSrv.URL,
 		"--var", "WEBHOOK_ENCRYPTION_KEY:eval-test-master-secret-32bytes!!",
 		"--var", "RELEASE_BASE_URL:"+releaseSrv.URL,
 	)
@@ -1397,4 +1398,299 @@ func TestInvariantSuite(t *testing.T) {
 		_, _ = client.CancelRun(context.Background(), childEnv.Run.ID, false, "cleanup")
 		_, _ = client.CancelRun(context.Background(), parentEnv.Run.ID, false, "cleanup")
 	})
+}
+
+func TestInvariant_NodeDefaultNotifyAndNativeEventsIsolation(t *testing.T) {
+	h := newTestHarness(t)
+
+	wsRootMac := filepath.Join(h.tmpDir, "workspaces", "notify-mac-root")
+	wsMac := h.makeWorkspaceDir(filepath.Join("notify-mac-root", "proj-mac"))
+	wsRootMbp := filepath.Join(h.tmpDir, "workspaces", "notify-mbp-root")
+	wsMbp := h.makeWorkspaceDir(filepath.Join("notify-mbp-root", "proj-mbp"))
+
+	macTok := h.createKey("macmini-node", "node", "macmini", []string{"macmini"}, 0)
+	mbpTok := h.createKey("mbp-node", "node", "mbp", []string{"mbp"}, 0)
+	h.startDaemon("macmini", macTok, "", wsRootMac, 1)
+	h.startDaemon("mbp", mbpTok, "", wsRootMbp, 1)
+
+	botACh := make(chan map[string]interface{}, 8)
+	botBCh := make(chan map[string]interface{}, 8)
+	makeBotServer := func(ch chan map[string]interface{}) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var payload map[string]interface{}
+			_ = json.NewDecoder(r.Body).Decode(&payload)
+			ch <- payload
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}))
+	}
+	botASrv := makeBotServer(botACh)
+	defer botASrv.Close()
+	botBSrv := makeBotServer(botBCh)
+	defer botBSrv.Close()
+
+	botAKeyID, _ := h.createKeyWithWebhook("bot-a", "client", "", []string{"macmini"}, 1, botASrv.URL+"/hook", "sec_bot_a")
+	_, botBTok := h.createKeyWithWebhook("bot-b", "client", "", []string{"macmini", "mbp"}, 1, botBSrv.URL+"/hook", "sec_bot_b")
+	adminKeyTok := h.createKey("ops-admin", "admin", "", []string{}, 1)
+
+	doJSON := func(method, reqPath, tok string, payload interface{}) (int, []byte) {
+		t.Helper()
+		var bodyReader io.Reader
+		if payload != nil {
+			raw, _ := json.Marshal(payload)
+			bodyReader = bytes.NewReader(raw)
+		}
+		req, err := http.NewRequest(method, h.hubURL+reqPath, bodyReader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+tok)
+		if payload != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, raw
+	}
+
+	// 1. Bind macmini default notify channel to Bot A & verify admin vs client node visibility (R3.1)
+	st, raw := doJSON(http.MethodPatch, "/api/v1/nodes/macmini", h.adminToken, map[string]interface{}{
+		"default_notify_key_id": botAKeyID,
+	})
+	if st != http.StatusOK {
+		t.Fatalf("PATCH node default_notify_key_id failed (%d): %s", st, string(raw))
+	}
+
+	stAdminNodes, rawAdminNodes := doJSON(http.MethodGet, "/api/v1/nodes", h.adminToken, nil)
+	if stAdminNodes != http.StatusOK || !strings.Contains(string(rawAdminNodes), botAKeyID) || !strings.Contains(string(rawAdminNodes), `"default_notify_valid":true`) {
+		t.Fatalf("admin GET /api/v1/nodes missing default_notify metadata: (%d) %s", stAdminNodes, string(rawAdminNodes))
+	}
+	stClientNodes, rawClientNodes := doJSON(http.MethodGet, "/api/v1/nodes", botBTok, nil)
+	if stClientNodes != http.StatusOK {
+		t.Fatalf("client GET /api/v1/nodes failed (%d): %s", stClientNodes, string(rawClientNodes))
+	}
+	for _, hiddenField := range []string{"default_notify_key_id", "default_notify_key_name", "default_notify_webhook_host", "default_notify_valid", botAKeyID} {
+		if strings.Contains(string(rawClientNodes), hiddenField) {
+			t.Fatalf("client GET /api/v1/nodes leaked %q: %s", hiddenField, string(rawClientNodes))
+		}
+	}
+
+	// 2. Admin/Web run with target="none" routes to Bot A; prompt is redacted in REST & webhook but raw during claim execution (R1.2)
+	promptWithSecret := "Inspect $HOME with token=raw_secret_prompt_999"
+	st, raw = doJSON(http.MethodPost, "/api/v1/runs?wait_ms=0", h.adminToken, map[string]interface{}{
+		"node_id": "macmini",
+		"workdir": wsMac,
+		"agent":   "agy",
+		"prompt":  promptWithSecret,
+		"notify":  map[string]string{"target": "none"},
+	})
+	if st != http.StatusCreated && st != http.StatusAccepted {
+		t.Fatalf("admin run create failed (%d): %s", st, string(raw))
+	}
+	var adminRunEnv struct {
+		Run api.RunRecord `json:"run"`
+	}
+	_ = json.Unmarshal(raw, &adminRunEnv)
+	doneAdmin := h.mustRunCLIJSON("", "wait", adminRunEnv.Run.ID, "--timeout", "10s")
+	if doneAdmin.Status != "done" {
+		t.Fatalf("expected done status for admin run, got %+v", doneAdmin)
+	}
+
+	adminClient := api.NewClient(h.hubURL, h.adminToken)
+	fullAdminRun, err := adminClient.GetRun(context.Background(), adminRunEnv.Run.ID, true, 16384)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(fullAdminRun.OutputMD, "raw_secret_prompt_999") {
+		t.Fatalf("expected fakeagent execution output to reflect raw claim prompt, got %q", fullAdminRun.OutputMD)
+	}
+	if strings.Contains(fullAdminRun.Prompt, "raw_secret_prompt_999") || !strings.Contains(fullAdminRun.Prompt, "token=[REDACTED]") {
+		t.Fatalf("expected GET /runs/:id?view=full prompt redacted, got %q", fullAdminRun.Prompt)
+	}
+	if !strings.Contains(fullAdminRun.Prompt, "$HOME") {
+		t.Fatalf("expected GET /runs/:id?view=full prompt to preserve $HOME placeholder, got %q", fullAdminRun.Prompt)
+	}
+
+	select {
+	case hit := <-botACh:
+		if hit["event"] != "ahub_run_completed" || hit["run_id"] != adminRunEnv.Run.ID {
+			t.Fatalf("unexpected botA webhook payload: %+v", hit)
+		}
+		preview, _ := hit["prompt_preview"].(string)
+		if strings.Contains(preview, "raw_secret_prompt_999") || !strings.Contains(preview, "token=[REDACTED]") {
+			t.Fatalf("expected webhook prompt_preview redacted, got %q", preview)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatalf("expected admin target=none run to notify bound Bot A within 8s")
+	}
+
+	// 3. Client key (Bot B) run with target="none" MUST NOT leak to macmini's bound Bot A (R1.1)
+	st, raw = doJSON(http.MethodPost, "/api/v1/runs?wait_ms=0", botBTok, map[string]interface{}{
+		"node_id": "macmini",
+		"workdir": wsMac,
+		"agent":   "agy",
+		"prompt":  `{"directives":[{"op":"sleep","ms":15}]}`,
+		"notify":  map[string]string{"target": "none"},
+	})
+	if st != http.StatusCreated && st != http.StatusAccepted {
+		t.Fatalf("botB silent run create failed (%d): %s", st, string(raw))
+	}
+	var botBRunEnv struct {
+		Run api.RunRecord `json:"run"`
+	}
+	_ = json.Unmarshal(raw, &botBRunEnv)
+	h.mustRunCLIJSON("", "wait", botBRunEnv.Run.ID, "--timeout", "10s")
+	time.Sleep(500 * time.Millisecond)
+
+	botBChecked, err := adminClient.GetRun(context.Background(), botBRunEnv.Run.ID, false, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if botBChecked.NotifyStatus != "none" {
+		t.Fatalf("expected client key target=none notify_status=none, got %q", botBChecked.NotifyStatus)
+	}
+	select {
+	case leak := <-botACh:
+		t.Fatalf("cross-Bot leakage: Bot B target=none run notified Bot A: %+v", leak)
+	case leakB := <-botBCh:
+		t.Fatalf("unexpected Bot B notification for target=none: %+v", leakB)
+	case leakG := <-h.webhookCh:
+		t.Fatalf("unexpected global webhook for Bot B target=none: %+v", leakG)
+	case <-time.After(350 * time.Millisecond):
+	}
+
+	// 4. Admin API key with explicit --notify grok routes to node_default (macmini -> Bot A) and global_legacy (mbp -> webhookCh) (R2.1)
+	st, raw = doJSON(http.MethodPost, "/api/v1/runs?wait_ms=0", adminKeyTok, map[string]interface{}{
+		"node_id": "macmini",
+		"workdir": wsMac,
+		"agent":   "agy",
+		"prompt":  `{"directives":[{"op":"sleep","ms":15}]}`,
+		"notify":  map[string]string{"target": "grok"},
+	})
+	if st != http.StatusCreated && st != http.StatusAccepted {
+		t.Fatalf("adminKey macmini run failed (%d): %s", st, string(raw))
+	}
+	var admBoundEnv struct {
+		Run api.RunRecord `json:"run"`
+	}
+	_ = json.Unmarshal(raw, &admBoundEnv)
+	select {
+	case hit := <-botACh:
+		if hit["run_id"] != admBoundEnv.Run.ID {
+			t.Fatalf("expected Bot A hit for %s, got %+v", admBoundEnv.Run.ID, hit)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatalf("adminKey bound run did not deliver to Bot A within 8s")
+	}
+
+	st, raw = doJSON(http.MethodPost, "/api/v1/runs?wait_ms=0", adminKeyTok, map[string]interface{}{
+		"node_id": "mbp",
+		"workdir": wsMbp,
+		"agent":   "agy",
+		"prompt":  `{"directives":[{"op":"sleep","ms":15}]}`,
+		"notify":  map[string]string{"target": "grok"},
+	})
+	if st != http.StatusCreated && st != http.StatusAccepted {
+		t.Fatalf("adminKey mbp run failed (%d): %s", st, string(raw))
+	}
+	var admUnboundEnv struct {
+		Run api.RunRecord `json:"run"`
+	}
+	_ = json.Unmarshal(raw, &admUnboundEnv)
+	select {
+	case hit := <-h.webhookCh:
+		if hit["run_id"] != admUnboundEnv.Run.ID {
+			t.Fatalf("expected global GROK_WEBHOOK_URL hit for %s, got %+v", admUnboundEnv.Run.ID, hit)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatalf("adminKey unbound run did not deliver to GROK_WEBHOOK_URL within 8s")
+	}
+
+	// 5. ahub native-emit ignores poisoned AHUB_TOKEN/AHUB_URL env vars and delivers redacted ahub_native_event via node.json (R1.3)
+	nativeCfgPath := filepath.Join(h.tmpDir, "node-macmini-native.json")
+	nativeCfg := config.NodeConfig{
+		NodeID:       "macmini",
+		DisplayName:  "macmini",
+		HubURL:       h.hubURL,
+		Token:        macTok,
+		ProjectRoots: []string{wsRootMac},
+		NativeNotify: &config.NativeNotifyConfig{
+			Enabled:      true,
+			AllowedRoots: []string{wsRootMac},
+		},
+	}
+	nativeCfgRaw, _ := json.MarshalIndent(nativeCfg, "", "  ")
+	if err := os.WriteFile(nativeCfgPath, nativeCfgRaw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	emitCmd := exec.Command(
+		h.ahubBin, "--json", "native-emit",
+		"--config", nativeCfgPath,
+		"--agent", "claude",
+		"--kind", "interaction_needed",
+		"--dir", wsMac,
+		"--title", "Approve token=title_sec",
+		"--summary", "Summary ahub_cli_emitsecret123456",
+		"--event-id", "sub_native_evt_1",
+	)
+	emitCmd.Env = append(os.Environ(),
+		"AHUB_CONFIG_DIR="+h.configDir,
+		"AHUB_TOKEN=ahub_cli_poisoned_must_ignore",
+		"AHUB_URL=http://127.0.0.1:1",
+	)
+	emitOut, err := emitCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("native-emit failed with poisoned env: %v\n%s", err, string(emitOut))
+	}
+	select {
+	case hit := <-botACh:
+		if hit["event"] != "ahub_native_event" {
+			t.Fatalf("expected ahub_native_event webhook, got %+v", hit)
+		}
+		titleStr, _ := hit["title"].(string)
+		sumStr, _ := hit["summary"].(string)
+		if strings.Contains(titleStr, "title_sec") || strings.Contains(sumStr, "emitsecret123456") || !strings.Contains(sumStr, "ahub_cli_[REDACTED]") {
+			t.Fatalf("native event webhook contained unredacted secrets: %+v", hit)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatalf("native event webhook not delivered to Bot A within 8s")
+	}
+
+	// 6. Revoke Bot A -> subsequent native-emit fails closed with DEFAULT_CHANNEL_INVALID_OR_REVOKED and zero global fallback
+	stRevoke, rawRevoke := doJSON(http.MethodDelete, "/api/v1/keys/"+botAKeyID, h.adminToken, nil)
+	if stRevoke != http.StatusOK {
+		t.Fatalf("DELETE botA key failed (%d): %s", stRevoke, string(rawRevoke))
+	}
+
+	emitRevokedCmd := exec.Command(
+		h.ahubBin, "--json", "native-emit",
+		"--config", nativeCfgPath,
+		"--agent", "claude",
+		"--kind", "turn_summary",
+		"--dir", wsMac,
+		"--summary", "After revoke summary",
+		"--event-id", "sub_native_evt_2_revoked",
+	)
+	emitRevokedCmd.Env = append(os.Environ(), "AHUB_CONFIG_DIR="+h.configDir)
+	revokedOut, err := emitRevokedCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("native-emit after revoke failed unexpectedly: %v\n%s", err, string(revokedOut))
+	}
+	var emitRevokedEnv api.NativeEventResponse
+	if err := json.Unmarshal(revokedOut, &emitRevokedEnv); err != nil {
+		t.Fatalf("decode native-emit revoked json: %v (%s)", err, string(revokedOut))
+	}
+	if emitRevokedEnv.Event.NotifyStatus != "failed" || emitRevokedEnv.Event.NotifyError != "DEFAULT_CHANNEL_INVALID_OR_REVOKED" {
+		t.Fatalf("expected failed/DEFAULT_CHANNEL_INVALID_OR_REVOKED after key revoke, got %+v", emitRevokedEnv.Event)
+	}
+	select {
+	case stray := <-h.webhookCh:
+		t.Fatalf("revoked channel leaked to global webhook: %+v", stray)
+	case <-time.After(350 * time.Millisecond):
+	}
 }

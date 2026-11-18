@@ -1,4 +1,5 @@
 import { ensureNodeAllowedForClient, ensureRunAccessible, isNodeVisibleToPrincipal } from "./auth";
+import { buildPromptPreview, redactSecrets } from "./redact";
 import {
   type AgentName,
   type ApiKeyRecord,
@@ -7,11 +8,15 @@ import {
   type EffortLevel,
   type Env,
   HubError,
+  type NativeEventKind,
+  type NativeEventNotifyStatus,
+  type NativeEventRecord,
   type NodeRecord,
   type NodeStatus,
   type NotifyEvent,
   type NotifyPolicy,
   type NotifyQueueMessage,
+  type NotifyRouteMode,
   type NotifyStatus,
   type RunEventInput,
   type RunEventKind,
@@ -26,6 +31,7 @@ import { newId, nowIso, sanitizeTailPreview, truncateUtf8Bytes } from "./ulid";
 import {
   type ApprovalCheckpointInput,
   type ParsedCreateRun,
+  type ParsedNativeEventCreate,
   type ResolveRunInput
 } from "./validation";
 
@@ -42,7 +48,32 @@ interface NodeRow {
   status: NodeStatus;
   max_concurrency: number;
   active_runs_count: number;
+  default_notify_key_id: string | null;
   last_seen_at: string | null;
+  created_at: string;
+  updated_at: string;
+  notify_key_name?: string | null;
+  notify_key_scope?: ApiScope | null;
+  notify_key_revoked_at?: string | null;
+  notify_key_webhook_host?: string | null;
+  notify_key_has_webhook?: number | null;
+  notify_key_allowed_nodes_json?: string | null;
+}
+
+interface NativeEventRow {
+  id: string;
+  node_id: string;
+  event_id: string;
+  agent: AgentName;
+  event_kind: NativeEventKind;
+  native_session_id: string;
+  workdir: string;
+  title: string;
+  summary: string;
+  source: string;
+  notify_key_id: string | null;
+  notify_status: NativeEventNotifyStatus;
+  notify_error: string;
   created_at: string;
   updated_at: string;
 }
@@ -167,8 +198,25 @@ export function parseNotifyPolicy(raw: string): NotifyPolicy {
   return { target: "none" };
 }
 
+function isBoundNotifyKeyValidForNode(
+  nodeId: string,
+  key: {
+    scope: ApiScope | null | undefined;
+    revoked_at: string | null | undefined;
+    has_webhook: boolean;
+    allowed_nodes_json: string | null | undefined;
+  }
+): boolean {
+  if (key.scope !== "client" || key.revoked_at !== null || !key.has_webhook) {
+    return false;
+  }
+  const allowed = parseStringArray(key.allowed_nodes_json ?? "[]");
+  return allowed.length === 0 || allowed.includes(nodeId);
+}
+
 export function mapNodeRow(row: NodeRow): NodeRecord {
-  return {
+  const defaultNotifyKeyId = row.default_notify_key_id ?? null;
+  const record: NodeRecord = {
     id: row.id,
     display_name: row.display_name,
     os: row.os,
@@ -179,7 +227,39 @@ export function mapNodeRow(row: NodeRow): NodeRecord {
     status: row.status,
     max_concurrency: row.max_concurrency,
     active_runs_count: row.active_runs_count,
+    default_notify_key_id: defaultNotifyKeyId,
     last_seen_at: row.last_seen_at,
+    created_at: row.created_at,
+    updated_at: row.updated_at
+  };
+  if (defaultNotifyKeyId) {
+    record.default_notify_key_name = row.notify_key_name ?? "";
+    record.default_notify_webhook_host = row.notify_key_webhook_host ?? "";
+    record.default_notify_valid = isBoundNotifyKeyValidForNode(row.id, {
+      scope: row.notify_key_scope,
+      revoked_at: row.notify_key_revoked_at ?? null,
+      has_webhook: row.notify_key_has_webhook === 1,
+      allowed_nodes_json: row.notify_key_allowed_nodes_json
+    });
+  }
+  return record;
+}
+
+export function mapNativeEventRow(row: NativeEventRow): NativeEventRecord {
+  return {
+    id: row.id,
+    node_id: row.node_id,
+    event_id: row.event_id,
+    agent: row.agent,
+    event_kind: row.event_kind,
+    native_session_id: row.native_session_id,
+    workdir: row.workdir,
+    title: row.title,
+    summary: row.summary,
+    source: row.source,
+    notify_key_id: row.notify_key_id ?? null,
+    notify_status: row.notify_status,
+    notify_error: row.notify_error,
     created_at: row.created_at,
     updated_at: row.updated_at
   };
@@ -203,17 +283,32 @@ export function mapThreadRow(row: ThreadRow): ThreadRecord {
   };
 }
 
+export type RunPromptMode = "preview" | "full_redacted" | "raw" | "none";
+
+export function sanitizeNodeForScope(node: NodeRecord, scope: ApiScope): NodeRecord {
+  if (scope === "admin") {
+    return node;
+  }
+  const copy: NodeRecord = { ...node };
+  delete copy.default_notify_key_id;
+  delete copy.default_notify_key_name;
+  delete copy.default_notify_webhook_host;
+  delete copy.default_notify_valid;
+  return copy;
+}
+
 export function mapRunRow(
   row: RunRow,
   options: {
     view?: "summary" | "full" | "list";
     tailBytes?: number;
-    includePrompt?: boolean;
+    promptMode?: RunPromptMode;
     webhookArmed?: boolean;
   } = {}
 ): RunRecord {
   const view = options.view ?? "summary";
   const tailBytes = options.tailBytes ?? 16384;
+  const promptMode = options.promptMode ?? "preview";
   const record: RunRecord = {
     id: row.id,
     thread_id: row.thread_id,
@@ -247,8 +342,12 @@ export function mapRunRow(
     updated_at: row.updated_at
   };
 
-  if (options.includePrompt) {
+  if (promptMode === "raw") {
     record.prompt = row.prompt;
+  } else if (promptMode === "full_redacted") {
+    record.prompt = redactSecrets(row.prompt);
+  } else if (promptMode === "preview") {
+    record.prompt = buildPromptPreview(row.prompt, 1200).promptPreview;
   }
   if (options.webhookArmed !== undefined) {
     record.webhook_armed = options.webhookArmed;
@@ -350,15 +449,39 @@ export function resolveWorkspace(
   );
 }
 
+const NODE_SELECT_SQL = `SELECT n.*,
+  k.name AS notify_key_name,
+  k.scope AS notify_key_scope,
+  k.revoked_at AS notify_key_revoked_at,
+  k.notify_webhook_host AS notify_key_webhook_host,
+  CASE WHEN k.notify_webhook_ciphertext != '' THEN 1 ELSE 0 END AS notify_key_has_webhook,
+  k.allowed_nodes_json AS notify_key_allowed_nodes_json
+FROM nodes n
+LEFT JOIN api_keys k ON k.id = n.default_notify_key_id`;
+
 export async function listNodes(
   db: D1Database,
   principal: AuthPrincipal
 ): Promise<NodeRecord[]> {
   const res = await db
-    .prepare(`SELECT * FROM nodes ORDER BY CASE status WHEN 'online' THEN 0 WHEN 'draining' THEN 1 ELSE 2 END, id ASC`)
+    .prepare(`${NODE_SELECT_SQL} ORDER BY CASE n.status WHEN 'online' THEN 0 WHEN 'draining' THEN 1 ELSE 2 END, n.id ASC`)
     .all<NodeRow>();
   const rows = res.results ?? [];
-  return rows.map(mapNodeRow).filter((n) => isNodeVisibleToPrincipal(principal, n.id));
+  return rows
+    .map(mapNodeRow)
+    .filter((n) => isNodeVisibleToPrincipal(principal, n.id))
+    .map((n) => sanitizeNodeForScope(n, principal.scope));
+}
+
+export async function listNodesBoundToNotifyKey(
+  db: D1Database,
+  keyId: string
+): Promise<NodeRecord[]> {
+  const res = await db
+    .prepare(`${NODE_SELECT_SQL} WHERE n.default_notify_key_id = ?1`)
+    .bind(keyId)
+    .all<NodeRow>();
+  return (res.results ?? []).map(mapNodeRow);
 }
 
 function makeRecalcNodeActiveRunsStmt(db: D1Database, nodeId: string, now: string): D1PreparedStatement {
@@ -421,30 +544,92 @@ async function ensureThreadAccessible(
 }
 
 export async function getNodeById(db: D1Database, nodeId: string): Promise<NodeRecord | null> {
-  const row = await db.prepare(`SELECT * FROM nodes WHERE id = ?1`).bind(nodeId).first<NodeRow>();
+  const row = await db.prepare(`${NODE_SELECT_SQL} WHERE n.id = ?1`).bind(nodeId).first<NodeRow>();
   return row ? mapNodeRow(row) : null;
 }
 
 export async function patchNode(
   db: D1Database,
   nodeId: string,
-  patch: { displayName?: string; status?: NodeStatus; maxConcurrency?: number }
+  patch: {
+    displayName?: string;
+    status?: NodeStatus;
+    maxConcurrency?: number;
+    defaultNotifyKeyId?: string | null;
+  }
 ): Promise<NodeRecord> {
   const existing = await db.prepare(`SELECT * FROM nodes WHERE id = ?1`).bind(nodeId).first<NodeRow>();
   if (!existing) {
     throw new HubError(404, "NODE_NOT_FOUND", `Node '${nodeId}' not found.`);
   }
+
+  let nextDefaultNotifyKeyId = existing.default_notify_key_id ?? null;
+  if (patch.defaultNotifyKeyId !== undefined) {
+    if (patch.defaultNotifyKeyId === null) {
+      nextDefaultNotifyKeyId = null;
+    } else {
+      const keyRow = await db
+        .prepare(
+          `SELECT id, scope, allowed_nodes_json, notify_webhook_ciphertext, revoked_at
+           FROM api_keys WHERE id = ?1 LIMIT 1`
+        )
+        .bind(patch.defaultNotifyKeyId)
+        .first<{
+          id: string;
+          scope: ApiScope;
+          allowed_nodes_json: string;
+          notify_webhook_ciphertext: string;
+          revoked_at: string | null;
+        }>();
+      if (!keyRow) {
+        throw new HubError(404, "NOT_FOUND", `API key '${patch.defaultNotifyKeyId}' not found.`);
+      }
+      if (keyRow.revoked_at !== null) {
+        throw new HubError(
+          409,
+          "INVALID_STATE_TRANSITION",
+          `API key '${patch.defaultNotifyKeyId}' is revoked and cannot be bound as node default channel.`
+        );
+      }
+      if (keyRow.scope !== "client") {
+        throw new HubError(
+          400,
+          "BAD_REQUEST",
+          "Node default notify channel must reference a client scope API key."
+        );
+      }
+      if (!keyRow.notify_webhook_ciphertext?.trim()) {
+        throw new HubError(
+          400,
+          "BAD_REQUEST",
+          `Client key '${patch.defaultNotifyKeyId}' has no configured Bot Webhook.`
+        );
+      }
+      const allowed = parseStringArray(keyRow.allowed_nodes_json);
+      if (allowed.length > 0 && !allowed.includes(nodeId)) {
+        throw new HubError(
+          400,
+          "BAD_REQUEST",
+          `Client key '${patch.defaultNotifyKeyId}' does not allow node '${nodeId}'.`
+        );
+      }
+      nextDefaultNotifyKeyId = keyRow.id;
+    }
+  }
+
   const now = nowIso();
   const displayName = patch.displayName ?? existing.display_name;
   const status = patch.status ?? existing.status;
   const maxConcurrency = patch.maxConcurrency ?? existing.max_concurrency;
   await db
     .prepare(
-      `UPDATE nodes SET display_name = ?1, status = ?2, max_concurrency = ?3, updated_at = ?4 WHERE id = ?5`
+      `UPDATE nodes
+       SET display_name = ?1, status = ?2, max_concurrency = ?3, default_notify_key_id = ?4, updated_at = ?5
+       WHERE id = ?6`
     )
-    .bind(displayName, status, maxConcurrency, now, nodeId)
+    .bind(displayName, status, maxConcurrency, nextDefaultNotifyKeyId, now, nodeId)
     .run();
-  const updated = await db.prepare(`SELECT * FROM nodes WHERE id = ?1`).bind(nodeId).first<NodeRow>();
+  const updated = await db.prepare(`${NODE_SELECT_SQL} WHERE n.id = ?1`).bind(nodeId).first<NodeRow>();
   return mapNodeRow(updated!);
 }
 
@@ -495,7 +680,7 @@ export async function upsertNodeHello(
       now
     )
     .run();
-  const row = await db.prepare(`SELECT * FROM nodes WHERE id = ?1`).bind(nodeId).first<NodeRow>();
+  const row = await db.prepare(`${NODE_SELECT_SQL} WHERE n.id = ?1`).bind(nodeId).first<NodeRow>();
   return mapNodeRow(row!);
 }
 
@@ -510,7 +695,7 @@ export async function setNodeOffline(db: D1Database, nodeId: string): Promise<No
     )
     .bind(now, nodeId)
     .run();
-  const row = await db.prepare(`SELECT * FROM nodes WHERE id = ?1`).bind(nodeId).first<NodeRow>();
+  const row = await db.prepare(`${NODE_SELECT_SQL} WHERE n.id = ?1`).bind(nodeId).first<NodeRow>();
   return row ? mapNodeRow(row) : null;
 }
 
@@ -979,10 +1164,49 @@ export async function enqueueRunNotificationIfNeeded(
   event: NotifyEvent
 ): Promise<boolean> {
   const policy = parseNotifyPolicy(run.notify_policy_json);
-  if (!shouldNotifyOnEvent(policy, event)) {
-    return false;
+  let target = policy.target;
+  let routeMode: NotifyRouteMode = "key";
+
+  let isAdminOrHuman = true;
+  if (run.created_by_key_id) {
+    const keyRow = await db
+      .prepare(`SELECT scope FROM api_keys WHERE id = ?1 LIMIT 1`)
+      .bind(run.created_by_key_id)
+      .first<{ scope: ApiScope }>();
+    isAdminOrHuman = keyRow?.scope === "admin";
   }
+
+  if (target === "none") {
+    if (run.depth !== 0 || !isAdminOrHuman) {
+      return false;
+    }
+    const node = await getNodeById(db, run.node_id);
+    if (!node?.default_notify_key_id) {
+      return false;
+    }
+    if (!node.default_notify_valid) {
+      await db
+        .prepare(`UPDATE runs SET notify_status = 'failed', updated_at = ?1 WHERE id = ?2`)
+        .bind(nowIso(), run.id)
+        .run();
+      return false;
+    }
+    target = "grok";
+    routeMode = "node_default";
+  } else {
+    if (!shouldNotifyOnEvent(policy, event)) {
+      return false;
+    }
+    if (!isAdminOrHuman) {
+      routeMode = "key";
+    } else {
+      const node = await getNodeById(db, run.node_id);
+      routeMode = node?.default_notify_key_id ? "node_default" : "global_legacy";
+    }
+  }
+
   const msg: NotifyQueueMessage = {
+    kind: "run",
     run_id: run.id,
     thread_id: run.thread_id,
     root_run_id: run.root_run_id,
@@ -990,7 +1214,8 @@ export async function enqueueRunNotificationIfNeeded(
     workdir: run.workdir,
     agent: run.agent,
     status: run.status,
-    target: policy.target,
+    target,
+    route_mode: routeMode,
     attempt: 1
   };
   await env.NOTIFY_QUEUE.send(msg);
@@ -999,6 +1224,98 @@ export async function enqueueRunNotificationIfNeeded(
     .bind(nowIso(), run.id)
     .run();
   return true;
+}
+
+export async function createNativeEvent(
+  db: D1Database,
+  env: Env,
+  nodeId: string,
+  input: ParsedNativeEventCreate
+): Promise<{ event: NativeEventRecord; deduplicated: boolean }> {
+  const existing = await db
+    .prepare(`SELECT * FROM native_events WHERE node_id = ?1 AND event_id = ?2 LIMIT 1`)
+    .bind(nodeId, input.eventId)
+    .first<NativeEventRow>();
+  if (existing) {
+    return { event: mapNativeEventRow(existing), deduplicated: true };
+  }
+
+  const node = await getNodeById(db, nodeId);
+  if (!node) {
+    throw new HubError(404, "NODE_NOT_FOUND", `Node '${nodeId}' not found.`);
+  }
+
+  const sanitizedTitle = redactSecrets(input.title).slice(0, 200);
+  const sanitizedSummary = redactSecrets(input.summary).slice(0, 4000);
+  const id = newId("evt");
+  const now = nowIso();
+
+  let notifyKeyId: string | null = node.default_notify_key_id ?? null;
+  let notifyStatus: NativeEventNotifyStatus = "skipped";
+  let notifyError = "";
+
+  if (!notifyKeyId) {
+    notifyStatus = "skipped";
+    notifyError = "NODE_DEFAULT_CHANNEL_UNBOUND";
+  } else if (!node.default_notify_valid) {
+    notifyStatus = "failed";
+    notifyError = "DEFAULT_CHANNEL_INVALID_OR_REVOKED";
+  } else {
+    notifyStatus = "queued";
+  }
+
+  const insertRes = await db
+    .prepare(
+      `INSERT OR IGNORE INTO native_events (
+         id, node_id, event_id, agent, event_kind, native_session_id, workdir,
+         title, summary, source, notify_key_id, notify_status, notify_error, created_at, updated_at
+       ) VALUES (
+         ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+         ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14
+       )`
+    )
+    .bind(
+      id,
+      nodeId,
+      input.eventId,
+      input.agent,
+      input.eventKind,
+      input.nativeSessionId,
+      input.workdir,
+      sanitizedTitle,
+      sanitizedSummary,
+      input.source,
+      notifyKeyId,
+      notifyStatus,
+      notifyError,
+      now
+    )
+    .run();
+
+  if ((insertRes.meta.changes ?? 0) === 0) {
+    const raced = await db
+      .prepare(`SELECT * FROM native_events WHERE node_id = ?1 AND event_id = ?2 LIMIT 1`)
+      .bind(nodeId, input.eventId)
+      .first<NativeEventRow>();
+    if (raced) {
+      return { event: mapNativeEventRow(raced), deduplicated: true };
+    }
+  }
+
+  if (notifyStatus === "queued") {
+    await env.NOTIFY_QUEUE.send({
+      kind: "native_event",
+      native_event_id: id,
+      node_id: nodeId,
+      attempt: 1
+    });
+  }
+
+  const created = await db
+    .prepare(`SELECT * FROM native_events WHERE id = ?1 LIMIT 1`)
+    .bind(id)
+    .first<NativeEventRow>();
+  return { event: mapNativeEventRow(created!), deduplicated: false };
 }
 
 export async function completeRun(
@@ -1726,7 +2043,7 @@ export async function listRuns(
   const res = await db.prepare(sql).bind(...binds).all<RunRow>();
   return (res.results ?? [])
     .filter((r) => isNodeVisibleToPrincipal(principal, r.node_id))
-    .map((r) => mapRunRow(r, { view: "list", includePrompt: true }));
+    .map((r) => mapRunRow(r, { view: "list", promptMode: "preview" }));
 }
 
 export async function getRunById(
@@ -1741,7 +2058,11 @@ export async function getRunById(
     throw new HubError(404, "NOT_FOUND", `Run '${runId}' not found.`);
   }
   ensureRunAccessible(principal, row);
-  return mapRunRow(row, { view, tailBytes, includePrompt: true });
+  return mapRunRow(row, {
+    view,
+    tailBytes,
+    promptMode: view === "full" ? "full_redacted" : "preview"
+  });
 }
 
 export async function listRunEvents(

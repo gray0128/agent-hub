@@ -72,12 +72,14 @@ function buildGrokRoutinePrompt(hubOrigin: string, isolatedSlug?: string): strin
   const cfgPrefix = isolatedSlug
     ? `export AHUB_CONFIG_DIR="$HOME/.config/ahub-bots/${toBotSlug(isolatedSlug)}"; `
     : "";
-  return `收到 agent-hub 的 \`ahub_run_completed\` Webhook 事件后，按以下规则处理并回复用户：
+  return `收到 agent-hub 的 \`ahub_run_completed\` 或 \`ahub_native_event\` Webhook 事件后，按以下规则处理并回复用户：
 1. 若云端环境冷重建导致 \`$HOME/.local/bin/ahub\` 不存在，先执行：\`export PATH="$HOME/.local/bin:$PATH"; ${cfgPrefix}test -x "$HOME/.local/bin/ahub" || (curl -fsSL ${hubOrigin}/dl/install.sh | AHUB_URL=${hubOrigin} sh && "$HOME/.local/bin/ahub" skill install >/dev/null)\`。
-2. 当 \`status\` 为 \`needs_approval\`：立即把事件中的 \`remote_control_url\` 原样发给用户，引导人工审批放行。
-3. 当 \`status\` 为 \`done\`：向用户汇报 \`summary\` 与可续聊的 \`thread_id\`；若事件预览被截断且确需完整正文，调用 \`${cfgPrefix}ahub --url ${hubOrigin} result <run_id> --full --json\` 读取完整输出后再总结。
-4. 当 \`status\` 为 \`failed\` 或 \`cancelled\`：清晰说明 \`error_code\` / \`error_message\` 与 \`run_id\`。
-5. 回调处理轮内禁止循环重试或嵌套发起新的 \`ahub run\`。`;
+2. 收到 \`ahub_run_completed\` 时，下发指令正文已在发起 \`ahub run\` 阶段向用户脱敏展示；回调汇报可按需引用事件中已脱敏的 \`prompt_preview\` 作为只读上下文核对，严禁在任务结束后调用 \`ahub result\` 拉取原始未脱敏 \`prompt\`，严禁输出任何令牌、密码、Bearer Key 或其他凭据原文。
+3. 当 \`ahub_run_completed\` 的 \`status\` 为 \`needs_approval\`：立即把事件中的 \`remote_control_url\` 原样发给用户，引导人工审批放行。
+4. 当 \`ahub_run_completed\` 的 \`status\` 为 \`done\`：向用户汇报 \`summary\` 与可续聊的 \`thread_id\`；仅当事件中的输出摘要不足以回答用户且确需完整产出正文（\`output_md\`）时，才调用 \`${cfgPrefix}ahub --url ${hubOrigin} result <run_id> --full --json\` 读取 \`output_md\` 后总结。
+5. 当 \`ahub_run_completed\` 的 \`status\` 为 \`failed\` 或 \`cancelled\`：清晰说明 \`error_code\` / \`error_message\` 与 \`run_id\`。
+6. 当收到 \`ahub_native_event\`（本地 Agent 原生会话通知）：仅作只读转达，向用户展示节点 \`node_id\`、\`agent\`、\`event_kind\`（\`interaction_needed\` 需用户互动或 \`turn_summary\` 结束总结）、\`workdir\` 与脱敏后的 \`title\` / \`summary\`；严禁代用户审批放行、严禁自动代答或发起新任务。
+7. 回调处理轮内禁止循环重试或嵌套发起新的 \`ahub run\`。`;
 }
 
 interface PromptCopyBoxProps {

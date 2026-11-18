@@ -36,7 +36,7 @@ registerHooks({
   }
 });
 
-const { handleBinaryDownload, handleBootstrapMd, handleClientBootstrapMd, handleInstallSh } =
+const { handleBinaryDownload, handleBootstrapMd, handleClientBootstrapMd, handleInstallSh, handleSkillMd } =
   await import("./downloads.ts");
 
 test("handleBootstrapMd injects HUB_PUBLIC_URL across all placeholders", async () => {
@@ -70,6 +70,21 @@ test("handleClientBootstrapMd injects HUB_PUBLIC_URL and enforces client isolati
   assert.equal(text.includes(".grok/skills"), true);
   assert.equal(text.includes("严禁执行"), true);
   assert.equal(text.includes("ahub node init"), true);
+  assert.equal(text.includes("prompt_preview"), true);
+  assert.equal(text.includes("严格脱敏"), true);
+  assert.equal(text.includes("派单时") || text.includes("下发时"), true);
+  assert.equal(text.includes("读取 `prompt`"), false);
+});
+
+test("handleSkillMd includes redacted dispatched prompt reporting rule", async () => {
+  const resp = handleSkillMd();
+  assert.equal(resp.status, 200);
+  const text = await resp.text();
+  assert.equal(text.includes("prompt_preview"), true);
+  assert.equal(text.includes("Mandatory redaction"), true);
+  assert.equal(text.includes("dispatch time"), true);
+  assert.equal(text.includes("Do **not** call `ahub result` to fetch `prompt`"), true);
+  assert.equal(text.includes("fetch `prompt` via `ahub result"), false);
 });
 
 test("handleInstallSh injects HUB_PUBLIC_URL cleanly", async () => {

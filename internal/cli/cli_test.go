@@ -362,3 +362,173 @@ func TestAuthLoginTokenStdinIsolationAndRedactedStatus(t *testing.T) {
 		t.Fatalf("expected token_source=env and verified=true, got %+v", envRes)
 	}
 }
+
+func TestResultIncludesRedactedPromptAndBoundsSummary(t *testing.T) {
+	longTail := strings.Repeat("x", 1800)
+	rawPrompt := "Inspect repo with token ahub_cli_rawsecret9988 password=my_secret_pw and var $AHUB_TOKEN\n" + longTail
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/runs/run_prompt_1" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"ok": true,
+			"run": api.RunRecord{
+				ID:        "run_prompt_1",
+				ThreadID:  "thr_prompt_1",
+				RootRunID: "run_prompt_1",
+				NodeID:    "macmini",
+				Workdir:   "/workspace/demo",
+				Agent:     "agy",
+				Status:    "done",
+				Prompt:    rawPrompt,
+				Summary:   "done",
+			},
+		})
+	}))
+	defer srv.Close()
+
+	// Default summary mode: prompt is redacted and bounded
+	codeSummary, outSummary := captureExecute(t, []string{
+		"--url", srv.URL,
+		"--token", "tok_test",
+		"--json",
+		"result", "run_prompt_1",
+	}, "")
+	if codeSummary != 0 {
+		t.Fatalf("result summary exit=%d out=%s", codeSummary, outSummary)
+	}
+	for _, secret := range []string{"rawsecret9988", "my_secret_pw"} {
+		if strings.Contains(outSummary, secret) {
+			t.Fatalf("result summary leaked secret %q: %s", secret, outSummary)
+		}
+	}
+	var sumRun api.RunRecord
+	if err := json.Unmarshal([]byte(outSummary), &sumRun); err != nil {
+		t.Fatalf("invalid json from result summary: %v (%s)", err, outSummary)
+	}
+	if !strings.Contains(sumRun.Prompt, "ahub_cli_[REDACTED]") || !strings.Contains(sumRun.Prompt, "$AHUB_TOKEN") {
+		t.Fatalf("unexpected redacted prompt in summary: %q", sumRun.Prompt)
+	}
+	if !strings.Contains(sumRun.Prompt, "--full") {
+		t.Fatalf("expected truncated prompt hint in summary mode, got len=%d", len(sumRun.Prompt))
+	}
+
+	// Full mode: complete redacted prompt returned
+	codeFull, outFull := captureExecute(t, []string{
+		"--url", srv.URL,
+		"--token", "tok_test",
+		"--json",
+		"result", "run_prompt_1", "--full",
+	}, "")
+	if codeFull != 0 {
+		t.Fatalf("result --full exit=%d out=%s", codeFull, outFull)
+	}
+	for _, secret := range []string{"rawsecret9988", "my_secret_pw"} {
+		if strings.Contains(outFull, secret) {
+			t.Fatalf("result --full leaked secret %q: %s", secret, outFull)
+		}
+	}
+	var fullRun api.RunRecord
+	if err := json.Unmarshal([]byte(outFull), &fullRun); err != nil {
+		t.Fatalf("invalid json from result --full: %v (%s)", err, outFull)
+	}
+	if !strings.HasSuffix(fullRun.Prompt, longTail) {
+		t.Fatalf("expected full redacted prompt to retain tail")
+	}
+}
+
+func TestRunsCancelResolveSanitizePromptLeaseAndBound(t *testing.T) {
+	longTail := strings.Repeat("y", 1800)
+	dirtyRun := api.RunRecord{
+		ID:         "run_san_1",
+		ThreadID:   "thr_san_1",
+		RootRunID:  "run_san_1",
+		NodeID:     "macmini",
+		Workdir:    "/workspace/demo",
+		Agent:      "agy",
+		Status:     "done",
+		LeaseOwner: "conn_secret",
+		Prompt:     "Run with ahub_cli_leaksecret123456 and Authorization: Bearer tok_xyz987654\n" + longTail,
+		Summary:    "done",
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/runs":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"ok":   true,
+				"runs": []api.RunRecord{dirtyRun},
+			})
+		case "/api/v1/runs/run_san_1/cancel":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"ok":             true,
+				"cancelled_runs": []api.RunRecord{dirtyRun},
+			})
+		case "/api/v1/runs/run_san_1/resolve":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"ok":  true,
+				"run": dirtyRun,
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	assertCleanRecord := func(label string, rawOut string, rec api.RunRecord) {
+		t.Helper()
+		for _, secret := range []string{"leaksecret123456", "tok_xyz987654", "conn_secret"} {
+			if strings.Contains(rawOut, secret) {
+				t.Fatalf("%s leaked %q in stdout: %s", label, secret, rawOut)
+			}
+		}
+		if rec.LeaseOwner != "" {
+			t.Fatalf("%s retained lease_owner: %q", label, rec.LeaseOwner)
+		}
+		if !strings.Contains(rec.Prompt, "ahub_cli_[REDACTED]") || !strings.Contains(rec.Prompt, "Bearer [REDACTED]") {
+			t.Fatalf("%s did not redact secrets in prompt: %q", label, rec.Prompt)
+		}
+		if !strings.Contains(rec.Prompt, "--full") || len(rec.Prompt) > 1600 {
+			t.Fatalf("%s prompt not properly bounded: len=%d prompt=%q", label, len(rec.Prompt), rec.Prompt)
+		}
+	}
+
+	codeRuns, outRuns := captureExecute(t, []string{"--url", srv.URL, "--token", "tok", "--json", "runs"}, "")
+	if codeRuns != 0 {
+		t.Fatalf("runs exit=%d out=%s", codeRuns, outRuns)
+	}
+	var runsPayload struct {
+		Runs []api.RunRecord `json:"runs"`
+	}
+	if err := json.Unmarshal([]byte(outRuns), &runsPayload); err != nil || len(runsPayload.Runs) != 1 {
+		t.Fatalf("invalid runs json: err=%v out=%s", err, outRuns)
+	}
+	assertCleanRecord("runs", outRuns, runsPayload.Runs[0])
+
+	codeCancel, outCancel := captureExecute(t, []string{"--url", srv.URL, "--token", "tok", "--json", "cancel", "run_san_1"}, "")
+	if codeCancel != 0 {
+		t.Fatalf("cancel exit=%d out=%s", codeCancel, outCancel)
+	}
+	var cancelPayload struct {
+		CancelledRuns []api.RunRecord `json:"cancelled_runs"`
+	}
+	if err := json.Unmarshal([]byte(outCancel), &cancelPayload); err != nil || len(cancelPayload.CancelledRuns) != 1 {
+		t.Fatalf("invalid cancel json: err=%v out=%s", err, outCancel)
+	}
+	assertCleanRecord("cancel", outCancel, cancelPayload.CancelledRuns[0])
+
+	codeResolve, outResolve := captureExecute(t, []string{"--url", srv.URL, "--token", "tok", "--json", "resolve", "run_san_1"}, "")
+	if codeResolve != 0 {
+		t.Fatalf("resolve exit=%d out=%s", codeResolve, outResolve)
+	}
+	var resolvePayload struct {
+		Run api.RunRecord `json:"run"`
+	}
+	if err := json.Unmarshal([]byte(outResolve), &resolvePayload); err != nil {
+		t.Fatalf("invalid resolve json: err=%v out=%s", err, outResolve)
+	}
+	assertCleanRecord("resolve", outResolve, resolvePayload.Run)
+}

@@ -26,7 +26,9 @@ registerHooks({
 const {
   parseApprovalCheckpointRequest,
   parseCreateRunRequest,
+  parseNativeEventCreateRequest,
   parseNodeWsFrame,
+  parsePatchNodeRequest,
   parsePatchRunRequest,
   parseResolveRunRequest
 } = await import("./validation.ts");
@@ -162,4 +164,47 @@ test("parseApprovalCheckpointRequest and parseResolveRunRequest validate payload
     summary: "Approved remotely"
   });
   assert.throws(() => parseResolveRunRequest({ unknown: true }), /Unexpected field/);
+});
+
+test("parsePatchNodeRequest and parseNativeEventCreateRequest validate default_notify_key_id and native events", () => {
+  assert.deepEqual(parsePatchNodeRequest({ default_notify_key_id: "key_01ABCDEF1234" }), {
+    displayName: undefined,
+    status: undefined,
+    maxConcurrency: undefined,
+    defaultNotifyKeyId: "key_01ABCDEF1234"
+  });
+  assert.deepEqual(parsePatchNodeRequest({ default_notify_key_id: "" }), {
+    displayName: undefined,
+    status: undefined,
+    maxConcurrency: undefined,
+    defaultNotifyKeyId: null
+  });
+  assert.throws(() => parsePatchNodeRequest({ default_notify_key_id: "bad_id" }), /default_notify_key_id/);
+
+  const ev = parseNativeEventCreateRequest({
+    event_id: "claude:sess_1:Stop:abcdef123456",
+    agent: "claude",
+    event_kind: "interaction_needed",
+    native_session_id: "sess_1",
+    workdir: "~/workspace/demo",
+    title: "Permission required",
+    summary: "Claude needs confirmation",
+    source: "claude-hook"
+  });
+  assert.equal(ev.agent, "claude");
+  assert.equal(ev.eventKind, "interaction_needed");
+  assert.throws(
+    () => parseNativeEventCreateRequest({ event_id: "bad", agent: "claude", event_kind: "turn_summary", summary: "x" }),
+    /event_id/
+  );
+  assert.throws(
+    () =>
+      parseNativeEventCreateRequest({
+        event_id: "evt_valid_1234",
+        agent: "claude",
+        event_kind: "other",
+        summary: "x"
+      }),
+    /event_kind/
+  );
 });
