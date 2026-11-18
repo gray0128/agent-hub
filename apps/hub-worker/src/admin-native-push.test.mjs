@@ -140,9 +140,16 @@ async function generateVapidEnv() {
   };
 }
 
-function createTestHarness({ vapidEnv = {}, allowLoopback = false, retentionDays } = {}) {
+function createTestHarness({
+  vapidEnv = {},
+  allowLoopback = false,
+  retentionDays,
+  quietSec,
+  cooldownSec
+} = {}) {
   const db = createSqliteD1();
   const queuedMessages = [];
+  const queuedSendRecords = [];
   const streamSockets = [];
 
   const mockCtx = {
@@ -163,10 +170,13 @@ function createTestHarness({ vapidEnv = {}, allowLoopback = false, retentionDays
     WEBHOOK_ENCRYPTION_KEY: "test-encryption-secret-for-unit-suite",
     ...(allowLoopback ? { ALLOW_LOOPBACK_PUSH_FOR_TEST: "true" } : {}),
     ...(retentionDays !== undefined ? { NATIVE_EVENTS_RETENTION_DAYS: retentionDays } : {}),
+    ...(quietSec !== undefined ? { NATIVE_NOTIFY_QUIET_SEC: quietSec } : {}),
+    ...(cooldownSec !== undefined ? { NATIVE_NOTIFY_COOLDOWN_SEC: cooldownSec } : {}),
     ...vapidEnv,
     NOTIFY_QUEUE: {
-      async send(msg) {
+      async send(msg, options) {
         queuedMessages.push(msg);
+        queuedSendRecords.push({ msg, options });
       }
     },
     NODE_HUB: {
@@ -232,6 +242,7 @@ function createTestHarness({ vapidEnv = {}, allowLoopback = false, retentionDays
     env,
     execCtx,
     queuedMessages,
+    queuedSendRecords,
     addStreamSocket,
     callApi,
     flushWaitUntil
@@ -789,4 +800,385 @@ test("scheduled Cron prunes expired native_events and notification_deliveries wh
   await harness.flushWaitUntil();
   const remainingAfter7d = harness.db.sqlite.prepare("SELECT id FROM native_events").all();
   assert.equal(remainingAfter7d.length, 0);
+});
+
+test("node default_notify_events filters Bot webhook deliveries, redacts from client scope, and leaves Web Push independent", async (t) => {
+  const webhookBodies = [];
+  const webhookServer = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      webhookBodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end('{"ok":true}');
+    });
+  });
+  await new Promise((resolve) => webhookServer.listen(0, "127.0.0.1", resolve));
+  t.after(() => webhookServer.close());
+  const webhookUrl = `http://127.0.0.1:${webhookServer.address().port}/bot`;
+
+  const harness = createTestHarness({
+    allowLoopback: true,
+    quietSec: "60",
+    cooldownSec: "300"
+  });
+  const { adminTok, clientTok, nodeTok } = await seedBaseFixtures(harness);
+  harness.db.sqlite
+    .prepare(`UPDATE nodes SET workspaces_json = '[{"key":"demo","path":"/workspace/demo"}]' WHERE id = 'macmini'`)
+    .run();
+
+  const createdKey = await harness.callApi("POST", "/api/v1/keys", adminTok, {
+    name: "bot-filtered",
+    scope: "client",
+    allowed_nodes: ["macmini"],
+    webhook_url: webhookUrl,
+    webhook_key: "bot-secret"
+  });
+  assert.equal(createdKey.status, 201);
+  const botKeyId = createdKey.json.key.id;
+
+  const patchRes = await harness.callApi("PATCH", "/api/v1/nodes/macmini", adminTok, {
+    default_notify_key_id: botKeyId,
+    default_notify_events: ["run_needs_approval", "run_failed", "native_interaction_needed"]
+  });
+  assert.equal(patchRes.status, 200);
+  assert.equal(patchRes.json.node.default_notify_key_id, botKeyId);
+  assert.deepEqual(patchRes.json.node.default_notify_events, [
+    "run_needs_approval",
+    "run_failed",
+    "native_interaction_needed"
+  ]);
+
+  // client scope GET /api/v1/nodes must redact default_notify_* including default_notify_events
+  const clientNodes = await harness.callApi("GET", "/api/v1/nodes", clientTok);
+  assert.equal(clientNodes.status, 200);
+  const clientMacmini = clientNodes.json.nodes.find((n) => n.id === "macmini");
+  assert.equal("default_notify_key_id" in clientMacmini, false);
+  assert.equal("default_notify_events" in clientMacmini, false);
+
+  // turn_summary with no Web Push sub and native_turn_summary disabled on Bot -> skipped (NO_MATCHING_CHANNELS)
+  harness.queuedSendRecords.length = 0;
+  const skippedTurn = await harness.callApi("POST", "/api/v1/nodes/macmini/native-events", nodeTok, {
+    event_id: "agy:sess_f:turn1",
+    agent: "agy",
+    event_kind: "turn_summary",
+    native_session_id: "sess_f",
+    workdir: "/workspace/demo",
+    title: "Summary disabled on bot",
+    summary: "Should be skipped cleanly",
+    source: "agy-hook"
+  });
+  assert.equal(skippedTurn.status, 200);
+  assert.equal(skippedTurn.json.event.notify_status, "skipped");
+  assert.equal(skippedTurn.json.event.notify_error, "NO_MATCHING_CHANNELS");
+  assert.equal(harness.queuedSendRecords.length, 0);
+
+  // Subscribe Web Push specifically to native_turn_summary -> turn_summary still queues Web Push even when Bot disables it
+  const validP256dh = toBase64Url(new Uint8Array([0x04, ...new Array(64).fill(0x55)]));
+  const validAuth = toBase64Url(new Uint8Array(16).fill(0x66));
+  const subRes = await harness.callApi("POST", "/api/v1/push-subscriptions", adminTok, {
+    label: "Test Push Sub",
+    subscription: {
+      endpoint: "http://127.0.0.1:18080/push",
+      keys: { p256dh: validP256dh, auth: validAuth }
+    },
+    node_filter: ["macmini"],
+    event_filter: ["native_turn_summary"]
+  });
+  assert.equal(subRes.status, 201);
+
+  const pushOnlyTurn = await harness.callApi("POST", "/api/v1/nodes/macmini/native-events", nodeTok, {
+    event_id: "agy:sess_f:turn2",
+    agent: "agy",
+    event_kind: "turn_summary",
+    native_session_id: "sess_f",
+    workdir: "/workspace/demo",
+    title: "Push only turn",
+    summary: "Should queue only web_push",
+    source: "agy-hook"
+  });
+  assert.equal(pushOnlyTurn.status, 202);
+  const pushTurnDeliveries = await harness.callApi(
+    "GET",
+    `/api/v1/native-events/${pushOnlyTurn.json.event.id}`,
+    adminTok
+  );
+  assert.deepEqual(
+    pushTurnDeliveries.json.deliveries.map((d) => d.channel_kind),
+    ["web_push"]
+  );
+  assert.deepEqual(harness.queuedSendRecords[0].options, { delaySeconds: 60 });
+
+  // interaction_needed uses Bot immediately with 0s delay (options === undefined)
+  harness.queuedSendRecords.length = 0;
+  const urgentEv = await harness.callApi("POST", "/api/v1/nodes/macmini/native-events", nodeTok, {
+    event_id: "agy:sess_f:ask1",
+    agent: "agy",
+    event_kind: "interaction_needed",
+    native_session_id: "sess_f",
+    workdir: "/workspace/demo",
+    title: "Need user input",
+    summary: "Please answer",
+    source: "agy-hook"
+  });
+  assert.equal(urgentEv.status, 202);
+  assert.equal(harness.queuedSendRecords.length, 1);
+  assert.equal(harness.queuedSendRecords[0].options, undefined);
+
+  // Run done vs failed respects node default_notify_events
+  harness.queuedSendRecords.length = 0;
+  const doneRunRes = await harness.callApi("POST", "/api/v1/runs", adminTok, {
+    node_id: "macmini",
+    workdir: "/workspace/demo",
+    agent: "agy",
+    prompt: "done run",
+    notify: { target: "none" }
+  });
+  assert.equal(doneRunRes.status, 202);
+  const claim1 = await harness.callApi("POST", "/api/v1/nodes/macmini/claim", nodeTok, {
+    conn_nonce: "nonce_test_01"
+  });
+  assert.equal(claim1.status, 200);
+  const completeDone = await harness.callApi(
+    "POST",
+    `/api/v1/runs/${doneRunRes.json.run.id}/complete`,
+    nodeTok,
+    { lease_owner: "macmini:nonce_test_01", status: "done", summary: "ok", output_md: "ok" }
+  );
+  assert.equal(completeDone.status, 200);
+  assert.equal(harness.queuedSendRecords.length, 0);
+
+  const failRunRes = await harness.callApi("POST", "/api/v1/runs", adminTok, {
+    node_id: "macmini",
+    workdir: "/workspace/demo",
+    agent: "agy",
+    prompt: "failed run",
+    notify: { target: "none" }
+  });
+  assert.equal(failRunRes.status, 202);
+  const claim2 = await harness.callApi("POST", "/api/v1/nodes/macmini/claim", nodeTok, {
+    conn_nonce: "nonce_test_01"
+  });
+  assert.equal(claim2.status, 200);
+  const completeFailed = await harness.callApi(
+    "POST",
+    `/api/v1/runs/${failRunRes.json.run.id}/complete`,
+    nodeTok,
+    { lease_owner: "macmini:nonce_test_01", status: "failed", summary: "boom", output_md: "boom" }
+  );
+  assert.equal(completeFailed.status, 200);
+  assert.equal(harness.queuedSendRecords.length, 1);
+});
+
+test("quiet window supersedes queued non-urgent turns, enforces 300s cooldown, keeps interaction_needed immediate, and supports single-delivery redeliver", async (t) => {
+  const webhookBodies = [];
+  const webhookServer = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      webhookBodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end('{"ok":true}');
+    });
+  });
+  await new Promise((resolve) => webhookServer.listen(0, "127.0.0.1", resolve));
+  t.after(() => webhookServer.close());
+  const webhookUrl = `http://127.0.0.1:${webhookServer.address().port}/bot`;
+
+  const harness = createTestHarness({ quietSec: "60", cooldownSec: "300" });
+  const { adminTok, nodeTok } = await seedBaseFixtures(harness);
+  const adminGlobalFrames = harness.addStreamSocket({
+    role: "stream",
+    runId: null,
+    scope: "admin",
+    keyId: "key_adm_1",
+    boundNodeId: null,
+    allowedNodes: []
+  });
+
+  const createdKey = await harness.callApi("POST", "/api/v1/keys", adminTok, {
+    name: "bot-quiet",
+    scope: "client",
+    allowed_nodes: ["macmini"],
+    webhook_url: webhookUrl,
+    webhook_key: "bot-secret"
+  });
+  assert.equal(createdKey.status, 201);
+
+  const patchRes = await harness.callApi("PATCH", "/api/v1/nodes/macmini", adminTok, {
+    default_notify_key_id: createdKey.json.key.id
+  });
+  assert.equal(patchRes.status, 200);
+
+  // 1. First turn_summary queues with 60s delay
+  const ev1 = await harness.callApi("POST", "/api/v1/nodes/macmini/native-events", nodeTok, {
+    event_id: "agy:sess_q1:turn1",
+    agent: "agy",
+    event_kind: "turn_summary",
+    native_session_id: "sess_q1",
+    workdir: "/workspace/demo",
+    title: "Turn 1",
+    summary: "Summary 1",
+    source: "agy-hook"
+  });
+  assert.equal(ev1.status, 202);
+  assert.equal(harness.queuedSendRecords.length, 1);
+  assert.deepEqual(harness.queuedSendRecords[0].options, { delaySeconds: 60 });
+  const dlv1Id = harness.queuedSendRecords[0].msg.delivery_id;
+
+  // 2. Second turn_summary in same session supersedes dlv1 -> SUPERSEDED_BY_NEWER_TURN and queues dlv2 with 60s delay
+  adminGlobalFrames.length = 0;
+  const ev2 = await harness.callApi("POST", "/api/v1/nodes/macmini/native-events", nodeTok, {
+    event_id: "agy:sess_q1:turn2",
+    agent: "agy",
+    event_kind: "turn_summary",
+    native_session_id: "sess_q1",
+    workdir: "/workspace/demo",
+    title: "Turn 2",
+    summary: "Summary 2",
+    source: "agy-hook"
+  });
+  assert.equal(ev2.status, 202);
+  assert.equal(harness.queuedSendRecords.length, 2);
+  assert.deepEqual(harness.queuedSendRecords[1].options, { delaySeconds: 60 });
+  const dlv2Id = harness.queuedSendRecords[1].msg.delivery_id;
+
+  const ev1Detail = await harness.callApi("GET", `/api/v1/native-events/${ev1.json.event.id}`, adminTok);
+  assert.equal(ev1Detail.json.event.notify_status, "skipped");
+  assert.equal(ev1Detail.json.event.notify_error, "SUPERSEDED_BY_NEWER_TURN");
+  assert.equal(ev1Detail.json.deliveries[0].id, dlv1Id);
+  assert.equal(ev1Detail.json.deliveries[0].status, "skipped");
+  assert.equal(ev1Detail.json.deliveries[0].error_code, "SUPERSEDED_BY_NEWER_TURN");
+  assert.equal(
+    adminGlobalFrames.some(
+      (f) => f.type === "delivery.updated" && f.delivery.id === dlv1Id && f.delivery.status === "skipped"
+    ),
+    true
+  );
+  assert.equal(
+    adminGlobalFrames.some(
+      (f) =>
+        f.type === "native_event.upserted" &&
+        f.event.id === ev1.json.event.id &&
+        f.event.notify_status === "skipped"
+    ),
+    true
+  );
+
+  // Consume dlv2 through worker.queue -> delivers Summary 2 over HTTP 200 and establishes sent_at for 300s cooldown
+  await worker.queue(
+    {
+      messages: [
+        {
+          attempts: 1,
+          body: harness.queuedSendRecords[1].msg,
+          ack() {},
+          retry() {
+            assert.fail("dlv2 should succeed without retry");
+          }
+        }
+      ]
+    },
+    harness.env,
+    harness.execCtx
+  );
+  await harness.flushWaitUntil();
+  assert.equal(webhookBodies.length, 1);
+  assert.equal(webhookBodies[0].summary, "Summary 2");
+
+  // 3. Third turn_summary in same session hits 300s cooldown at ingest -> status='skipped' SESSION_COOLDOWN_ACTIVE, not queued
+  const queueLenBeforeCooldown = harness.queuedSendRecords.length;
+  const ev3 = await harness.callApi("POST", "/api/v1/nodes/macmini/native-events", nodeTok, {
+    event_id: "agy:sess_q1:turn3",
+    agent: "agy",
+    event_kind: "turn_summary",
+    native_session_id: "sess_q1",
+    workdir: "/workspace/demo",
+    title: "Turn 3",
+    summary: "Summary 3",
+    source: "agy-hook"
+  });
+  assert.equal(ev3.status, 200);
+  assert.equal(ev3.json.event.notify_status, "skipped");
+  assert.equal(ev3.json.event.notify_error, "SESSION_COOLDOWN_ACTIVE");
+  assert.equal(harness.queuedSendRecords.length, queueLenBeforeCooldown);
+
+  const ev3Detail = await harness.callApi("GET", `/api/v1/native-events/${ev3.json.event.id}`, adminTok);
+  assert.equal(ev3Detail.json.deliveries.length, 1);
+  const dlv3Id = ev3Detail.json.deliveries[0].id;
+  assert.equal(ev3Detail.json.deliveries[0].status, "skipped");
+  assert.equal(ev3Detail.json.deliveries[0].error_code, "SESSION_COOLDOWN_ACTIVE");
+
+  // 4. Urgent interaction_needed in same session during active cooldown still queues immediately with 0s delay
+  const urgentEv = await harness.callApi("POST", "/api/v1/nodes/macmini/native-events", nodeTok, {
+    event_id: "agy:sess_q1:ask1",
+    agent: "agy",
+    event_kind: "interaction_needed",
+    native_session_id: "sess_q1",
+    workdir: "/workspace/demo",
+    title: "Approval required",
+    summary: "Urgent question",
+    source: "agy-hook"
+  });
+  assert.equal(urgentEv.status, 202);
+  assert.equal(harness.queuedSendRecords.length, queueLenBeforeCooldown + 1);
+  const urgentSend = harness.queuedSendRecords.at(-1);
+  assert.equal(urgentSend.options, undefined);
+  await worker.queue(
+    {
+      messages: [
+        {
+          attempts: 1,
+          body: urgentSend.msg,
+          ack() {},
+          retry() {
+            assert.fail("urgent delivery should succeed");
+          }
+        }
+      ]
+    },
+    harness.env,
+    harness.execCtx
+  );
+  await harness.flushWaitUntil();
+  assert.equal(webhookBodies.length, 2);
+  assert.equal(webhookBodies[1].event_kind, "interaction_needed");
+
+  // 5. Manual single-channel redeliver on skipped dlv3Id attaches bypass_coalesce: true, 0s delay, and delivers HTTP 200
+  const redeliverSkipped = await harness.callApi(
+    "POST",
+    `/api/v1/native-events/${ev3.json.event.id}/redeliver`,
+    adminTok,
+    { delivery_id: dlv3Id }
+  );
+  assert.equal(redeliverSkipped.status, 200);
+  assert.equal(redeliverSkipped.json.requeued_count, 1);
+  assert.equal(redeliverSkipped.json.event.notify_status, "queued");
+  const manualSend = harness.queuedSendRecords.at(-1);
+  assert.deepEqual(manualSend.msg, {
+    kind: "delivery",
+    delivery_id: dlv3Id,
+    bypass_coalesce: true
+  });
+  assert.equal(manualSend.options, undefined);
+
+  await worker.queue(
+    {
+      messages: [
+        {
+          attempts: 1,
+          body: manualSend.msg,
+          ack() {},
+          retry() {
+            assert.fail("manual bypassed redeliver should succeed");
+          }
+        }
+      ]
+    },
+    harness.env,
+    harness.execCtx
+  );
+  await harness.flushWaitUntil();
+  assert.equal(webhookBodies.length, 3);
+  assert.equal(webhookBodies[2].summary, "Summary 3");
 });

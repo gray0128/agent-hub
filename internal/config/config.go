@@ -31,6 +31,7 @@ type NativeNotifyConfig struct {
 	Enabled                  bool     `json:"enabled"`
 	AllowedRoots             []string `json:"allowed_roots,omitempty"`
 	IncludeTranscriptSummary bool     `json:"include_transcript_summary,omitempty"`
+	Events                   []string `json:"events,omitempty"`
 }
 
 type NodeConfig struct {

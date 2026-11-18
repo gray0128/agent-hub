@@ -139,6 +139,30 @@ function createControlPlaneMockDb({
           if (sql.includes("FROM native_events WHERE id = ?1")) {
             return nativeEvents.get(args[0]) ?? null;
           }
+          if (sql.includes("FROM notification_deliveries WHERE id = ?1")) {
+            return notificationDeliveries.get(args[0]) ?? null;
+          }
+          if (sql.includes("SELECT 1 AS cooldown_hit") && sql.includes("FROM notification_deliveries")) {
+            const [channelKind, channelId, cutoffIso, nodeId, agent, sessionId] = args;
+            for (const d of notificationDeliveries.values()) {
+              if (
+                d.source_kind !== "native_event" ||
+                d.status !== "sent" ||
+                (d.trigger_event !== "turn_summary" && d.trigger_event !== "progress") ||
+                d.channel_kind !== channelKind ||
+                d.channel_id !== channelId ||
+                !d.sent_at ||
+                d.sent_at < cutoffIso
+              ) {
+                continue;
+              }
+              const ev = nativeEvents.get(d.source_id);
+              if (ev && ev.node_id === nodeId && ev.agent === agent && ev.native_session_id === sessionId) {
+                return { cooldown_hit: 1 };
+              }
+            }
+            return null;
+          }
           if (sql.includes("SELECT 1 AS hit") && sql.includes("FROM native_events")) {
             const [nodeId, agent, sessionId, createdAt, id] = args;
             for (const ev of nativeEvents.values()) {
@@ -204,12 +228,48 @@ function createControlPlaneMockDb({
               )
             };
           }
+          if (sql.includes("SELECT d.id, d.source_id") && sql.includes("FROM notification_deliveries d")) {
+            const [nodeId, agent, sessionId, createdAt, id] = args;
+            const results = [];
+            for (const d of notificationDeliveries.values()) {
+              if (
+                d.source_kind !== "native_event" ||
+                d.status !== "queued" ||
+                (d.trigger_event !== "turn_summary" && d.trigger_event !== "progress")
+              ) {
+                continue;
+              }
+              const ev = nativeEvents.get(d.source_id);
+              if (
+                ev &&
+                ev.node_id === nodeId &&
+                ev.agent === agent &&
+                ev.native_session_id === sessionId &&
+                (ev.created_at < createdAt || (ev.created_at === createdAt && ev.id < id))
+              ) {
+                results.push({ id: d.id, source_id: d.source_id });
+              }
+            }
+            return { results };
+          }
           if (sql.includes("FROM runs")) {
             return { results: Array.from(runs.values()) };
           }
           return { results: [] };
         },
         async run() {
+          if (sql.includes("UPDATE nodes") && sql.includes("default_notify_events_json = ?5")) {
+            const n = nodeMap.get(args[6]);
+            if (n) {
+              n.display_name = args[0];
+              n.status = args[1];
+              n.max_concurrency = args[2];
+              n.default_notify_key_id = args[3];
+              n.default_notify_events_json = args[4];
+              n.updated_at = args[5];
+            }
+            return { success: true, meta: { changes: n ? 1 : 0 } };
+          }
           if (sql.includes("UPDATE nodes") && sql.includes("default_notify_key_id = ?4")) {
             const n = nodeMap.get(args[5]);
             if (n) {
@@ -251,6 +311,7 @@ function createControlPlaneMockDb({
           if (sql.includes("INSERT OR IGNORE INTO notification_deliveries")) {
             const isRun = sql.includes("'run'");
             const sourceKind = isRun ? "run" : "native_event";
+            const isCustomStatus = args.length === 13;
             const [
               id,
               sourceId,
@@ -260,9 +321,12 @@ function createControlPlaneMockDb({
               channelId,
               channelLabel,
               targetHost,
-              routeMode,
-              now
+              routeMode
             ] = args;
+            const status = isCustomStatus ? args[9] : "queued";
+            const errorCode = isCustomStatus ? args[10] : "";
+            const errorMessage = isCustomStatus ? args[11] : "";
+            const now = isCustomStatus ? args[12] : args[9];
             for (const existing of notificationDeliveries.values()) {
               if (
                 existing.source_kind === sourceKind &&
@@ -285,17 +349,28 @@ function createControlPlaneMockDb({
               channel_label: channelLabel,
               target_host: targetHost,
               route_mode: routeMode,
-              status: "queued",
+              status,
               attempts: 0,
               http_status: null,
-              error_code: "",
-              error_message: "",
+              error_code: errorCode,
+              error_message: errorMessage,
               sent_at: null,
               created_at: now,
               updated_at: now
             };
             notificationDeliveries.set(id, row);
             return { success: true, meta: { changes: 1 } };
+          }
+          if (sql.includes("UPDATE notification_deliveries") && sql.includes("SET status = 'skipped'")) {
+            const d = notificationDeliveries.get(args[1]);
+            if (d && d.status === "queued") {
+              d.status = "skipped";
+              d.error_code = "SUPERSEDED_BY_NEWER_TURN";
+              d.error_message = "Superseded by newer event in the same session during quiet window";
+              d.updated_at = args[0];
+              return { success: true, meta: { changes: 1 } };
+            }
+            return { success: true, meta: { changes: 0 } };
           }
           if (sql.includes("UPDATE native_events") && sql.includes("SET notify_status = ?1")) {
             const ev = nativeEvents.get(args[3]);

@@ -154,6 +154,41 @@ function createMockDb(
             }
             return { cnt };
           }
+          if (sql.includes("SELECT id AS newer_id") && sql.includes("FROM native_events")) {
+            const [nodeId, agent, sessionId, createdAt, id] = args;
+            for (const ev of nativeEvents.values()) {
+              if (
+                ev.node_id === nodeId &&
+                ev.agent === agent &&
+                ev.native_session_id === sessionId &&
+                (ev.created_at > createdAt || (ev.created_at === createdAt && ev.id > id))
+              ) {
+                return { newer_id: ev.id };
+              }
+            }
+            return null;
+          }
+          if (sql.includes("SELECT 1 AS cooldown_hit") && sql.includes("FROM notification_deliveries")) {
+            const [channelKind, channelId, cutoffIso, nodeId, agent, sessionId] = args;
+            for (const d of deliveries.values()) {
+              if (
+                d.source_kind !== "native_event" ||
+                d.status !== "sent" ||
+                (d.trigger_event !== "turn_summary" && d.trigger_event !== "progress") ||
+                d.channel_kind !== channelKind ||
+                d.channel_id !== channelId ||
+                !d.sent_at ||
+                d.sent_at < cutoffIso
+              ) {
+                continue;
+              }
+              const ev = nativeEvents.get(d.source_id);
+              if (ev && ev.node_id === nodeId && ev.agent === agent && ev.native_session_id === sessionId) {
+                return { cooldown_hit: 1 };
+              }
+            }
+            return null;
+          }
           if (sql.includes("SELECT 1 AS hit") && sql.includes("FROM native_events")) {
             return null;
           }
@@ -215,6 +250,14 @@ function createMockDb(
                 d.error_code = args[2];
                 d.error_message = args[3];
                 d.updated_at = args[4];
+              }
+            } else if (sql.includes("SET status = 'skipped'")) {
+              const d = deliveries.get(args[3]);
+              if (d) {
+                d.status = "skipped";
+                d.error_code = args[0];
+                d.error_message = args[1];
+                d.updated_at = args[2];
               }
             } else {
               const d = deliveries.get(args[4]);
@@ -1597,4 +1640,239 @@ test("NodeHub broadcasts delivery.updated, run.updated, and native_event.upserte
     wsClientGlobalDefense.frames.some((f) => f.type === "delivery.updated" || f.type === "native_event.upserted"),
     false
   );
+});
+
+test("processNotifyBatch skips non-urgent native deliveries on SUPERSEDED_BY_NEWER_TURN or SESSION_COOLDOWN_ACTIVE unless bypass_coalesce is true", async () => {
+  const recentIso = new Date(Date.now() - 10_000).toISOString();
+  const t1 = new Date(Date.now() - 5000).toISOString();
+  const t2 = new Date(Date.now() - 3000).toISOString();
+
+  const mockDb = createMockDb(
+    [],
+    [],
+    [{ id: "macmini", default_notify_key_id: "key_bot_1" }],
+    [
+      {
+        id: "evt_turn_1",
+        node_id: "macmini",
+        event_id: "agy:sess_q:1",
+        agent: "agy",
+        event_kind: "turn_summary",
+        native_session_id: "sess_q",
+        workdir: "/workspace/demo",
+        title: "Turn 1",
+        summary: "First",
+        source: "agy-hook",
+        notify_key_id: "key_bot_1",
+        notify_status: "queued",
+        notify_error: "",
+        ack_at: null,
+        created_at: t1,
+        updated_at: t1
+      },
+      {
+        id: "evt_turn_2",
+        node_id: "macmini",
+        event_id: "agy:sess_q:2",
+        agent: "agy",
+        event_kind: "progress",
+        native_session_id: "sess_q",
+        workdir: "/workspace/demo",
+        title: "Turn 2",
+        summary: "Second",
+        source: "agy-hook",
+        notify_key_id: "key_bot_1",
+        notify_status: "queued",
+        notify_error: "",
+        ack_at: null,
+        created_at: t2,
+        updated_at: t2
+      },
+      {
+        id: "evt_cool_prev",
+        node_id: "macmini",
+        event_id: "claude:sess_c:1",
+        agent: "claude",
+        event_kind: "turn_summary",
+        native_session_id: "sess_c",
+        workdir: "/workspace/demo",
+        title: "Prev",
+        summary: "Delivered earlier",
+        source: "claude-hook",
+        notify_key_id: "key_bot_1",
+        notify_status: "sent",
+        notify_error: "",
+        ack_at: null,
+        created_at: t1,
+        updated_at: t1
+      },
+      {
+        id: "evt_cool_next",
+        node_id: "macmini",
+        event_id: "claude:sess_c:2",
+        agent: "claude",
+        event_kind: "turn_summary",
+        native_session_id: "sess_c",
+        workdir: "/workspace/demo",
+        title: "Next",
+        summary: "Hits cooldown",
+        source: "claude-hook",
+        notify_key_id: "key_bot_1",
+        notify_status: "queued",
+        notify_error: "",
+        ack_at: null,
+        created_at: t2,
+        updated_at: t2
+      }
+    ],
+    [
+      {
+        id: "dlv_turn_1",
+        source_kind: "native_event",
+        source_id: "evt_turn_1",
+        trigger_event: "turn_summary",
+        node_id: "macmini",
+        channel_kind: "bot_webhook",
+        channel_id: "key_bot_1",
+        channel_label: "bot-1",
+        target_host: "hooks.example.com",
+        route_mode: "node_default",
+        status: "queued",
+        attempts: 0,
+        http_status: null,
+        error_code: "",
+        error_message: "",
+        sent_at: null,
+        created_at: t1,
+        updated_at: t1
+      },
+      {
+        id: "dlv_cool_prev",
+        source_kind: "native_event",
+        source_id: "evt_cool_prev",
+        trigger_event: "turn_summary",
+        node_id: "macmini",
+        channel_kind: "bot_webhook",
+        channel_id: "key_bot_1",
+        channel_label: "bot-1",
+        target_host: "hooks.example.com",
+        route_mode: "node_default",
+        status: "sent",
+        attempts: 1,
+        http_status: 200,
+        error_code: "",
+        error_message: "",
+        sent_at: recentIso,
+        created_at: t1,
+        updated_at: recentIso
+      },
+      {
+        id: "dlv_cool_next",
+        source_kind: "native_event",
+        source_id: "evt_cool_next",
+        trigger_event: "turn_summary",
+        node_id: "macmini",
+        channel_kind: "bot_webhook",
+        channel_id: "key_bot_1",
+        channel_label: "bot-1",
+        target_host: "hooks.example.com",
+        route_mode: "node_default",
+        status: "queued",
+        attempts: 0,
+        http_status: null,
+        error_code: "",
+        error_message: "",
+        sent_at: null,
+        created_at: t2,
+        updated_at: t2
+      },
+      {
+        id: "dlv_bypass",
+        source_kind: "native_event",
+        source_id: "evt_turn_1",
+        trigger_event: "turn_summary",
+        node_id: "macmini",
+        channel_kind: "bot_webhook",
+        channel_id: "key_bot_1",
+        channel_label: "bot-1",
+        target_host: "hooks.example.com",
+        route_mode: "node_default",
+        status: "queued",
+        attempts: 0,
+        http_status: null,
+        error_code: "",
+        error_message: "",
+        sent_at: null,
+        created_at: t1,
+        updated_at: t1
+      }
+    ]
+  );
+
+  const env = {
+    DB: mockDb,
+    WEBHOOK_ENCRYPTION_KEY: "test-encryption-secret-for-unit-suite",
+    HUB_PUBLIC_URL: "https://ahub.bobocai.win",
+    NATIVE_NOTIFY_COOLDOWN_SEC: "300",
+    NODE_HUB: {
+      idFromName: () => "global",
+      get: () => ({ fetch: async () => new Response("ok") })
+    }
+  };
+
+  let ackSuperseded = false;
+  let ackCooldown = false;
+  let ackBypass = false;
+
+  await processNotifyBatch(
+    {
+      messages: [
+        {
+          attempts: 1,
+          body: { kind: "delivery", delivery_id: "dlv_turn_1" },
+          ack() {
+            ackSuperseded = true;
+          },
+          retry() {
+            assert.fail("superseded delivery must ack without retry");
+          }
+        },
+        {
+          attempts: 1,
+          body: { kind: "delivery", delivery_id: "dlv_cool_next" },
+          ack() {
+            ackCooldown = true;
+          },
+          retry() {
+            assert.fail("cooldown-skipped delivery must ack without retry");
+          }
+        },
+        {
+          attempts: 1,
+          body: { kind: "delivery", delivery_id: "dlv_bypass", bypass_coalesce: true },
+          ack() {
+            ackBypass = true;
+          },
+          retry() {
+            assert.fail("bypassed fail-closed delivery must ack without retry");
+          }
+        }
+      ]
+    },
+    env
+  );
+
+  assert.equal(ackSuperseded, true);
+  assert.equal(ackCooldown, true);
+  assert.equal(ackBypass, true);
+
+  assert.equal(mockDb.deliveries.get("dlv_turn_1").status, "skipped");
+  assert.equal(mockDb.deliveries.get("dlv_turn_1").error_code, "SUPERSEDED_BY_NEWER_TURN");
+
+  assert.equal(mockDb.deliveries.get("dlv_cool_next").status, "skipped");
+  assert.equal(mockDb.deliveries.get("dlv_cool_next").error_code, "SESSION_COOLDOWN_ACTIVE");
+
+  // bypass_coalesce skips supersede check & proceeds into webhook resolution
+  assert.notEqual(mockDb.deliveries.get("dlv_bypass").status, "skipped");
+  assert.equal(mockDb.deliveries.get("dlv_bypass").error_code, "CHANNEL_UNBOUND_OR_REVOKED");
 });

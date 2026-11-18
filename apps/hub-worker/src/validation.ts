@@ -59,6 +59,16 @@ export const DEFAULT_PUSH_EVENT_FILTER: readonly PushEventFilterKey[] = [
   "run_failed",
   "native_interaction_needed"
 ];
+export const DEFAULT_NODE_NOTIFY_EVENTS: readonly PushEventFilterKey[] = [
+  "run_needs_approval",
+  "run_failed",
+  "run_done",
+  "run_cancelled",
+  "native_interaction_needed",
+  "native_turn_summary",
+  "native_progress"
+];
+export const VALID_PUSH_EVENT_FILTER_KEYS: ReadonlySet<PushEventFilterKey> = PUSH_EVENT_FILTER_KEYS;
 const NODE_ID_RE = /^[a-z0-9][a-z0-9_-]*$/;
 const THREAD_ID_RE = /^thr_[A-Za-z0-9]+$/;
 const RUN_ID_RE = /^run_[A-Za-z0-9]+$/;
@@ -294,11 +304,12 @@ export function parsePatchNodeRequest(raw: unknown): {
   status?: NodeStatus;
   maxConcurrency?: number;
   defaultNotifyKeyId?: string | null;
+  defaultNotifyEvents?: PushEventFilterKey[];
 } {
   const obj = asRecord(raw, "PatchNodeRequest");
   rejectUnknownKeys(
     obj,
-    ["display_name", "status", "max_concurrency", "default_notify_key_id"],
+    ["display_name", "status", "max_concurrency", "default_notify_key_id", "default_notify_events"],
     "PatchNodeRequest"
   );
   const displayName = asOptionalString(obj, "display_name", 128);
@@ -332,7 +343,18 @@ export function parsePatchNodeRequest(raw: unknown): {
     }
   }
 
-  return { displayName, status, maxConcurrency, defaultNotifyKeyId };
+  let defaultNotifyEvents: PushEventFilterKey[] | undefined;
+  if (obj["default_notify_events"] !== undefined) {
+    defaultNotifyEvents = parseEventFilter(obj["default_notify_events"]);
+  }
+
+  return {
+    displayName,
+    status,
+    maxConcurrency,
+    defaultNotifyKeyId,
+    ...(defaultNotifyEvents !== undefined ? { defaultNotifyEvents } : {})
+  };
 }
 
 export interface ParsedNativeEventCreate {

@@ -168,6 +168,7 @@ export interface NodeRecord {
   default_notify_key_name?: string;
   default_notify_webhook_host?: string;
   default_notify_valid?: boolean;
+  default_notify_events?: PushEventFilterKey[];
   last_seen_at: string | null;
   created_at: string;
   updated_at: string;

@@ -40,9 +40,11 @@ import {
 import { newId, nowIso, sanitizeTailPreview, truncateUtf8Bytes } from "./ulid";
 import {
   type ApprovalCheckpointInput,
+  DEFAULT_NODE_NOTIFY_EVENTS,
   type ParsedCreateRun,
   type ParsedNativeEventCreate,
-  type ResolveRunInput
+  type ResolveRunInput,
+  VALID_PUSH_EVENT_FILTER_KEYS
 } from "./validation";
 import { type WebPushSendResult } from "./web-push";
 
@@ -60,6 +62,7 @@ interface NodeRow {
   max_concurrency: number;
   active_runs_count: number;
   default_notify_key_id: string | null;
+  default_notify_events_json?: string | null;
   last_seen_at: string | null;
   created_at: string;
   updated_at: string;
@@ -271,6 +274,56 @@ function isBoundNotifyKeyValidForNode(
   return allowed.length === 0 || allowed.includes(nodeId);
 }
 
+export function parseNodeDefaultNotifyEvents(raw: string | null | undefined): PushEventFilterKey[] {
+  if (raw === undefined || raw === null) {
+    return [...DEFAULT_NODE_NOTIFY_EVENTS];
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      const seen = new Set<PushEventFilterKey>();
+      const out: PushEventFilterKey[] = [];
+      for (const item of parsed) {
+        if (typeof item === "string" && VALID_PUSH_EVENT_FILTER_KEYS.has(item as PushEventFilterKey)) {
+          const key = item as PushEventFilterKey;
+          if (!seen.has(key)) {
+            seen.add(key);
+            out.push(key);
+          }
+        }
+      }
+      return out;
+    }
+  } catch {
+    // fall through
+  }
+  return [...DEFAULT_NODE_NOTIFY_EVENTS];
+}
+
+export function getNativeNotifyQuietSec(env: Partial<Env>): number {
+  const raw = env.NATIVE_NOTIFY_QUIET_SEC?.trim() ?? "";
+  if (!/^\d+$/.test(raw)) {
+    return 60;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    return 60;
+  }
+  return Math.min(parsed, 3600);
+}
+
+export function getNativeNotifyCooldownSec(env: Partial<Env>): number {
+  const raw = env.NATIVE_NOTIFY_COOLDOWN_SEC?.trim() ?? "";
+  if (!/^\d+$/.test(raw)) {
+    return 300;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    return 300;
+  }
+  return Math.min(parsed, 86400);
+}
+
 export function mapNodeRow(row: NodeRow): NodeRecord {
   const defaultNotifyKeyId = row.default_notify_key_id ?? null;
   const record: NodeRecord = {
@@ -285,6 +338,7 @@ export function mapNodeRow(row: NodeRow): NodeRecord {
     max_concurrency: row.max_concurrency,
     active_runs_count: row.active_runs_count,
     default_notify_key_id: defaultNotifyKeyId,
+    default_notify_events: parseNodeDefaultNotifyEvents(row.default_notify_events_json),
     last_seen_at: row.last_seen_at,
     created_at: row.created_at,
     updated_at: row.updated_at
@@ -375,6 +429,7 @@ export function computeAggregateNotifyStatus(
   options?: {
     nodeDefaultNotifyKeyId?: string | null;
     nodeDefaultNotifyValid?: boolean;
+    nodeDefaultNotifyAllowsEvent?: boolean;
   }
 ): { notifyStatus: NativeEventNotifyStatus; notifyError: string; deliveriesSummary: DeliveriesSummary };
 export function computeAggregateNotifyStatus(
@@ -391,6 +446,7 @@ export function computeAggregateNotifyStatus(
   options: {
     nodeDefaultNotifyKeyId?: string | null;
     nodeDefaultNotifyValid?: boolean;
+    nodeDefaultNotifyAllowsEvent?: boolean;
     currentNotifyStatus?: NotifyStatus;
     failClosedWithoutDeliveries?: boolean;
   } = {}
@@ -402,6 +458,13 @@ export function computeAggregateNotifyStatus(
         return {
           notifyStatus: "skipped",
           notifyError: "NODE_DEFAULT_CHANNEL_UNBOUND",
+          deliveriesSummary
+        };
+      }
+      if (options.nodeDefaultNotifyAllowsEvent === false) {
+        return {
+          notifyStatus: "skipped",
+          notifyError: "NO_MATCHING_CHANNELS",
           deliveriesSummary
         };
       }
@@ -446,9 +509,11 @@ export function computeAggregateNotifyStatus(
       deliveriesSummary
     };
   }
+  const firstSkipErr =
+    deliveries.find((d) => d.status === "skipped" && d.error_code)?.error_code || "";
   return {
     notifyStatus: sourceKind === "native_event" ? "skipped" : "none",
-    notifyError: "",
+    notifyError: sourceKind === "native_event" ? firstSkipErr : "",
     deliveriesSummary
   };
 }
@@ -553,6 +618,7 @@ export function sanitizeNodeForScope(node: NodeRecord, scope: ApiScope): NodeRec
   delete copy.default_notify_key_name;
   delete copy.default_notify_webhook_host;
   delete copy.default_notify_valid;
+  delete copy.default_notify_events;
   return copy;
 }
 
@@ -819,6 +885,7 @@ export async function patchNode(
     status?: NodeStatus;
     maxConcurrency?: number;
     defaultNotifyKeyId?: string | null;
+    defaultNotifyEvents?: PushEventFilterKey[];
   }
 ): Promise<NodeRecord> {
   const existing = await db.prepare(`SELECT * FROM nodes WHERE id = ?1`).bind(nodeId).first<NodeRow>();
@@ -884,14 +951,26 @@ export async function patchNode(
   const displayName = patch.displayName ?? existing.display_name;
   const status = patch.status ?? existing.status;
   const maxConcurrency = patch.maxConcurrency ?? existing.max_concurrency;
-  await db
-    .prepare(
-      `UPDATE nodes
-       SET display_name = ?1, status = ?2, max_concurrency = ?3, default_notify_key_id = ?4, updated_at = ?5
-       WHERE id = ?6`
-    )
-    .bind(displayName, status, maxConcurrency, nextDefaultNotifyKeyId, now, nodeId)
-    .run();
+  if (patch.defaultNotifyEvents !== undefined) {
+    const eventsJson = JSON.stringify(patch.defaultNotifyEvents);
+    await db
+      .prepare(
+        `UPDATE nodes
+         SET display_name = ?1, status = ?2, max_concurrency = ?3, default_notify_key_id = ?4, default_notify_events_json = ?5, updated_at = ?6
+         WHERE id = ?7`
+      )
+      .bind(displayName, status, maxConcurrency, nextDefaultNotifyKeyId, eventsJson, now, nodeId)
+      .run();
+  } else {
+    await db
+      .prepare(
+        `UPDATE nodes
+         SET display_name = ?1, status = ?2, max_concurrency = ?3, default_notify_key_id = ?4, updated_at = ?5
+         WHERE id = ?6`
+      )
+      .bind(displayName, status, maxConcurrency, nextDefaultNotifyKeyId, now, nodeId)
+      .run();
+  }
   const updated = await db.prepare(`${NODE_SELECT_SQL} WHERE n.id = ?1`).bind(nodeId).first<NodeRow>();
   return mapNodeRow(updated!);
 }
@@ -1562,20 +1641,26 @@ export async function recomputeSourceNotifyStatus(
   if (sourceKind === "native_event") {
     let nodeDefaultNotifyKeyId: string | null = null;
     let nodeDefaultNotifyValid = false;
+    let nodeDefaultNotifyAllowsEvent = true;
     if (deliveries.length === 0) {
       const evRow = await db
-        .prepare(`SELECT node_id FROM native_events WHERE id = ?1 LIMIT 1`)
+        .prepare(`SELECT node_id, event_kind FROM native_events WHERE id = ?1 LIMIT 1`)
         .bind(sourceId)
-        .first<{ node_id: string }>();
+        .first<{ node_id: string; event_kind: NativeEventKind }>();
       if (evRow) {
         const node = await getNodeById(db, evRow.node_id);
         nodeDefaultNotifyKeyId = node?.default_notify_key_id ?? null;
         nodeDefaultNotifyValid = Boolean(node?.default_notify_valid);
+        const filterKey = `native_${evRow.event_kind}` as PushEventFilterKey;
+        nodeDefaultNotifyAllowsEvent = (
+          node?.default_notify_events ?? DEFAULT_NODE_NOTIFY_EVENTS
+        ).includes(filterKey);
       }
     }
     const agg = computeAggregateNotifyStatus("native_event", deliveries, {
       nodeDefaultNotifyKeyId,
-      nodeDefaultNotifyValid
+      nodeDefaultNotifyValid,
+      nodeDefaultNotifyAllowsEvent
     });
     await db
       .prepare(
@@ -1610,6 +1695,40 @@ interface DeliveryCandidate {
   routeMode: NotifyRouteMode;
 }
 
+export async function hasRecentNonUrgentSessionDelivery(
+  db: D1Database,
+  nodeId: string,
+  agent: string,
+  nativeSessionId: string,
+  channelKind: DeliveryChannelKind,
+  channelId: string,
+  cutoffIso: string
+): Promise<boolean> {
+  if (!nativeSessionId) {
+    return false;
+  }
+  const hit = await db
+    .prepare(
+      `SELECT 1 AS cooldown_hit
+       FROM notification_deliveries d
+       JOIN native_events e ON e.id = d.source_id
+       WHERE d.source_kind = 'native_event'
+         AND d.status = 'sent'
+         AND d.trigger_event IN ('turn_summary', 'progress')
+         AND d.channel_kind = ?1
+         AND d.channel_id = ?2
+         AND d.sent_at IS NOT NULL
+         AND d.sent_at >= ?3
+         AND e.node_id = ?4
+         AND e.agent = ?5
+         AND e.native_session_id = ?6
+       LIMIT 1`
+    )
+    .bind(channelKind, channelId, cutoffIso, nodeId, agent, nativeSessionId)
+    .first<{ cooldown_hit: number }>();
+  return Boolean(hit);
+}
+
 export async function enqueueRunNotificationIfNeeded(
   db: D1Database,
   env: Env,
@@ -1631,19 +1750,25 @@ export async function enqueueRunNotificationIfNeeded(
   const node = await getNodeById(db, run.node_id);
   const candidates: DeliveryCandidate[] = [];
   let botInvalidFailClosed = false;
+  const runFilterKey = `run_${event}` as PushEventFilterKey;
+  const botAllowsRunEvent = (node?.default_notify_events ?? DEFAULT_NODE_NOTIFY_EVENTS).includes(
+    runFilterKey
+  );
 
   if (policy.target === "none") {
     if (run.depth === 0 && isAdminOrHuman && node?.default_notify_key_id) {
-      if (!node.default_notify_valid) {
-        botInvalidFailClosed = true;
-      } else {
-        candidates.push({
-          channelKind: "bot_webhook",
-          channelId: node.default_notify_key_id,
-          channelLabel: node.default_notify_key_name || node.default_notify_key_id,
-          targetHost: node.default_notify_webhook_host || "",
-          routeMode: "node_default"
-        });
+      if (botAllowsRunEvent) {
+        if (!node.default_notify_valid) {
+          botInvalidFailClosed = true;
+        } else {
+          candidates.push({
+            channelKind: "bot_webhook",
+            channelId: node.default_notify_key_id,
+            channelLabel: node.default_notify_key_name || node.default_notify_key_id,
+            targetHost: node.default_notify_webhook_host || "",
+            routeMode: "node_default"
+          });
+        }
       }
     }
   } else if (shouldNotifyOnEvent(policy, event)) {
@@ -1656,16 +1781,18 @@ export async function enqueueRunNotificationIfNeeded(
         routeMode: "key"
       });
     } else if (run.depth === 0 && node?.default_notify_key_id) {
-      if (!node.default_notify_valid) {
-        botInvalidFailClosed = true;
-      } else {
-        candidates.push({
-          channelKind: "bot_webhook",
-          channelId: node.default_notify_key_id,
-          channelLabel: node.default_notify_key_name || node.default_notify_key_id,
-          targetHost: node.default_notify_webhook_host || "",
-          routeMode: "node_default"
-        });
+      if (botAllowsRunEvent) {
+        if (!node.default_notify_valid) {
+          botInvalidFailClosed = true;
+        } else {
+          candidates.push({
+            channelKind: "bot_webhook",
+            channelId: node.default_notify_key_id,
+            channelLabel: node.default_notify_key_name || node.default_notify_key_id,
+            targetHost: node.default_notify_webhook_host || "",
+            routeMode: "node_default"
+          });
+        }
       }
     } else {
       candidates.push({
@@ -2001,7 +2128,12 @@ export async function createNativeEvent(
   env: Env,
   nodeId: string,
   input: ParsedNativeEventCreate
-): Promise<{ event: NativeEventRecord; deduplicated: boolean }> {
+): Promise<{
+  event: NativeEventRecord;
+  deduplicated: boolean;
+  supersededEvents?: NativeEventRecord[];
+  supersededDeliveries?: NotificationDeliveryRecord[];
+}> {
   const existing = await db
     .prepare(`SELECT * FROM native_events WHERE node_id = ?1 AND event_id = ?2 LIMIT 1`)
     .bind(nodeId, input.eventId)
@@ -2024,16 +2156,22 @@ export async function createNativeEvent(
   const hasValidBot = Boolean(notifyKeyId && node.default_notify_valid);
   const botInvalid = Boolean(notifyKeyId && !node.default_notify_valid);
   const pushFilterKey = `native_${input.eventKind}` as PushEventFilterKey;
+  const botAllowsEvent = (node.default_notify_events ?? DEFAULT_NODE_NOTIFY_EVENTS).includes(
+    pushFilterKey
+  );
   const pushSubs = await listMatchingWebPushSubscriptions(db, nodeId, pushFilterKey);
 
   let notifyStatus: NativeEventNotifyStatus = "skipped";
   let notifyError = "";
 
-  if (hasValidBot || pushSubs.length > 0) {
+  if ((hasValidBot && botAllowsEvent) || pushSubs.length > 0) {
     notifyStatus = "queued";
-  } else if (botInvalid) {
+  } else if (botInvalid && botAllowsEvent) {
     notifyStatus = "failed";
     notifyError = "DEFAULT_CHANNEL_INVALID_OR_REVOKED";
+  } else if (notifyKeyId && !botAllowsEvent) {
+    notifyStatus = "skipped";
+    notifyError = "NO_MATCHING_CHANNELS";
   } else {
     notifyStatus = "skipped";
     notifyError = "NODE_DEFAULT_CHANNEL_UNBOUND";
@@ -2077,8 +2215,60 @@ export async function createNativeEvent(
     }
   }
 
+  const supersededDeliveries: NotificationDeliveryRecord[] = [];
+  const supersededEvents: NativeEventRecord[] = [];
+  if (input.nativeSessionId !== "") {
+    const staleRes = await db
+      .prepare(
+        `SELECT d.id, d.source_id
+         FROM notification_deliveries d
+         JOIN native_events e ON e.id = d.source_id
+         WHERE d.source_kind = 'native_event'
+           AND d.status = 'queued'
+           AND d.trigger_event IN ('turn_summary', 'progress')
+           AND e.node_id = ?1
+           AND e.agent = ?2
+           AND e.native_session_id = ?3
+           AND (e.created_at < ?4 OR (e.created_at = ?4 AND e.id < ?5))`
+      )
+      .bind(nodeId, input.agent, input.nativeSessionId, now, id)
+      .all<{ id: string; source_id: string }>();
+
+    const staleRows = staleRes.results ?? [];
+    if (staleRows.length > 0) {
+      const supersededSourceIds = new Set<string>();
+      for (const stale of staleRows) {
+        const upd = await db
+          .prepare(
+            `UPDATE notification_deliveries
+             SET status = 'skipped',
+                 error_code = 'SUPERSEDED_BY_NEWER_TURN',
+                 error_message = 'Superseded by newer event in the same session during quiet window',
+                 updated_at = ?1
+             WHERE id = ?2 AND status = 'queued'`
+          )
+          .bind(now, stale.id)
+          .run();
+        if ((upd.meta.changes ?? 0) === 1) {
+          supersededSourceIds.add(stale.source_id);
+          const refreshedDelivery = await getDeliveryById(db, stale.id);
+          if (refreshedDelivery) {
+            supersededDeliveries.push(refreshedDelivery);
+          }
+        }
+      }
+      for (const oldSourceId of supersededSourceIds) {
+        await recomputeSourceNotifyStatus(db, "native_event", oldSourceId);
+        const refreshedEvent = await getNativeEventById(db, oldSourceId);
+        if (refreshedEvent) {
+          supersededEvents.push(refreshedEvent);
+        }
+      }
+    }
+  }
+
   const candidates: DeliveryCandidate[] = [];
-  if (hasValidBot && notifyKeyId) {
+  if (hasValidBot && notifyKeyId && botAllowsEvent) {
     candidates.push({
       channelKind: "bot_webhook",
       channelId: notifyKeyId,
@@ -2097,8 +2287,65 @@ export async function createNativeEvent(
     });
   }
 
+  const isNonUrgentNative = input.eventKind === "turn_summary" || input.eventKind === "progress";
+  const quietSec = getNativeNotifyQuietSec(env);
+  const cooldownSec = getNativeNotifyCooldownSec(env);
+  const cooldownCutoffIso =
+    isNonUrgentNative && cooldownSec > 0
+      ? new Date(Date.now() - cooldownSec * 1000).toISOString()
+      : "";
+  let skippedAny = false;
+
   for (const cand of candidates) {
     const dlvId = newId("dlv");
+    const hitCooldown =
+      isNonUrgentNative && input.nativeSessionId !== "" && cooldownSec > 0
+        ? await hasRecentNonUrgentSessionDelivery(
+            db,
+            nodeId,
+            input.agent,
+            input.nativeSessionId,
+            cand.channelKind,
+            cand.channelId,
+            cooldownCutoffIso
+          )
+        : false;
+
+    if (hitCooldown) {
+      const skipRes = await db
+        .prepare(
+          `INSERT OR IGNORE INTO notification_deliveries (
+             id, source_kind, source_id, trigger_event, node_id,
+             channel_kind, channel_id, channel_label, target_host, route_mode,
+             status, attempts, http_status, error_code, error_message, sent_at, created_at, updated_at
+           ) VALUES (
+             ?1, 'native_event', ?2, ?3, ?4,
+             ?5, ?6, ?7, ?8, ?9,
+             ?10, 0, NULL, ?11, ?12, NULL, ?13, ?13
+           )`
+        )
+        .bind(
+          dlvId,
+          id,
+          input.eventKind as DeliveryTriggerEvent,
+          nodeId,
+          cand.channelKind,
+          cand.channelId,
+          cand.channelLabel,
+          cand.targetHost,
+          cand.routeMode,
+          "skipped",
+          "SESSION_COOLDOWN_ACTIVE",
+          "Skipped: session cooldown window active",
+          now
+        )
+        .run();
+      if ((skipRes.meta.changes ?? 0) === 1) {
+        skippedAny = true;
+      }
+      continue;
+    }
+
     const dlvRes = await db
       .prepare(
         `INSERT OR IGNORE INTO notification_deliveries (
@@ -2125,15 +2372,28 @@ export async function createNativeEvent(
       )
       .run();
     if ((dlvRes.meta.changes ?? 0) === 1) {
-      await env.NOTIFY_QUEUE.send({ kind: "delivery", delivery_id: dlvId });
+      if (isNonUrgentNative && quietSec > 0) {
+        await env.NOTIFY_QUEUE.send({ kind: "delivery", delivery_id: dlvId }, { delaySeconds: quietSec });
+      } else {
+        await env.NOTIFY_QUEUE.send({ kind: "delivery", delivery_id: dlvId });
+      }
     }
+  }
+
+  if (skippedAny) {
+    await recomputeSourceNotifyStatus(db, "native_event", id);
   }
 
   const created = await db
     .prepare(`SELECT * FROM native_events WHERE id = ?1 LIMIT 1`)
     .bind(id)
     .first<NativeEventRow>();
-  return { event: await hydrateNativeEventRow(db, created!), deduplicated: false };
+  return {
+    event: await hydrateNativeEventRow(db, created!),
+    deduplicated: false,
+    ...(supersededEvents.length > 0 ? { supersededEvents } : {}),
+    ...(supersededDeliveries.length > 0 ? { supersededDeliveries } : {})
+  };
 }
 
 export async function completeRun(
@@ -3370,7 +3630,11 @@ export async function redeliverSourceDeliveries(
         )
         .bind(now, row.id)
         .run();
-      await env.NOTIFY_QUEUE.send({ kind: "delivery", delivery_id: row.id });
+      await env.NOTIFY_QUEUE.send(
+        sourceKind === "native_event" && Boolean(deliveryId)
+          ? { kind: "delivery", delivery_id: row.id, bypass_coalesce: true }
+          : { kind: "delivery", delivery_id: row.id }
+      );
     }
     await recomputeSourceNotifyStatus(db, sourceKind, sourceId);
   }

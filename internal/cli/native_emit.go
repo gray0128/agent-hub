@@ -188,6 +188,9 @@ func runNativeEmit(g globalOpts, args []string) int {
 	if !isWorkdirAllowedForNativeNotify(req.Workdir, effectiveRoots) {
 		return emitSkipped(g.JSON, "workdir_outside_allowed_roots")
 	}
+	if !isNativeEventKindEnabled(req.EventKind, cfg.NativeNotify.Events) {
+		return emitSkipped(g.JSON, "event_kind_filtered")
+	}
 
 	// Pre-egress secret redaction & size bounding on node before leaving host
 	req.Title = boundRunes(redact.Text(req.Title), 200)
@@ -233,6 +236,19 @@ func isValidNativeEventKind(kind string) bool {
 	default:
 		return false
 	}
+}
+
+func isNativeEventKindEnabled(eventKind string, allowedEvents []string) bool {
+	if len(allowedEvents) == 0 {
+		return true
+	}
+	target := strings.ToLower(strings.TrimSpace(eventKind))
+	for _, ev := range allowedEvents {
+		if strings.ToLower(strings.TrimSpace(ev)) == target {
+			return true
+		}
+	}
+	return false
 }
 
 func emitSkipped(asJSON bool, reason string) int {
@@ -353,6 +369,9 @@ func parseClaudeHookEvent(raw string, effectiveRoots []string) (*api.NativeEvent
 		CWD                  string `json:"cwd"`
 		HookEventName        string `json:"hook_event_name"`
 		StopHookActive       bool   `json:"stop_hook_active"`
+		AgentID              string `json:"agent_id"`
+		SubagentType         string `json:"subagent_type"`
+		ParentSessionID      string `json:"parent_session_id"`
 		LastAssistantMessage string `json:"last_assistant_message"`
 		NotificationType     string `json:"notification_type"`
 		Message              string `json:"message"`
@@ -364,6 +383,13 @@ func parseClaudeHookEvent(raw string, effectiveRoots []string) (*api.NativeEvent
 	}
 	if payload.StopHookActive {
 		return nil, "stop_hook_active", nil
+	}
+	if strings.EqualFold(strings.TrimSpace(payload.HookEventName), "SubagentStop") ||
+		strings.EqualFold(strings.TrimSpace(payload.HookEventName), "SubagentEnd") ||
+		strings.TrimSpace(payload.AgentID) != "" ||
+		strings.TrimSpace(payload.SubagentType) != "" ||
+		strings.TrimSpace(payload.ParentSessionID) != "" {
+		return nil, "subagent_session", nil
 	}
 	if payload.HookEventName != "Notification" && payload.HookEventName != "Stop" {
 		return nil, "unsupported_claude_hook_event", nil
@@ -443,6 +469,12 @@ func parseGrokHookEvent(raw string, effectiveRoots []string) (*api.NativeEventRe
 		Title                     string `json:"title"`
 		PromptID                  string `json:"prompt_id"`
 		PromptIDCamel             string `json:"promptId"`
+		AgentID                   string `json:"agent_id"`
+		AgentIDCamel              string `json:"agentId"`
+		SubagentType              string `json:"subagent_type"`
+		SubagentTypeCamel         string `json:"subagentType"`
+		ParentSessionID           string `json:"parent_session_id"`
+		ParentSessionIDCamel      string `json:"parentSessionId"`
 		TranscriptPath            string `json:"transcript_path"`
 		TranscriptPathCamel       string `json:"transcriptPath"`
 	}
@@ -453,6 +485,18 @@ func parseGrokHookEvent(raw string, effectiveRoots []string) (*api.NativeEventRe
 		return nil, "stop_hook_active", nil
 	}
 	eventName := strings.ToLower(strings.TrimSpace(firstNonEmpty(payload.HookEventName, payload.HookEventNameCamel)))
+	if eventName == "subagentstop" ||
+		eventName == "subagentend" ||
+		firstNonEmpty(
+			payload.AgentID,
+			payload.AgentIDCamel,
+			payload.SubagentType,
+			payload.SubagentTypeCamel,
+			payload.ParentSessionID,
+			payload.ParentSessionIDCamel,
+		) != "" {
+		return nil, "subagent_session", nil
+	}
 	if eventName != "notification" && eventName != "stop" {
 		return nil, "unsupported_grok_hook_event", nil
 	}
@@ -471,6 +515,9 @@ func parseGrokHookEvent(raw string, effectiveRoots []string) (*api.NativeEventRe
 		notifType := firstNonEmpty(payload.NotificationType, payload.NotificationTypeCamel)
 		if strings.EqualFold(notifType, "idle_prompt") {
 			return nil, "idle_prompt", nil
+		}
+		if strings.EqualFold(notifType, "task_complete") {
+			return nil, "task_complete_notification", nil
 		}
 		summary := firstNonEmpty(payload.Message, payload.Title, notifType)
 		if summary == "" {
@@ -542,28 +589,33 @@ func parseCodexNotifyEvent(raw string) (*api.NativeEventRequest, string, error) 
 }
 
 type agyTranscriptTail struct {
-	lastContent     string
-	lastStep        int
-	lineCount       int
-	finalStep       int
-	finalContent    string
-	hasExitPlanMode bool
-	hasAskQuestion  bool
-	askQuestions    []string
+	lastContent      string
+	lastStep         int
+	lineCount        int
+	finalStep        int
+	finalContent     string
+	hasExitPlanMode  bool
+	hasAskQuestion   bool
+	askQuestions     []string
+	hasUserInput     bool
+	hasSubagentEntry bool
 }
 
 func parseAgyHookEvent(raw string, allowTranscript bool, effectiveRoots []string) (*api.NativeEventRequest, string, error) {
 	var payload struct {
-		ConversationID    string   `json:"conversationId"`
-		ExecutionNum      int      `json:"executionNum"`
-		TerminationReason string   `json:"terminationReason"`
-		Error             string   `json:"error"`
-		LastUserInput     string   `json:"lastUserInput"`
-		CWD               string   `json:"cwd"`
-		WorkspacePaths    []string `json:"workspacePaths"`
-		TranscriptPath    string   `json:"transcriptPath"`
-		HookEventName     string   `json:"hookEventName"`
-		FullyIdle         *bool    `json:"fullyIdle"`
+		ConversationID       string   `json:"conversationId"`
+		ParentConversationID string   `json:"parentConversationId"`
+		RootConversationID   string   `json:"rootConversationId"`
+		ExecutionID          string   `json:"executionId"`
+		ExecutionNum         int      `json:"executionNum"`
+		TerminationReason    string   `json:"terminationReason"`
+		Error                string   `json:"error"`
+		LastUserInput        string   `json:"lastUserInput"`
+		CWD                  string   `json:"cwd"`
+		WorkspacePaths       []string `json:"workspacePaths"`
+		TranscriptPath       string   `json:"transcriptPath"`
+		HookEventName        string   `json:"hookEventName"`
+		FullyIdle            *bool    `json:"fullyIdle"`
 	}
 	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
 		return nil, "", fmt.Errorf("invalid agy hook json: %w", err)
@@ -576,6 +628,12 @@ func parseAgyHookEvent(raw string, allowTranscript bool, effectiveRoots []string
 	}
 	if payload.FullyIdle != nil && !*payload.FullyIdle {
 		return nil, "not_fully_idle", nil
+	}
+	convID := strings.TrimSpace(payload.ConversationID)
+	parentID := strings.TrimSpace(payload.ParentConversationID)
+	rootID := strings.TrimSpace(payload.RootConversationID)
+	if parentID != "" || (rootID != "" && convID != "" && rootID != convID) {
+		return nil, "subagent_session", nil
 	}
 	workdir := strings.TrimSpace(payload.CWD)
 	if workdir == "" && len(payload.WorkspacePaths) > 0 {
@@ -595,6 +653,9 @@ func parseAgyHookEvent(raw string, allowTranscript bool, effectiveRoots []string
 		lineCount = tail.lineCount
 		if tail.hasExitPlanMode {
 			return nil, "exit_plan_mode_handoff", nil
+		}
+		if strings.TrimSpace(payload.LastUserInput) == "" && !tail.hasAskQuestion && tail.hasSubagentEntry && !tail.hasUserInput {
+			return nil, "subagent_session", nil
 		}
 		if tail.hasAskQuestion {
 			eventKind = "interaction_needed"
@@ -636,21 +697,36 @@ func parseAgyHookEvent(raw string, allowTranscript bool, effectiveRoots []string
 	}
 
 	var eventID string
-	if payload.ExecutionNum > 0 {
-		eventID = deterministicEventID("agy", payload.ConversationID, fmt.Sprintf("%d", payload.ExecutionNum), eventKind, payload.TerminationReason)
+	execID := strings.TrimSpace(payload.ExecutionID)
+	if execID != "" {
+		marker := "exec:" + execID
+		if payload.ExecutionNum > 0 {
+			marker += fmt.Sprintf(":num:%d", payload.ExecutionNum)
+		}
+		if lastStep > 0 || lineCount > 0 {
+			marker += fmt.Sprintf(":step:%d:lines:%d", lastStep, lineCount)
+		}
+		eventID = deterministicEventID("agy", convID, marker, eventKind, payload.TerminationReason)
+	} else if payload.ExecutionNum > 0 {
+		if lastStep > 0 || lineCount > 0 {
+			marker := fmt.Sprintf("num:%d:step:%d:lines:%d", payload.ExecutionNum, lastStep, lineCount)
+			eventID = deterministicEventID("agy", convID, marker, eventKind, payload.TerminationReason)
+		} else {
+			eventID = deterministicEventID("agy", convID, fmt.Sprintf("%d", payload.ExecutionNum), eventKind, payload.TerminationReason, payload.LastUserInput)
+		}
 	} else {
 		turnMarker := fmt.Sprintf("tb:%d", nativeEmitNow().Unix()/15)
 		if lastStep > 0 || lineCount > 0 {
 			turnMarker = fmt.Sprintf("step:%d:lines:%d", lastStep, lineCount)
 		}
-		eventID = deterministicEventID("agy", payload.ConversationID, turnMarker, eventKind, payload.TerminationReason, payload.LastUserInput)
+		eventID = deterministicEventID("agy", convID, turnMarker, eventKind, payload.TerminationReason, payload.LastUserInput)
 	}
 
 	return &api.NativeEventRequest{
 		EventID:         eventID,
 		Agent:           "agy",
 		EventKind:       eventKind,
-		NativeSessionID: strings.TrimSpace(payload.ConversationID),
+		NativeSessionID: convID,
 		Workdir:         workdir,
 		Title:           title,
 		Summary:         summary,
@@ -710,6 +786,7 @@ func readAgyTranscriptTail(transcriptPath string) agyTranscriptTail {
 				}
 				var row struct {
 					StepIndex int    `json:"step_index"`
+					Source    string `json:"source"`
 					Type      string `json:"type"`
 					Content   string `json:"content"`
 					ToolCalls []struct {
@@ -717,32 +794,43 @@ func readAgyTranscriptTail(transcriptPath string) agyTranscriptTail {
 						Args json.RawMessage `json:"args"`
 					} `json:"tool_calls"`
 				}
-				if json.Unmarshal(line, &row) == nil && row.Type == "PLANNER_RESPONSE" {
-					content := strings.TrimSpace(row.Content)
-					if content != "" {
-						tail.lastContent = content
-						tail.lastStep = row.StepIndex
+				if json.Unmarshal(line, &row) == nil {
+					if row.Type == "USER_INPUT" || row.Source == "USER_EXPLICIT" {
+						tail.hasUserInput = true
 					}
-					tail.finalStep = row.StepIndex
-					tail.finalContent = content
-					tail.hasExitPlanMode = false
-					tail.hasAskQuestion = false
-					tail.askQuestions = nil
-					for _, tc := range row.ToolCalls {
-						switch tc.Name {
-						case "exit_plan_mode":
-							tail.hasExitPlanMode = true
-						case "ask_question":
-							tail.hasAskQuestion = true
-							var args struct {
-								Questions []struct {
-									Question string `json:"question"`
-								} `json:"questions"`
-							}
-							if len(tc.Args) > 0 && json.Unmarshal(tc.Args, &args) == nil {
-								for _, q := range args.Questions {
-									if qs := strings.TrimSpace(q.Question); qs != "" {
-										tail.askQuestions = append(tail.askQuestions, qs)
+					if row.Type == "SYSTEM_MESSAGE" &&
+						row.Source == "SYSTEM" &&
+						strings.Contains(row.Content, "[Message]") &&
+						strings.Contains(row.Content, "sender=") {
+						tail.hasSubagentEntry = true
+					}
+					if row.Type == "PLANNER_RESPONSE" {
+						content := strings.TrimSpace(row.Content)
+						if content != "" {
+							tail.lastContent = content
+							tail.lastStep = row.StepIndex
+						}
+						tail.finalStep = row.StepIndex
+						tail.finalContent = content
+						tail.hasExitPlanMode = false
+						tail.hasAskQuestion = false
+						tail.askQuestions = nil
+						for _, tc := range row.ToolCalls {
+							switch tc.Name {
+							case "exit_plan_mode":
+								tail.hasExitPlanMode = true
+							case "ask_question":
+								tail.hasAskQuestion = true
+								var args struct {
+									Questions []struct {
+										Question string `json:"question"`
+									} `json:"questions"`
+								}
+								if len(tc.Args) > 0 && json.Unmarshal(tc.Args, &args) == nil {
+									for _, q := range args.Questions {
+										if qs := strings.TrimSpace(q.Question); qs != "" {
+											tail.askQuestions = append(tail.askQuestions, qs)
+										}
 									}
 								}
 							}

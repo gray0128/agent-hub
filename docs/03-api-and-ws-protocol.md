@@ -43,8 +43,8 @@
 
 | 方法与路径 | 允许 Scope | 功能说明 | 关键请求/响应约定 |
 | --- | --- | --- | --- |
-| `GET /api/v1/nodes` | `admin`, `client` | 列出所有已注册节点及其在线态、可用 Agent、模型简称及已上报工作区；仅 `admin` Scope 额外返回脱敏默认通知通道状态（`default_notify_key_id`、`default_notify_key_name`、`default_notify_webhook_host`、`default_notify_valid`） | 响应 `nodes[]`（按 `client` Key 的 `bound_node_id` 与 `allowed_nodes_json` 自动过滤可见范围；`client` Scope 一律省略上述 `default_notify_*` 字段） |
-| `PATCH /api/v1/nodes/:id` | `admin` | 修改节点显示名、`status`（如设为 `draining` 停止派发新任务）、`max_concurrency` 或节点默认通知通道 `default_notify_key_id` | 请求体 `{display_name?, status?, max_concurrency?, default_notify_key_id?}`；绑定非空 `default_notify_key_id` 时强制校验目标为未吊销、已配置 Webhook 且允许访问该节点的 `client` Key，传 `null` 或 `""` 解绑 |
+| `GET /api/v1/nodes` | `admin`, `client` | 列出所有已注册节点及其在线态、可用 Agent、模型简称及已上报工作区；仅 `admin` Scope 额外返回脱敏默认通知通道状态（`default_notify_key_id`、`default_notify_key_name`、`default_notify_webhook_host`、`default_notify_valid`、`default_notify_events`） | 响应 `nodes[]`（按 `client` Key 的 `bound_node_id` 与 `allowed_nodes_json` 自动过滤可见范围；`client` Scope 一律省略上述 `default_notify_*` 字段） |
+| `PATCH /api/v1/nodes/:id` | `admin` | 修改节点显示名、`status`（如设为 `draining` 停止派发新任务）、`max_concurrency`、节点默认通知通道 `default_notify_key_id` 或默认 Bot 触发事件白名单 `default_notify_events` | 请求体 `{display_name?, status?, max_concurrency?, default_notify_key_id?, default_notify_events?}`；绑定非空 `default_notify_key_id` 时强制校验目标为未吊销、已配置 Webhook 且允许访问该节点的 `client` Key，传 `null` 或 `""` 解绑；`default_notify_events` 接收去重后的 `PushEventFilterKey[]`（允许 `[]` 静默默认 Bot） |
 | `POST /api/v1/nodes/:id/native-events` | `node` | 节点上报脱离 `ahub` 运行的本地 Agent 官方 Hook / 扩展 / 阶段里程碑原生事件（`event_kind` 支持 `interaction_needed \| turn_summary \| progress`，`agent` 支持 `agy \| pi \| omp \| codex \| claude \| grok`） | 仅允许 `bound_node_id == :id` 的节点凭证调用；按 `(node_id, event_id)` 幂等去重，入库前二次脱敏；多渠道扇出写入 `notification_deliveries`（`bot_webhook` 按 `nodes.default_notify_key_id` Fail-Closed 校验，节点未绑定时仅跳过 Bot 通道且**不阻断 `web_push`**；若没有任何匹配渠道则保留 `skipped` `NODE_DEFAULT_CHANNEL_UNBOUND` 或 `failed` `DEFAULT_CHANNEL_INVALID_OR_REVOKED`）；当 `!deduplicated` 时经 `NodeHub` DO 向全局 `admin` `/ws/stream` 广播 `native_event.upserted`（含 `open_interaction_count`） |
 | `POST /api/v1/nodes/:id/claim` | `node` | 节点认领待执行任务（WS `hub.wake` 后及重连握手后必调） | 请求 `{conn_nonce, busy_workdirs?}`；返回 `claimed_runs[]`（**全系统唯一返回原始未脱敏 `prompt` 的接口**，供节点本地执行；伴随广播至 `/ws/stream` 的 `run.updated` 帧仍须对 `prompt` 脱敏并截断至 `<= 1200` 字符） |
 | `POST /api/v1/runs/:id/heartbeat` | `node` | 为运行中的任务续期 `90s` 租约，并检查是否已被取消 | 请求 `{lease_owner}`；返回 `{ok: true, status, should_abort: boolean, lease_expires_at}` |
@@ -99,7 +99,7 @@
 | `GET /api/v1/native-events` | `admin` | 分页查询原生交互会话活动记录及 `deliveries_summary` | 查询参数：`?node_id=&agent=&event_kind=&notify_status=&unacked_only=false&q=&limit=50&before_ts=&before_id=`（`limit` 夹逼 `1..100`）；`unacked_only=true` 仅返回 `event_kind = 'interaction_needed'` 且派生 `attention_state === 'open'` 的记录；响应 `200 { ok: true, events: NativeEventView[], open_interaction_count: number, next_cursor: { before_ts: string, before_id: string } \| null }` |
 | `GET /api/v1/native-events/:id` | `admin` | 查询单条原生活动详情及其逐渠道投递账本 | 不存在返回 `404 NOT_FOUND`；响应 `200 { ok: true, event: NativeEventView, deliveries: NotificationDeliveryRecord[] }` |
 | `POST /api/v1/native-events/:id/ack` | `admin` | 幂等确认指定 `interaction_needed`（或同会话未确认互动）已处理 | 可选请求体 `{ scope?: "single" \| "session" }`（默认 `"single"`）；`"session"` 且 `native_session_id != ''` 时一并确认同 `(node_id, agent, native_session_id)` 下全部未确认 `interaction_needed`；广播 `native_event.upserted` 至全局 `admin` `/ws/stream`，返回 `200 { ok: true, event: NativeEventView, acked_count: number, open_interaction_count: number }` |
-| `POST /api/v1/native-events/:id/redeliver` | `admin` | 对原生事件的失败通道或指定 `delivery_id` 重新入队投递 | 可选请求体 `{ delivery_id?: string }`（指定时校验归属 `('native_event', :id)`，否则 `404 NOT_FOUND`）；重置目标明细为 `'queued'`、重算外层 `notify_status`、投递 `{ kind: "delivery", delivery_id }` 并广播 `delivery.updated` 与 `native_event.upserted`，返回 `200 { ok: true, event: NativeEventView, deliveries: NotificationDeliveryRecord[], requeued_count: number }` |
+| `POST /api/v1/native-events/:id/redeliver` | `admin` | 对原生事件的失败通道或指定 `delivery_id` 重新入队投递 | 可选请求体 `{ delivery_id?: string }`（指定时校验归属 `('native_event', :id)`，否则 `404 NOT_FOUND`；传入明确 `delivery_id` 时同时允许重推 `failed` 或 `skipped` 明细，并以 `bypass_coalesce: true`、`0s` 延迟立即投递，不传 `delivery_id` 的批量重推仍仅针对 `failed`）；重置目标明细为 `'queued'`、重算外层 `notify_status`、投递 `{ kind: "delivery", delivery_id, bypass_coalesce? }` 并广播 `delivery.updated` 与 `native_event.upserted`，返回 `200 { ok: true, event: NativeEventView, deliveries: NotificationDeliveryRecord[], requeued_count: number }` |
 | `GET /api/v1/runs/:id/deliveries` | `admin` | 查询指定受控 `Run` 的多渠道通知投递账本明细 | 任务不存在返回 `404 NOT_FOUND`；返回 `200 { ok: true, deliveries: NotificationDeliveryRecord[] }` |
 | `POST /api/v1/runs/:id/redeliver` | `admin` | 对受控 `Run` 的失败通道或指定 `delivery_id` 重新入队投递（供 `InspectorPane` 单通道重推复用） | 可选请求体 `{ delivery_id?: string }`（校验归属 `('run', :id)`，否则 `404 NOT_FOUND`）；重置目标明细为 `'queued'`、重算 `runs.notify_status`、投递 `{ kind: "delivery", delivery_id }` 并广播 `delivery.updated` 与 `run.updated`，返回 `200 { ok: true, run: RunRecord, deliveries: NotificationDeliveryRecord[], requeued_count: number }` |
 
@@ -163,19 +163,21 @@
 ```json
 {
   "kind": "delivery",
-  "delivery_id": "dlv_01J..."
+  "delivery_id": "dlv_01J...",
+  "bypass_coalesce": false
 }
 ```
 
-> 隔离原则：由于每条消息只负责一个 `(source_kind, source_id, trigger_event, channel_kind, channel_id)` 投递目标，单条 Web Push 返回 `503` / `429` 重试时绝不会重复触发已成功的 Bot Webhook 或其他浏览器设备。
+> 隔离原则：由于每条消息只负责一个 `(source_kind, source_id, trigger_event, channel_kind, channel_id)` 投递目标，单条 Web Push 返回 `503` / `429` 重试时绝不会重复触发已成功的 Bot Webhook 或其他浏览器设备。`bypass_coalesce` 仅在人工指定 `delivery_id` 重推原生事件明细时置为 `true` 以跳过防抖与冷却复核。
 
 目标入队规则如下：
 
 - **受控 `Run` 任务通知**：
-  - Bot Webhook：若 `runs.notify_policy_json` 显式指定有效目标（`target` 为 `"grok"` 或 `"webhook"` 且命中 `events` 过滤），任务进入 `done`、`failed`、`cancelled` 或首次进入 `needs_approval` 时生成对应 `bot_webhook` / `legacy_webhook` 投递行；若 `target == "none"`，**仅当**满足 `depth == 0` **且**发起方为人工控制面（`runs.created_by_key_id IS NULL`）或 `admin` API Key 时转入 `nodes.default_notify_key_id`（`route_mode = "node_default"`；失效则将 `runs.notify_status` 置为 `'failed'`）。`client` 静默任务与 `depth >= 1` 子任务绝不触发 `node_default`。
+  - Bot Webhook：若 `runs.notify_policy_json` 显式指定有效目标（`target` 为 `"grok"` 或 `"webhook"` 且命中 `events` 过滤），任务进入 `done`、`failed`、`cancelled` 或首次进入 `needs_approval` 时生成对应 `bot_webhook` / `legacy_webhook` 投递行；若 `target == "none"`，**仅当**满足 `depth == 0` **且**发起方为人工控制面（`runs.created_by_key_id IS NULL`）或 `admin` API Key 时转入 `nodes.default_notify_key_id`（`route_mode = "node_default"`；失效则将 `runs.notify_status` 置为 `'failed'`）。凡走 `node_default` 路由均额外校验 `nodes.default_notify_events` 包含 `run_<status>`。`client` 静默任务与 `depth >= 1` 子任务绝不触发 `node_default`。
   - Web Push：仅当 `depth == 0` 时匹配 `enabled = 1 AND revoked_at IS NULL` 且 `node_filter_json` 覆盖目标节点的管理员订阅；其中人工/`admin` 任务按 `run_<status>` 过滤，**`client` Key 创建的 `depth == 0` 任务仅匹配 `needs_approval` 与 `failed`（绝不在 `done` / `cancelled` 弹窗）**，`depth >= 1` 子任务对 Web Push 完全静默。
 - **节点原生 Agent 事件通知（`native_events`）**：
-  - `POST /api/v1/nodes/:id/native-events` 在 `!deduplicated` 时：若节点存在有效的 `default_notify_key_id`，生成 `bot_webhook`（`route_mode = "node_default"`）投递行（未绑定时跳过 Bot 通道但**不阻断 Web Push**）；同时为所有匹配 `node_filter_json` 与 `native_<event_kind>`（`interaction_needed` / `turn_summary` / `progress`）的活跃 `web_push_subscriptions` 各自生成 `web_push` 投递行。若最终两者皆无匹配，按规则保留 `notify_status = 'skipped'`（`NODE_DEFAULT_CHANNEL_UNBOUND`）或 `'failed'`（`DEFAULT_CHANNEL_INVALID_OR_REVOKED`）。
+  - `POST /api/v1/nodes/:id/native-events` 在 `!deduplicated` 时：若节点存在有效的 `default_notify_key_id` 且 `nodes.default_notify_events` 包含 `native_<event_kind>`，生成 `bot_webhook`（`route_mode = "node_default"`）投递行（未绑定或未命中事件过滤时跳过 Bot 通道但**不阻断 Web Push**）；同时为所有匹配 `node_filter_json` 与 `native_<event_kind>`（`interaction_needed` / `turn_summary` / `progress`）的活跃 `web_push_subscriptions` 各自生成 `web_push` 投递行。若最终两者皆无匹配，按规则保留 `notify_status = 'skipped'`（`NODE_DEFAULT_CHANNEL_UNBOUND` 或 `NO_MATCHING_CHANNELS`）或 `'failed'`（`DEFAULT_CHANNEL_INVALID_OR_REVOKED`）。
+  - 对于非紧急事件（`turn_summary`、`progress`），入队阶段附带 `delaySeconds = NATIVE_NOTIFY_QUIET_SEC`（默认 `60`），并在 `native_session_id != ''` 时先将同会话在途旧队列行标为 `skipped`（`SUPERSEDED_BY_NEWER_TURN`）；同时在入库与消费双阶段校验同会话同通道 `NATIVE_NOTIFY_COOLDOWN_SEC`（默认 `300`）冷却窗（命中则置 `skipped` `SESSION_COOLDOWN_ACTIVE`）。`interaction_needed` 恒以 `delaySeconds = 0` 立即投递且不受冷却限制。
 
 ### 4.2 Bot Webhook 回调格式与 Fail-Closed 隔离
 
@@ -303,3 +305,6 @@ Bot Webhook 重试策略：HTTP 非 `2xx` 时抛出异常由 Cloudflare Queues �
 | `SUBSCRIPTION_EXPIRED` | `notification_deliveries.error_code` | Push 网关返回 `404` / `410 Gone`，订阅已自动写入 `revoked_at` |
 | `PUSH_REJECTED_<status>` | `notification_deliveries.error_code` | Push 网关返回确定性客户端错误（如 `400`、`401`、`403`、`413`），不重试 |
 | `PUSH_UPSTREAM_TIMEOUT` | `notification_deliveries.error_code` | Push 网关返回 `429` / `5xx` 或网络超时，且 `5` 次退避重试均失败 |
+| `NO_MATCHING_CHANNELS` | `native_events.notify_error` | 节点已绑定默认通道但未命中事件过滤规则且无匹配 Web Push 订阅，`notify_status` 记为 `skipped` |
+| `SUPERSEDED_BY_NEWER_TURN` | `notification_deliveries.error_code` / `native_events.notify_error` | 非紧急原生事件在静默防抖窗内被同 `(node_id, agent, native_session_id)` 的更新事件覆盖消解，`status` 记为 `skipped` |
+| `SESSION_COOLDOWN_ACTIVE` | `notification_deliveries.error_code` / `native_events.notify_error` | 非紧急原生事件命中同会话同通道冷却窗，已跳过外发（仍保留 Web 原生活动记录），`status` 记为 `skipped` |

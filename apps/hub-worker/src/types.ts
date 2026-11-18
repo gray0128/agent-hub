@@ -102,6 +102,7 @@ export interface NodeRecord {
   default_notify_key_name?: string;
   default_notify_webhook_host?: string;
   default_notify_valid?: boolean;
+  default_notify_events?: PushEventFilterKey[];
   last_seen_at: string | null;
   created_at: string;
   updated_at: string;
@@ -308,6 +309,7 @@ export interface NativeEventNotifyQueueMessage {
 export interface DeliveryNotifyQueueMessage {
   kind: "delivery";
   delivery_id: string;
+  bypass_coalesce?: boolean;
 }
 
 export type NotifyQueueMessage =
@@ -336,6 +338,8 @@ export interface Env {
   VAPID_PRIVATE_JWK?: string;
   VAPID_SUBJECT?: string;
   NATIVE_EVENTS_RETENTION_DAYS?: string;
+  NATIVE_NOTIFY_QUIET_SEC?: string;
+  NATIVE_NOTIFY_COOLDOWN_SEC?: string;
   ALLOW_LOOPBACK_PUSH_FOR_TEST?: string;
 }
 

@@ -274,6 +274,22 @@ CREATE INDEX IF NOT EXISTS idx_deliveries_status_updated
   WHERE status IN ('queued', 'failed');
 ```
 
+### 1.2 节点默认通知事件过滤与投递冷却索引迁移（`migrations/0007_node_default_notify_events.sql`）
+
+为解耦「原生活动落库观察」与「节点默认 Bot 外发打断」，并支撑非紧急通知的同会话冷却查询，`0007` 迁移按如下 DDL 演进：
+
+```sql
+PRAGMA foreign_keys = ON;
+
+ALTER TABLE nodes
+  ADD COLUMN default_notify_events_json TEXT NOT NULL
+  DEFAULT '["run_needs_approval","run_failed","run_done","run_cancelled","native_interaction_needed","native_turn_summary","native_progress"]';
+
+CREATE INDEX IF NOT EXISTS idx_deliveries_channel_sent
+  ON notification_deliveries (source_kind, channel_kind, channel_id, sent_at DESC)
+  WHERE status = 'sent';
+```
+
 ### 字段语义与容量边界
 
 - 所有时间字段统一使用 RFC 3339 UTC 字符串（精度至毫秒，例如 `2026-11-13T04:15:30.123Z`），确保按字典序比较与索引扫描结果一致。
@@ -395,10 +411,22 @@ D1 查询层与 Web Store 共享同一纯函数逻辑推导每条 `native_events
 
 | 事件来源 | Bot Webhook 路由规则 | 浏览器 Web Push 路由规则 |
 | --- | --- | --- |
-| `native_events` | 按 `nodes.default_notify_key_id` Fail-Closed；未绑定时仅跳过 Bot 通道，**不阻断 Web Push 通道** | 匹配 `enabled = 1 AND revoked_at IS NULL`、`node_filter_json`（空数组为全部节点）及 `native_<event_kind>` |
-| 人工 / `admin` 发起的 `runs`（`depth = 0`） | 按 `--notify` 或 `nodes.default_notify_key_id`（`node_default -> global_legacy`）路由 | 匹配 `node_filter_json` 与 `run_<status>` |
+| `native_events` | 按 `nodes.default_notify_key_id` Fail-Closed，并过滤 `nodes.default_notify_events`（非 `admin` 作用域剥离，默认启用全部 7 项 `PushEventFilterKey`）；未绑定或未命中事件时仅跳过 Bot 通道，**不阻断 Web Push 通道** | 匹配 `enabled = 1 AND revoked_at IS NULL`、`node_filter_json`（空数组为全部节点）及 `native_<event_kind>` |
+| 人工 / `admin` 发起的 `runs`（`depth = 0`） | 按 `--notify` 或 `nodes.default_notify_key_id`（走 `node_default` 时同步受 `nodes.default_notify_events` 过滤，否则回退 `global_legacy`）路由 | 匹配 `node_filter_json` 与 `run_<status>` |
 | `client` Key 发起的 `runs`（`depth = 0`） | 仅当显式传 `--notify` 时锁定发起方 `client` Key 自身 Webhook（`target = 'none'` 时不发 Bot 回调） | 仅向匹配 `node_filter_json` 的管理员订阅推送 `needs_approval` 与 `failed`（`done` / `cancelled` 绝不触发） |
 | 衍生子任务 `runs`（`depth >= 1`） | 禁止落入 `node_default` | 静默（不向管理员推送 Web Push，防止子任务通知风暴） |
+
+#### 非紧急原生通知的静默防抖与同会话冷却规则
+
+为消除终端连续短问答带来的逐轮外呼轰炸，控制面对非紧急原生事件（`turn_summary`、`progress`）实施双层节流，而「原生活动」时间线与 `/ws/stream` 仍保持 `0ms` 实时入库与广播：
+
+1. **紧急事件直通（`0s` 延迟、零冷却）**：`native_interaction_needed`、`run_needs_approval`、`run_failed`、`run_done`、`run_cancelled` 以及人工在控制台指定 `delivery_id` 发起的单通道重推（`bypass_coalesce: true`）一律立即入队投递，绝不延迟或因冷却跳过。
+2. **静默防抖窗与后继覆盖消解（默认 `60s`，环境变量 `NATIVE_NOTIFY_QUIET_SEC`，范围 `0..3600`）**：
+   - `turn_summary` 与 `progress` 入队时设置 `delaySeconds = quietSec`。
+   - 新事件入库且 `native_session_id != ''` 时，主动将同 `(node_id, agent, native_session_id)` 下早于当前事件且仍处于 `queued` 状态的旧 `turn_summary` / `progress` 投递行收敛为 `status = 'skipped'`（`SUPERSEDED_BY_NEWER_TURN`），并重算旧事件聚合状态；队列消费端在投递前再次复核是否存在更新的同会话事件，确保旧轮次绝不延迟抢跑。
+3. **同会话冷却窗（默认 `300s`，环境变量 `NATIVE_NOTIFY_COOLDOWN_SEC`，范围 `0..86400`）**：
+   - 当 `native_session_id != ''` 且同一 `(node_id, agent, native_session_id, channel_kind, channel_id)` 在 `[now - cooldownSec, now]` 内已存在 `status = 'sent'` 的非紧急（`turn_summary` / `progress`）投递时，入库期直接落盘 `status = 'skipped'`（`SESSION_COOLDOWN_ACTIVE`）且不再入队，消费端在发送前亦二次复核。
+   - 若所有候选通道均被跳过，外层 `native_events.notify_status` 按规则收敛为 `'skipped'` 并写入对应诊断码（`NO_MATCHING_CHANNELS` / `SUPERSEDED_BY_NEWER_TURN` / `SESSION_COOLDOWN_ACTIVE`）。
 
 ### 5.4 原生活动与投递账本留存清理契约（Cron）
 

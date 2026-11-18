@@ -1,4 +1,6 @@
 const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+let lastUlidTime = -1;
+const lastUlidRand = new Uint8Array(10);
 
 export function newUlid(): string {
   const now = Date.now();
@@ -8,13 +10,25 @@ export function newUlid(): string {
     tsPart = CROCKFORD[t % 32] + tsPart;
     t = Math.floor(t / 32);
   }
-  const bytes = new Uint8Array(10);
-  crypto.getRandomValues(bytes);
+  if (now === lastUlidTime) {
+    let carry = 1;
+    for (let i = lastUlidRand.length - 1; i >= 0 && carry > 0; i--) {
+      const next = (lastUlidRand[i]! + carry) & 0xff;
+      carry = lastUlidRand[i]! + carry > 0xff ? 1 : 0;
+      lastUlidRand[i] = next;
+    }
+    if (carry > 0) {
+      crypto.getRandomValues(lastUlidRand);
+    }
+  } else {
+    lastUlidTime = now;
+    crypto.getRandomValues(lastUlidRand);
+  }
   let randPart = "";
   // Encode 80 random bits as 16 Crockford base32 characters
   let buffer = 0;
   let bits = 0;
-  for (const b of bytes) {
+  for (const b of lastUlidRand) {
     buffer = (buffer << 8) | b;
     bits += 8;
     while (bits >= 5) {

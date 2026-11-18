@@ -666,3 +666,183 @@ func TestNativeEmitCLIProgressAndTitleDisambiguation(t *testing.T) {
 		t.Fatalf("expected inside_ahub_run skip for progress, got code=%d out=%s", codeSkip, outSkip)
 	}
 }
+
+func TestNativeEmitFiltersSubagentsTaskCompleteEventsAndDisambiguatesAgyTurns(t *testing.T) {
+	var received []api.NativeEventRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req api.NativeEventRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatal(err)
+		}
+		received = append(received, req)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(api.NativeEventResponse{
+			OK: true,
+			Event: api.NativeEventRecord{
+				ID:           "evt_sub_filter",
+				NodeID:       "macmini",
+				EventID:      req.EventID,
+				Agent:        req.Agent,
+				EventKind:    req.EventKind,
+				NotifyStatus: "queued",
+			},
+		})
+	}))
+	defer srv.Close()
+
+	tmpDir := t.TempDir()
+	allowedRoot := filepath.Join(tmpDir, "workspace")
+	demoDir := filepath.Join(allowedRoot, "demo")
+	if err := os.MkdirAll(demoDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := writeTempNodeConfig(t, config.NodeConfig{
+		NodeID: "macmini",
+		HubURL: srv.URL,
+		Token:  "ahub_nod_filter_token",
+		NativeNotify: &config.NativeNotifyConfig{
+			Enabled:                  true,
+			AllowedRoots:             []string{allowedRoot},
+			IncludeTranscriptSummary: true,
+		},
+	})
+
+	t.Setenv("AHUB_RUN_ID", "")
+	t.Setenv("AHUB_DEPTH", "")
+	t.Setenv("AHUB_TOKEN", "")
+	t.Setenv("AHUB_URL", "")
+
+	// 1. Agy parentConversationId / rootConversationId != conversationId -> subagent_session
+	agyParent := `{"conversationId":"conv_sub_1","parentConversationId":"conv_root_1","executionNum":1,"fullyIdle":true,"terminationReason":"NO_TOOL_CALL","cwd":` + jsonQuote(demoDir) + `,"hookEventName":"Stop"}`
+	code, out := captureExecute(t, []string{"--json", "native-emit", "--config", cfgPath, "--from-hook", "agy"}, agyParent)
+	if code != 0 || !strings.Contains(out, "subagent_session") {
+		t.Fatalf("expected subagent_session skip for parentConversationId, got code=%d out=%s", code, out)
+	}
+
+	agyRootMismatch := `{"conversationId":"conv_sub_2","rootConversationId":"conv_root_1","executionNum":1,"fullyIdle":true,"terminationReason":"NO_TOOL_CALL","cwd":` + jsonQuote(demoDir) + `,"hookEventName":"Stop"}`
+	code, out = captureExecute(t, []string{"--json", "native-emit", "--config", cfgPath, "--from-hook", "agy"}, agyRootMismatch)
+	if code != 0 || !strings.Contains(out, "subagent_session") {
+		t.Fatalf("expected subagent_session skip for rootConversationId mismatch, got code=%d out=%s", code, out)
+	}
+
+	// 2. Agy transcript fallback: empty lastUserInput + [Message] sender=... without USER_INPUT -> subagent_session
+	subTranscript := filepath.Join(tmpDir, "subagent.jsonl")
+	_ = os.WriteFile(subTranscript, []byte(
+		`{"step_index":0,"source":"SYSTEM_SDK","type":"SYSTEM_MESSAGE","content":"init"}`+"\n"+
+			`{"step_index":2,"source":"SYSTEM","type":"SYSTEM_MESSAGE","content":"[Message] sender=856d6e29-14e4-430a-a4da-8f530099eed8 content=Verify M4b"}`+"\n"+
+			`{"step_index":10,"source":"MODEL","type":"PLANNER_RESPONSE","content":"Challenger report complete."}`+"\n",
+	), 0o600)
+	agySubTranscript := `{"conversationId":"conv_sub_3","executionNum":1,"fullyIdle":true,"terminationReason":"NO_TOOL_CALL","lastUserInput":"","cwd":` + jsonQuote(demoDir) + `,"transcriptPath":` + jsonQuote(subTranscript) + `,"hookEventName":"Stop"}`
+	code, out = captureExecute(t, []string{"--json", "native-emit", "--config", cfgPath, "--from-hook", "agy"}, agySubTranscript)
+	if code != 0 || !strings.Contains(out, "subagent_session") {
+		t.Fatalf("expected subagent_session skip from transcript heuristic, got code=%d out=%s", code, out)
+	}
+
+	// 3. Root session that receives subagent messages AND has USER_INPUT MUST still emit
+	rootTranscript := filepath.Join(tmpDir, "root.jsonl")
+	_ = os.WriteFile(rootTranscript, []byte(
+		`{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"/teamwork start"}`+"\n"+
+			`{"step_index":5,"source":"SYSTEM","type":"SYSTEM_MESSAGE","content":"[Message] sender=sub1 content=Milestone done"}`+"\n"+
+			`{"step_index":6,"source":"MODEL","type":"PLANNER_RESPONSE","content":"Turn 1 summary"}`+"\n",
+	), 0o600)
+	agyRootTurn1 := `{"conversationId":"conv_root_real","executionId":"exec_1","executionNum":1,"fullyIdle":true,"terminationReason":"NO_TOOL_CALL","lastUserInput":"","cwd":` + jsonQuote(demoDir) + `,"transcriptPath":` + jsonQuote(rootTranscript) + `,"hookEventName":"Stop"}`
+	code, out = captureExecute(t, []string{"--json", "native-emit", "--config", cfgPath, "--from-hook", "agy"}, agyRootTurn1)
+	if code != 0 {
+		t.Fatalf("expected root session with USER_INPUT to emit, got code=%d out=%s", code, out)
+	}
+
+	// 4. Same conversationId, executionNum=1 again in Turn 2 with new executionId / transcript step -> distinct EventID
+	_ = os.WriteFile(rootTranscript, []byte(
+		`{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"/teamwork start"}`+"\n"+
+			`{"step_index":5,"source":"SYSTEM","type":"SYSTEM_MESSAGE","content":"[Message] sender=sub1 content=Milestone done"}`+"\n"+
+			`{"step_index":6,"source":"MODEL","type":"PLANNER_RESPONSE","content":"Turn 1 summary"}`+"\n"+
+			`{"step_index":7,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"continue"}`+"\n"+
+			`{"step_index":8,"source":"MODEL","type":"PLANNER_RESPONSE","content":"Turn 2 summary"}`+"\n",
+	), 0o600)
+	agyRootTurn2 := `{"conversationId":"conv_root_real","executionId":"exec_2","executionNum":1,"fullyIdle":true,"terminationReason":"NO_TOOL_CALL","lastUserInput":"","cwd":` + jsonQuote(demoDir) + `,"transcriptPath":` + jsonQuote(rootTranscript) + `,"hookEventName":"Stop"}`
+	code, out = captureExecute(t, []string{"--json", "native-emit", "--config", cfgPath, "--from-hook", "agy"}, agyRootTurn2)
+	if code != 0 {
+		t.Fatalf("expected root session turn 2 to emit, got code=%d out=%s", code, out)
+	}
+	// Also verify without executionId when step/lineCount advances while executionNum stays 1
+	reqNoExec1, _, err := parseAgyHookEvent(
+		`{"conversationId":"conv_no_exec","executionNum":1,"fullyIdle":true,"terminationReason":"NO_TOOL_CALL","lastUserInput":"same","cwd":`+jsonQuote(demoDir)+`,"transcriptPath":`+jsonQuote(subTranscript[:len(subTranscript)-len("subagent.jsonl")]+"root.jsonl")+`,"hookEventName":"Stop"}`,
+		true,
+		[]string{allowedRoot},
+	)
+	if err != nil || reqNoExec1 == nil {
+		t.Fatalf("parseAgyHookEvent reqNoExec1 failed: %v", err)
+	}
+	rootTranscript2 := filepath.Join(tmpDir, "root2.jsonl")
+	_ = os.WriteFile(rootTranscript2, []byte(
+		`{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"same"}`+"\n"+
+			`{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","content":"Earlier"}`+"\n",
+	), 0o600)
+	reqNoExec2, _, err := parseAgyHookEvent(
+		`{"conversationId":"conv_no_exec","executionNum":1,"fullyIdle":true,"terminationReason":"NO_TOOL_CALL","lastUserInput":"same","cwd":`+jsonQuote(demoDir)+`,"transcriptPath":`+jsonQuote(rootTranscript2)+`,"hookEventName":"Stop"}`,
+		true,
+		[]string{allowedRoot},
+	)
+	if err != nil || reqNoExec2 == nil {
+		t.Fatalf("parseAgyHookEvent reqNoExec2 failed: %v", err)
+	}
+	if reqNoExec1.EventID == reqNoExec2.EventID {
+		t.Fatalf("expected distinct EventIDs across turns with same executionNum=1 when step/lines differ: %q", reqNoExec1.EventID)
+	}
+
+	// 5. Claude SubagentStop / agent_id -> subagent_session
+	for _, claudePayload := range []string{
+		`{"session_id":"sess_c_sub","cwd":` + jsonQuote(demoDir) + `,"hook_event_name":"SubagentStop","last_assistant_message":"done"}`,
+		`{"session_id":"sess_c_sub2","cwd":` + jsonQuote(demoDir) + `,"hook_event_name":"Stop","agent_id":"sub_123","last_assistant_message":"done"}`,
+	} {
+		code, out = captureExecute(t, []string{"--json", "native-emit", "--config", cfgPath, "--from-hook", "claude"}, claudePayload)
+		if code != 0 || !strings.Contains(out, "subagent_session") {
+			t.Fatalf("expected claude subagent skip, got code=%d out=%s", code, out)
+		}
+	}
+
+	// 6. Grok SubagentStop / parentSessionId -> subagent_session, Notification(task_complete) -> task_complete_notification
+	for _, grokPayload := range []string{
+		`{"sessionId":"sess_g_sub","workspaceRoot":` + jsonQuote(demoDir) + `,"hookEventName":"SubagentStop","lastAssistantMessage":"sub done"}`,
+		`{"sessionId":"sess_g_sub2","workspaceRoot":` + jsonQuote(demoDir) + `,"hookEventName":"stop","parentSessionId":"sess_root","lastAssistantMessage":"sub done"}`,
+	} {
+		code, out = captureExecute(t, []string{"--json", "native-emit", "--config", cfgPath, "--from-hook", "grok"}, grokPayload)
+		if code != 0 || !strings.Contains(out, "subagent_session") {
+			t.Fatalf("expected grok subagent skip, got code=%d out=%s", code, out)
+		}
+	}
+	grokTaskComplete := `{"session_id":"sess_g_tc","cwd":` + jsonQuote(demoDir) + `,"hook_event_name":"Notification","notification_type":"task_complete","title":"Task Complete","message":"Turn done"}`
+	code, out = captureExecute(t, []string{"--json", "native-emit", "--config", cfgPath, "--from-hook", "grok"}, grokTaskComplete)
+	if code != 0 || !strings.Contains(out, "task_complete_notification") {
+		t.Fatalf("expected grok task_complete skip, got code=%d out=%s", code, out)
+	}
+
+	if len(received) != 2 {
+		t.Fatalf("expected only 2 root agy events emitted, got %d: %+v", len(received), received)
+	}
+	if received[0].EventID == received[1].EventID {
+		t.Fatalf("expected distinct EventIDs for root turn 1 and turn 2, both got %q", received[0].EventID)
+	}
+
+	// 7. NativeNotifyConfig.Events local event_kind whitelist filtering
+	filteredCfgPath := writeTempNodeConfig(t, config.NodeConfig{
+		NodeID: "macmini",
+		HubURL: srv.URL,
+		Token:  "ahub_nod_filter_token",
+		NativeNotify: &config.NativeNotifyConfig{
+			Enabled:      true,
+			AllowedRoots: []string{allowedRoot},
+			Events:       []string{"interaction_needed"},
+		},
+	})
+	code, out = captureExecute(t, []string{
+		"--json", "native-emit", "--config", filteredCfgPath, "--from-hook", "claude",
+	}, `{"session_id":"sess_flt","cwd":`+jsonQuote(demoDir)+`,"hook_event_name":"Stop","last_assistant_message":"turn done"}`)
+	if code != 0 || !strings.Contains(out, "event_kind_filtered") {
+		t.Fatalf("expected event_kind_filtered skip, got code=%d out=%s", code, out)
+	}
+	if len(received) != 2 {
+		t.Fatalf("filtered turn_summary must not hit server, got len=%d", len(received))
+	}
+}

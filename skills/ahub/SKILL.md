@@ -51,5 +51,5 @@ Use the `ahub` CLI as the sole interface to `agent-hub`. Do not hand-craft HTTP 
 6. **Native activity & progress milestones** (no `workdir` locks):
    - Read-only inspect (`admin` only; `client` exits `78` `FORBIDDEN_SCOPE`):
      `ahub activity [--node <id>] [--agent <a>] [--kind interaction_needed|turn_summary|progress] [--unacked] [--limit 20] [--json]`
-   - Long-task milestone (never mount `PostToolUse` hooks):
+   - Long-task milestone (never mount `PostToolUse` hooks; non-urgent `turn_summary`/`progress` are filtered by `native_notify.events` & node default Bot event rules and coalesced with 60s quiet-window + 300s session cooldown):
      `ahub native-emit --agent <a> --kind progress --session-id <sid> --dir "$PWD" --title "<t>" --summary -`

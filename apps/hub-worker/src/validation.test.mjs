@@ -343,3 +343,25 @@ test("M3 admin query, ack, redeliver, and push-subscription parsers enforce cont
   assert.equal(patchedSub.enabled, false);
   assert.deepEqual(patchedSub.eventFilter, ["native_interaction_needed", "native_progress"]);
 });
+
+test("parsePatchNodeRequest validates default_notify_events", () => {
+  const emptyEvents = parsePatchNodeRequest({ default_notify_events: [] });
+  assert.deepEqual(emptyEvents.defaultNotifyEvents, []);
+
+  const subset = parsePatchNodeRequest({
+    default_notify_events: ["native_interaction_needed", "run_failed", "native_interaction_needed"]
+  });
+  assert.deepEqual(subset.defaultNotifyEvents, ["native_interaction_needed", "run_failed"]);
+
+  const withoutEvents = parsePatchNodeRequest({ display_name: "Node A" });
+  assert.equal("defaultNotifyEvents" in withoutEvents, false);
+
+  assert.throws(
+    () => parsePatchNodeRequest({ default_notify_events: ["not_an_event"] }),
+    /Invalid event filter key/
+  );
+  assert.throws(
+    () => parsePatchNodeRequest({ default_notify_events: "native_turn_summary" }),
+    /must be an array/
+  );
+});

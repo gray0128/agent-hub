@@ -321,18 +321,37 @@ export default {
             throw new HubError(403, "FORBIDDEN_SCOPE", "Node key cannot emit native events for another node.");
           }
           const body = parseNativeEventCreateRequest(await readJsonBody(request));
-          const result = await createNativeEvent(env.DB, env, nodeId, body);
-          if (!result.deduplicated) {
-            if (result.event.deliveries_summary && result.event.deliveries_summary.total > 0) {
-              const deliveries = await listDeliveriesForSource(env.DB, "native_event", result.event.id);
+          const { supersededEvents, supersededDeliveries, ...publicResult } = await createNativeEvent(
+            env.DB,
+            env,
+            nodeId,
+            body
+          );
+          if (!publicResult.deduplicated) {
+            for (const d of supersededDeliveries ?? []) {
+              ctx.waitUntil(broadcastDelivery(env, d));
+            }
+            for (const ev of supersededEvents ?? []) {
+              ctx.waitUntil(broadcastNativeEvent(env, ev));
+            }
+            if (publicResult.event.deliveries_summary && publicResult.event.deliveries_summary.total > 0) {
+              const deliveries = await listDeliveriesForSource(
+                env.DB,
+                "native_event",
+                publicResult.event.id
+              );
               for (const d of deliveries) {
                 ctx.waitUntil(broadcastDelivery(env, d));
               }
             }
-            ctx.waitUntil(broadcastNativeEvent(env, result.event));
+            ctx.waitUntil(broadcastNativeEvent(env, publicResult.event));
           }
-          const status = result.deduplicated ? 200 : result.event.notify_status === "queued" ? 202 : 200;
-          return Response.json({ ok: true, ...result }, { status });
+          const status = publicResult.deduplicated
+            ? 200
+            : publicResult.event.notify_status === "queued"
+              ? 202
+              : 200;
+          return Response.json({ ok: true, ...publicResult }, { status });
         }
 
         const claimMatch = /^\/api\/v1\/nodes\/([^/]+)\/claim$/.exec(pathname);

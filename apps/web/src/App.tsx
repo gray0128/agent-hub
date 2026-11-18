@@ -72,6 +72,7 @@ import type {
   DeliverySourceKind,
   NativeEventView,
   NodeRecord,
+  PushEventFilterKey,
   ThreadRecord
 } from "@/types";
 
@@ -1229,6 +1230,21 @@ export function App() {
     }
   }
 
+  async function handleUpdateNodeDefaultNotifyEvents(
+    nodeId: string,
+    events: PushEventFilterKey[]
+  ) {
+    if (!hasSession) return;
+    try {
+      const res = await apiClient.patchNode(token, nodeId, {
+        default_notify_events: events
+      });
+      upsertNode(res.node);
+    } catch (err) {
+      setErrorBanner(err instanceof ApiClientError ? err.message : "更新默认推送事件失败");
+    }
+  }
+
   async function handleUpdateNodeConcurrency(nodeId: string, maxConcurrency: number) {
     if (!hasSession) return;
     try {
@@ -1440,6 +1456,8 @@ export function App() {
     onToggleNodeDrain: handleToggleNodeDrain,
     onUpdateNodeConcurrency: handleUpdateNodeConcurrency,
     onUpdateNodeDefaultNotify: authScope === "admin" ? handleUpdateNodeDefaultNotify : undefined,
+    onUpdateNodeDefaultNotifyEvents:
+      authScope === "admin" ? handleUpdateNodeDefaultNotifyEvents : undefined,
     onPickWorkspace: handlePickWorkspace
   };
 

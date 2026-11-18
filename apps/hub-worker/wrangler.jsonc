@@ -70,6 +70,8 @@
     "HUB_PUBLIC_URL": "https://ahub.bobocai.win",
     "DEFAULT_MAX_DEPTH": "1",
     "LEASE_TTL_SECONDS": "90",
+    "NATIVE_NOTIFY_QUIET_SEC": "60",
+    "NATIVE_NOTIFY_COOLDOWN_SEC": "300",
     "RELEASE_BASE_URL": "https://github.com/gray0128/agent-hub/releases/latest/download"
   }
 }

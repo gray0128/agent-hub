@@ -333,8 +333,16 @@ export function NativeActivityPane({
                 </div>
 
                 {ev.notify_error ? (
-                  <div className="mt-2 border-l-2 border-[var(--status-failed)] pl-2.5 font-mono text-[11px] text-[var(--status-failed)]">
-                    通知异常：{ev.notify_error}
+                  <div
+                    className={cn(
+                      "mt-2 border-l-2 pl-2.5 font-mono text-[11px]",
+                      ev.notify_status === "skipped"
+                        ? "border-border text-muted-foreground"
+                        : "border-[var(--status-failed)] text-[var(--status-failed)]"
+                    )}
+                  >
+                    {ev.notify_status === "skipped" ? "跳过原因：" : "通知异常："}
+                    {ev.notify_error}
                   </div>
                 ) : null}
 

@@ -81,6 +81,7 @@ export const apiClient = {
       status?: NodeStatus;
       max_concurrency?: number;
       default_notify_key_id?: string | null;
+      default_notify_events?: PushEventFilterKey[];
     }
   ) {
     return requestJson<{ ok: true; node: NodeRecord }>(`/api/v1/nodes/${encodeURIComponent(nodeId)}`, token, {

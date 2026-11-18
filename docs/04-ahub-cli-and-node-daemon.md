@@ -105,7 +105,12 @@ skills/ahub/SKILL.md             # 通过 go:embed 内嵌于二进制中
       "~/workspace",
       "~/projects"
     ],
-    "include_transcript_summary": false
+    "include_transcript_summary": false,
+    "events": [
+      "interaction_needed",
+      "turn_summary",
+      "progress"
+    ]
   },
   "agents": {
     "agy": {
@@ -187,19 +192,19 @@ skills/ahub/SKILL.md             # 通过 go:embed 内嵌于二进制中
 
 | Agent | 官方接入方式 | 已覆盖事件 | 未覆盖 / 已知限制 |
 | --- | --- | --- | --- |
-| `claude` | `~/.claude/settings.json`（`Notification`、`Stop` Hook） | `interaction_needed`（`Notification`，自动跳过 `idle_prompt`）、`turn_summary`（`Stop` `last_assistant_message`） | 未读外部全盘历史，依赖 Hook 传入 JSON |
+| `claude` | `~/.claude/settings.json`（`Notification`、`Stop` Hook） | `interaction_needed`（`Notification`，自动跳过 `idle_prompt`）、`turn_summary`（`Stop` `last_assistant_message`；自动跳过 `SubagentStop`/`SubagentEnd` 及含 `agent_id`/`subagent_type`/`parent_session_id` 的子代理事件） | 未读外部全盘历史，依赖 Hook 传入 JSON |
 | `codex` | `~/.codex/config.toml`（`notify = [...]`） | `turn_summary`（`agent-turn-complete`） | Codex TUI 审批/互动提示不经 `notify` 触发 |
-| `agy` | `~/.gemini/config/hooks.json` 或 `.agents/hooks.json`（`Stop` Hook） | `turn_summary`（跳过 `fullyIdle: false` 与 `exit_plan_mode` 交接；开启 `include_transcript_summary` 时提取末条回复，若末步调用 `ask_question` 则上报 `interaction_needed`） | 仅靠内置弹窗但未落盘至 Transcript 的非工具交互不触发 `Stop` |
+| `agy` | `~/.gemini/config/hooks.json` 或 `.agents/hooks.json`（`Stop` Hook） | `turn_summary`（跳过 `fullyIdle: false`、`exit_plan_mode` 交接及子代理会话——含 `parentConversationId`、`rootConversationId != conversationId` 或无 `USER_INPUT` 的子代理轨迹；结合 `executionId` 与 `(lastStep, lineCount)` 构造幂等键防跨回合碰撞；开启 `include_transcript_summary` 时提取末条回复，若末步调用 `ask_question` 则上报 `interaction_needed`） | 仅靠内置弹窗但未落盘至 Transcript 的非工具交互不触发 `Stop` |
 | `pi` | `~/.pi/agent/extensions/ahub-native-notify.ts` 自动加载扩展 | `turn_summary`（`agent_settled`/`agent_end`）、`interaction_needed`（`ui_prompt_start`） | 无 UI 的 headless `-p` 默认跳过防刷屏 |
 | `omp` | `~/.omp/agent/extensions/ahub-native-notify.ts` 自动加载扩展（或 `--from-hook omp`） | `turn_summary`（`agent_settled`/`agent_end`）、`interaction_needed`（`tool_approval_requested` / `ui_prompt_start`） | 无 UI 的 headless `-p` 默认跳过防刷屏 |
-| `grok` | `~/.grok/hooks/ahub-native-notify.json`（`Notification`、`Stop` 调 `ahub native-emit --from-hook grok`） | `interaction_needed`（`Notification`，跳过 `idle_prompt`）、`turn_summary`（`Stop`，跳过 `stop_hook_active`） | 依赖 Grok Hook 传入 `cwd`/`last_assistant_message` |
+| `grok` | `~/.grok/hooks/ahub-native-notify.json`（`Notification`、`Stop` 调 `ahub native-emit --from-hook grok`） | `interaction_needed`（`Notification`，自动跳过 `idle_prompt` 与 `task_complete`）、`turn_summary`（`Stop`，跳过 `stop_hook_active` 与 `SubagentStop`/子代理字段） | 依赖 Grok Hook 传入 `cwd`/`last_assistant_message` |
 
 `ahub native-emit` 强制执行以下安全与幂等边界：
 
 1. **凭证隔离**：除命令行显式传入 `--url` / `--token` 外，固定只读取 `node.json` 中的 `hub_url` 与 `token`，忽略环境变量 `AHUB_URL`、`AHUB_TOKEN` 与客户端 `credentials` 文件。
-2. **目录白名单回退与先校验后读盘**：`native_notify.allowed_roots` 为空时默认回退复用 `node.json` 的 `project_roots`（两者均为空时 Fail-Closed 跳过）；**必须在工作区白名单校验通过之后**才允许打开读取 `agy` 的 `transcriptPath`，禁止对未授权路径触发磁盘读取。
-3. **大体积 Transcript 流式读取**：扫描 `agy` 的 `transcriptPath` 时采用流式 `bufio.Reader` 逐行读取并跳过超过 `4 MB` 的超长非目标行（或尾部定位最新 `PLANNER_RESPONSE`），避免固定 `4 MB` 缓冲上限导致扫描提前中止并返回旧轮次内容。
-4. **无单调轮次 ID Hook 的幂等键**：对于缺乏原生单调轮次 ID 的 Hook（如 `claude` `Notification` 重复审批通知，或未传有效 `executionNum` 的 `agy` `Stop`），在未显式指定 `--event-id` 时将 Transcript 末尾 `step_index`/行号或短时间粒度桶纳入 `event_id` 哈希维度，避免同会话重复审批或第 2 轮起总结通知被 `(node_id, event_id)` 去重静默丢弃。
+2. **目录白名单回退与先校验后读盘**：`native_notify.allowed_roots` 为空时默认回退复用 `node.json` 的 `project_roots`（两者均为空时 Fail-Closed 跳过）；**必须在工作区白名单校验通过之后**才允许打开读取 `agy` 的 `transcriptPath`，禁止对未授权路径触发磁盘读取。支持可选 `native_notify.events` 在节点出网前过滤 `event_kind`（留空则不过滤）。
+3. **大体积 Transcript 流式读取与子代理拦截**：扫描 `agy` 的 `transcriptPath` 时采用流式 `bufio.Reader` 逐行读取并跳过超过 `4 MB` 的超长非目标行，精准拦截无人工输入且由父代理消息拉起的子代理会话（避免 `/teamwork` 等编排器派生数十子代理逐一刷屏）。
+4. **无单调轮次 ID Hook 的幂等键**：对于缺乏原生单调轮次 ID 的 Hook（如 `claude` `Notification` 重复审批通知，或未传有效/唯一 `executionId` 的 `agy` `Stop`），在未显式指定 `--event-id` 时将 `executionId`、Transcript 末尾 `step_index`/行号或短时间粒度桶纳入 `event_id` 哈希维度，避免同会话重复审批、跨回合同 `executionNum` 碰撞或第 2 轮起总结通知被 `(node_id, event_id)` 去重静默丢弃。
 5. **出站前脱敏、长度有界与多渠道扇出**：上报前在节点本地对 `title`（上限 `200` 字符）与 `summary`（上限 `4000` 字符）执行 `redact.Text` 脱敏；云端 `POST /api/v1/nodes/:id/native-events` 执行二次脱敏落库后，在 `notification_deliveries` 按节点默认 Bot Webhook 与匹配的 `web_push_subscriptions` 多渠道扇出并独立入队，外层 `notify_status` 聚合为 `none | queued | sent | partial | failed | skipped`。
 
 ## 5. 配套 `skills/ahub/SKILL.md` 标准全文
@@ -260,6 +265,6 @@ Use the `ahub` CLI as the sole interface to `agent-hub`. Do not hand-craft HTTP 
 6. **Native activity & progress milestones** (no `workdir` locks):
    - Read-only inspect (`admin` only; `client` exits `78` `FORBIDDEN_SCOPE`):
      `ahub activity [--node <id>] [--agent <a>] [--kind interaction_needed|turn_summary|progress] [--unacked] [--limit 20] [--json]`
-   - Long-task milestone (never mount `PostToolUse` hooks):
+   - Long-task milestone (never mount `PostToolUse` hooks; non-urgent `turn_summary`/`progress` are filtered by `native_notify.events` & node default Bot event rules and coalesced with 60s quiet-window + 300s session cooldown):
      `ahub native-emit --agent <a> --kind progress --session-id <sid> --dir "$PWD" --title "<t>" --summary -`
 ```

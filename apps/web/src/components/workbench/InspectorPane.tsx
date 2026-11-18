@@ -22,6 +22,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { PUSH_EVENT_FILTER_OPTIONS } from "@/lib/browser-notify";
 import {
   cn,
   type EventTone,
@@ -36,6 +37,7 @@ import type {
   NativeEventView,
   NodeRecord,
   NotificationDeliveryRecord,
+  PushEventFilterKey,
   RunEventItem,
   RunRecord
 } from "@/types";
@@ -141,6 +143,7 @@ export interface InspectorPaneProps {
   onToggleNodeDrain: (node: NodeRecord) => void;
   onUpdateNodeConcurrency: (nodeId: string, maxConcurrency: number) => void;
   onUpdateNodeDefaultNotify?: (nodeId: string, keyId: string | null) => void;
+  onUpdateNodeDefaultNotifyEvents?: (nodeId: string, events: PushEventFilterKey[]) => void;
   onPickWorkspace: (nodeId: string, workdir: string) => void;
 }
 
@@ -166,6 +169,7 @@ export function InspectorPane({
   onToggleNodeDrain,
   onUpdateNodeConcurrency,
   onUpdateNodeDefaultNotify,
+  onUpdateNodeDefaultNotifyEvents,
   onPickWorkspace
 }: InspectorPaneProps) {
   const [expandedEvents, setExpandedEvents] = useState<Record<string, boolean>>({});
@@ -631,6 +635,61 @@ export function InspectorPane({
                       可在「API Keys」为 client 凭证配置 Bot Webhook 后在此绑定
                     </div>
                   )}
+
+                  {selectedNode.default_notify_key_id && onUpdateNodeDefaultNotifyEvents ? (
+                    <div className="space-y-1.5 pt-1">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[11px] font-medium text-muted-foreground">
+                          默认 Bot 推送事件
+                        </span>
+                        <span className="font-mono text-[10px] text-muted-foreground tabular-nums">
+                          {
+                            (
+                              selectedNode.default_notify_events ??
+                              PUSH_EVENT_FILTER_OPTIONS.map((o) => o.key)
+                            ).length
+                          }
+                          /{PUSH_EVENT_FILTER_OPTIONS.length}
+                        </span>
+                      </div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {PUSH_EVENT_FILTER_OPTIONS.map((opt) => {
+                          const currentEvents =
+                            selectedNode.default_notify_events ??
+                            PUSH_EVENT_FILTER_OPTIONS.map((o) => o.key);
+                          const active = currentEvents.includes(opt.key);
+                          return (
+                            <button
+                              key={opt.key}
+                              type="button"
+                              aria-pressed={active}
+                              data-testid={`node-notify-event-toggle-${opt.key}`}
+                              onClick={() => {
+                                const nextSet = new Set(currentEvents);
+                                if (active) {
+                                  nextSet.delete(opt.key);
+                                } else {
+                                  nextSet.add(opt.key);
+                                }
+                                const ordered = PUSH_EVENT_FILTER_OPTIONS.map((o) => o.key).filter((k) =>
+                                  nextSet.has(k)
+                                );
+                                onUpdateNodeDefaultNotifyEvents(selectedNode.id, ordered);
+                              }}
+                              className={cn(
+                                "min-h-11 md:min-h-0 md:h-7 rounded-md border px-2.5 md:px-2 text-xs md:text-[11px] font-medium transition-colors",
+                                active
+                                  ? "border-primary/40 bg-primary/10 text-foreground"
+                                  : "border-border bg-transparent text-muted-foreground hover:text-foreground"
+                              )}
+                            >
+                              {opt.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ) : null}
                 </div>
               ) : null}
 
@@ -834,12 +893,19 @@ export function InspectorPane({
                       </div>
 
                       {d.error_code || d.error_message ? (
-                        <div className="font-mono text-[10px] text-[var(--status-failed)] break-all">
+                        <div
+                          className={cn(
+                            "font-mono text-[10px] break-all",
+                            d.status === "skipped"
+                              ? "text-muted-foreground"
+                              : "text-[var(--status-failed)]"
+                          )}
+                        >
                           [{d.error_code || "ERROR"}] {d.error_message}
                         </div>
                       ) : null}
 
-                      {d.status === "failed" && onRedeliverChannel ? (
+                      {(d.status === "failed" || d.status === "skipped") && onRedeliverChannel ? (
                         <div className="pt-0.5">
                           <Button
                             type="button"
@@ -851,7 +917,11 @@ export function InspectorPane({
                             className="min-h-11 md:min-h-0 md:h-7 px-2.5 md:px-2 text-xs md:text-[11px]"
                           >
                             <RefreshCw className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
-                            {redeliveringIds[d.id] ? "重推中..." : "重推此通道"}
+                            {redeliveringIds[d.id]
+                              ? "推送中..."
+                              : d.status === "skipped"
+                                ? "立即推送此通道"
+                                : "重推此通道"}
                           </Button>
                         </div>
                       ) : null}

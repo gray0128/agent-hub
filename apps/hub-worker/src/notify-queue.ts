@@ -1,6 +1,8 @@
 import {
   getDeliveryById,
   getNativeEventById,
+  getNativeNotifyCooldownSec,
+  hasRecentNonUrgentSessionDelivery,
   mapRunRow,
   parseNotifyPolicy,
   recomputeSourceNotifyStatus,
@@ -803,6 +805,26 @@ async function processDeliveryWebPush(
   message.retry({ delaySeconds: Math.min(30, 2 ** message.attempts) });
 }
 
+async function markDeliverySkippedAndAck(
+  message: Message<NotifyQueueMessage>,
+  env: Env,
+  delivery: { id: string; source_kind: DeliverySourceKind; source_id: string },
+  errorCode: string,
+  errorMessage: string
+): Promise<void> {
+  const now = nowIso();
+  await env.DB.prepare(
+    `UPDATE notification_deliveries
+     SET status = 'skipped', error_code = ?1, error_message = ?2, updated_at = ?3
+     WHERE id = ?4`
+  )
+    .bind(errorCode, errorMessage.slice(0, 300), now, delivery.id)
+    .run();
+  const agg = await recomputeSourceNotifyStatus(env.DB, delivery.source_kind, delivery.source_id);
+  await broadcastDeliveryAndParent(env, delivery.id, delivery.source_kind, delivery.source_id, agg.deliveriesSummary);
+  message.ack();
+}
+
 async function processDeliveryMessage(
   message: Message<NotifyQueueMessage>,
   body: DeliveryNotifyQueueMessage,
@@ -812,6 +834,65 @@ async function processDeliveryMessage(
   if (!delivery || delivery.status === "sent" || delivery.status === "skipped") {
     message.ack();
     return;
+  }
+
+  if (
+    !body.bypass_coalesce &&
+    delivery.source_kind === "native_event" &&
+    (delivery.trigger_event === "turn_summary" || delivery.trigger_event === "progress")
+  ) {
+    const ev = await getNativeEventById(env.DB, delivery.source_id);
+    if (!ev) {
+      message.ack();
+      return;
+    }
+    if (ev.native_session_id !== "") {
+      const newerEv = await env.DB.prepare(
+        `SELECT id AS newer_id
+         FROM native_events
+         WHERE node_id = ?1
+           AND agent = ?2
+           AND native_session_id = ?3
+           AND (created_at > ?4 OR (created_at = ?4 AND id > ?5))
+         LIMIT 1`
+      )
+        .bind(ev.node_id, ev.agent, ev.native_session_id, ev.created_at, ev.id)
+        .first<{ newer_id: string }>();
+      if (newerEv) {
+        await markDeliverySkippedAndAck(
+          message,
+          env,
+          delivery,
+          "SUPERSEDED_BY_NEWER_TURN",
+          "Superseded by newer event in the same session"
+        );
+        return;
+      }
+
+      const cooldownSec = getNativeNotifyCooldownSec(env);
+      if (cooldownSec > 0) {
+        const cutoffIso = new Date(Date.now() - cooldownSec * 1000).toISOString();
+        const hitCooldown = await hasRecentNonUrgentSessionDelivery(
+          env.DB,
+          ev.node_id,
+          ev.agent,
+          ev.native_session_id,
+          delivery.channel_kind,
+          delivery.channel_id,
+          cutoffIso
+        );
+        if (hitCooldown) {
+          await markDeliverySkippedAndAck(
+            message,
+            env,
+            delivery,
+            "SESSION_COOLDOWN_ACTIVE",
+            "Skipped: session cooldown window active"
+          );
+          return;
+        }
+      }
+    }
   }
 
   if (delivery.channel_kind === "web_push") {
