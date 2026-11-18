@@ -23,13 +23,15 @@ export const SheetContent = React.forwardRef<
       ref={ref}
       aria-describedby={undefined}
       className={cn(
-        "fixed inset-y-0 z-50 flex w-[min(86vw,340px)] flex-col border-border bg-background shadow-2xl focus:outline-none",
-        side === "left" ? "left-0 border-r" : "right-0 border-l",
+        "fixed inset-y-0 z-50 flex w-[min(88vw,360px)] flex-col border-border bg-background pt-[var(--safe-top)] pb-[var(--safe-bottom)] shadow-2xl focus:outline-none",
+        side === "left"
+          ? "left-0 border-r pl-[var(--safe-left)]"
+          : "right-0 border-l pr-[var(--safe-right)]",
         className
       )}
       {...props}
     >
-      <div className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border bg-surface-elevated pl-3 pr-1">
+      <div className="flex min-h-12 shrink-0 items-center justify-between gap-2 border-b border-border bg-surface-elevated pl-3 pr-1">
         <DialogPrimitive.Title className="truncate text-xs font-semibold tracking-tight text-foreground">
           {title}
         </DialogPrimitive.Title>

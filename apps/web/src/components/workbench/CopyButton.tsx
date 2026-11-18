@@ -105,7 +105,7 @@ export function CopyButton({
         data-copied={status === "copied" ? "" : undefined}
         data-failed={status === "failed" ? "" : undefined}
         className={cn(
-          "inline-flex min-h-6 min-w-6 items-center justify-center gap-1 rounded-[5px] px-1.5 py-0.5 text-[11px] font-medium transition-[color,background-color,border-color,transform] duration-150 active:scale-[0.97] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring cursor-pointer",
+          "inline-flex min-h-11 min-w-11 md:min-h-6 md:min-w-6 items-center justify-center gap-1 rounded-[5px] px-2.5 md:px-1.5 py-0.5 text-xs md:text-[11px] font-medium transition-[color,background-color,border-color,transform] duration-150 active:scale-[0.97] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring cursor-pointer",
           variant === "outline"
             ? "border border-border bg-background/80 text-muted-foreground hover:border-foreground/30 hover:bg-accent hover:text-foreground"
             : "text-muted-foreground hover:bg-accent hover:text-foreground",

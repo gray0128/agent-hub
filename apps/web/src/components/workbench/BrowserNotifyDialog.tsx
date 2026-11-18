@@ -283,7 +283,10 @@ export function BrowserNotifyDialog({
                   value={deviceLabel}
                   onChange={(e) => setDeviceLabel(e.target.value)}
                   placeholder="例如：MacMini Chrome / iPhone Safari"
-                  className="h-8 text-xs"
+                  autoComplete="off"
+                  autoCorrect="off"
+                  autoCapitalize="none"
+                  spellCheck={false}
                 />
               </div>
               <div className="flex items-end">
@@ -311,7 +314,7 @@ export function BrowserNotifyDialog({
                     aria-pressed={nodeFilter.length === 0}
                     onClick={() => setNodeFilter([])}
                     className={cn(
-                      "inline-flex h-6 items-center rounded-[4px] border px-2 text-[11px] font-medium transition-colors duration-150 cursor-pointer",
+                      "inline-flex min-h-11 px-2.5 sm:min-h-0 sm:h-6 sm:px-2 items-center rounded-[4px] border text-xs sm:text-[11px] font-medium transition-colors duration-150 cursor-pointer",
                       nodeFilter.length === 0
                         ? "border-[var(--status-running)]/50 bg-[var(--status-running)]/12 text-foreground"
                         : "border-border bg-background/60 text-muted-foreground hover:text-foreground"
@@ -328,7 +331,7 @@ export function BrowserNotifyDialog({
                         aria-pressed={selected}
                         onClick={() => toggleNodeFilter(node.id)}
                         className={cn(
-                          "inline-flex h-6 items-center rounded-[4px] border px-2 font-mono text-[11px] transition-colors duration-150 cursor-pointer",
+                          "inline-flex min-h-11 px-2.5 sm:min-h-0 sm:h-6 sm:px-2 items-center rounded-[4px] border font-mono text-xs sm:text-[11px] transition-colors duration-150 cursor-pointer",
                           selected
                             ? "border-[var(--status-running)]/50 bg-[var(--status-running)]/12 text-foreground"
                             : "border-border bg-background/60 text-muted-foreground hover:text-foreground"
@@ -348,7 +351,7 @@ export function BrowserNotifyDialog({
                 return (
                   <label
                     key={opt.key}
-                    className="flex items-center justify-between gap-2 px-2.5 py-2 cursor-pointer"
+                    className="flex min-h-11 items-center justify-between gap-2 px-2.5 py-2 cursor-pointer"
                   >
                     <div className="min-w-0">
                       <div className="text-[11px] font-medium text-foreground">{opt.label}</div>
@@ -379,7 +382,7 @@ export function BrowserNotifyDialog({
                     .then((res) => onSubscriptionsChange(res.subscriptions))
                     .catch(() => {});
                 }}
-                className="inline-flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground cursor-pointer"
+                className="inline-flex min-h-11 px-2 sm:min-h-0 sm:px-0 items-center gap-1 text-xs sm:text-[11px] text-muted-foreground hover:text-foreground cursor-pointer"
               >
                 <RefreshCw className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
                 刷新
@@ -408,11 +411,12 @@ export function BrowserNotifyDialog({
                       <div className="flex flex-wrap items-center justify-between gap-2">
                         <div className="flex min-w-0 items-center gap-1.5">
                           {editingId === sub.id ? (
-                            <div className="flex items-center gap-1">
+                            <div className="flex flex-wrap items-center gap-1">
                               <Input
                                 value={editingLabel}
                                 onChange={(e) => setEditingLabel(e.target.value)}
-                                className="h-7 w-40 text-xs"
+                                autoComplete="off"
+                                className="w-40"
                               />
                               <Button
                                 type="button"
@@ -420,7 +424,7 @@ export function BrowserNotifyDialog({
                                 variant="outline"
                                 disabled={isBusy}
                                 onClick={() => handleSaveRename(sub.id)}
-                                className="h-7 px-2 text-[11px]"
+                                className="min-h-11 sm:min-h-0 sm:h-7 px-2.5 sm:px-2 text-xs sm:text-[11px]"
                               >
                                 保存
                               </Button>
@@ -429,7 +433,7 @@ export function BrowserNotifyDialog({
                                 size="sm"
                                 variant="ghost"
                                 onClick={() => setEditingId(null)}
-                                className="h-7 px-2 text-[11px]"
+                                className="min-h-11 sm:min-h-0 sm:h-7 px-2.5 sm:px-2 text-xs sm:text-[11px]"
                               >
                                 取消
                               </Button>
@@ -443,7 +447,7 @@ export function BrowserNotifyDialog({
                                   setEditingLabel(sub.label);
                                 }}
                                 title="点击重命名设备"
-                                className="truncate text-xs font-medium text-foreground hover:underline cursor-pointer"
+                                className="inline-flex min-h-11 sm:min-h-0 items-center truncate text-xs font-medium text-foreground hover:underline cursor-pointer"
                               >
                                 {sub.label}
                               </button>
@@ -456,7 +460,7 @@ export function BrowserNotifyDialog({
                           )}
                         </div>
 
-                        <div className="flex shrink-0 items-center gap-1.5">
+                        <div className="flex shrink-0 flex-wrap items-center gap-1.5">
                           <Switch
                             data-testid={`toggle-push-sub-${sub.id}`}
                             checked={sub.enabled}
@@ -470,7 +474,7 @@ export function BrowserNotifyDialog({
                             data-testid={`test-push-sub-${sub.id}`}
                             disabled={isBusy || !sub.enabled}
                             onClick={() => handleTestSub(sub.id)}
-                            className="h-7 px-2 text-[11px]"
+                            className="min-h-11 sm:min-h-0 sm:h-7 px-2.5 sm:px-2 text-xs sm:text-[11px]"
                           >
                             <Send className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
                             发送测试通知
@@ -483,7 +487,7 @@ export function BrowserNotifyDialog({
                             disabled={isBusy}
                             onClick={() => handleRevokeSub(sub.id)}
                             aria-label={`解绑 ${sub.label}`}
-                            className="h-7 px-2 text-[11px] text-[var(--status-failed)] hover:text-[var(--status-failed)]"
+                            className="min-h-11 sm:min-h-0 sm:h-7 px-2.5 sm:px-2 text-xs sm:text-[11px] text-[var(--status-failed)] hover:text-[var(--status-failed)]"
                           >
                             <Trash2 className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
                             解绑

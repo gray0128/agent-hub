@@ -15,6 +15,7 @@ import { Button } from "@/components/ui/button";
 import { cn, formatBytes, formatShortTime, shellQuote } from "@/lib/utils";
 import type { NativeEventView } from "@/types";
 import { CopyButton } from "./CopyButton";
+import { MARKDOWN_COMPONENTS } from "./markdown-components";
 
 const LONG_OUTPUT_CHARS = 4000;
 const LONG_OUTPUT_LINES = 60;
@@ -290,7 +291,7 @@ export function NativeActivityPane({
                         onSelectEvent(ev.id);
                         onOpenDeliveries(ev.id);
                       }}
-                      className="inline-flex items-center gap-1 rounded-[5px] border border-border bg-card px-1.5 py-0.5 text-[10px] font-sans text-foreground hover:bg-accent cursor-pointer tabular-nums"
+                      className="inline-flex min-h-11 px-2.5 md:min-h-0 md:px-1.5 md:py-0.5 items-center gap-1 rounded-[5px] border border-border bg-card text-[11px] md:text-[10px] font-sans text-foreground hover:bg-accent cursor-pointer tabular-nums"
                     >
                       <Bell className="h-2.5 w-2.5" strokeWidth={1.75} aria-hidden="true" />
                       <span>{notifyMeta.label}</span>
@@ -321,7 +322,7 @@ export function NativeActivityPane({
                         data-testid={`ack-native-event-${ev.id}`}
                         disabled={Boolean(acknowledgingIds[ev.id])}
                         onClick={() => onAckEvent(ev.id, "single")}
-                        className="h-7 border-[var(--status-approval)]/60 px-2.5 text-[11px] text-[var(--status-approval)] hover:bg-[var(--status-approval)]/15"
+                        className="min-h-11 md:min-h-0 md:h-7 border-[var(--status-approval)]/60 px-2.5 text-xs md:text-[11px] text-[var(--status-approval)] hover:bg-[var(--status-approval)]/15"
                       >
                         <CheckCircle2 className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
                         {acknowledgingIds[ev.id] ? "确认中..." : "标记已处理"}
@@ -345,7 +346,9 @@ export function NativeActivityPane({
                         isLongSummary && !bodyExpanded && "max-h-[30rem] overflow-hidden"
                       )}
                     >
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{ev.summary}</ReactMarkdown>
+                      <ReactMarkdown remarkPlugins={[remarkGfm]} components={MARKDOWN_COMPONENTS}>
+                        {ev.summary}
+                      </ReactMarkdown>
                       {isLongSummary && !bodyExpanded ? (
                         <div
                           aria-hidden="true"
@@ -362,7 +365,7 @@ export function NativeActivityPane({
                             e.stopPropagation();
                             setExpandedBodies((prev) => ({ ...prev, [ev.id]: !bodyExpanded }));
                           }}
-                          className="inline-flex items-center gap-1 rounded-[5px] border border-border bg-muted/40 px-2.5 py-1 text-[11px] font-medium text-foreground tabular-nums transition-colors duration-150 hover:bg-accent cursor-pointer"
+                          className="inline-flex min-h-11 md:min-h-0 items-center gap-1 rounded-[5px] border border-border bg-muted/40 px-3 md:px-2.5 py-1.5 md:py-1 text-xs md:text-[11px] font-medium text-foreground tabular-nums transition-colors duration-150 hover:bg-accent cursor-pointer"
                         >
                           {bodyExpanded ? (
                             <>
@@ -387,7 +390,7 @@ export function NativeActivityPane({
       </div>
 
       {/* Honest Physical Boundary Footer (Read-Only, NO Pseudo-Terminal Input) */}
-      <footer className="shrink-0 border-t border-border bg-surface-elevated px-4 py-2.5 text-xs text-muted-foreground">
+      <footer className="shrink-0 border-t border-border bg-surface-elevated pt-2.5 pb-[max(0.625rem,var(--safe-bottom))] pl-[max(1rem,var(--safe-left))] pr-[max(1rem,var(--safe-right))] text-xs text-muted-foreground">
         <div className="flex items-start gap-2">
           <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" strokeWidth={1.75} aria-hidden="true" />
           <div className="min-w-0 flex-1 space-y-1">

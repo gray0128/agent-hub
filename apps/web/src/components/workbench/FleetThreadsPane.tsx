@@ -85,16 +85,19 @@ function DraggableWorkspaceChip({
   nodeId,
   ws,
   active,
+  disableDrag = false,
   onSelect
 }: {
   nodeId: string;
   ws: WorkspaceEntry;
   active: boolean;
+  disableDrag?: boolean;
   onSelect: () => void;
 }) {
   const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
     id: `ws:${nodeId}:${ws.path}`,
-    data: { type: "workspace", nodeId, workdir: ws.path }
+    data: { type: "workspace", nodeId, workdir: ws.path },
+    disabled: disableDrag
   });
 
   return (
@@ -102,12 +105,12 @@ function DraggableWorkspaceChip({
       ref={setNodeRef}
       type="button"
       onClick={onSelect}
-      {...listeners}
-      {...attributes}
+      {...(disableDrag ? {} : listeners)}
+      {...(disableDrag ? {} : attributes)}
       data-testid={`workspace-chip-${nodeId}-${ws.key}`}
-      title={`${ws.path}（点击选中或拖拽至派发台）`}
+      title={disableDrag ? `${ws.path}（点击选中）` : `${ws.path}（点击选中或拖拽至派发台）`}
       className={cn(
-        "inline-flex min-h-11 md:min-h-0 max-w-full items-center gap-1 rounded-[5px] border px-2 py-1 text-[11px] font-mono transition-[color,background-color,border-color] duration-150 cursor-pointer",
+        "inline-flex min-h-11 md:min-h-0 max-w-full items-center gap-1 rounded-[5px] border px-2.5 md:px-2 py-1 text-xs md:text-[11px] font-mono transition-[color,background-color,border-color] duration-150 cursor-pointer",
         active
           ? "border-[var(--status-running)] bg-[var(--status-running)]/12 text-foreground"
           : "border-border bg-background/60 text-muted-foreground hover:border-foreground/30 hover:text-foreground",
@@ -166,16 +169,16 @@ function SortableThreadRow({
         aria-label="拖拽排序会话"
         {...attributes}
         {...listeners}
-        className="mt-0.5 inline-flex h-6 w-5 shrink-0 items-center justify-center rounded text-muted-foreground/60 hover:text-foreground cursor-grab active:cursor-grabbing"
+        className="touch-none inline-flex h-11 w-8 md:mt-0.5 md:h-6 md:w-5 shrink-0 items-center justify-center rounded text-muted-foreground/60 hover:text-foreground cursor-grab active:cursor-grabbing"
       >
-        <GripVertical className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
+        <GripVertical className="h-4 w-4 md:h-3.5 md:w-3.5" strokeWidth={1.75} aria-hidden="true" />
       </button>
 
       {/* 2nd button child: select thread (must remain 2nd <button> for CDP eval selector) */}
       <button
         type="button"
         onClick={onSelect}
-        className="min-w-0 flex-1 text-left cursor-pointer"
+        className="min-h-11 py-1 md:min-h-0 md:py-0 min-w-0 flex-1 text-left cursor-pointer"
       >
         <div className="flex items-center justify-between gap-1.5">
           <div className="flex min-w-0 items-center gap-1.5">
@@ -217,22 +220,22 @@ function SortableThreadRow({
           aria-label={thread.pinned ? "取消置顶会话" : "置顶会话"}
           title={thread.pinned ? "取消置顶" : "置顶会话"}
           className={cn(
-            "inline-flex h-7 w-7 items-center justify-center rounded-[5px] transition-colors duration-150 cursor-pointer",
+            "inline-flex h-11 w-11 md:h-7 md:w-7 items-center justify-center rounded-[5px] transition-colors duration-150 cursor-pointer",
             thread.pinned
               ? "text-[var(--status-approval)] bg-[var(--status-approval)]/10"
               : "text-muted-foreground hover:bg-accent hover:text-foreground"
           )}
         >
-          <Pin className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
+          <Pin className="h-4 w-4 md:h-3.5 md:w-3.5" strokeWidth={1.75} aria-hidden="true" />
         </button>
         <button
           type="button"
           onClick={onFork}
           aria-label="分叉会话"
           title="分叉会话"
-          className="inline-flex h-7 w-7 items-center justify-center rounded-[5px] text-muted-foreground hover:bg-accent hover:text-foreground transition-colors duration-150 cursor-pointer"
+          className="inline-flex h-11 w-11 md:h-7 md:w-7 items-center justify-center rounded-[5px] text-muted-foreground hover:bg-accent hover:text-foreground transition-colors duration-150 cursor-pointer"
         >
-          <GitBranch className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
+          <GitBranch className="h-4 w-4 md:h-3.5 md:w-3.5" strokeWidth={1.75} aria-hidden="true" />
         </button>
       </div>
     </div>
@@ -445,7 +448,10 @@ export function FleetThreadsPane({
               variant="outline"
               onClick={onNewThread}
               data-testid="new-thread-btn"
-              className={cn("shrink-0 px-2 text-[11px]", inDrawer ? "h-9" : "h-7")}
+              className={cn(
+                "shrink-0 px-2.5 md:px-2 text-xs md:text-[11px]",
+                inDrawer ? "min-h-11" : "min-h-11 md:min-h-0 md:h-7"
+              )}
             >
               <Plus className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
               新建会话
@@ -454,15 +460,15 @@ export function FleetThreadsPane({
 
           <TabsList
             className={cn(
-              "grid w-full",
+              "grid w-full p-0.5",
               canViewNative ? "grid-cols-3" : "grid-cols-2",
-              inDrawer ? "h-10" : "h-8"
+              inDrawer ? "h-auto min-h-12" : "h-auto min-h-12 md:min-h-0 md:h-8"
             )}
           >
             <TabsTrigger
               value="threads"
               data-testid="fleet-tab-threads"
-              className="gap-1 px-1.5 text-[11px] tabular-nums"
+              className="min-h-11 md:min-h-0 gap-1 px-1.5 text-xs md:text-[11px] tabular-nums"
             >
               <span>受控会话</span>
               <span className="inline-block min-w-[1.1rem] rounded px-0.5 text-center text-[10px] leading-tight text-muted-foreground tabular-nums">
@@ -473,7 +479,7 @@ export function FleetThreadsPane({
               <TabsTrigger
                 value="native"
                 data-testid="fleet-tab-native"
-                className="gap-1 px-1.5 text-[11px] tabular-nums"
+                className="min-h-11 md:min-h-0 gap-1 px-1.5 text-xs md:text-[11px] tabular-nums"
               >
                 <span>原生活动</span>
                 {openInteractionCount > 0 ? (
@@ -489,7 +495,7 @@ export function FleetThreadsPane({
             <TabsTrigger
               value="nodes"
               data-testid="fleet-tab-nodes"
-              className="gap-1 px-1.5 text-[11px] tabular-nums"
+              className="min-h-11 md:min-h-0 gap-1 px-1.5 text-xs md:text-[11px] tabular-nums"
             >
               <span>节点</span>
               <span className="inline-block min-w-[1.1rem] rounded px-0.5 text-center text-[10px] leading-tight text-muted-foreground tabular-nums">
@@ -514,7 +520,12 @@ export function FleetThreadsPane({
                 value={threadQuery}
                 onChange={(e) => onThreadQueryChange(e.target.value)}
                 placeholder="搜索会话标题、节点或目录..."
-                className="h-8 pl-8 text-xs"
+                autoComplete="off"
+                autoCorrect="off"
+                autoCapitalize="none"
+                spellCheck={false}
+                enterKeyHint="search"
+                className="pl-8"
               />
             </div>
 
@@ -524,7 +535,7 @@ export function FleetThreadsPane({
                 aria-pressed={statusFilter === "all"}
                 onClick={() => setStatusFilter("all")}
                 className={cn(
-                  "inline-flex h-6 items-center rounded-[4px] border px-2 text-[10px] font-medium transition-colors duration-150 cursor-pointer tabular-nums",
+                  "inline-flex min-h-11 px-2.5 md:min-h-0 md:h-6 md:px-2 items-center rounded-[4px] border text-xs md:text-[10px] font-medium transition-colors duration-150 cursor-pointer tabular-nums",
                   statusFilter === "all"
                     ? "border-[var(--status-running)]/50 bg-[var(--status-running)]/12 text-foreground"
                     : "border-border bg-background/50 text-muted-foreground hover:text-foreground"
@@ -537,7 +548,7 @@ export function FleetThreadsPane({
                 aria-pressed={statusFilter === "active"}
                 onClick={() => setStatusFilter((prev) => (prev === "active" ? "all" : "active"))}
                 className={cn(
-                  "inline-flex h-6 items-center rounded-[4px] border px-2 text-[10px] font-medium transition-colors duration-150 cursor-pointer tabular-nums",
+                  "inline-flex min-h-11 px-2.5 md:min-h-0 md:h-6 md:px-2 items-center rounded-[4px] border text-xs md:text-[10px] font-medium transition-colors duration-150 cursor-pointer tabular-nums",
                   statusFilter === "active"
                     ? "border-[var(--status-running)]/50 bg-[var(--status-running)]/12 text-foreground"
                     : "border-border bg-background/50 text-muted-foreground hover:text-foreground"
@@ -552,7 +563,7 @@ export function FleetThreadsPane({
                   setStatusFilter((prev) => (prev === "needs_approval" ? "all" : "needs_approval"))
                 }
                 className={cn(
-                  "inline-flex h-6 items-center rounded-[4px] border px-2 text-[10px] font-medium transition-colors duration-150 cursor-pointer tabular-nums",
+                  "inline-flex min-h-11 px-2.5 md:min-h-0 md:h-6 md:px-2 items-center rounded-[4px] border text-xs md:text-[10px] font-medium transition-colors duration-150 cursor-pointer tabular-nums",
                   statusFilter === "needs_approval"
                     ? "border-[var(--status-approval)]/60 bg-[var(--status-approval)]/15 text-[var(--status-approval)]"
                     : "border-border bg-background/50 text-muted-foreground hover:text-foreground"
@@ -566,7 +577,7 @@ export function FleetThreadsPane({
                   aria-pressed={onlySelectedNode}
                   onClick={() => setOnlySelectedNode((prev) => !prev)}
                   className={cn(
-                    "ml-auto inline-flex h-6 items-center rounded-[4px] border px-2 text-[10px] font-mono transition-colors duration-150 cursor-pointer",
+                    "ml-auto inline-flex min-h-11 px-2.5 md:min-h-0 md:h-6 md:px-2 items-center rounded-[4px] border text-xs md:text-[10px] font-mono transition-colors duration-150 cursor-pointer",
                     onlySelectedNode
                       ? "border-foreground/40 bg-accent text-foreground"
                       : "border-border bg-background/50 text-muted-foreground hover:text-foreground"
@@ -596,6 +607,7 @@ export function FleetThreadsPane({
                       setStatusFilter("all");
                       setOnlySelectedNode(false);
                     }}
+                    className="min-h-11 md:min-h-0 md:h-7"
                   >
                     清除筛选
                   </Button>
@@ -639,7 +651,12 @@ export function FleetThreadsPane({
                     value={nativeSearchQuery}
                     onChange={(e) => onNativeSearchQueryChange?.(e.target.value)}
                     placeholder="搜索标题、摘要、节点或目录..."
-                    className="h-8 pl-8 text-xs"
+                    autoComplete="off"
+                    autoCorrect="off"
+                    autoCapitalize="none"
+                    spellCheck={false}
+                    enterKeyHint="search"
+                    className="pl-8"
                   />
                 </div>
                 <button
@@ -649,7 +666,7 @@ export function FleetThreadsPane({
                     onNativeViewModeChange?.(nativeViewMode === "sessions" ? "timeline" : "sessions")
                   }
                   title={nativeViewMode === "sessions" ? "切换为按时间平铺流" : "切换为按会话聚合"}
-                  className="inline-flex h-8 shrink-0 items-center gap-1 rounded-[5px] border border-border bg-background/70 px-2 text-[11px] font-medium text-foreground hover:bg-accent cursor-pointer"
+                  className="inline-flex min-h-11 md:min-h-0 md:h-8 shrink-0 items-center gap-1 rounded-[5px] border border-border bg-background/70 px-2.5 md:px-2 text-xs md:text-[11px] font-medium text-foreground hover:bg-accent cursor-pointer"
                 >
                   {nativeViewMode === "sessions" ? (
                     <>
@@ -672,7 +689,7 @@ export function FleetThreadsPane({
                   aria-pressed={nativeFilterMode === "all"}
                   onClick={() => onNativeFilterModeChange?.("all")}
                   className={cn(
-                    "inline-flex h-6 items-center rounded-[4px] border px-2 text-[10px] font-medium transition-colors duration-150 cursor-pointer tabular-nums",
+                    "inline-flex min-h-11 px-2.5 md:min-h-0 md:h-6 md:px-2 items-center rounded-[4px] border text-xs md:text-[10px] font-medium transition-colors duration-150 cursor-pointer tabular-nums",
                     nativeFilterMode === "all"
                       ? "border-[var(--status-running)]/50 bg-[var(--status-running)]/12 text-foreground"
                       : "border-border bg-background/50 text-muted-foreground hover:text-foreground"
@@ -690,7 +707,7 @@ export function FleetThreadsPane({
                     )
                   }
                   className={cn(
-                    "inline-flex h-6 items-center rounded-[4px] border px-2 text-[10px] font-medium transition-colors duration-150 cursor-pointer tabular-nums",
+                    "inline-flex min-h-11 px-2.5 md:min-h-0 md:h-6 md:px-2 items-center rounded-[4px] border text-xs md:text-[10px] font-medium transition-colors duration-150 cursor-pointer tabular-nums",
                     nativeFilterMode === "unacked"
                       ? "border-[var(--status-approval)]/60 bg-[var(--status-approval)]/15 text-[var(--status-approval)]"
                       : "border-border bg-background/50 text-muted-foreground hover:text-foreground"
@@ -706,7 +723,7 @@ export function FleetThreadsPane({
                     onNativeFilterModeChange?.(nativeFilterMode === "failed" ? "all" : "failed")
                   }
                   className={cn(
-                    "inline-flex h-6 items-center rounded-[4px] border px-2 text-[10px] font-medium transition-colors duration-150 cursor-pointer tabular-nums",
+                    "inline-flex min-h-11 px-2.5 md:min-h-0 md:h-6 md:px-2 items-center rounded-[4px] border text-xs md:text-[10px] font-medium transition-colors duration-150 cursor-pointer tabular-nums",
                     nativeFilterMode === "failed"
                       ? "border-[var(--status-failed)]/60 bg-[var(--status-failed)]/15 text-[var(--status-failed)]"
                       : "border-border bg-background/50 text-muted-foreground hover:text-foreground"
@@ -721,7 +738,7 @@ export function FleetThreadsPane({
                     aria-pressed={nativeOnlySelectedNode}
                     onClick={() => onNativeOnlySelectedNodeChange?.(!nativeOnlySelectedNode)}
                     className={cn(
-                      "ml-auto inline-flex h-6 items-center rounded-[4px] border px-2 text-[10px] font-mono transition-colors duration-150 cursor-pointer",
+                      "ml-auto inline-flex min-h-11 px-2.5 md:min-h-0 md:h-6 md:px-2 items-center rounded-[4px] border text-xs md:text-[10px] font-mono transition-colors duration-150 cursor-pointer",
                       nativeOnlySelectedNode
                         ? "border-foreground/40 bg-accent text-foreground"
                         : "border-border bg-background/50 text-muted-foreground hover:text-foreground"
@@ -751,6 +768,7 @@ export function FleetThreadsPane({
                         onNativeFilterModeChange?.("all");
                         onNativeOnlySelectedNodeChange?.(false);
                       }}
+                      className="min-h-11 md:min-h-0 md:h-7"
                     >
                       清除筛选
                     </Button>
@@ -767,7 +785,7 @@ export function FleetThreadsPane({
                       data-testid={`native-session-item-${group.sessionKey}`}
                       onClick={() => onSelectNativeSession?.(group.sessionKey)}
                       className={cn(
-                        "w-full px-3 py-2 text-left transition-colors duration-150 cursor-pointer",
+                        "min-h-11 md:min-h-0 w-full px-3 py-2.5 md:py-2 text-left transition-colors duration-150 cursor-pointer",
                         isSelected
                           ? "border-l-2 border-l-[var(--status-running)] bg-accent/80 pl-2.5"
                           : "hover:bg-accent/40"
@@ -826,7 +844,7 @@ export function FleetThreadsPane({
                         onSelectNativeEvent?.(ev.id);
                       }}
                       className={cn(
-                        "w-full px-3 py-2 text-left transition-colors duration-150 cursor-pointer",
+                        "min-h-11 md:min-h-0 w-full px-3 py-2.5 md:py-2 text-left transition-colors duration-150 cursor-pointer",
                         isSelected
                           ? "border-l-2 border-l-[var(--status-running)] bg-accent/80 pl-2.5"
                           : "hover:bg-accent/40"
@@ -886,7 +904,7 @@ export function FleetThreadsPane({
                     }
                     setCollapsedNodes(nextCollapsed);
                   }}
-                  className="inline-flex items-center gap-1 rounded-[4px] border border-border bg-background/60 px-2 py-0.5 text-[10px] font-medium text-foreground hover:bg-accent transition-colors duration-150 cursor-pointer"
+                  className="inline-flex min-h-11 px-2.5 md:min-h-0 md:px-2 md:py-0.5 items-center gap-1 rounded-[4px] border border-border bg-background/60 text-[11px] md:text-[10px] font-medium text-foreground hover:bg-accent transition-colors duration-150 cursor-pointer"
                 >
                   {hasExpandedNode ? (
                     <>
@@ -929,7 +947,7 @@ export function FleetThreadsPane({
                         type="button"
                         data-testid={`select-node-${node.id}`}
                         onClick={() => onSelectNode(node.id)}
-                        className="flex min-w-0 flex-1 items-center justify-between gap-2 text-left cursor-pointer"
+                        className="flex min-h-11 py-1 md:min-h-0 md:py-0 min-w-0 flex-1 items-center justify-between gap-2 text-left cursor-pointer"
                       >
                         <div className="flex min-w-0 items-center gap-1.5">
                           <NodeStatusDot status={node.status} />
@@ -960,7 +978,7 @@ export function FleetThreadsPane({
                               [node.id]: !isWsCollapsed
                             }))
                           }
-                          className="inline-flex shrink-0 items-center gap-1 rounded-[5px] border border-border bg-background/60 px-2 py-0.5 text-[10px] font-mono text-muted-foreground hover:border-foreground/30 hover:text-foreground transition-colors duration-150 tabular-nums cursor-pointer"
+                          className="inline-flex min-h-11 px-2.5 md:min-h-0 md:px-2 md:py-0.5 shrink-0 items-center gap-1 rounded-[5px] border border-border bg-background/60 text-[11px] md:text-[10px] font-mono text-muted-foreground hover:border-foreground/30 hover:text-foreground transition-colors duration-150 tabular-nums cursor-pointer"
                         >
                           <span>{totalWs} 目录</span>
                           {isWsCollapsed ? (
@@ -981,7 +999,7 @@ export function FleetThreadsPane({
                     {!isWsCollapsed && totalWs > 0 ? (
                       <div
                         data-testid={`node-workspaces-${node.id}`}
-                        className="mt-2 flex flex-wrap items-center gap-1"
+                        className="mt-2 flex flex-wrap items-center gap-1.5 md:gap-1"
                       >
                         {node.workspaces.map((ws) => (
                           <DraggableWorkspaceChip
@@ -989,6 +1007,7 @@ export function FleetThreadsPane({
                             nodeId={node.id}
                             ws={ws}
                             active={activeTargetNodeId === node.id && activeWorkdir === ws.path}
+                            disableDrag={inDrawer}
                             onSelect={() => onPickWorkspace(node.id, ws.path)}
                           />
                         ))}

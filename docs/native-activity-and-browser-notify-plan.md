@@ -1,6 +1,6 @@
 # 独立「原生活动记录」与浏览器通知渠道调研及架构方案报告
 
-> **文档状态**：调研与方案设计稿（待评审确认后进入契约更新与编码切片）
+> **文档状态**：已实施归档（已于 `v0.1.7` / `71ee56a` 全量交付上线）
 > **适用范围**：`apps/hub-worker`（Cloudflare Workers / D1 / Durable Object `NodeHub` / Queues）、`apps/web`（`radix-nova` 三栏控制台 + Service Worker）、`cmd/ahub` 与 `internal/cli`（`ahub native-emit` / `ahub activity`）
 > **基线版本**：`v0.1.6`（提交 `e573ce4`）
 

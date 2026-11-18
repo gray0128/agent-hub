@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useDroppable } from "@dnd-kit/core";
 import {
+  Activity,
   AlertTriangle,
   ArrowLeftRight,
   Bell,
@@ -44,6 +45,7 @@ import {
 import type { ComposerDraft } from "@/stores/workbench-store";
 import type { AgentName, EffortLevel, NodeRecord, RunEventItem, RunRecord, ThreadRecord } from "@/types";
 import { CopyButton } from "./CopyButton";
+import { MARKDOWN_COMPONENTS } from "./markdown-components";
 import { RunStatusBadge } from "./StatusBadge";
 
 const DEFAULT_OPTION_VALUE = "__default__";
@@ -75,6 +77,8 @@ export interface ConversationPaneProps {
   onResolveRun?: (runId: string) => void;
   onForkThread: (thread: ThreadRecord) => void;
   onOpenLineage?: () => void;
+  onOpenRunEvents?: (runId: string) => void;
+  onOpenRunDeliveries?: (runId: string) => void;
   onSubmitPrompt: () => void;
 }
 
@@ -97,6 +101,8 @@ export function ConversationPane({
   onResolveRun,
   onForkThread,
   onOpenLineage,
+  onOpenRunEvents,
+  onOpenRunDeliveries,
   onSubmitPrompt
 }: ConversationPaneProps) {
   const { setNodeRef: setDropRef, isOver } = useDroppable({
@@ -109,6 +115,7 @@ export function ConversationPane({
   const [expandedPrompts, setExpandedPrompts] = useState<Record<string, boolean>>({});
   const [expandedOutputs, setExpandedOutputs] = useState<Record<string, boolean>>({});
   const [mobileParamsOpen, setMobileParamsOpen] = useState(false);
+  const [mobileComposerCollapsed, setMobileComposerCollapsed] = useState(false);
   const [customModelMode, setCustomModelMode] = useState(false);
 
   const selectedNode = nodes.find((n) => n.id === composer.nodeId);
@@ -142,6 +149,15 @@ export function ConversationPane({
       onPatchComposer(patch);
     }
   }, [composer.agent, composer.model, composer.effort, targetNode, isReplyMode, onPatchComposer]);
+
+  useEffect(() => {
+    if (threadRuns.length === 0 || composer.mode === "new" || composer.prompt.trim() !== "") {
+      setMobileComposerCollapsed(false);
+    }
+  }, [composer.mode, composer.prompt, threadRuns.length]);
+
+  const showMobileComposerToggle = threadRuns.length > 0;
+  const isMobileComposerCompact = showMobileComposerToggle && mobileComposerCollapsed;
 
   const modelInCatalog = catalog.models.some((m) => m.id === composer.model);
   const showCustomModelInput =
@@ -177,16 +193,16 @@ export function ConversationPane({
       className="relative flex h-full min-w-0 flex-col bg-background overflow-hidden"
     >
       {/* Active Thread Bar */}
-      <div className="flex min-h-11 shrink-0 flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-1.5">
+      <div className="flex min-h-12 md:min-h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-3 sm:px-4 py-1.5">
         {selectedThread ? (
           <>
-            <div className="flex min-w-0 items-center gap-2">
-              <h2 className="truncate text-xs font-semibold text-foreground text-balance">
+            <div className="flex min-w-0 flex-1 items-center gap-1.5 sm:gap-2">
+              <h2 className="min-w-0 truncate text-xs font-semibold text-foreground text-balance">
                 {selectedThread.title || selectedThread.project_key}
               </h2>
               <span
                 title={selectedThread.workdir}
-                className="inline-flex items-center gap-1 rounded-[4px] border border-border px-1.5 py-0.5 text-[10px] font-mono text-muted-foreground"
+                className="inline-flex max-w-[128px] sm:max-w-none shrink-0 items-center gap-1 truncate rounded-[4px] border border-border px-1.5 py-0.5 text-[10px] font-mono text-muted-foreground"
               >
                 {selectedThread.node_id}:{selectedThread.project_key}
               </span>
@@ -205,17 +221,18 @@ export function ConversationPane({
                 </span>
               ) : null}
             </div>
-            <div className="flex items-center gap-1.5">
+            <div className="flex shrink-0 items-center gap-1.5">
               {hasLineage && onOpenLineage ? (
                 <Button
                   type="button"
                   variant="ghost"
                   size="sm"
                   onClick={onOpenLineage}
-                  className="min-h-11 md:min-h-0 md:h-7 px-2 text-[11px]"
+                  className="min-h-11 md:min-h-0 md:h-7 px-2 text-xs md:text-[11px]"
                 >
                   <GitFork className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
-                  委派拓扑
+                  <span className="hidden sm:inline">委派拓扑</span>
+                  <span className="sm:hidden">拓扑</span>
                 </Button>
               ) : null}
               <Button
@@ -223,10 +240,11 @@ export function ConversationPane({
                 variant="outline"
                 size="sm"
                 onClick={() => onForkThread(selectedThread)}
-                className="min-h-11 md:min-h-0 md:h-7 text-[11px]"
+                className="min-h-11 md:min-h-0 md:h-7 px-2.5 text-xs md:text-[11px]"
               >
                 <GitBranch className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
-                分叉会话
+                <span className="hidden sm:inline">分叉会话</span>
+                <span className="sm:hidden">分叉</span>
               </Button>
             </div>
           </>
@@ -268,9 +286,14 @@ export function ConversationPane({
               </div>
             </div>
           </div>
-          <div className="flex shrink-0 items-center gap-1.5">
+          <div className="flex shrink-0 flex-wrap items-center gap-1.5">
             {approvalRun.remote_control_url ? (
-              <Button asChild size="sm" variant="outline" className="border-[var(--status-approval)]/50">
+              <Button
+                asChild
+                size="sm"
+                variant="outline"
+                className="min-h-11 md:min-h-0 md:h-7 border-[var(--status-approval)]/50"
+              >
                 <a
                   href={approvalRun.remote_control_url}
                   target="_blank"
@@ -289,7 +312,7 @@ export function ConversationPane({
                 variant="outline"
                 data-testid="resolve-approval-btn"
                 onClick={() => onResolveRun(approvalRun.id)}
-                className="border-[var(--status-approval)]/50"
+                className="min-h-11 md:min-h-0 md:h-7 border-[var(--status-approval)]/50"
               >
                 <CheckCircle2 className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
                 标记已放行
@@ -371,10 +394,30 @@ export function ConversationPane({
                       </Badge>
                     ) : null}
                     {notifyMeta ? (
-                      <Badge variant={notifyMeta.tone === "neutral" ? "outline" : notifyMeta.tone} className="shrink-0 text-[10px]">
-                        <Bell className="h-2.5 w-2.5" strokeWidth={1.75} aria-hidden="true" />
-                        {notifyMeta.label}
-                      </Badge>
+                      onOpenRunDeliveries ? (
+                        <button
+                          type="button"
+                          data-testid={`open-run-deliveries-${run.id}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onOpenRunDeliveries(run.id);
+                          }}
+                          className="inline-flex min-h-11 px-2.5 md:min-h-6 md:px-1.5 items-center gap-1 rounded-[5px] border border-border bg-card text-[11px] md:text-[10px] font-medium text-foreground hover:bg-accent cursor-pointer tabular-nums"
+                        >
+                          <Bell className="h-2.5 w-2.5" strokeWidth={1.75} aria-hidden="true" />
+                          <span>{notifyMeta.label}</span>
+                          {run.deliveries_summary && run.deliveries_summary.total > 0 ? (
+                            <span className="font-mono text-muted-foreground">
+                              {run.deliveries_summary.sent}/{run.deliveries_summary.total}
+                            </span>
+                          ) : null}
+                        </button>
+                      ) : (
+                        <Badge variant={notifyMeta.tone === "neutral" ? "outline" : notifyMeta.tone} className="shrink-0 text-[10px]">
+                          <Bell className="h-2.5 w-2.5" strokeWidth={1.75} aria-hidden="true" />
+                          {notifyMeta.label}
+                        </Badge>
+                      )
                     ) : null}
                   </div>
 
@@ -385,13 +428,13 @@ export function ConversationPane({
                   </div>
                 </div>
 
-                <div className="mt-1 flex min-h-7 flex-wrap items-center justify-between gap-x-2 gap-y-1 text-[11px] text-muted-foreground tabular-nums sm:h-7 sm:flex-nowrap">
+                <div className="mt-1 flex min-h-7 flex-wrap items-center justify-between gap-x-2 gap-y-1 text-[11px] text-muted-foreground tabular-nums sm:flex-nowrap">
                   <span className="min-w-0 flex-1 truncate font-mono">
                     {run.agent} · {run.resolved_model || run.model || "default"}
                     {run.resolved_effort || run.effort ? `@${run.resolved_effort || run.effort}` : ""} · 过程事件：{evCount} 条
                   </span>
                   <div
-                    className="flex shrink-0 items-center gap-1"
+                    className="flex shrink-0 flex-wrap items-center gap-1"
                     onClick={(e) => e.stopPropagation()}
                   >
                     {copyableText ? (
@@ -404,7 +447,7 @@ export function ConversationPane({
                         size="sm"
                         variant="outline"
                         onClick={() => onCancelRun(run.id, false)}
-                        className="h-6 px-2 text-[11px]"
+                        className="min-h-11 md:min-h-0 md:h-6 px-2.5 md:px-2 text-xs md:text-[11px]"
                       >
                         <Square className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
                         取消任务
@@ -416,11 +459,23 @@ export function ConversationPane({
                         variant="ghost"
                         data-testid={`load-full-output-${run.id}`}
                         onClick={() => onLoadFullOutput(run.id)}
-                        className="h-6 px-2 text-[11px]"
+                        className="min-h-11 md:min-h-0 md:h-6 px-2.5 md:px-2 text-xs md:text-[11px]"
                       >
                         <FileText className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
                         加载完整输出
                       </Button>
+                    ) : null}
+
+                    {onOpenRunEvents ? (
+                      <button
+                        type="button"
+                        data-testid={`open-run-events-${run.id}`}
+                        onClick={() => onOpenRunEvents(run.id)}
+                        className="inline-flex min-h-11 md:min-h-6 items-center gap-1 rounded-[5px] border border-border bg-transparent px-2.5 md:px-2 py-0.5 text-xs md:text-[11px] font-medium text-muted-foreground transition-colors duration-150 hover:bg-accent hover:text-foreground cursor-pointer tabular-nums"
+                      >
+                        <Activity className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
+                        事件 {evCount}
+                      </button>
                     ) : null}
 
                     <button
@@ -431,7 +486,7 @@ export function ConversationPane({
                       }
                       data-testid={`toggle-cmd-${run.id}`}
                       className={cn(
-                        "inline-flex min-h-6 items-center gap-1 rounded-[5px] border px-2 py-0.5 text-[11px] font-medium transition-colors duration-150 cursor-pointer",
+                        "inline-flex min-h-11 md:min-h-6 items-center gap-1 rounded-[5px] border px-2.5 md:px-2 py-0.5 text-xs md:text-[11px] font-medium transition-colors duration-150 cursor-pointer",
                         cmdExpanded
                           ? "border-foreground/30 bg-accent text-foreground"
                           : "border-border bg-transparent text-muted-foreground hover:bg-accent hover:text-foreground"
@@ -472,7 +527,7 @@ export function ConversationPane({
                             e.stopPropagation();
                             setExpandedPrompts((prev) => ({ ...prev, [run.id]: !promptExpanded }));
                           }}
-                          className="inline-flex items-center gap-0.5 text-[10px] text-muted-foreground hover:text-foreground cursor-pointer"
+                          className="inline-flex min-h-11 px-2 md:min-h-0 md:px-1 items-center gap-0.5 text-xs md:text-[10px] text-muted-foreground hover:text-foreground cursor-pointer"
                         >
                           {promptExpanded ? "收起" : "展开全文"}
                           {promptExpanded ? (
@@ -508,7 +563,9 @@ export function ConversationPane({
                         isLongOutput && !outputExpanded && "max-h-[30rem] overflow-hidden"
                       )}
                     >
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{fullText}</ReactMarkdown>
+                      <ReactMarkdown remarkPlugins={[remarkGfm]} components={MARKDOWN_COMPONENTS}>
+                        {fullText}
+                      </ReactMarkdown>
                       {isLongOutput && !outputExpanded ? (
                         <div
                           aria-hidden="true"
@@ -528,7 +585,7 @@ export function ConversationPane({
                             e.stopPropagation();
                             setExpandedOutputs((prev) => ({ ...prev, [run.id]: !outputExpanded }));
                           }}
-                          className="inline-flex items-center gap-1 rounded-[5px] border border-border bg-muted/40 px-2.5 py-1 text-[11px] font-medium text-foreground tabular-nums transition-colors duration-150 hover:bg-accent cursor-pointer"
+                          className="inline-flex min-h-11 md:min-h-0 items-center gap-1 rounded-[5px] border border-border bg-muted/40 px-3 md:px-2.5 py-1.5 md:py-1 text-xs md:text-[11px] font-medium text-foreground tabular-nums transition-colors duration-150 hover:bg-accent cursor-pointer"
                         >
                           {outputExpanded ? (
                             <>
@@ -559,14 +616,16 @@ export function ConversationPane({
                         variant="outline"
                         data-testid={`load-full-output-banner-${run.id}`}
                         onClick={() => onLoadFullOutput(run.id)}
-                        className="h-6 px-2 text-[11px]"
+                        className="min-h-11 md:min-h-0 md:h-6 px-2.5 md:px-2 text-xs md:text-[11px]"
                       >
                         <FileText className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
                         加载完整输出
                       </Button>
                     </div>
                     <div className="ahub-markdown">
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{previewText}</ReactMarkdown>
+                      <ReactMarkdown remarkPlugins={[remarkGfm]} components={MARKDOWN_COMPONENTS}>
+                        {previewText}
+                      </ReactMarkdown>
                     </div>
                   </div>
                 ) : hasUnloadedOutput ? (
@@ -583,7 +642,7 @@ export function ConversationPane({
                         variant="outline"
                         data-testid={`load-full-output-banner-${run.id}`}
                         onClick={() => onLoadFullOutput(run.id)}
-                        className="h-6 px-2 text-[11px]"
+                        className="min-h-11 md:min-h-0 md:h-6 px-2.5 md:px-2 text-xs md:text-[11px]"
                       >
                         <FileText className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
                         加载完整输出
@@ -597,7 +656,9 @@ export function ConversationPane({
                   </div>
                 ) : run.summary ? (
                   <div className="ahub-markdown mt-2.5">
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{run.summary}</ReactMarkdown>
+                    <ReactMarkdown remarkPlugins={[remarkGfm]} components={MARKDOWN_COMPONENTS}>
+                      {run.summary}
+                    </ReactMarkdown>
                   </div>
                 ) : null}
               </article>
@@ -617,81 +678,136 @@ export function ConversationPane({
         }}
         data-testid="prompt-composer"
         className={cn(
-          "relative shrink-0 border-t border-border bg-surface-elevated p-3 transition-colors duration-150",
+          "relative shrink-0 border-t border-border bg-surface-elevated pt-2.5 pb-[max(0.75rem,var(--safe-bottom))] pl-[max(0.75rem,var(--safe-left))] pr-[max(0.75rem,var(--safe-right))] sm:p-3 sm:pb-[max(0.75rem,var(--safe-bottom))] transition-colors duration-150",
           isOver && "bg-[var(--status-running)]/10 border-[var(--status-running)]"
         )}
       >
-        {composerNotice ? (
-          <div
-            role="status"
-            data-testid="composer-notice"
-            className="mb-2 flex items-center justify-between gap-2 rounded-[5px] border border-[var(--status-running)]/35 bg-[var(--status-running)]/10 px-2.5 py-1.5 text-[11px] text-foreground text-pretty"
-          >
-            <span>{composerNotice}</span>
-            {onDismissComposerNotice ? (
-              <button
-                type="button"
-                onClick={onDismissComposerNotice}
-                aria-label="关闭提示"
-                className="shrink-0 text-[10px] text-muted-foreground hover:text-foreground cursor-pointer"
-              >
-                关闭
-              </button>
-            ) : null}
-          </div>
-        ) : null}
-        {targetNode?.status === "offline" ? (
-          <div className="mb-2 rounded-[5px] border border-[var(--status-approval)]/40 bg-[var(--status-approval)]/10 px-2.5 py-1 text-[11px] text-[var(--status-approval)] text-pretty">
-            目标节点当前离线。现在提交的任务将安全进入排队队列，并在节点上线后自动开始执行。
+        {isMobileComposerCompact ? (
+          <div className="flex items-center justify-between gap-2 md:hidden">
+            <span className="min-w-0 truncate font-mono text-[11px] text-muted-foreground">
+              {isReplyMode
+                ? `续聊 ${selectedThread.node_id}:${selectedThread.project_key} · ${selectedThread.agent}`
+                : `新建 ${composer.nodeId || "节点"} · ${composer.agent}`}
+            </span>
+            <button
+              type="button"
+              data-testid="toggle-mobile-composer"
+              aria-expanded={false}
+              onClick={() => {
+                setMobileComposerCollapsed(false);
+                window.requestAnimationFrame(() => {
+                  document.getElementById("prompt-input")?.focus();
+                });
+              }}
+              className="inline-flex min-h-11 shrink-0 items-center gap-1 rounded-[5px] border border-border bg-card px-2.5 text-xs font-medium text-foreground hover:bg-accent cursor-pointer"
+            >
+              <ChevronUp className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
+              展开输入指令
+            </button>
           </div>
         ) : null}
 
-        {/* Target binding mode strip: Reply (locked) vs New (selectable) */}
-        {isReplyMode ? (
-          <div className="mb-2 flex items-center justify-between gap-2 rounded-[6px] border border-border bg-background/60 px-2.5 py-1.5">
-            <div className="flex min-w-0 items-center gap-1.5 text-[11px]">
-              <Lock className="h-3 w-3 shrink-0 text-[var(--status-running)]" strokeWidth={1.75} aria-hidden="true" />
-              <span className="shrink-0 font-medium text-foreground">续聊绑定</span>
-              <span className="truncate font-mono text-muted-foreground" title={selectedThread.workdir}>
-                {selectedThread.node_id}:{selectedThread.project_key} · {selectedThread.agent}
-              </span>
-            </div>
-            <button
-              type="button"
-              onClick={() => onPatchComposer({ mode: "new" })}
-              data-testid="switch-to-new-thread-btn"
-              className="inline-flex shrink-0 items-center gap-1 rounded-[4px] border border-border bg-card px-2 py-0.5 text-[11px] font-medium text-foreground hover:bg-accent cursor-pointer"
+        <div className={cn(isMobileComposerCompact && "hidden md:block")}>
+          {composerNotice ? (
+            <div
+              role="status"
+              data-testid="composer-notice"
+              className="mb-2 flex items-center justify-between gap-2 rounded-[5px] border border-[var(--status-running)]/35 bg-[var(--status-running)]/10 px-2.5 py-1.5 text-[11px] text-foreground text-pretty"
             >
-              <ArrowLeftRight className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
-              切换为新建会话
-            </button>
-          </div>
-        ) : (
-          <div className="mb-2 space-y-1.5">
-            {selectedThread ? (
-              <div className="flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
-                <span>新建独立会话</span>
+              <span>{composerNotice}</span>
+              {onDismissComposerNotice ? (
                 <button
                   type="button"
-                  onClick={() => {
-                    const sameBinding =
-                      selectedThread.node_id === composer.nodeId &&
-                      selectedThread.agent === composer.agent;
-                    setCustomModelMode(false);
-                    onPatchComposer({
-                      mode: "reply",
-                      nodeId: selectedThread.node_id,
-                      workdir: selectedThread.workdir,
-                      agent: selectedThread.agent,
-                      ...(sameBinding ? {} : { model: "", effort: "" })
-                    });
-                  }}
-                  className="text-[11px] font-medium text-[var(--status-running)] hover:underline cursor-pointer"
+                  onClick={onDismissComposerNotice}
+                  aria-label="关闭提示"
+                  className="inline-flex min-h-11 px-2 md:min-h-0 md:px-0 shrink-0 items-center text-xs md:text-[10px] text-muted-foreground hover:text-foreground cursor-pointer"
                 >
-                  返回当前会话续聊
+                  关闭
                 </button>
+              ) : null}
+            </div>
+          ) : null}
+          {targetNode?.status === "offline" ? (
+            <div className="mb-2 rounded-[5px] border border-[var(--status-approval)]/40 bg-[var(--status-approval)]/10 px-2.5 py-1 text-[11px] text-[var(--status-approval)] text-pretty">
+              目标节点当前离线。现在提交的任务将安全进入排队队列，并在节点上线后自动开始执行。
+            </div>
+          ) : null}
+
+          {/* Target binding mode strip: Reply (locked) vs New (selectable) */}
+          {isReplyMode ? (
+            <div className="mb-2 flex items-center justify-between gap-1.5 rounded-[6px] border border-border bg-background/60 px-2.5 py-1 md:py-1.5">
+              <div className="flex min-w-0 items-center gap-1.5 text-[11px]">
+                <Lock className="h-3 w-3 shrink-0 text-[var(--status-running)]" strokeWidth={1.75} aria-hidden="true" />
+                <span className="hidden sm:inline shrink-0 font-medium text-foreground">续聊绑定</span>
+                <span className="truncate font-mono text-muted-foreground" title={selectedThread.workdir}>
+                  {selectedThread.node_id}:{selectedThread.project_key} · {selectedThread.agent}
+                </span>
               </div>
-            ) : null}
+              <div className="flex shrink-0 items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => onPatchComposer({ mode: "new" })}
+                  data-testid="switch-to-new-thread-btn"
+                  className="inline-flex min-h-11 sm:min-h-0 shrink-0 items-center gap-1 rounded-[4px] border border-border bg-card px-2.5 sm:px-2 py-1 sm:py-0.5 text-xs sm:text-[11px] font-medium text-foreground hover:bg-accent cursor-pointer"
+                >
+                  <ArrowLeftRight className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
+                  <span className="hidden sm:inline">切换为新建会话</span>
+                  <span className="sm:hidden">新建</span>
+                </button>
+                {showMobileComposerToggle ? (
+                  <button
+                    type="button"
+                    data-testid="toggle-mobile-composer"
+                    aria-expanded={true}
+                    onClick={() => setMobileComposerCollapsed(true)}
+                    className="inline-flex min-h-11 shrink-0 items-center gap-1 rounded-[4px] border border-border bg-card px-2.5 text-xs font-medium text-muted-foreground hover:bg-accent hover:text-foreground cursor-pointer md:hidden"
+                  >
+                    <ChevronDown className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
+                    收起
+                  </button>
+                ) : null}
+              </div>
+            </div>
+          ) : (
+            <div className="mb-2 space-y-1.5">
+              {selectedThread ? (
+                <div className="flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
+                  <span>新建独立会话</span>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const sameBinding =
+                          selectedThread.node_id === composer.nodeId &&
+                          selectedThread.agent === composer.agent;
+                        setCustomModelMode(false);
+                        onPatchComposer({
+                          mode: "reply",
+                          nodeId: selectedThread.node_id,
+                          workdir: selectedThread.workdir,
+                          agent: selectedThread.agent,
+                          ...(sameBinding ? {} : { model: "", effort: "" })
+                        });
+                      }}
+                      className="inline-flex min-h-11 sm:min-h-0 items-center px-2 sm:px-0 text-xs sm:text-[11px] font-medium text-[var(--status-running)] hover:underline cursor-pointer"
+                    >
+                      返回当前会话续聊
+                    </button>
+                    {showMobileComposerToggle ? (
+                      <button
+                        type="button"
+                        data-testid="toggle-mobile-composer"
+                        aria-expanded={true}
+                        onClick={() => setMobileComposerCollapsed(true)}
+                        className="inline-flex min-h-11 shrink-0 items-center gap-1 rounded-[4px] border border-border bg-card px-2.5 text-xs font-medium text-muted-foreground hover:bg-accent hover:text-foreground cursor-pointer md:hidden"
+                      >
+                        <ChevronDown className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
+                        收起
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+              ) : null}
             <div className="grid grid-cols-2 gap-1.5">
               <div className="min-w-0">
                 <label htmlFor="composer-node" className="mb-1 block text-[10px] text-muted-foreground">
@@ -767,11 +883,12 @@ export function ConversationPane({
           </span>
           <button
             type="button"
+            data-testid="toggle-mobile-params"
             aria-expanded={mobileParamsOpen}
             onClick={() => setMobileParamsOpen((v) => !v)}
-            className="inline-flex h-7 shrink-0 items-center gap-1 rounded-[5px] border border-border bg-background/70 px-2 text-[11px] text-foreground cursor-pointer"
+            className="inline-flex min-h-11 shrink-0 items-center gap-1 rounded-[5px] border border-border bg-background/70 px-2.5 text-xs text-foreground cursor-pointer"
           >
-            <SlidersHorizontal className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
+            <SlidersHorizontal className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
             {mobileParamsOpen ? "收起参数" : "参数"}
           </button>
         </div>
@@ -830,7 +947,11 @@ export function ConversationPane({
                   value={composer.model}
                   onChange={(e) => onPatchComposer({ model: e.target.value })}
                   placeholder={catalog.defaultModel ? `默认: ${catalog.defaultModel}` : "输入模型 ID"}
-                  className="h-8 font-mono text-xs"
+                  autoComplete="off"
+                  autoCorrect="off"
+                  autoCapitalize="none"
+                  spellCheck={false}
+                  className="font-mono"
                 />
                 <Button
                   type="button"
@@ -840,7 +961,7 @@ export function ConversationPane({
                     setCustomModelMode(false);
                     onPatchComposer({ model: catalog.defaultModel || "" });
                   }}
-                  className="h-8 shrink-0 px-2 text-[11px]"
+                  className="min-h-11 sm:min-h-0 sm:h-8 shrink-0 px-2.5 text-xs sm:text-[11px]"
                 >
                   列表
                 </Button>
@@ -956,8 +1077,8 @@ export function ConversationPane({
             lastCompositionEndRef.current = Date.now();
           }}
           onKeyDown={handleKeyDown}
-          placeholder="输入任务指令（Enter 发送，Shift+Enter 换行，支持将左侧工作区拖入此处）..."
-          className="min-h-[68px] text-xs"
+          placeholder="输入任务指令（Enter 发送，Shift+Enter 换行）..."
+          className="min-h-[64px] sm:min-h-[68px]"
         />
 
         <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
@@ -981,6 +1102,7 @@ export function ConversationPane({
             <Send className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
             {submitting ? "派发中..." : "发送指令"}
           </Button>
+        </div>
         </div>
       </form>
     </section>

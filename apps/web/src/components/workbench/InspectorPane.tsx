@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import {
@@ -90,12 +90,16 @@ function SortableQueuedRunRow({
         aria-label="拖拽调整队列优先级"
         {...attributes}
         {...listeners}
-        className="inline-flex h-7 w-5 shrink-0 items-center justify-center rounded text-muted-foreground hover:text-foreground cursor-grab active:cursor-grabbing"
+        className="touch-none inline-flex h-11 w-8 md:h-7 md:w-5 shrink-0 items-center justify-center rounded text-muted-foreground hover:text-foreground cursor-grab active:cursor-grabbing"
       >
-        <GripVertical className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
+        <GripVertical className="h-4 w-4 md:h-3.5 md:w-3.5" strokeWidth={1.75} aria-hidden="true" />
       </button>
 
-      <button type="button" onClick={onSelect} className="min-w-0 flex-1 text-left cursor-pointer">
+      <button
+        type="button"
+        onClick={onSelect}
+        className="min-h-11 py-1 md:min-h-0 md:py-0 min-w-0 flex-1 text-left cursor-pointer"
+      >
         <div className="flex items-center justify-between gap-2">
           <span className="truncate text-xs font-mono text-foreground">{run.id}</span>
           <span className="text-[10px] font-mono text-muted-foreground tabular-nums">
@@ -113,6 +117,7 @@ function SortableQueuedRunRow({
 export interface InspectorPaneProps {
   activeTab: InspectorTab;
   onTabChange: (tab: InspectorTab) => void;
+  inDrawer?: boolean;
   selectedRun: RunRecord | null;
   allRuns: RunRecord[];
   selectedNode: NodeRecord | null;
@@ -144,6 +149,7 @@ const UNBOUND_NOTIFY_VALUE = "__unbound__";
 export function InspectorPane({
   activeTab,
   onTabChange,
+  inDrawer = false,
   selectedRun,
   allRuns,
   selectedNode,
@@ -165,6 +171,14 @@ export function InspectorPane({
   const [expandedEvents, setExpandedEvents] = useState<Record<string, boolean>>({});
   const [wsQuery, setWsQuery] = useState("");
   const [nowMs, setNowMs] = useState(() => Date.now());
+  const tabsListRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const list = tabsListRef.current;
+    if (!list) return;
+    const activeEl = list.querySelector<HTMLElement>('[role="tab"][data-state="active"]');
+    activeEl?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [activeTab, inDrawer]);
 
   const runIsActive = Boolean(
     selectedRun &&
@@ -243,12 +257,24 @@ export function InspectorPane({
         className="flex h-full flex-col overflow-hidden"
       >
         <div className="shrink-0 border-b border-border px-2.5 py-1.5">
-          <TabsList className={cn("grid w-full h-8", canViewDeliveries ? "grid-cols-5" : "grid-cols-4")}>
-            <TabsTrigger value="events" className="gap-1 px-1 text-[11px]">
+          <TabsList
+            ref={tabsListRef}
+            className={cn(
+              "flex w-full h-auto min-h-12 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden snap-x snap-proximity p-0.5 md:grid md:h-8",
+              canViewDeliveries ? "md:grid-cols-5" : "md:grid-cols-4"
+            )}
+          >
+            <TabsTrigger
+              value="events"
+              className="shrink-0 min-h-11 min-w-[4.75rem] px-3 text-xs snap-start gap-1 md:min-h-0 md:min-w-0 md:px-1 md:text-[11px]"
+            >
               <Activity className="h-3 w-3 hidden xl:inline" strokeWidth={1.75} aria-hidden="true" />
               过程事件
             </TabsTrigger>
-            <TabsTrigger value="queue" className="gap-1 px-1 text-[11px] tabular-nums">
+            <TabsTrigger
+              value="queue"
+              className="shrink-0 min-h-11 min-w-[4.75rem] px-3 text-xs snap-start gap-1 md:min-h-0 md:min-w-0 md:px-1 md:text-[11px] tabular-nums"
+            >
               <ListOrdered className="h-3 w-3 hidden xl:inline" strokeWidth={1.75} aria-hidden="true" />
               <span>待跑队列</span>
               <span
@@ -260,11 +286,17 @@ export function InspectorPane({
                 {queuedRuns.length}
               </span>
             </TabsTrigger>
-            <TabsTrigger value="lineage" className="gap-1 px-1 text-[11px]">
+            <TabsTrigger
+              value="lineage"
+              className="shrink-0 min-h-11 min-w-[4.75rem] px-3 text-xs snap-start gap-1 md:min-h-0 md:min-w-0 md:px-1 md:text-[11px]"
+            >
               <GitFork className="h-3 w-3 hidden xl:inline" strokeWidth={1.75} aria-hidden="true" />
               委派拓扑
             </TabsTrigger>
-            <TabsTrigger value="control" className="gap-1 px-1 text-[11px]">
+            <TabsTrigger
+              value="control"
+              className="shrink-0 min-h-11 min-w-[4.75rem] px-3 text-xs snap-start gap-1 md:min-h-0 md:min-w-0 md:px-1 md:text-[11px]"
+            >
               <Sliders className="h-3 w-3 hidden xl:inline" strokeWidth={1.75} aria-hidden="true" />
               节点控制
             </TabsTrigger>
@@ -272,7 +304,7 @@ export function InspectorPane({
               <TabsTrigger
                 value="deliveries"
                 data-testid="inspector-tab-deliveries"
-                className="gap-1 px-1 text-[11px]"
+                className="shrink-0 min-h-11 min-w-[4.75rem] px-3 text-xs snap-start gap-1 md:min-h-0 md:min-w-0 md:px-1 md:text-[11px]"
               >
                 <Bell className="h-3 w-3 hidden xl:inline" strokeWidth={1.75} aria-hidden="true" />
                 投递明细
@@ -283,7 +315,7 @@ export function InspectorPane({
 
         {/* 1. Process Events (<= 500 ring buffer) */}
         <TabsContent value="events" className="mt-0 min-h-0 flex-1 flex flex-col overflow-hidden">
-          <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-border px-3 text-[11px] text-muted-foreground tabular-nums">
+          <div className="flex min-h-11 md:min-h-0 md:h-10 shrink-0 items-center justify-between gap-2 border-b border-border px-3 py-1.5 md:py-0 text-[11px] text-muted-foreground tabular-nums">
             <span className="truncate font-mono">
               {selectedRun ? `${selectedRun.id} · ${events.length} 条缓冲` : "未选择任务"}
             </span>
@@ -302,7 +334,7 @@ export function InspectorPane({
                   size="sm"
                   variant="destructive"
                   onClick={() => onCancelRun(selectedRun.id, false)}
-                  className="h-6 px-2 text-[11px]"
+                  className="min-h-11 md:min-h-0 md:h-6 px-2.5 md:px-2 text-xs md:text-[11px]"
                 >
                   取消任务
                 </Button>
@@ -333,7 +365,7 @@ export function InspectorPane({
                       onClick={() =>
                         setExpandedEvents((prev) => ({ ...prev, [evKey]: !expanded }))
                       }
-                      className="w-full px-3 py-1.5 text-left hover:bg-accent/35 transition-colors duration-150 cursor-pointer"
+                      className="min-h-11 md:min-h-0 w-full px-3 py-2 md:py-1.5 text-left hover:bg-accent/35 transition-colors duration-150 cursor-pointer"
                     >
                       <div className="flex items-center justify-between gap-2 tabular-nums">
                         <div className="flex min-w-0 items-center gap-1.5">
@@ -414,7 +446,7 @@ export function InspectorPane({
                 <button
                   type="button"
                   onClick={() => onSelectRun(r.id)}
-                  className="min-w-0 flex-1 text-left cursor-pointer"
+                  className="min-h-11 py-1 md:min-h-0 md:py-0 min-w-0 flex-1 text-left cursor-pointer"
                 >
                   <div className="flex items-center gap-1.5">
                     <span className="text-[10px] font-mono text-muted-foreground tabular-nums">
@@ -435,7 +467,7 @@ export function InspectorPane({
                       variant="outline"
                       onClick={() => onCancelRun(r.id, true)}
                       title="级联取消整棵树"
-                      className="h-7 px-2 text-[10px]"
+                      className="min-h-11 md:min-h-0 md:h-7 px-2.5 md:px-2 text-xs md:text-[10px]"
                     >
                       <XCircle className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
                       级联取消整棵树
@@ -502,6 +534,7 @@ export function InspectorPane({
                   size="sm"
                   variant={selectedNode.status === "draining" ? "default" : "outline"}
                   onClick={() => onToggleNodeDrain(selectedNode)}
+                  className="min-h-11 md:min-h-0 md:h-7"
                 >
                   {selectedNode.status === "draining" ? (
                     <>
@@ -535,7 +568,7 @@ export function InspectorPane({
                         onUpdateNodeConcurrency(selectedNode.id, val);
                       }
                     }}
-                    className="h-8 w-16 text-right font-mono tabular-nums"
+                    className="w-20 sm:w-16 text-right font-mono tabular-nums"
                   />
                 </div>
               </div>
@@ -620,7 +653,12 @@ export function InspectorPane({
                       value={wsQuery}
                       onChange={(e) => setWsQuery(e.target.value)}
                       placeholder="筛选工作区名称或完整路径..."
-                      className="h-8 pl-8 text-xs font-mono"
+                      autoComplete="off"
+                      autoCorrect="off"
+                      autoCapitalize="none"
+                      spellCheck={false}
+                      enterKeyHint="search"
+                      className="pl-8 font-mono"
                     />
                   </div>
                 ) : null}
@@ -662,7 +700,7 @@ export function InspectorPane({
                               type="button"
                               onClick={() => onPickWorkspace(selectedNode.id, ws.path)}
                               data-testid={`control-pick-ws-${ws.key}`}
-                              className="inline-flex min-h-6 items-center gap-1 rounded-[5px] border border-border bg-card px-2 py-0.5 text-[11px] font-medium text-foreground transition-[color,background-color,transform] duration-150 active:scale-[0.97] hover:bg-accent cursor-pointer"
+                              className="inline-flex min-h-11 px-2.5 md:min-h-6 md:px-2 md:py-0.5 items-center gap-1 rounded-[5px] border border-border bg-card text-xs md:text-[11px] font-medium text-foreground transition-[color,background-color,transform] duration-150 active:scale-[0.97] hover:bg-accent cursor-pointer"
                             >
                               <Send className="h-3 w-3 text-[var(--status-running)]" strokeWidth={1.75} aria-hidden="true" />
                               派发
@@ -690,7 +728,7 @@ export function InspectorPane({
             value="deliveries"
             className="mt-0 min-h-0 flex-1 flex flex-col overflow-hidden"
           >
-            <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-border px-3 text-[11px] text-muted-foreground tabular-nums">
+            <div className="flex min-h-11 md:min-h-0 md:h-10 shrink-0 items-center justify-between gap-2 border-b border-border px-3 py-1.5 md:py-0 text-[11px] text-muted-foreground tabular-nums">
               <span className="truncate font-mono">
                 {deliveryTarget
                   ? deliveryTarget.kind === "native_event"
@@ -719,7 +757,7 @@ export function InspectorPane({
                         : deliveryTarget.run.id
                     )
                   }
-                  className="h-6 px-2 text-[11px]"
+                  className="min-h-11 md:min-h-0 md:h-6 px-2.5 md:px-2 text-xs md:text-[11px]"
                 >
                   <RefreshCw className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
                   重推失败通道
@@ -810,7 +848,7 @@ export function InspectorPane({
                             data-testid={`redeliver-btn-${d.id}`}
                             disabled={Boolean(redeliveringIds[d.id])}
                             onClick={() => onRedeliverChannel(d.source_kind, d.source_id, d.id)}
-                            className="h-7 px-2 text-[11px]"
+                            className="min-h-11 md:min-h-0 md:h-7 px-2.5 md:px-2 text-xs md:text-[11px]"
                           >
                             <RefreshCw className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
                             {redeliveringIds[d.id] ? "重推中..." : "重推此通道"}

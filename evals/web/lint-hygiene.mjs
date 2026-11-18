@@ -167,6 +167,9 @@ const indexHtml = fs.readFileSync(indexHtmlPath, "utf8");
 if (!indexHtml.includes("manifest.webmanifest") || !indexHtml.includes('crossorigin="use-credentials"')) {
   fail("pwa-index-html", 'apps/web/index.html 必须包含 <link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials" />');
 }
+if (!/<meta[^>]*name=["']viewport["'][^>]*viewport-fit=cover/i.test(indexHtml)) {
+  fail("mobile-viewport-fit", 'apps/web/index.html 的 viewport meta 必须声明 viewport-fit=cover');
+}
 
 if (failures.length > 0) {
   console.error("L1 Frontend Hygiene Check FAILED:");

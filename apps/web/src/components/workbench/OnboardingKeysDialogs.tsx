@@ -186,18 +186,18 @@ export function OnboardingDialog({
         </DialogHeader>
 
         <Tabs defaultValue="node" className="w-full">
-          <TabsList className="grid w-full grid-cols-3">
-            <TabsTrigger value="node" className="px-1.5 text-[11px] sm:px-2.5 sm:text-xs">
+          <TabsList className="grid w-full grid-cols-3 h-auto min-h-12 p-0.5 sm:h-8 sm:min-h-0">
+            <TabsTrigger value="node" className="min-h-11 sm:min-h-0 px-1.5 text-xs sm:px-2.5 sm:text-xs">
               一键接入节点
             </TabsTrigger>
             <TabsTrigger
               value="skill"
               data-testid="onboarding-tab-skill"
-              className="px-1.5 text-[11px] sm:px-2.5 sm:text-xs"
+              className="min-h-11 sm:min-h-0 px-1.5 text-xs sm:px-2.5 sm:text-xs"
             >
               接入 Bot / Skill
             </TabsTrigger>
-            <TabsTrigger value="auth" className="px-1.5 text-[11px] sm:px-2.5 sm:text-xs">
+            <TabsTrigger value="auth" className="min-h-11 sm:min-h-0 px-1.5 text-xs sm:px-2.5 sm:text-xs">
               Token 登录
             </TabsTrigger>
           </TabsList>
@@ -209,12 +209,17 @@ export function OnboardingDialog({
                 onChange={(e) => setNodeName(e.target.value)}
                 placeholder="节点名称（例如 macmini / mbp）"
                 aria-label="节点名称"
+                autoComplete="off"
+                autoCorrect="off"
+                autoCapitalize="none"
+                spellCheck={false}
               />
               <Button
                 type="button"
                 variant="outline"
                 onClick={handleIssueNodeKey}
                 disabled={issuing}
+                className="min-h-11 sm:min-h-0 sm:h-8"
               >
                 <KeyRound className="h-3.5 w-3.5" strokeWidth={1.75} />
                 {issuing ? "签发中…" : "签发节点 Token"}
@@ -248,7 +253,7 @@ export function OnboardingDialog({
                   <a
                     key={item.href}
                     href={item.href}
-                    className="inline-flex h-7 items-center gap-1 rounded-[5px] border border-border bg-card px-2 text-[11px] text-foreground hover:bg-accent"
+                    className="inline-flex min-h-11 sm:min-h-0 sm:h-7 items-center gap-1 rounded-[5px] border border-border bg-card px-2.5 sm:px-2 text-xs sm:text-[11px] text-foreground hover:bg-accent"
                   >
                     <Download className="h-3 w-3 text-muted-foreground" strokeWidth={1.75} />
                     {item.label}
@@ -300,6 +305,10 @@ export function OnboardingDialog({
                 value={tokenInput}
                 onChange={(e) => setTokenInput(e.target.value)}
                 placeholder="ahub_..."
+                autoComplete="off"
+                autoCorrect="off"
+                autoCapitalize="none"
+                spellCheck={false}
               />
             </div>
             <div className="flex justify-end gap-2">
@@ -310,6 +319,7 @@ export function OnboardingDialog({
                   setTokenInput("");
                   onApplyToken("");
                 }}
+                className="min-h-11 sm:min-h-0 sm:h-8"
               >
                 清除 Token
               </Button>
@@ -319,6 +329,7 @@ export function OnboardingDialog({
                   onApplyToken(tokenInput.trim());
                   onOpenChange(false);
                 }}
+                className="min-h-11 sm:min-h-0 sm:h-8"
               >
                 保存并重连
               </Button>
@@ -537,6 +548,10 @@ export function KeysDialog({
                 onChange={(e) => setName(e.target.value)}
                 placeholder="密钥用途备注（如 grok-bot-alpha）"
                 aria-label="密钥用途备注"
+                autoComplete="off"
+                autoCorrect="off"
+                autoCapitalize="none"
+                spellCheck={false}
                 data-testid="key-name-input"
               />
               <Select value={scope} onValueChange={(v) => setScope(v as typeof scope)}>
@@ -554,6 +569,7 @@ export function KeysDialog({
                 onClick={handleCreate}
                 disabled={!canCreate}
                 data-testid="create-key-btn"
+                className="min-h-11 sm:min-h-0 sm:h-8"
               >
                 <Plus className="h-3.5 w-3.5" strokeWidth={1.75} />
                 创建
@@ -566,6 +582,10 @@ export function KeysDialog({
                 onChange={(e) => setBoundNodeId(e.target.value)}
                 placeholder="绑定节点 ID（必填，如 macmini）"
                 aria-label="绑定节点 ID"
+                autoComplete="off"
+                autoCorrect="off"
+                autoCapitalize="none"
+                spellCheck={false}
                 data-testid="key-bound-node-input"
               />
             )}
@@ -583,7 +603,7 @@ export function KeysDialog({
                           type="button"
                           onClick={() => setAllowedNodesText((prev) => toggleNodeInList(prev, nodeId))}
                           data-testid={`key-node-chip-${nodeId}`}
-                          className={`rounded-[4px] border px-2 py-0.5 font-mono text-[11px] transition-colors ${
+                          className={`inline-flex min-h-11 px-2.5 sm:min-h-0 sm:px-2 sm:py-0.5 items-center rounded-[4px] border font-mono text-xs sm:text-[11px] transition-colors cursor-pointer ${
                             active
                               ? "border-[var(--status-running)] bg-[var(--status-running)]/15 text-foreground"
                               : "border-border bg-background text-muted-foreground hover:text-foreground"
@@ -603,6 +623,10 @@ export function KeysDialog({
                   onChange={(e) => setAllowedNodesText(e.target.value)}
                   placeholder="允许调度节点列表（逗号分隔，如 macmini,mbp；留空允许全部）"
                   aria-label="允许调度节点列表"
+                  autoComplete="off"
+                  autoCorrect="off"
+                  autoCapitalize="none"
+                  spellCheck={false}
                   data-testid="key-allowed-nodes-input"
                 />
                 <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
@@ -611,6 +635,10 @@ export function KeysDialog({
                     onChange={(e) => setWebhookUrl(e.target.value)}
                     placeholder="独立 Bot Webhook URL（可选，https://...）"
                     aria-label="Bot Webhook URL"
+                    autoComplete="off"
+                    autoCorrect="off"
+                    autoCapitalize="none"
+                    spellCheck={false}
                     data-testid="key-webhook-url-input"
                   />
                   <Input
@@ -619,6 +647,10 @@ export function KeysDialog({
                     onChange={(e) => setWebhookKey(e.target.value)}
                     placeholder="Webhook Bearer Key（可选）"
                     aria-label="Bot Webhook Key"
+                    autoComplete="off"
+                    autoCorrect="off"
+                    autoCapitalize="none"
+                    spellCheck={false}
                     data-testid="key-webhook-key-input"
                   />
                 </div>
@@ -735,7 +767,7 @@ export function KeysDialog({
                           </div>
                         </div>
                         {!item.revoked_at && (
-                          <div className="flex shrink-0 items-center gap-1">
+                          <div className="flex shrink-0 flex-wrap items-center gap-1">
                             {confirmRevokeId === item.id ? (
                               <>
                                 <Button
@@ -744,7 +776,7 @@ export function KeysDialog({
                                   variant="destructive"
                                   onClick={() => handleRevoke(item.id)}
                                   data-testid={`confirm-revoke-${item.id}`}
-                                  className="h-7 px-2 text-[11px]"
+                                  className="min-h-11 sm:min-h-0 sm:h-7 px-2.5 sm:px-2 text-xs sm:text-[11px]"
                                 >
                                   确认吊销
                                 </Button>
@@ -753,7 +785,7 @@ export function KeysDialog({
                                   size="sm"
                                   variant="ghost"
                                   onClick={() => setConfirmRevokeId(null)}
-                                  className="h-7 px-2 text-[11px]"
+                                  className="min-h-11 sm:min-h-0 sm:h-7 px-2.5 sm:px-2 text-xs sm:text-[11px]"
                                 >
                                   取消
                                 </Button>
@@ -768,6 +800,7 @@ export function KeysDialog({
                                     onClick={() => (isEditing ? setEditingKeyId(null) : startEdit(item))}
                                     data-testid={`edit-key-${item.id}`}
                                     aria-label={`编辑 ${item.name}`}
+                                    className="min-h-11 sm:min-h-0 sm:h-7"
                                   >
                                     {isEditing ? (
                                       <X className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
@@ -786,7 +819,7 @@ export function KeysDialog({
                                     setConfirmRevokeId(item.id);
                                   }}
                                   data-testid={`revoke-key-${item.id}`}
-                                  className="text-[var(--status-failed)] hover:text-[var(--status-failed)]"
+                                  className="min-h-11 sm:min-h-0 sm:h-7 text-[var(--status-failed)] hover:text-[var(--status-failed)]"
                                   aria-label={`吊销 ${item.name}`}
                                 >
                                   <Trash2 className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
@@ -812,7 +845,7 @@ export function KeysDialog({
                                     onClick={() =>
                                       setEditAllowedNodesText((prev) => toggleNodeInList(prev, nodeId))
                                     }
-                                    className={`rounded-[4px] border px-2 py-0.5 font-mono text-[11px] transition-colors ${
+                                    className={`inline-flex min-h-11 px-2.5 sm:min-h-0 sm:px-2 sm:py-0.5 items-center rounded-[4px] border font-mono text-xs sm:text-[11px] transition-colors cursor-pointer ${
                                       active
                                         ? "border-[var(--status-running)] bg-[var(--status-running)]/15 text-foreground"
                                         : "border-border bg-background text-muted-foreground hover:text-foreground"
@@ -829,6 +862,10 @@ export function KeysDialog({
                             onChange={(e) => setEditAllowedNodesText(e.target.value)}
                             placeholder="允许调度节点（逗号分隔，留空允许全部节点）"
                             aria-label="编辑允许节点"
+                            autoComplete="off"
+                            autoCorrect="off"
+                            autoCapitalize="none"
+                            spellCheck={false}
                             data-testid={`edit-allowed-nodes-${item.id}`}
                           />
                           <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
@@ -842,6 +879,10 @@ export function KeysDialog({
                                   : "设置 Bot Webhook URL（https://...）"
                               }
                               aria-label="编辑 Bot Webhook URL"
+                              autoComplete="off"
+                              autoCorrect="off"
+                              autoCapitalize="none"
+                              spellCheck={false}
                               data-testid={`edit-webhook-url-${item.id}`}
                             />
                             <Input
@@ -851,12 +892,16 @@ export function KeysDialog({
                               disabled={editClearWebhook}
                               placeholder="更新 Bearer Key（留空保持不变或配合新 URL）"
                               aria-label="编辑 Bot Webhook Key"
+                              autoComplete="off"
+                              autoCorrect="off"
+                              autoCapitalize="none"
+                              spellCheck={false}
                               data-testid={`edit-webhook-key-${item.id}`}
                             />
                           </div>
                           <div className="flex flex-wrap items-center justify-between gap-2">
                             {item.has_webhook ? (
-                              <label className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                              <label className="flex min-h-11 sm:min-h-0 items-center gap-1.5 text-xs sm:text-[11px] text-muted-foreground cursor-pointer">
                                 <input
                                   type="checkbox"
                                   checked={editClearWebhook}
@@ -885,6 +930,7 @@ export function KeysDialog({
                                 size="sm"
                                 variant="ghost"
                                 onClick={() => setEditingKeyId(null)}
+                                className="min-h-11 sm:min-h-0 sm:h-7"
                               >
                                 取消
                               </Button>
@@ -894,6 +940,7 @@ export function KeysDialog({
                                 disabled={savingEdit}
                                 onClick={() => handleSaveEdit(item.id)}
                                 data-testid={`save-key-edit-${item.id}`}
+                                className="min-h-11 sm:min-h-0 sm:h-7"
                               >
                                 {savingEdit ? "保存中…" : "保存绑定"}
                               </Button>

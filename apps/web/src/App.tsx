@@ -5,7 +5,8 @@ import {
   type DragEndEvent,
   type DragStartEvent,
   KeyboardSensor,
-  PointerSensor,
+  MouseSensor,
+  TouchSensor,
   useSensor,
   useSensors
 } from "@dnd-kit/core";
@@ -14,6 +15,7 @@ import { Group, Panel, Separator } from "react-resizable-panels";
 import {
   AlertCircle,
   Bell,
+  Ellipsis,
   KeyRound,
   Moon,
   PanelLeft,
@@ -23,6 +25,13 @@ import {
   X
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger
+} from "@/components/ui/dropdown-menu";
 import { Sheet, SheetContent } from "@/components/ui/sheet";
 import { BrowserNotifyDialog } from "@/components/workbench/BrowserNotifyDialog";
 import { ConversationPane } from "@/components/workbench/ConversationPane";
@@ -233,7 +242,8 @@ export function App() {
   }, [inPageFallbackEnabled]);
 
   const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(MouseSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(TouchSensor, { activationConstraint: { delay: 220, tolerance: 6 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
   );
 
@@ -855,6 +865,18 @@ export function App() {
     return { online, total: nodes.length, running, approval, queued };
   }, [nodes, runs]);
 
+  const localPushActive = useMemo(
+    () =>
+      Boolean(
+        localEndpointShaPrefix &&
+          pushSubscriptions.some(
+            (s) =>
+              s.endpoint_sha256_prefix === localEndpointShaPrefix && s.enabled && !s.revoked_at
+          )
+      ),
+    [localEndpointShaPrefix, pushSubscriptions]
+  );
+
   function handleSelectThreadById(threadId: string) {
     const thread = threads.find((t) => t.id === threadId);
     if (!thread) return;
@@ -971,6 +993,43 @@ export function App() {
     }
   }
 
+  function handleSelectRunFromInspector(runId: string) {
+    const targetRun = runs.find((r) => r.id === runId);
+    if (targetRun) {
+      selectThread(targetRun.thread_id);
+    }
+    selectRun(runId);
+    setCenterMode("controlled");
+    if (!isDesktop) {
+      setMobileRightOpen(false);
+    }
+  }
+
+  function handleOpenRunEvents(runId: string) {
+    const targetRun = runs.find((r) => r.id === runId);
+    if (targetRun) {
+      selectThread(targetRun.thread_id);
+    }
+    selectRun(runId);
+    setActiveTab("events");
+    if (!isDesktop) {
+      setMobileRightOpen(true);
+    }
+  }
+
+  function handleOpenRunDeliveries(runId: string) {
+    if (authScope !== "admin") return;
+    const targetRun = runs.find((r) => r.id === runId);
+    if (targetRun) {
+      selectThread(targetRun.thread_id);
+    }
+    selectRun(runId);
+    setActiveTab("deliveries");
+    if (!isDesktop) {
+      setMobileRightOpen(true);
+    }
+  }
+
   async function handleRedeliverChannel(
     sourceKind: DeliverySourceKind,
     sourceId: string,
@@ -1075,6 +1134,7 @@ export function App() {
       upsertRun(res.run);
       selectThread(res.thread.id);
       selectRun(res.run.id);
+      setCenterMode("controlled");
       patchComposer({
         mode: "reply",
         nodeId: res.thread.node_id,
@@ -1083,6 +1143,7 @@ export function App() {
         model: "",
         effort: ""
       });
+      setMobileLeftOpen(false);
     } catch (err) {
       setErrorBanner(err instanceof ApiClientError ? err.message : "分叉线程失败");
     }
@@ -1374,7 +1435,7 @@ export function App() {
     deliveriesLoading,
     redeliveringIds,
     onRedeliverChannel: authScope === "admin" ? handleRedeliverChannel : undefined,
-    onSelectRun: selectRun,
+    onSelectRun: handleSelectRunFromInspector,
     onCancelRun: handleCancelRun,
     onToggleNodeDrain: handleToggleNodeDrain,
     onUpdateNodeConcurrency: handleUpdateNodeConcurrency,
@@ -1419,6 +1480,8 @@ export function App() {
           setActiveTab("lineage");
           if (!isDesktop) setMobileRightOpen(true);
         }}
+        onOpenRunEvents={handleOpenRunEvents}
+        onOpenRunDeliveries={authScope === "admin" ? handleOpenRunDeliveries : undefined}
         onSubmitPrompt={handleSubmitPrompt}
       />
     );
@@ -1432,167 +1495,247 @@ export function App() {
     >
       <div className="relative flex h-dvh w-full flex-col overflow-hidden bg-background text-foreground">
         {/* Global slim header bar */}
-        <header className="flex h-12 shrink-0 items-center justify-between gap-1.5 border-b border-border bg-card px-1.5 sm:gap-2 sm:px-3">
-          <div className="flex min-w-0 items-center gap-1 sm:gap-2">
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              onClick={() => setMobileLeftOpen(true)}
-              className="relative h-11 w-11 shrink-0 md:hidden"
-              aria-label="打开节点与会话列表"
-              data-testid="mobile-left-trigger"
-            >
-              <PanelLeft className="h-4 w-4" strokeWidth={1.75} aria-hidden="true" />
-              {authScope === "admin" && openInteractionCount > 0 ? (
+        <header className="shrink-0 border-b border-border bg-card pt-[var(--safe-top)] pl-[max(0.375rem,var(--safe-left))] pr-[max(0.375rem,var(--safe-right))] sm:pl-[max(0.75rem,var(--safe-left))] sm:pr-[max(0.75rem,var(--safe-right))]">
+          <div className="flex h-12 w-full items-center justify-between gap-1 sm:gap-2">
+            <div className="flex min-w-0 items-center gap-1 sm:gap-2">
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                onClick={() => setMobileLeftOpen(true)}
+                className="relative h-11 w-11 shrink-0 md:hidden"
+                aria-label="打开节点与会话列表"
+                data-testid="mobile-left-trigger"
+              >
+                <PanelLeft className="h-4 w-4" strokeWidth={1.75} aria-hidden="true" />
+                {authScope === "admin" && openInteractionCount > 0 ? (
+                  <span
+                    aria-hidden="true"
+                    className="absolute right-1 top-1 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-[var(--status-approval)] px-1 text-[10px] font-semibold text-black tabular-nums"
+                  >
+                    {openInteractionCount}
+                  </span>
+                ) : null}
+              </Button>
+
+              <div className="flex min-w-0 items-center gap-1.5 px-0.5 sm:px-1">
+                <span
+                  data-testid="brand-stream-dot"
+                  className={cn(
+                    "h-2 w-2 shrink-0 rounded-full",
+                    streamStatus === "connected" && "bg-[var(--status-done)]",
+                    streamStatus === "connecting" && "bg-[var(--status-running)] animate-pulse",
+                    streamStatus === "disconnected" && "bg-[var(--status-failed)]"
+                  )}
+                  aria-hidden="true"
+                />
+                <h1 className="truncate font-mono text-xs sm:text-sm font-semibold tracking-tight">
+                  agent-hub
+                </h1>
+                <span className="shrink-0 rounded-[4px] border border-border bg-background/60 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground tabular-nums sm:hidden">
+                  在线 {fleetTelemetry.online}/{fleetTelemetry.total}
+                </span>
+              </div>
+
+              <span
+                data-testid="stream-status-pill"
+                className="hidden items-center gap-1.5 rounded-[5px] border border-border bg-background px-2 py-0.5 text-[11px] text-muted-foreground sm:inline-flex"
+              >
                 <span
                   aria-hidden="true"
-                  className="absolute right-1 top-1 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-[var(--status-approval)] px-1 text-[10px] font-semibold text-black tabular-nums"
+                  className={cn(
+                    "h-1.5 w-1.5 rounded-full",
+                    streamStatus === "connected" && "bg-[var(--status-done)]",
+                    streamStatus === "connecting" && "bg-[var(--status-running)]",
+                    streamStatus === "disconnected" && "bg-[var(--status-failed)]"
+                  )}
+                />
+                {streamStatus === "connected"
+                  ? "实时已连接"
+                  : streamStatus === "connecting"
+                    ? "连接中"
+                    : "已断开"}
+              </span>
+
+              <div className="hidden items-center gap-1.5 font-mono text-[11px] text-muted-foreground tabular-nums lg:inline-flex">
+                <button
+                  type="button"
+                  onClick={() => setActiveTab("control")}
+                  className="inline-flex items-center gap-1 rounded-[5px] border border-border bg-background/60 px-2 py-0.5 hover:text-foreground cursor-pointer"
                 >
-                  {openInteractionCount}
-                </span>
+                  在线 {fleetTelemetry.online}/{fleetTelemetry.total}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setActiveTab("queue")}
+                  className="inline-flex items-center gap-2 rounded-[5px] border border-border bg-background/60 px-2 py-0.5 hover:text-foreground cursor-pointer"
+                >
+                  <span>运行 {fleetTelemetry.running}</span>
+                  <span>排队 {fleetTelemetry.queued}</span>
+                  <span
+                    className={cn(
+                      fleetTelemetry.approval > 0 && "text-[var(--status-approval)] font-medium"
+                    )}
+                  >
+                    审批 {fleetTelemetry.approval}
+                  </span>
+                </button>
+              </div>
+            </div>
+
+            <div className="flex shrink-0 items-center gap-0.5 sm:gap-1.5">
+              {authScope === "admin" ? (
+                <>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => {
+                      setLeftTab("native");
+                      setNativeFilterMode("unacked");
+                      setCenterMode("native");
+                    }}
+                    data-testid="open-interactions-pill"
+                    className={cn(
+                      "hidden sm:inline-flex min-h-11 min-w-11 px-2.5 md:min-h-8 md:h-8 md:px-2.5 font-mono text-[11px] tabular-nums",
+                      openInteractionCount > 0 &&
+                        "border-[var(--status-approval)]/60 bg-[var(--status-approval)]/12 text-[var(--status-approval)] hover:bg-[var(--status-approval)]/20"
+                    )}
+                  >
+                    互动 {openInteractionCount}
+                  </Button>
+
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => setBrowserNotifyOpen(true)}
+                    className="relative h-11 w-11 p-0 sm:w-auto sm:min-h-11 sm:min-w-11 sm:px-2.5 md:min-h-8 md:h-8 md:px-2.5"
+                    aria-label="通知渠道"
+                    data-testid="open-browser-notify-btn"
+                  >
+                    <Bell className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
+                    <span className="hidden md:inline">通知渠道</span>
+                    {localPushActive ? (
+                      <span
+                        aria-hidden="true"
+                        className="absolute right-1.5 top-1.5 h-1.5 w-1.5 rounded-full bg-[var(--status-done)] sm:static"
+                      />
+                    ) : null}
+                  </Button>
+                </>
               ) : null}
-            </Button>
 
-            <div className="flex min-w-0 items-center gap-1.5 px-0.5 sm:px-1">
-              <span className="h-2 w-2 shrink-0 rounded-full bg-[var(--status-running)]" aria-hidden="true" />
-              <h1 className="truncate font-mono text-xs sm:text-sm font-semibold tracking-tight">
-                agent-hub
-              </h1>
-            </div>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setOnboardingOpen(true)}
+                className="hidden sm:inline-flex sm:min-h-11 sm:min-w-11 sm:px-2.5 md:min-h-8 md:h-8 md:px-2.5"
+                aria-label="接入节点"
+                data-testid="open-onboarding-btn"
+              >
+                <Plus className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
+                <span>接入节点</span>
+              </Button>
 
-            <span
-              data-testid="stream-status-pill"
-              className="hidden items-center gap-1.5 rounded-[5px] border border-border bg-background px-2 py-0.5 text-[11px] text-muted-foreground sm:inline-flex"
-            >
-              <span
-                aria-hidden="true"
-                className={cn(
-                  "h-1.5 w-1.5 rounded-full",
-                  streamStatus === "connected" && "bg-[var(--status-done)]",
-                  streamStatus === "connecting" && "bg-[var(--status-running)]",
-                  streamStatus === "disconnected" && "bg-[var(--status-failed)]"
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setKeysDialogOpen(true)}
+                className="hidden sm:inline-flex sm:min-h-11 sm:min-w-11 sm:px-2.5 md:min-h-8 md:h-8 md:px-2.5"
+                aria-label="API Keys"
+                data-testid="open-keys-btn"
+              >
+                <KeyRound className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
+                <span>API Keys</span>
+              </Button>
+
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                onClick={toggleTheme}
+                className="hidden sm:inline-flex sm:h-11 sm:w-11 shrink-0 md:h-8 md:w-8"
+                aria-label={theme === "dark" ? "切换浅色主题" : "切换深色主题"}
+                data-testid="theme-toggle-btn"
+              >
+                {theme === "dark" ? (
+                  <Sun className="h-4 w-4" strokeWidth={1.75} aria-hidden="true" />
+                ) : (
+                  <Moon className="h-4 w-4" strokeWidth={1.75} aria-hidden="true" />
                 )}
-              />
-              {streamStatus === "connected"
-                ? "实时已连接"
-                : streamStatus === "connecting"
-                  ? "连接中"
-                  : "已断开"}
-            </span>
+              </Button>
 
-            <div className="hidden items-center gap-1.5 font-mono text-[11px] text-muted-foreground tabular-nums lg:inline-flex">
-              <button
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="h-11 w-11 shrink-0 sm:hidden"
+                    aria-label="更多管理与外观选项"
+                    data-testid="mobile-more-menu-btn"
+                  >
+                    <Ellipsis className="h-4 w-4" strokeWidth={1.75} aria-hidden="true" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  <DropdownMenuItem
+                    data-testid="mobile-menu-onboarding"
+                    onSelect={() => setOnboardingOpen(true)}
+                  >
+                    <Plus className="h-4 w-4 text-muted-foreground" strokeWidth={1.75} aria-hidden="true" />
+                    <span>接入节点与 Token</span>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    data-testid="mobile-menu-keys"
+                    onSelect={() => setKeysDialogOpen(true)}
+                  >
+                    <KeyRound className="h-4 w-4 text-muted-foreground" strokeWidth={1.75} aria-hidden="true" />
+                    <span>API Keys 凭证管理</span>
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem
+                    data-testid="mobile-menu-theme"
+                    onSelect={toggleTheme}
+                  >
+                    {theme === "dark" ? (
+                      <Sun className="h-4 w-4 text-muted-foreground" strokeWidth={1.75} aria-hidden="true" />
+                    ) : (
+                      <Moon className="h-4 w-4 text-muted-foreground" strokeWidth={1.75} aria-hidden="true" />
+                    )}
+                    <span>{theme === "dark" ? "切换浅色主题" : "切换深色主题"}</span>
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+
+              <Button
                 type="button"
-                onClick={() => setActiveTab("control")}
-                className="inline-flex items-center gap-1 rounded-[5px] border border-border bg-background/60 px-2 py-0.5 hover:text-foreground cursor-pointer"
+                variant="ghost"
+                size="icon"
+                onClick={() => setMobileRightOpen(true)}
+                className="relative h-11 w-11 shrink-0 md:hidden"
+                aria-label="打开检视面板"
+                data-testid="mobile-right-trigger"
               >
-                在线 {fleetTelemetry.online}/{fleetTelemetry.total}
-              </button>
-              <button
-                type="button"
-                onClick={() => setActiveTab("queue")}
-                className="inline-flex items-center gap-2 rounded-[5px] border border-border bg-background/60 px-2 py-0.5 hover:text-foreground cursor-pointer"
-              >
-                <span>运行 {fleetTelemetry.running}</span>
-                <span>排队 {fleetTelemetry.queued}</span>
-                <span
-                  className={cn(
-                    fleetTelemetry.approval > 0 && "text-[var(--status-approval)] font-medium"
-                  )}
-                >
-                  审批 {fleetTelemetry.approval}
-                </span>
-              </button>
+                <PanelRight className="h-4 w-4" strokeWidth={1.75} aria-hidden="true" />
+                {fleetTelemetry.approval > 0 ? (
+                  <span
+                    data-testid="mobile-right-badge"
+                    aria-hidden="true"
+                    className="absolute right-1 top-1 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-[var(--status-approval)] px-1 text-[10px] font-semibold text-black tabular-nums"
+                  >
+                    {fleetTelemetry.approval}
+                  </span>
+                ) : fleetTelemetry.running + fleetTelemetry.queued > 0 ? (
+                  <span
+                    data-testid="mobile-right-badge"
+                    aria-hidden="true"
+                    className="absolute right-1 top-1 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-[var(--status-running)] px-1 text-[10px] font-semibold text-white tabular-nums"
+                  >
+                    {fleetTelemetry.running + fleetTelemetry.queued}
+                  </span>
+                ) : null}
+              </Button>
             </div>
-          </div>
-
-          <div className="flex shrink-0 items-center gap-0.5 sm:gap-1.5">
-            {authScope === "admin" ? (
-              <>
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={() => {
-                    setLeftTab("native");
-                    setNativeFilterMode("unacked");
-                    setCenterMode("native");
-                  }}
-                  data-testid="open-interactions-pill"
-                  className={cn(
-                    "hidden sm:inline-flex min-h-11 min-w-11 px-2.5 md:min-h-8 md:h-8 md:px-2.5 font-mono text-[11px] tabular-nums",
-                    openInteractionCount > 0 &&
-                      "border-[var(--status-approval)]/60 bg-[var(--status-approval)]/12 text-[var(--status-approval)] hover:bg-[var(--status-approval)]/20"
-                  )}
-                >
-                  互动 {openInteractionCount}
-                </Button>
-
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={() => setBrowserNotifyOpen(true)}
-                  className="h-11 w-11 p-0 sm:w-auto sm:min-h-11 sm:min-w-11 sm:px-2.5 md:min-h-8 md:h-8 md:px-2.5"
-                  aria-label="通知渠道"
-                  data-testid="open-browser-notify-btn"
-                >
-                  <Bell className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
-                  <span className="hidden md:inline">通知渠道</span>
-                </Button>
-              </>
-            ) : null}
-
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => setOnboardingOpen(true)}
-              className="h-11 w-11 p-0 sm:w-auto sm:min-h-11 sm:min-w-11 sm:px-2.5 md:min-h-8 md:h-8 md:px-2.5"
-              aria-label="接入节点"
-              data-testid="open-onboarding-btn"
-            >
-              <Plus className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
-              <span className="hidden sm:inline">接入节点</span>
-            </Button>
-
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => setKeysDialogOpen(true)}
-              className="h-11 w-11 p-0 sm:w-auto sm:min-h-11 sm:min-w-11 sm:px-2.5 md:min-h-8 md:h-8 md:px-2.5"
-              aria-label="API Keys"
-              data-testid="open-keys-btn"
-            >
-              <KeyRound className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
-              <span className="hidden sm:inline">API Keys</span>
-            </Button>
-
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              onClick={toggleTheme}
-              className="h-11 w-11 shrink-0 md:h-8 md:w-8"
-              aria-label={theme === "dark" ? "切换浅色主题" : "切换深色主题"}
-              data-testid="theme-toggle-btn"
-            >
-              {theme === "dark" ? (
-                <Sun className="h-4 w-4" strokeWidth={1.75} aria-hidden="true" />
-              ) : (
-                <Moon className="h-4 w-4" strokeWidth={1.75} aria-hidden="true" />
-              )}
-            </Button>
-
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              onClick={() => setMobileRightOpen(true)}
-              className="h-11 w-11 shrink-0 md:hidden"
-              aria-label="打开检视面板"
-              data-testid="mobile-right-trigger"
-            >
-              <PanelRight className="h-4 w-4" strokeWidth={1.75} aria-hidden="true" />
-            </Button>
           </div>
         </header>
 
@@ -1645,7 +1788,7 @@ export function App() {
 
         <Sheet open={mobileRightOpen} onOpenChange={setMobileRightOpen}>
           <SheetContent side="right" title="实时检视与节点控制">
-            <InspectorPane {...inspectorProps} />
+            <InspectorPane {...inspectorProps} inDrawer />
           </SheetContent>
         </Sheet>
 

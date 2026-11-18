@@ -50,8 +50,8 @@
 
 - **字体平滑与等宽对齐**：根节点设置 `-webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;`。所有动态更新数字（运行耗时、队列计数、字节大小、时间戳、租约倒计时，以及新增 `NativeActivityPane.tsx`、`BrowserNotifyDialog.tsx`、`InspectorPane`「投递明细」与顶栏「互动」计数徽标）统一施加 `tabular-nums`（`font-variant-numeric: tabular-nums`），防止数字刷新时引发横向抖动。
 - **网络调用与 Service Worker 边界（L1/L2 门禁）**：全仓前端仅允许 `apps/web/src/lib/api-client.ts` 调用 `fetch(`，任何组件、Store 或 `public/sw.js` 均严禁直接发起裸 `fetch`（`sw.js` 严禁请求 `/api/`，保持零回源）。
-- **移动端触控与零溢出约束**：在 `< 768px`（含 `390×844` 基准视口）下，顶栏全部可见按钮（含新增「通知渠道」触发按钮）均须保持 `>= 44×44px` 触控热区（如 `min-h-11 min-w-11 md:min-h-8 md:h-8`），且页面横向溢出始终为 `0`（`document.documentElement.scrollWidth <= document.documentElement.clientWidth`）。
-- **标题与正文折行**：标题设置 `text-wrap: balance`，长段提示文案设置 `text-wrap: pretty`。节点 ID、工作区路径、`run_id`、模型名称与事件日志流统一使用等宽字体（`font-mono`）。
+- **移动端触控与零溢出约束**：`<head>` 须声明 `<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content" />`；在 `:root` 中定义 `--safe-top`/`--safe-right`/`--safe-bottom`/`--safe-left`（绑定 `env(safe-area-inset-*, 0px)`），供顶栏、底栏、左右抽屉与居中弹窗避让刘海屏与底部手势条。移动端（`< 640px`）所有 `Input` 与 `Textarea` 表单控件计算字号须保持 `>= 16px`（`text-base sm:text-xs`），防止 iOS Safari / Standalone PWA 聚焦时强制放大视口；节点 ID、目录、Token、模型 ID、Webhook URL 与搜索框等标识符输入字段须显式关闭自动纠错与首字母大写（`autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false}`）。在 `< 768px`（含 `360×780`、`390×844` 视口）下，顶栏、抽屉标签页与筛选/操作按钮均须保持 `>= 44×44px` 触控热区（如 `min-h-11` / `h-11 w-11`），页面横向与纵向溢出始终为 `0`（`document.documentElement.scrollWidth <= document.documentElement.clientWidth`）。
+- **标题与正文折行**：标题设置 `text-wrap: balance`，长段提示文案设置 `text-wrap: pretty`。节点 ID、工作区路径、`run_id`、模型名称与事件日志流统一使用等宽字体（`font-mono`）。Markdown 表格须包裹于可键盘聚焦的局部横向滚动容器（`.ahub-table-scroll`，`role="region"`、`tabIndex={0}`、`aria-label="数据表格"`），确保多列表格在窄屏不被挤压成单字竖排且不撑宽页面。
 - **同心圆角法则**：所有嵌套容器遵循 `outer_radius = inner_radius + padding`（例如外框 `rounded-lg` `8px` 配 `p-1` `4px` 时，内按钮用 `rounded-sm` `4px`）。
 - **克制的 `motion/react` 动效**：
   - 根应用包裹 `<MotionConfig reducedMotion="user">`。
@@ -113,8 +113,16 @@
 ### 3.2 移动端响应式降级（`< 768px`）
 
 - 隐藏三栏分割线，主屏幕专注渲染中栏「当前会话消息流 + 底部紧贴派发台」（或「原生活动详情流」）。
-- 顶部导航条提供「节点与会话」及「队列与流」两个抽屉触发按钮，使用 `shadcn/ui` `Sheet` 组件从左右滑出。
-- 全部可交互按钮（含顶栏「通知渠道」触发按钮）、Tab 与列表项在移动端保持至少 `44×44px` 触控热区，页面横向溢出为 `0`，确保无外部 Bot 时仅靠手机浏览器即可顺畅完成派单、审批与原生活动确认。
+- **顶部导航条**：
+  - 保留左抽屉触发器（存在 `openInteractionCount > 0` 时展示琥珀色 `tabular-nums` 角标）、随 `streamStatus` 实时变色的品牌连接指示圆点、`sm:hidden` 在线节点计数摘要、通知渠道直达按钮（保障移动端单次点击手势兼容 Safari Web Push 订阅）、以及右抽屉触发器（存在 `approval > 0` 时展示琥珀色待审批角标，否则存在 `running + queued > 0` 时展示蓝色活跃角标）。
+  - 在 `< 640px` 窄屏下，将「接入节点」「API Keys」「主题切换」三个低频管理/外观入口收拢进顶栏右侧「更多」菜单（`DropdownMenu`，触发按钮与菜单项均满足 `>= 44px` 高度），避免窄屏顶栏拥挤；`>= 640px` 维持既有独立按钮展示。
+- **左右响应式抽屉（`shadcn/ui` `Sheet`）**：
+  - 左抽屉（`FleetThreadsPane`）与右抽屉（`InspectorPane`）适配安全区内边距；左抽屉在移动端禁用工作区芯片拖拽（保留点击直选工作区，防止与竖向滚动手势冲突），在分叉会话成功后自动收起抽屉并切至新分支受控对话流。
+  - 右抽屉中点击Queued/Lineage 任一 `Run` 时同步切换对应 `Thread` 与 `Run` 并在移动端自动收起抽屉。
+  - 右抽屉的 5 个标签页（`events`、`queue`、`lineage`、`control`、`deliveries`）在 `< 768px` 下采用单行可滑动横向滚动条（`overflow-x-auto`，严禁折行或挤压成窄格，单项高度 `>= 44px`），切换激活标签页时自动调用 `scrollIntoView({ block: "nearest", inline: "nearest" })` 确保当前页签可见。
+- **中栏阅读与派单体验**：
+  - `ConversationPane` 任务卡片在移动端与桌面端均提供直达右抽屉「过程事件」的快捷按钮（管理员同时支持点击通知状态胶囊直达「投递明细」）；当会话已有历史任务（`threadRuns.length > 0`）时，底部 Composer 在 `< 768px` 下支持一键收折为单行紧凑条（「续聊 `<node>:<project>` · 展开输入指令」），释放手机竖屏阅读高度，展开后自动聚焦指令输入框。
+- 全部可交互按钮（含顶栏按钮、更多菜单项、抽屉标签页、筛选胶囊、任务卡片操作与弹窗关闭按钮）、Tab 与列表项在移动端保持至少 `44×44px` 触控热区，页面横向溢出为 `0`，确保无外部 Bot 时仅靠手机浏览器或主屏幕 PWA 即可顺畅完成巡检、审批、阅读与派单闭环。
 
 ### 3.3 PWA 清单、零回源 Service Worker 与双模式浏览器通知协调
 
@@ -142,7 +150,8 @@
 
 ### 传感器与防误触约束
 
-- 统一配置 `PointerSensor` 带 `activationConstraint: { distance: 6 }`，防止普通点击选定会话时误触发拖拽。
+- 拆分鼠标与触屏传感器：配置 `MouseSensor`（`activationConstraint: { distance: 6 }`）与 `TouchSensor`（`activationConstraint: { delay: 220, tolerance: 6 }`），拖拽手柄施加 `touch-none`（`touch-action: none`），防止桌面端点击误触发以及移动端滑动抽屉列表时抢占滚动手势。
+- 在移动端左抽屉（`inDrawer`）内禁用工作区芯片跨栏拖拽，保留点击即选中工作区功能。
 - 同时注册 `KeyboardSensor`（配合 `sortableKeyboardCoordinates`）满足键盘无障碍操作。
 - 统一在顶层渲染单个 `<DragOverlay>` 浮层卡片，拖拽原位元素保持 `opacity-40` 占位。
 

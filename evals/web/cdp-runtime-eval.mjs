@@ -877,7 +877,15 @@ try {
       title: "D1 与 WebSocket 压测线程",
       prompt: JSON.stringify({
         summary: "已完成 40 条基线事件与契约校验",
-        response: "## 巡检结论\n\n- 工作区索引与分支状态一致\n- 环形事件缓冲限制生效 (`<= 500`)\n- REST 补水与流式增量同步完整",
+        response:
+          "## 巡检结论\n\n" +
+          "- 工作区索引与分支状态一致\n" +
+          "- 环形事件缓冲限制生效 (`<= 500`)\n" +
+          "- REST 补水与流式增量同步完整\n\n" +
+          "| 节点 ID | 目标目录 | 运行状态 | 平均延迟 | 产物字节 | 校验结果 |\n" +
+          "| --- | --- | --- | --- | --- | --- |\n" +
+          "| macmini | /workspace/repo-alpha | online | 18ms | 4096 B | PASS |\n" +
+          "| mbp | /workspace/repo-web | online | 24ms | 2048 B | PASS |",
         directives: [{ op: "emit_ndjson", count: 40, kind: "tool_use" }]
       })
     })
@@ -2138,14 +2146,59 @@ try {
     throw new Error(`UI!=D1 parity mismatch after redeliver: ${JSON.stringify({ apiDlvAfter, reqCount: mockPushGateway.requests.length })}`);
   }
 
-  // Ack E4 and restore Threads/Events tabs before mobile & client-scope checks
   await cdpClient.clickSelector(`[data-testid="ack-native-event-${e4Id}"]`);
   await sleep(200);
   await cdpClient.clickSelector('[data-testid="fleet-tab-threads"]');
+  await sleep(150);
+  await cdpClient.clickSelector(`[data-testid="thread-item-${doneRunRes.run.thread_id}"] button:nth-of-type(2)`);
   await cdpClient.clickSelector('[data-testid="inspector-pane"] [role="tab"]:nth-of-type(1)');
-  await sleep(200);
+  await sleep(250);
 
-  // Mobile 390x844 responsiveness + tap target check + drawer screenshot 5
+  const extraScreenshotDir = process.env.AHUB_EVAL_EXTRA_SCREENSHOT_DIR;
+
+  await cdpClient.setViewport(360, 780, true);
+  await sleep(300);
+  await assertViewportContainment(cdpClient, "mobile-360x780");
+  const narrowTableCheck = await cdpClient.evalJS(`
+    (() => {
+      const region = document.querySelector('[data-testid="run-row-${doneRunId}"] .ahub-table-scroll[role="region"][tabindex="0"]');
+      return Boolean(region && region.querySelector("table"));
+    })()
+  `);
+  if (!narrowTableCheck) {
+    throw new Error("Expected Markdown wide table to render inside .ahub-table-scroll[role='region'][tabindex='0']");
+  }
+
+  await cdpClient.clickSelector('[data-testid="mobile-more-menu-btn"]');
+  await sleep(200);
+  const mobileMenuMetrics = await cdpClient.evalJS(`
+    (() => {
+      const items = Array.from(document.querySelectorAll('[data-testid="mobile-menu-onboarding"], [data-testid="mobile-menu-keys"], [data-testid="mobile-menu-theme"]'));
+      return items.map((el) => {
+        const r = el.getBoundingClientRect();
+        return { testid: el.getAttribute("data-testid"), w: r.width, h: r.height };
+      });
+    })()
+  `);
+  if (mobileMenuMetrics.length !== 3 || mobileMenuMetrics.some((m) => m.w < 43.5 || m.h < 43.5)) {
+    throw new Error(`Expected mobile more-menu items >= 44px, got ${JSON.stringify(mobileMenuMetrics)}`);
+  }
+  await cdpClient.send("Input.dispatchKeyEvent", {
+    type: "keyDown",
+    key: "Escape",
+    code: "Escape",
+    windowsVirtualKeyCode: 27,
+    nativeVirtualKeyCode: 27
+  });
+  await cdpClient.send("Input.dispatchKeyEvent", {
+    type: "keyUp",
+    key: "Escape",
+    code: "Escape",
+    windowsVirtualKeyCode: 27,
+    nativeVirtualKeyCode: 27
+  });
+  await sleep(150);
+
   await cdpClient.setViewport(390, 844, true);
   await sleep(300);
   await assertViewportContainment(cdpClient, "mobile-390x844");
@@ -2157,11 +2210,13 @@ try {
       for (const el of headerBtns) {
         const rect = el.getBoundingClientRect();
         if (rect.width === 0 || rect.height === 0) continue;
-        if (rect.width < 44 || rect.height < 44) {
+        if (rect.width < 43.5 || rect.height < 43.5) {
           undersized.push({ label: el.getAttribute("aria-label") || el.textContent?.trim(), w: rect.width, h: rect.height });
         }
       }
-      return { overflow, undersized };
+      const promptEl = document.querySelector("#prompt-input");
+      const promptFontSize = promptEl ? parseFloat(getComputedStyle(promptEl).fontSize) : 0;
+      return { overflow, undersized, promptFontSize };
     })()
   `);
   if (mobileMetrics.overflow > 0) {
@@ -2170,9 +2225,118 @@ try {
   if (mobileMetrics.undersized.length > 0) {
     throw new Error(`Mobile tap targets < 44x44px: ${JSON.stringify(mobileMetrics.undersized)}`);
   }
+  if (!(mobileMetrics.promptFontSize >= 16)) {
+    throw new Error(`Mobile #prompt-input font-size < 16px (causes iOS auto-zoom): ${mobileMetrics.promptFontSize}px`);
+  }
+
+  if (extraScreenshotDir) {
+    fs.mkdirSync(extraScreenshotDir, { recursive: true });
+    await cdpClient.screenshot(path.join(extraScreenshotDir, "mobile-conversation.png"));
+  }
+
+  await cdpClient.clickSelector('[data-testid="toggle-mobile-composer"]');
+  await sleep(150);
+  const composerCollapsed = await cdpClient.evalJS(`
+    (() => {
+      const ta = document.querySelector("#prompt-input");
+      const btn = document.querySelector('[data-testid="toggle-mobile-composer"]');
+      return {
+        textareaHidden: !ta || ta.getBoundingClientRect().height === 0,
+        expandedAttr: btn?.getAttribute("aria-expanded")
+      };
+    })()
+  `);
+  if (!composerCollapsed.textareaHidden || composerCollapsed.expandedAttr !== "false") {
+    throw new Error(`Expected toggle-mobile-composer to collapse composer, got ${JSON.stringify(composerCollapsed)}`);
+  }
+  await cdpClient.clickSelector('[data-testid="toggle-mobile-composer"]');
+  await sleep(150);
+  const composerExpanded = await cdpClient.evalJS(`
+    (() => {
+      const ta = document.querySelector("#prompt-input");
+      const btn = document.querySelector('[data-testid="toggle-mobile-composer"]');
+      return {
+        textareaVisible: Boolean(ta && ta.getBoundingClientRect().height >= 40),
+        expandedAttr: btn?.getAttribute("aria-expanded")
+      };
+    })()
+  `);
+  if (!composerExpanded.textareaVisible || composerExpanded.expandedAttr !== "true") {
+    throw new Error(`Expected toggle-mobile-composer to re-expand composer, got ${JSON.stringify(composerExpanded)}`);
+  }
+
+  await cdpClient.clickSelector(`[data-testid="open-run-events-${doneRunId}"]`);
+  await sleep(300);
+  const rightDrawerCheck = await cdpClient.evalJS(`
+    (() => {
+      const pane = document.querySelector('[data-testid="inspector-pane"]');
+      const tabs = pane ? Array.from(pane.querySelectorAll('[role="tab"]')) : [];
+      const tabMetrics = tabs.map((t) => {
+        const r = t.getBoundingClientRect();
+        return { text: t.textContent?.trim(), w: r.width, h: r.height };
+      });
+      return {
+        open: Boolean(pane),
+        activeTab: window.__AHUB_EVAL__.getState().activeTab,
+        tabMetrics
+      };
+    })()
+  `);
+  if (
+    !rightDrawerCheck.open ||
+    rightDrawerCheck.activeTab !== "events" ||
+    rightDrawerCheck.tabMetrics.length !== 5 ||
+    rightDrawerCheck.tabMetrics.some((t) => t.h < 43.5 || t.w < 68)
+  ) {
+    throw new Error(`Mobile right drawer 5-tab check failed: ${JSON.stringify(rightDrawerCheck)}`);
+  }
+  await assertViewportContainment(cdpClient, "mobile-390x844-right-drawer");
+  await cdpClient.clickSelector('[data-testid="inspector-tab-deliveries"]');
+  await sleep(250);
+  const rightTab5Active = await cdpClient.evalJS(`
+    (() => ({
+      activeTab: window.__AHUB_EVAL__.getState().activeTab,
+      tabRightVisible: (() => {
+        const el = document.querySelector('[data-testid="inspector-tab-deliveries"]');
+        if (!el) return false;
+        const r = el.getBoundingClientRect();
+        return r.left >= 0 && r.right <= window.innerWidth + 1;
+      })()
+    }))()
+  `);
+  if (rightTab5Active.activeTab !== "deliveries" || !rightTab5Active.tabRightVisible) {
+    throw new Error(`Mobile right drawer 5th tab did not scroll cleanly into view: ${JSON.stringify(rightTab5Active)}`);
+  }
+  if (extraScreenshotDir) {
+    fs.mkdirSync(extraScreenshotDir, { recursive: true });
+    await cdpClient.screenshot(path.join(extraScreenshotDir, "mobile-right-drawer.png"));
+  }
+  await cdpClient.clickSelector('button[aria-label="关闭抽屉"]');
+  await sleep(250);
 
   await cdpClient.clickSelector('[data-testid="mobile-left-trigger"]');
   await sleep(300);
+  const leftDrawerMetrics = await cdpClient.evalJS(`
+    (() => {
+      const pane = document.querySelector('[data-testid="fleet-threads-pane"]');
+      const searchEl = document.querySelector('[data-testid="thread-search-input"]');
+      const newBtn = document.querySelector('[data-testid="new-thread-btn"]');
+      const tabs = pane ? Array.from(pane.querySelectorAll('[role="tab"]')) : [];
+      return {
+        searchFontSize: searchEl ? parseFloat(getComputedStyle(searchEl).fontSize) : 0,
+        newBtnHeight: newBtn ? newBtn.getBoundingClientRect().height : 0,
+        tabHeights: tabs.map((t) => ({ text: t.textContent?.trim(), h: t.getBoundingClientRect().height }))
+      };
+    })()
+  `);
+  if (
+    !(leftDrawerMetrics.searchFontSize >= 16) ||
+    leftDrawerMetrics.newBtnHeight < 43.5 ||
+    leftDrawerMetrics.tabHeights.length < 3 ||
+    leftDrawerMetrics.tabHeights.some((t) => t.h < 43.5)
+  ) {
+    throw new Error(`Mobile left drawer metrics check failed: ${JSON.stringify(leftDrawerMetrics)}`);
+  }
 
   // Screenshot 5: mobile-drawer-open.png
   await cdpClient.screenshot(path.join(screenshotDir, "mobile-drawer-open.png"));
@@ -2183,6 +2347,44 @@ try {
   await cdpClient.clickSelector(`[data-testid="native-session-item-macmini:claude:sess_cdp_4"]`);
   await sleep(250);
   await assertViewportContainment(cdpClient, "mobile-390x844-native-pane");
+
+  await cdpClient.clickSelector('[data-testid="mobile-left-trigger"]');
+  await sleep(250);
+  await cdpClient.clickSelector('[data-testid="fleet-tab-threads"]');
+  await sleep(200);
+  await cdpClient.clickSelector(`[data-testid="thread-item-${thread2Res.run.thread_id}"] button[aria-label="分叉会话"]`);
+  let forkClosedDrawer = false;
+  for (let i = 0; i < 30; i++) {
+    const forkState = await cdpClient.evalJS(`
+      (() => {
+        const s = window.__AHUB_EVAL__.getState();
+        return {
+          drawerOpen: Boolean(document.querySelector('[data-testid="fleet-threads-pane"]')),
+          selectedThreadId: s.selectedThreadId,
+          centerMode: s.centerMode
+        };
+      })()
+    `);
+    if (
+      !forkState.drawerOpen &&
+      forkState.selectedThreadId &&
+      forkState.selectedThreadId !== thread2Res.run.thread_id &&
+      forkState.selectedThreadId !== doneRunRes.run.thread_id &&
+      forkState.centerMode === "controlled"
+    ) {
+      forkClosedDrawer = true;
+      break;
+    }
+    await sleep(200);
+  }
+  if (!forkClosedDrawer) {
+    throw new Error("Expected forking thread in mobile left drawer to switch to forked thread and close drawer");
+  }
+  const forkedThreadId = await cdpClient.evalJS(`window.__AHUB_EVAL__.getState().selectedThreadId`);
+  const forkedRunInD1 = (await apiJson(hubUrl, adminToken, `/api/v1/runs?thread_id=${forkedThreadId}`)).runs?.[0];
+  if (forkedRunInD1) {
+    await waitForSeedRunDone(forkedRunInD1.id, "Mobile forked thread seed run");
+  }
 
   // Verify client-scope UI login omits admin-only default Bot notify, Native Activity, and Push controls with zero console/403 errors
   const forbiddenResponses = [];

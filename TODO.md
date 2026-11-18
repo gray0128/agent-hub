@@ -2,11 +2,15 @@
 
 ## Todo
 
-- [ ] 优化 agent-hub Web 页面的移动端体验
-
 ## Doing
 
 ## Done
+
+- [x] 优化 `agent-hub` Web 页面的移动端体验（补齐 `viewport-fit=cover` 与四向安全区适配、`Input`/`Textarea` 移动端 `>= 16px` 防 iOS 缩放与标识符输入属性、顶栏连接指示点/右抽屉态势角标/窄屏更多菜单、左抽屉禁用工作区拖拽并修复分叉与队列跳转抽屉收起闭环、右抽屉 5-Tab 单行横向滚动与自动定位、全量高频按钮与弹窗控件 `>= 44px` 触控热区、`MouseSensor` + `TouchSensor` 防滚动误触、Markdown 宽表局部横向滚动容器与阅读态 Composer 一键收折，同步更新 [05-web-frontend-spec.md](./docs/05-web-frontend-spec.md)、[lint-hygiene.mjs](./evals/web/lint-hygiene.mjs) 与 [cdp-runtime-eval.mjs](./evals/web/cdp-runtime-eval.mjs) 移动端评测与变异门禁）
+
+- [x] `v0.1.7`（`71ee56a`）：交付独立「原生活动」账本与零依赖标准 Web Push 通知渠道（新增 [0006_native_activity_and_web_push.sql](./apps/hub-worker/migrations/0006_native_activity_and_web_push.sql)、`progress` 事件类型与 30 天 Cron 清理、只读 `ahub activity` CLI、统一多渠道投递明细账本 `notification_deliveries` 及单通道重推、RFC 8291/8292 [web-push.ts](./apps/hub-worker/src/web-push.ts)、零回源 [sw.js](./apps/web/public/sw.js) / [manifest.webmanifest](./apps/web/public/manifest.webmanifest) 与三栏「原生活动」视图 [NativeActivityPane.tsx](./apps/web/src/components/workbench/NativeActivityPane.tsx) / [BrowserNotifyDialog.tsx](./apps/web/src/components/workbench/BrowserNotifyDialog.tsx)）
+
+- [x] `v0.1.6`（`e573ce4`）：扩展 `ahub native-emit` 支持 `grok` 与 `omp` 官方 Hook、`idle_prompt` 过滤及 `agy` `ask_question` 交互提问识别（[0005_native_events_allow_grok.sql](./apps/hub-worker/migrations/0005_native_events_allow_grok.sql)）
 
 - [x] 交付节点绑定默认 Grok Bot 通知通道与 Agent 原生事件实时推送（新增 [0004_node_default_notify_and_native_events.sql](./apps/hub-worker/migrations/0004_node_default_notify_and_native_events.sql)、`POST /api/v1/nodes/:id/native-events`、`ahub native-emit` 的 `claude`/`codex`/`agy`/`pi` 官方 Hook 适配器；实现 `admin` 与 `client` 作用域隔离通知路由、`client` 节点元数据最小权限裁剪、凭据隔离及 Web 节点默认通道绑定与吊销实时失效徽章，通过 Mutation Gate 1/2、`make eval-fast` 与 `make eval-ui` Chromium CDP 实测）
 
