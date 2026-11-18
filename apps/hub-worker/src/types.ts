@@ -1,6 +1,7 @@
 export type NodeStatus = "online" | "offline" | "draining";
 export type ApiScope = "admin" | "client" | "node";
 export type AgentName = "agy" | "pi" | "omp" | "codex" | "claude";
+export type NativeEventAgentName = AgentName | "grok";
 export type EffortLevel = "" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | "auto";
 export type ThreadStatus = "active" | "archived";
 export type RunStatus =
@@ -90,7 +91,7 @@ export interface NativeEventRecord {
   id: string;
   node_id: string;
   event_id: string;
-  agent: AgentName;
+  agent: NativeEventAgentName;
   event_kind: NativeEventKind;
   native_session_id: string;
   workdir: string;

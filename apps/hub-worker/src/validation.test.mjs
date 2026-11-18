@@ -207,4 +207,28 @@ test("parsePatchNodeRequest and parseNativeEventCreateRequest validate default_n
       }),
     /event_kind/
   );
+
+  const grokEv = parseNativeEventCreateRequest({
+    event_id: "grok_1234567890abcdef",
+    agent: "grok",
+    event_kind: "turn_summary",
+    native_session_id: "grok_sess_1",
+    workdir: "~/workspace/demo",
+    title: "Grok 会话总结",
+    summary: "Finished Grok turn",
+    source: "grok-hook"
+  });
+  assert.equal(grokEv.agent, "grok");
+  assert.equal(grokEv.source, "grok-hook");
+
+  assert.throws(
+    () =>
+      parseCreateRunRequest({
+        node_id: "macmini",
+        workdir: "demo",
+        agent: "grok",
+        prompt: "Must fail for Run creation"
+      }),
+    /Unsupported agent/
+  );
 });

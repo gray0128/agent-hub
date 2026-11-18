@@ -407,3 +407,128 @@ func TestNativeEmitEventIDDisambiguationAndOverride(t *testing.T) {
 		t.Fatalf("expected --event-id override custom_evt_123, got code=%d id=%q out=%s", code, capturedID, out)
 	}
 }
+
+func TestNativeEmitGrokOmpIdlePromptAndAgyRefinements(t *testing.T) {
+	var received []api.NativeEventRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req api.NativeEventRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatal(err)
+		}
+		received = append(received, req)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(api.NativeEventResponse{
+			OK:    true,
+			Event: api.NativeEventRecord{ID: "evt_refinement", EventID: req.EventID, NotifyStatus: "queued"},
+		})
+	}))
+	defer srv.Close()
+
+	tmpDir := t.TempDir()
+	allowedRoot := filepath.Join(tmpDir, "workspace")
+	demoDir := filepath.Join(allowedRoot, "demo")
+	if err := os.MkdirAll(demoDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := writeTempNodeConfig(t, config.NodeConfig{
+		NodeID: "macmini",
+		HubURL: srv.URL,
+		Token:  "ahub_nod_test_token",
+		NativeNotify: &config.NativeNotifyConfig{
+			Enabled:                  true,
+			AllowedRoots:             []string{allowedRoot},
+			IncludeTranscriptSummary: true,
+		},
+	})
+
+	t.Setenv("AHUB_RUN_ID", "")
+	t.Setenv("AHUB_DEPTH", "")
+	t.Setenv("AHUB_TOKEN", "")
+	t.Setenv("AHUB_URL", "")
+
+	// 1. Claude idle_prompt -> skipped
+	claudeIdle := `{"session_id":"sess_c_idle","cwd":` + jsonQuote(demoDir) + `,"hook_event_name":"Notification","notification_type":"idle_prompt","message":"Waiting for your next prompt"}`
+	code, out := captureExecute(t, []string{"--json", "native-emit", "--config", cfgPath, "--from-hook", "claude"}, claudeIdle)
+	if code != 0 || !strings.Contains(out, "idle_prompt") {
+		t.Fatalf("expected claude idle_prompt skip, got code=%d out=%s", code, out)
+	}
+
+	// 2. Grok idle_prompt -> skipped
+	grokIdle := `{"session_id":"sess_g1","cwd":` + jsonQuote(demoDir) + `,"hook_event_name":"Notification","notification_type":"idle_prompt","message":"Waiting for input"}`
+	code, out = captureExecute(t, []string{"--json", "native-emit", "--config", cfgPath, "--from-hook", "grok"}, grokIdle)
+	if code != 0 || !strings.Contains(out, "idle_prompt") {
+		t.Fatalf("expected grok idle_prompt skip, got code=%d out=%s", code, out)
+	}
+
+	// 3. Grok stopHookActive (camelCase) -> skipped
+	grokLoop := `{"sessionId":"sess_g1","workspaceRoot":` + jsonQuote(demoDir) + `,"hookEventName":"stop","stopHookActive":true,"lastAssistantMessage":"loop"}`
+	code, out = captureExecute(t, []string{"--json", "native-emit", "--config", cfgPath, "--from-hook", "grok"}, grokLoop)
+	if code != 0 || !strings.Contains(out, "stop_hook_active") {
+		t.Fatalf("expected grok stop_hook_active skip, got code=%d out=%s", code, out)
+	}
+
+	// 4. Grok camelCase Stop + snake_case Notification (permission_prompt) -> emitted
+	grokStop := `{"sessionId":"sess_g2","workspaceRoot":` + jsonQuote(demoDir) + `,"hookEventName":"stop","promptId":"p_42","lastAssistantMessage":"Grok completed refactor with token ahub_cli_secret999"}`
+	code, out = captureExecute(t, []string{"--json", "native-emit", "--config", cfgPath, "--from-hook", "grok"}, grokStop)
+	if code != 0 {
+		t.Fatalf("grok stop failed: code=%d out=%s", code, out)
+	}
+	grokPerm := `{"session_id":"sess_g2","cwd":` + jsonQuote(demoDir) + `,"hook_event_name":"Notification","notification_type":"permission_prompt","prompt_id":"p_43","title":"Approval Needed","message":"Allow bash command"}`
+	code, out = captureExecute(t, []string{"--json", "native-emit", "--config", cfgPath, "--from-hook", "grok"}, grokPerm)
+	if code != 0 {
+		t.Fatalf("grok permission notification failed: code=%d out=%s", code, out)
+	}
+
+	// 5. --from-hook omp -> emits agent=omp source=omp-ext
+	ompEvt := `{"session_id":"omp_1","turn_id":"t_1","cwd":` + jsonQuote(demoDir) + `,"event_kind":"turn_summary","summary":"OMP turn finished"}`
+	code, out = captureExecute(t, []string{"--json", "native-emit", "--config", cfgPath, "--from-hook", "omp"}, ompEvt)
+	if code != 0 {
+		t.Fatalf("omp hook failed: code=%d out=%s", code, out)
+	}
+
+	// 6. Agy fullyIdle=false -> skipped
+	agyNotIdle := `{"conversationId":"conv_busy","executionNum":1,"fullyIdle":false,"terminationReason":"NO_TOOL_CALL","cwd":` + jsonQuote(demoDir) + `,"hookEventName":"Stop"}`
+	code, out = captureExecute(t, []string{"--json", "native-emit", "--config", cfgPath, "--from-hook", "agy"}, agyNotIdle)
+	if code != 0 || !strings.Contains(out, "not_fully_idle") {
+		t.Fatalf("expected agy not_fully_idle skip, got code=%d out=%s", code, out)
+	}
+
+	// 7. Agy exit_plan_mode -> skipped
+	exitPlanTranscript := filepath.Join(tmpDir, "exit-plan.jsonl")
+	_ = os.WriteFile(exitPlanTranscript, []byte(
+		`{"step_index":1,"type":"PLANNER_RESPONSE","content":"Drafting plan","tool_calls":[{"name":"exit_plan_mode","args":{"plan":"step 1"}}]}`+"\n",
+	), 0o600)
+	agyExitPlan := `{"conversationId":"conv_plan","executionNum":2,"fullyIdle":true,"terminationReason":"TERMINAL_STEP_TYPE","cwd":` + jsonQuote(demoDir) + `,"transcriptPath":` + jsonQuote(exitPlanTranscript) + `,"hookEventName":"Stop"}`
+	code, out = captureExecute(t, []string{"--json", "native-emit", "--config", cfgPath, "--from-hook", "agy"}, agyExitPlan)
+	if code != 0 || !strings.Contains(out, "exit_plan_mode_handoff") {
+		t.Fatalf("expected agy exit_plan_mode_handoff skip, got code=%d out=%s", code, out)
+	}
+
+	// 8. Agy ask_question -> emits interaction_needed with extracted question text
+	askTranscript := filepath.Join(tmpDir, "ask-question.jsonl")
+	_ = os.WriteFile(askTranscript, []byte(
+		`{"step_index":1,"type":"PLANNER_RESPONSE","content":"Need clarification before editing.","tool_calls":[{"name":"ask_question","args":{"questions":[{"question":"Which environment?"},{"question":"Run deploy?"}]}}]}`+"\n",
+	), 0o600)
+	agyAsk := `{"conversationId":"conv_ask","executionNum":3,"fullyIdle":true,"terminationReason":"TERMINAL_STEP_TYPE","cwd":` + jsonQuote(demoDir) + `,"transcriptPath":` + jsonQuote(askTranscript) + `,"hookEventName":"Stop"}`
+	code, out = captureExecute(t, []string{"--json", "native-emit", "--config", cfgPath, "--from-hook", "agy"}, agyAsk)
+	if code != 0 {
+		t.Fatalf("agy ask_question failed: code=%d out=%s", code, out)
+	}
+
+	if len(received) != 4 {
+		t.Fatalf("expected 4 emitted events, got %d: %+v", len(received), received)
+	}
+	if received[0].Agent != "grok" || received[0].EventKind != "turn_summary" || received[0].Source != "grok-hook" || strings.Contains(received[0].Summary, "secret999") {
+		t.Fatalf("unexpected grok stop event: %+v", received[0])
+	}
+	if received[1].Agent != "grok" || received[1].EventKind != "interaction_needed" || received[1].Source != "grok-hook" || received[1].Summary != "Allow bash command" {
+		t.Fatalf("unexpected grok notification event: %+v", received[1])
+	}
+	if received[2].Agent != "omp" || received[2].Source != "omp-ext" || received[2].Title != "OMP 会话总结" {
+		t.Fatalf("unexpected omp event: %+v", received[2])
+	}
+	if received[3].Agent != "agy" || received[3].EventKind != "interaction_needed" || received[3].Title != "Antigravity 等待回答" || !strings.Contains(received[3].Summary, "Which environment?") || !strings.Contains(received[3].Summary, "Need clarification before editing.") {
+		t.Fatalf("unexpected agy ask_question event: %+v", received[3])
+	}
+}

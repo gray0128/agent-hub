@@ -59,7 +59,7 @@ skills/ahub/SKILL.md             # 通过 go:embed 内嵌于二进制中
 | `ahub runs [--node <n>] [--status <s>] [--limit 20] [--json]` | 查看任务队列与历史列表（每条 `RunRecord` 均清空 `lease_owner`、对 `prompt` 脱敏并截断至 `1536` UTF-8 字节） |
 | `ahub threads [--node <n>] [--q <keyword>] [--json]` | 查询历史会话线程 ID 以便跨轮续接 |
 | `ahub cancel <run_id> [--cascade] [--reason <text>] [--json]` | 取消单个任务；加 `--cascade` 时级联终止整棵 `root_run_id` 任务树（`cancelled_runs[]` 中每条 `RunRecord` 均经统一脱敏、清空 `lease_owner` 并截断 `prompt` 至 `1536` UTF-8 字节） |
-| `ahub native-emit [--from-hook claude\|codex\|agy\|pi\|cli] [--config <path>] [--agent <a>] [--kind interaction_needed\|turn_summary] [--event-id <id>] [--summary <text\|->] [--include-transcript-summary] [--json]` | 供本机 Agent 官方 Hook / 扩展调用：在 `node.json` 显式启用 `native_notify.enabled` 时，将脱离 `ahub` 运行的本地会话互动或结束总结脱敏上报至 `POST /api/v1/nodes/:id/native-events`；若检测到 `AHUB_RUN_ID`/`AHUB_DEPTH` 非空或 Hook 重入标记则立即静默跳过防双推与循环；凭证仅读取 `--url`/`--token` 或 `node.json`（忽略 `AHUB_TOKEN`/`AHUB_URL` 与客户端 `credentials`） |
+| `ahub native-emit [--from-hook claude\|codex\|agy\|pi\|omp\|grok\|cli] [--config <path>] [--agent <a>] [--kind interaction_needed\|turn_summary] [--event-id <id>] [--source <s>] [--summary <text\|->] [--include-transcript-summary] [--json]` | 供本机 Agent 官方 Hook / 扩展调用：在 `node.json` 显式启用 `native_notify.enabled` 时，将脱离 `ahub` 运行的本地会话互动或结束总结脱敏上报至 `POST /api/v1/nodes/:id/native-events`；若检测到 `AHUB_RUN_ID`/`AHUB_DEPTH` 非空或 Hook 重入标记则立即静默跳过防双推与循环；凭证仅读取 `--url`/`--token` 或 `node.json`（忽略 `AHUB_TOKEN`/`AHUB_URL` 与客户端 `credentials`） |
 | `ahub skill print \| install [--dir <path>]` | 打印内嵌 `SKILL.md`，或将其安装到指定 Agent Skill 目录（如 `~/.agents/skills/ahub/SKILL.md`） |
 | `ahub update [--check] [--target <path>] [--no-restart] [--json]` | 查询 `/dl/version.json` 并校验 SHA-256 原子替换当前二进制；默认在更新本机活跃二进制后自动向运行中的 `ahub node serve` 触发优雅排空重启（Unix 发 `SIGHUP`，Windows 写 `node.reload` 哨兵），或在未运行进程间回退系统服务重载（`--no-restart` 或指定 `--target` 时跳过重启） |
 | `ahub node init [--id <node_id>] [--name <display_name>] [--url <hub_url>] [--token <token> \| --token-stdin] [--root <dir> ...] [--max-concurrency <n>] [--config <path>] [--force] [--json]` | 幂等创建或更新 `0600` 权限 `~/.config/ahub/node.json`，自动探测主机名、已有工作区根目录与本机已安装 Agent（`agy`/`pi`/`omp`/`codex`/`claude`），`--json` 输出脱敏（仅含布尔值 `has_token`） |
@@ -186,11 +186,12 @@ skills/ahub/SKILL.md             # 通过 go:embed 内嵌于二进制中
 
 | Agent | 官方接入方式 | 已覆盖事件 | 未覆盖 / 已知限制 |
 | --- | --- | --- | --- |
-| `claude` | `~/.claude/settings.json`（`Notification`、`Stop` Hook） | `interaction_needed`（`Notification`）、`turn_summary`（`Stop` `last_assistant_message`） | 未读外部全盘历史，依赖 Hook 传入 JSON |
+| `claude` | `~/.claude/settings.json`（`Notification`、`Stop` Hook） | `interaction_needed`（`Notification`，自动跳过 `idle_prompt`）、`turn_summary`（`Stop` `last_assistant_message`） | 未读外部全盘历史，依赖 Hook 传入 JSON |
 | `codex` | `~/.codex/config.toml`（`notify = [...]`） | `turn_summary`（`agent-turn-complete`） | Codex TUI 审批/互动提示不经 `notify` 触发 |
-| `agy` | `~/.gemini/config/hooks.json` 或 `.agents/hooks.json`（`Stop` Hook） | `turn_summary`（默认仅含终止原因与脱敏提问摘要；显式开启 `include_transcript_summary` 时才读取单次传入的 `transcriptPath` 末条响应） | 官方 `hooks.json` 无非阻塞互动通知 Hook，`ask_question`/UI 审批暂停未覆盖 |
-| `pi` | 官方 Extension `pi.on("agent_end", ...)` 调 `ahub native-emit --from-hook pi` | `turn_summary` | TUI 互动确认未覆盖 |
-| `omp` | 暂无内置自动 Hook 适配器 | 仅支持显式 `ahub native-emit --agent omp ...` 手工调用 | 扩展自动监听未验证覆盖 |
+| `agy` | `~/.gemini/config/hooks.json` 或 `.agents/hooks.json`（`Stop` Hook） | `turn_summary`（跳过 `fullyIdle: false` 与 `exit_plan_mode` 交接；开启 `include_transcript_summary` 时提取末条回复，若末步调用 `ask_question` 则上报 `interaction_needed`） | 仅靠内置弹窗但未落盘至 Transcript 的非工具交互不触发 `Stop` |
+| `pi` | `~/.pi/agent/extensions/ahub-native-notify.ts` 自动加载扩展 | `turn_summary`（`agent_settled`/`agent_end`）、`interaction_needed`（`ui_prompt_start`） | 无 UI 的 headless `-p` 默认跳过防刷屏 |
+| `omp` | `~/.omp/agent/extensions/ahub-native-notify.ts` 自动加载扩展（或 `--from-hook omp`） | `turn_summary`（`agent_settled`/`agent_end`）、`interaction_needed`（`tool_approval_requested` / `ui_prompt_start`） | 无 UI 的 headless `-p` 默认跳过防刷屏 |
+| `grok` | `~/.grok/hooks/ahub-native-notify.json`（`Notification`、`Stop` 调 `ahub native-emit --from-hook grok`） | `interaction_needed`（`Notification`，跳过 `idle_prompt`）、`turn_summary`（`Stop`，跳过 `stop_hook_active`） | 依赖 Grok Hook 传入 `cwd`/`last_assistant_message` |
 
 `ahub native-emit` 强制执行以下安全与幂等边界：
 

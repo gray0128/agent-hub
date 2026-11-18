@@ -8,6 +8,7 @@ import {
   type EffortLevel,
   type Env,
   HubError,
+  type NativeEventAgentName,
   type NativeEventKind,
   type NativeEventNotifyStatus,
   type NativeEventRecord,
@@ -64,7 +65,7 @@ interface NativeEventRow {
   id: string;
   node_id: string;
   event_id: string;
-  agent: AgentName;
+  agent: NativeEventAgentName;
   event_kind: NativeEventKind;
   native_session_id: string;
   workdir: string;

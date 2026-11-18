@@ -270,6 +270,35 @@ test("createNativeEvent deduplicates by (node_id, event_id), redacts secrets, sk
   assert.equal(dup.event.id, first.event.id);
   assert.equal(queued.length, 1);
 
+  const grokEv = await createNativeEvent(db, env, "macmini", {
+    eventId: "grok:sess_g1:Stop:1234567890",
+    agent: "grok",
+    eventKind: "turn_summary",
+    nativeSessionId: "sess_g1",
+    workdir: "/workspace/demo",
+    title: "Grok 会话总结",
+    summary: "Completed task cleanly",
+    source: "grok-hook"
+  });
+  assert.equal(grokEv.deduplicated, false);
+  assert.equal(grokEv.event.agent, "grok");
+  assert.equal(grokEv.event.notify_status, "queued");
+  assert.equal(queued.length, 2);
+
+  const grokDup = await createNativeEvent(db, env, "macmini", {
+    eventId: "grok:sess_g1:Stop:1234567890",
+    agent: "grok",
+    eventKind: "turn_summary",
+    nativeSessionId: "sess_g1",
+    workdir: "/workspace/demo",
+    title: "Grok 会话总结",
+    summary: "Completed task cleanly",
+    source: "grok-hook"
+  });
+  assert.equal(grokDup.deduplicated, true);
+  assert.equal(grokDup.event.id, grokEv.event.id);
+  assert.equal(queued.length, 2);
+
   // 2. Unbound node -> skipped without global fallback
   const unbound = await createNativeEvent(db, env, "mbp", {
     eventId: "codex:t1:turn1:turn_summary",
@@ -283,7 +312,7 @@ test("createNativeEvent deduplicates by (node_id, event_id), redacts secrets, sk
   });
   assert.equal(unbound.event.notify_status, "skipped");
   assert.equal(unbound.event.notify_error, "NODE_DEFAULT_CHANNEL_UNBOUND");
-  assert.equal(queued.length, 1);
+  assert.equal(queued.length, 2);
 
   // 3. Revoked bound key -> fails closed without enqueueing or global fallback
   db.keyMap.get("key_bot_1").revoked_at = "2026-11-17T10:00:00.000Z";
@@ -299,7 +328,7 @@ test("createNativeEvent deduplicates by (node_id, event_id), redacts secrets, sk
   });
   assert.equal(revoked.event.notify_status, "failed");
   assert.equal(revoked.event.notify_error, "DEFAULT_CHANNEL_INVALID_OR_REVOKED");
-  assert.equal(queued.length, 1);
+  assert.equal(queued.length, 2);
 });
 
 test("enqueueRunNotificationIfNeeded routes Web/CLI root runs via node default channel, skips depth>0 and unbound nodes, and avoids double-push", async () => {

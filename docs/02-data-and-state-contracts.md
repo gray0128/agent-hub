@@ -140,18 +140,18 @@ CREATE INDEX IF NOT EXISTS idx_api_keys_scope_node
   ON api_keys (scope, bound_node_id)
   WHERE revoked_at IS NULL;
 
--- 6. 节点原生 Agent 事件幂等记录表（migrations/0004_node_default_notify_and_native_events.sql）
+-- 6. 节点原生 Agent 事件幂等记录表（migrations/0004_node_default_notify_and_native_events.sql & 0005_native_events_allow_grok.sql）
 CREATE TABLE IF NOT EXISTS native_events (
   id TEXT PRIMARY KEY,                              -- evt_<ulid>
   node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
   event_id TEXT NOT NULL,                           -- 幂等去重键（由官方 Hook / 调用端生成）
-  agent TEXT NOT NULL CHECK (agent IN ('agy', 'pi', 'omp', 'codex', 'claude')),
+  agent TEXT NOT NULL CHECK (agent IN ('agy', 'pi', 'omp', 'codex', 'claude', 'grok')),
   event_kind TEXT NOT NULL CHECK (event_kind IN ('interaction_needed', 'turn_summary')),
   native_session_id TEXT NOT NULL DEFAULT '',
   workdir TEXT NOT NULL DEFAULT '',
   title TEXT NOT NULL DEFAULT '',
   summary TEXT NOT NULL DEFAULT '',
-  source TEXT NOT NULL DEFAULT '',                  -- claude-hook / codex-notify / agy-hook / pi-ext / cli
+  source TEXT NOT NULL DEFAULT '',                  -- claude-hook / codex-notify / agy-hook / pi-ext / omp-ext / grok-hook / cli
   notify_key_id TEXT REFERENCES api_keys(id) ON DELETE SET NULL,
   notify_status TEXT NOT NULL DEFAULT 'none'
     CHECK (notify_status IN ('none', 'queued', 'sent', 'failed', 'skipped')),

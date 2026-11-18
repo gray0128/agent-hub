@@ -26,23 +26,25 @@ var nativeEmitNow = time.Now
 func runNativeEmit(g globalOpts, args []string) int {
 	fs := flag.NewFlagSet("native-emit", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	var fromHook, cfgPath, agentFlag, kindFlag, eventIDFlag, sessionIDFlag, workdirFlag, titleFlag, summaryFlag string
+	var fromHook, cfgPath, agentFlag, kindFlag, eventIDFlag, sessionIDFlag, workdirFlag, titleFlag, summaryFlag, sourceFlag string
 	var includeTranscriptSummary bool
 
-	fs.StringVar(&fromHook, "from-hook", "cli", "official hook adapter: claude|codex|agy|pi|cli")
+	fs.StringVar(&fromHook, "from-hook", "cli", "official hook adapter: claude|codex|agy|pi|omp|grok|cli")
 	fs.StringVar(&cfgPath, "config", "", "node.json config path")
-	fs.StringVar(&agentFlag, "agent", "", "agent name (agy|pi|omp|codex|claude)")
+	fs.StringVar(&agentFlag, "agent", "", "agent name (agy|pi|omp|codex|claude|grok)")
 	fs.StringVar(&kindFlag, "kind", "", "event kind (interaction_needed|turn_summary)")
 	fs.StringVar(&eventIDFlag, "event-id", "", "idempotent event id")
 	fs.StringVar(&sessionIDFlag, "session-id", "", "native session id")
 	fs.StringVar(&workdirFlag, "dir", "", "workdir path")
 	fs.StringVar(&titleFlag, "title", "", "event title")
 	fs.StringVar(&summaryFlag, "summary", "", "summary text (or '-' for stdin)")
+	fs.StringVar(&sourceFlag, "source", "", "event source label (default cli or adapter source)")
 	fs.BoolVar(&includeTranscriptSummary, "include-transcript-summary", false, "opt-in reading last assistant message from hook transcriptPath")
 
 	valFlags := map[string]bool{
 		"--from-hook": true, "--config": true, "--agent": true, "--kind": true,
-		"--event-id": true, "--session-id": true, "--dir": true, "--title": true, "--summary": true,
+		"--event-id": true, "--session-id": true, "--dir": true, "--title": true,
+		"--summary": true, "--source": true,
 	}
 	if err := parseFlagsFlexible(fs, args, valFlags); err != nil {
 		return api.ExitBadUsageOrInput
@@ -104,12 +106,25 @@ func runNativeEmit(g globalOpts, args []string) int {
 		if err != nil {
 			return failUsage(g.JSON, err.Error())
 		}
-	case "pi":
+	case "pi", "omp":
 		raw, err := readStdinBounded(1 << 20)
 		if err != nil {
 			return failErr(g.JSON, err)
 		}
-		req, skipReason, err = parsePiExtensionEvent(raw)
+		defaultAgent := "pi"
+		if strings.EqualFold(strings.TrimSpace(fromHook), "omp") {
+			defaultAgent = "omp"
+		}
+		req, skipReason, err = parsePiExtensionEvent(raw, defaultAgent)
+		if err != nil {
+			return failUsage(g.JSON, err.Error())
+		}
+	case "grok":
+		raw, err := readStdinBounded(1 << 20)
+		if err != nil {
+			return failErr(g.JSON, err)
+		}
+		req, skipReason, err = parseGrokHookEvent(raw, effectiveRoots)
 		if err != nil {
 			return failUsage(g.JSON, err.Error())
 		}
@@ -133,7 +148,7 @@ func runNativeEmit(g globalOpts, args []string) int {
 			Workdir:         strings.TrimSpace(workdirFlag),
 			Title:           strings.TrimSpace(titleFlag),
 			Summary:         strings.TrimSpace(summaryText),
-			Source:          "cli",
+			Source:          firstNonEmpty(sourceFlag, "cli"),
 		}
 	default:
 		return failUsage(g.JSON, fmt.Sprintf("unsupported --from-hook %q", fromHook))
@@ -147,6 +162,9 @@ func runNativeEmit(g globalOpts, args []string) int {
 	}
 	if evOverride := strings.TrimSpace(eventIDFlag); evOverride != "" {
 		req.EventID = evOverride
+	}
+	if srcOverride := strings.TrimSpace(sourceFlag); srcOverride != "" {
+		req.Source = srcOverride
 	}
 
 	if !isWorkdirAllowedForNativeNotify(req.Workdir, effectiveRoots) {
@@ -318,18 +336,13 @@ func parseClaudeHookEvent(raw string, effectiveRoots []string) (*api.NativeEvent
 		return nil, "workdir_outside_allowed_roots", nil
 	}
 
-	turnMarker := ""
-	if strings.TrimSpace(payload.TranscriptPath) != "" {
-		if lines := countRegularFileLinesBounded(payload.TranscriptPath, 32<<20); lines > 0 {
-			turnMarker = fmt.Sprintf("lines:%d", lines)
-		}
-	}
-	if turnMarker == "" {
-		turnMarker = fmt.Sprintf("tb:%d", nativeEmitNow().Unix()/15)
-	}
+	turnMarker := computeHookTurnMarker("", payload.TranscriptPath)
 
 	switch payload.HookEventName {
 	case "Notification":
+		if strings.EqualFold(strings.TrimSpace(payload.NotificationType), "idle_prompt") {
+			return nil, "idle_prompt", nil
+		}
 		summary := firstNonEmpty(payload.Message, payload.Title, payload.NotificationType)
 		if summary == "" {
 			return nil, "empty_notification", nil
@@ -361,6 +374,99 @@ func parseClaudeHookEvent(raw string, effectiveRoots []string) (*api.NativeEvent
 		}, "", nil
 	default:
 		return nil, "unsupported_claude_hook_event", nil
+	}
+}
+
+func computeHookTurnMarker(promptID, transcriptPath string) string {
+	if trimmedID := strings.TrimSpace(promptID); trimmedID != "" {
+		return "pid:" + trimmedID
+	}
+	if strings.TrimSpace(transcriptPath) != "" {
+		if lines := countRegularFileLinesBounded(transcriptPath, 32<<20); lines > 0 {
+			return fmt.Sprintf("lines:%d", lines)
+		}
+	}
+	return fmt.Sprintf("tb:%d", nativeEmitNow().Unix()/15)
+}
+
+func parseGrokHookEvent(raw string, effectiveRoots []string) (*api.NativeEventRequest, string, error) {
+	var payload struct {
+		SessionID                 string `json:"session_id"`
+		SessionIDCamel            string `json:"sessionId"`
+		CWD                       string `json:"cwd"`
+		WorkspaceRoot             string `json:"workspaceRoot"`
+		HookEventName             string `json:"hook_event_name"`
+		HookEventNameCamel        string `json:"hookEventName"`
+		StopHookActive            bool   `json:"stop_hook_active"`
+		StopHookActiveCamel       bool   `json:"stopHookActive"`
+		LastAssistantMessage      string `json:"last_assistant_message"`
+		LastAssistantMessageCamel string `json:"lastAssistantMessage"`
+		NotificationType          string `json:"notification_type"`
+		NotificationTypeCamel     string `json:"notificationType"`
+		Message                   string `json:"message"`
+		Title                     string `json:"title"`
+		PromptID                  string `json:"prompt_id"`
+		PromptIDCamel             string `json:"promptId"`
+		TranscriptPath            string `json:"transcript_path"`
+		TranscriptPathCamel       string `json:"transcriptPath"`
+	}
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return nil, "", fmt.Errorf("invalid grok hook json: %w", err)
+	}
+	if payload.StopHookActive || payload.StopHookActiveCamel {
+		return nil, "stop_hook_active", nil
+	}
+	eventName := strings.ToLower(strings.TrimSpace(firstNonEmpty(payload.HookEventName, payload.HookEventNameCamel)))
+	if eventName != "notification" && eventName != "stop" {
+		return nil, "unsupported_grok_hook_event", nil
+	}
+	workdir := firstNonEmpty(payload.CWD, payload.WorkspaceRoot)
+	if !isWorkdirAllowedForNativeNotify(workdir, effectiveRoots) {
+		return nil, "workdir_outside_allowed_roots", nil
+	}
+
+	sessionID := firstNonEmpty(payload.SessionID, payload.SessionIDCamel)
+	promptID := firstNonEmpty(payload.PromptID, payload.PromptIDCamel)
+	transcriptPath := firstNonEmpty(payload.TranscriptPath, payload.TranscriptPathCamel)
+	turnMarker := computeHookTurnMarker(promptID, transcriptPath)
+
+	switch eventName {
+	case "notification":
+		notifType := firstNonEmpty(payload.NotificationType, payload.NotificationTypeCamel)
+		if strings.EqualFold(notifType, "idle_prompt") {
+			return nil, "idle_prompt", nil
+		}
+		summary := firstNonEmpty(payload.Message, payload.Title, notifType)
+		if summary == "" {
+			return nil, "empty_notification", nil
+		}
+		return &api.NativeEventRequest{
+			EventID:         deterministicEventID("grok", sessionID, "Notification", notifType, turnMarker, summary),
+			Agent:           "grok",
+			EventKind:       "interaction_needed",
+			NativeSessionID: sessionID,
+			Workdir:         workdir,
+			Title:           firstNonEmpty(payload.Title, "Grok 需要确认"),
+			Summary:         summary,
+			Source:          "grok-hook",
+		}, "", nil
+	case "stop":
+		summary := firstNonEmpty(payload.LastAssistantMessage, payload.LastAssistantMessageCamel)
+		if summary == "" {
+			return nil, "empty_stop_message", nil
+		}
+		return &api.NativeEventRequest{
+			EventID:         deterministicEventID("grok", sessionID, "Stop", turnMarker, summary),
+			Agent:           "grok",
+			EventKind:       "turn_summary",
+			NativeSessionID: sessionID,
+			Workdir:         workdir,
+			Title:           "Grok 会话总结",
+			Summary:         summary,
+			Source:          "grok-hook",
+		}, "", nil
+	default:
+		return nil, "unsupported_grok_hook_event", nil
 	}
 }
 
@@ -399,6 +505,17 @@ func parseCodexNotifyEvent(raw string) (*api.NativeEventRequest, string, error) 
 	}, "", nil
 }
 
+type agyTranscriptTail struct {
+	lastContent     string
+	lastStep        int
+	lineCount       int
+	finalStep       int
+	finalContent    string
+	hasExitPlanMode bool
+	hasAskQuestion  bool
+	askQuestions    []string
+}
+
 func parseAgyHookEvent(raw string, allowTranscript bool, effectiveRoots []string) (*api.NativeEventRequest, string, error) {
 	var payload struct {
 		ConversationID    string   `json:"conversationId"`
@@ -410,6 +527,7 @@ func parseAgyHookEvent(raw string, allowTranscript bool, effectiveRoots []string
 		WorkspacePaths    []string `json:"workspacePaths"`
 		TranscriptPath    string   `json:"transcriptPath"`
 		HookEventName     string   `json:"hookEventName"`
+		FullyIdle         *bool    `json:"fullyIdle"`
 	}
 	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
 		return nil, "", fmt.Errorf("invalid agy hook json: %w", err)
@@ -420,6 +538,9 @@ func parseAgyHookEvent(raw string, allowTranscript bool, effectiveRoots []string
 	if payload.TerminationReason == "USER_CANCELED" {
 		return nil, "user_canceled", nil
 	}
+	if payload.FullyIdle != nil && !*payload.FullyIdle {
+		return nil, "not_fully_idle", nil
+	}
 	workdir := strings.TrimSpace(payload.CWD)
 	if workdir == "" && len(payload.WorkspacePaths) > 0 {
 		workdir = strings.TrimSpace(payload.WorkspacePaths[0])
@@ -428,11 +549,43 @@ func parseAgyHookEvent(raw string, allowTranscript bool, effectiveRoots []string
 		return nil, "workdir_outside_allowed_roots", nil
 	}
 
+	eventKind := "turn_summary"
+	title := firstNonEmpty(boundRunes(payload.LastUserInput, 120), "Antigravity 会话结束")
 	summary := ""
 	lastStep := 0
 	lineCount := 0
 	if allowTranscript && strings.TrimSpace(payload.TranscriptPath) != "" {
-		summary, lastStep, lineCount = readLastAssistantFromAgyTranscript(payload.TranscriptPath)
+		tail := readAgyTranscriptTail(payload.TranscriptPath)
+		lineCount = tail.lineCount
+		if tail.hasExitPlanMode {
+			return nil, "exit_plan_mode_handoff", nil
+		}
+		if tail.hasAskQuestion {
+			eventKind = "interaction_needed"
+			title = "Antigravity 等待回答"
+			qText := ""
+			if len(tail.askQuestions) == 1 {
+				qText = tail.askQuestions[0]
+			} else if len(tail.askQuestions) > 1 {
+				var b strings.Builder
+				for i, q := range tail.askQuestions {
+					if i > 0 {
+						b.WriteByte('\n')
+					}
+					fmt.Fprintf(&b, "%d. %s", i+1, q)
+				}
+				qText = b.String()
+			}
+			if tail.finalContent != "" && qText != "" {
+				summary = tail.finalContent + "\n\n" + qText
+			} else {
+				summary = firstNonEmpty(qText, tail.finalContent, "Antigravity 等待回答")
+			}
+			lastStep = tail.finalStep
+		} else {
+			summary = tail.lastContent
+			lastStep = tail.lastStep
+		}
 	}
 	if summary == "" {
 		reason := firstNonEmpty(payload.TerminationReason, "STOP")
@@ -448,46 +601,49 @@ func parseAgyHookEvent(raw string, allowTranscript bool, effectiveRoots []string
 
 	var eventID string
 	if payload.ExecutionNum > 0 {
-		eventID = deterministicEventID("agy", payload.ConversationID, fmt.Sprintf("%d", payload.ExecutionNum), payload.TerminationReason)
+		eventID = deterministicEventID("agy", payload.ConversationID, fmt.Sprintf("%d", payload.ExecutionNum), eventKind, payload.TerminationReason)
 	} else {
 		turnMarker := fmt.Sprintf("tb:%d", nativeEmitNow().Unix()/15)
 		if lastStep > 0 || lineCount > 0 {
 			turnMarker = fmt.Sprintf("step:%d:lines:%d", lastStep, lineCount)
 		}
-		eventID = deterministicEventID("agy", payload.ConversationID, turnMarker, payload.TerminationReason, payload.LastUserInput)
+		eventID = deterministicEventID("agy", payload.ConversationID, turnMarker, eventKind, payload.TerminationReason, payload.LastUserInput)
 	}
 
 	return &api.NativeEventRequest{
 		EventID:         eventID,
 		Agent:           "agy",
-		EventKind:       "turn_summary",
+		EventKind:       eventKind,
 		NativeSessionID: strings.TrimSpace(payload.ConversationID),
 		Workdir:         workdir,
-		Title:           firstNonEmpty(boundRunes(payload.LastUserInput, 120), "Antigravity 会话结束"),
+		Title:           title,
 		Summary:         summary,
 		Source:          "agy-hook",
 	}, "", nil
 }
 
 func readLastAssistantFromAgyTranscript(transcriptPath string) (string, int, int) {
+	tail := readAgyTranscriptTail(transcriptPath)
+	return tail.lastContent, tail.lastStep, tail.lineCount
+}
+
+func readAgyTranscriptTail(transcriptPath string) agyTranscriptTail {
+	var tail agyTranscriptTail
 	expanded := config.ExpandPath(transcriptPath)
 	if expanded == "" {
-		return "", 0, 0
+		return tail
 	}
 	f, err := os.Open(expanded)
 	if err != nil {
-		return "", 0, 0
+		return tail
 	}
 	defer f.Close()
 	st, err := f.Stat()
 	if err != nil || !st.Mode().IsRegular() {
-		return "", 0, 0
+		return tail
 	}
 
 	reader := bufio.NewReaderSize(f, 64*1024)
-	lastContent := ""
-	lastStep := 0
-	lineCount := 0
 	var lineBuf []byte
 	oversized := false
 
@@ -510,7 +666,7 @@ func readLastAssistantFromAgyTranscript(transcriptPath string) (string, int, int
 		}
 
 		if len(frag) > 0 || len(lineBuf) > 0 {
-			lineCount++
+			tail.lineCount++
 			if !oversized && len(lineBuf)+len(frag) <= maxAgyTranscriptLineBytes {
 				line := frag
 				if len(lineBuf) > 0 {
@@ -520,11 +676,41 @@ func readLastAssistantFromAgyTranscript(transcriptPath string) (string, int, int
 					StepIndex int    `json:"step_index"`
 					Type      string `json:"type"`
 					Content   string `json:"content"`
+					ToolCalls []struct {
+						Name string          `json:"name"`
+						Args json.RawMessage `json:"args"`
+					} `json:"tool_calls"`
 				}
-				if json.Unmarshal(line, &row) == nil {
-					if row.Type == "PLANNER_RESPONSE" && strings.TrimSpace(row.Content) != "" {
-						lastContent = strings.TrimSpace(row.Content)
-						lastStep = row.StepIndex
+				if json.Unmarshal(line, &row) == nil && row.Type == "PLANNER_RESPONSE" {
+					content := strings.TrimSpace(row.Content)
+					if content != "" {
+						tail.lastContent = content
+						tail.lastStep = row.StepIndex
+					}
+					tail.finalStep = row.StepIndex
+					tail.finalContent = content
+					tail.hasExitPlanMode = false
+					tail.hasAskQuestion = false
+					tail.askQuestions = nil
+					for _, tc := range row.ToolCalls {
+						switch tc.Name {
+						case "exit_plan_mode":
+							tail.hasExitPlanMode = true
+						case "ask_question":
+							tail.hasAskQuestion = true
+							var args struct {
+								Questions []struct {
+									Question string `json:"question"`
+								} `json:"questions"`
+							}
+							if len(tc.Args) > 0 && json.Unmarshal(tc.Args, &args) == nil {
+								for _, q := range args.Questions {
+									if qs := strings.TrimSpace(q.Question); qs != "" {
+										tail.askQuestions = append(tail.askQuestions, qs)
+									}
+								}
+							}
+						}
 					}
 				}
 			}
@@ -535,11 +721,12 @@ func readLastAssistantFromAgyTranscript(transcriptPath string) (string, int, int
 			break
 		}
 	}
-	return lastContent, lastStep, lineCount
+	return tail
 }
 
-func parsePiExtensionEvent(raw string) (*api.NativeEventRequest, string, error) {
+func parsePiExtensionEvent(raw, defaultAgent string) (*api.NativeEventRequest, string, error) {
 	var payload struct {
+		Agent     string `json:"agent"`
 		SessionID string `json:"session_id"`
 		TurnID    string `json:"turn_id"`
 		CWD       string `json:"cwd"`
@@ -550,6 +737,10 @@ func parsePiExtensionEvent(raw string) (*api.NativeEventRequest, string, error) 
 	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
 		return nil, "", fmt.Errorf("invalid pi hook json: %w", err)
 	}
+	agent := strings.ToLower(strings.TrimSpace(firstNonEmpty(payload.Agent, defaultAgent, "pi")))
+	if agent != "pi" && agent != "omp" {
+		return nil, "unsupported_pi_agent", nil
+	}
 	summary := strings.TrimSpace(payload.Summary)
 	if summary == "" {
 		return nil, "empty_pi_summary", nil
@@ -558,14 +749,24 @@ func parsePiExtensionEvent(raw string) (*api.NativeEventRequest, string, error) 
 	if kind != "turn_summary" && kind != "interaction_needed" {
 		return nil, "unsupported_pi_event_kind", nil
 	}
+	defaultTitle := "Pi 会话总结"
+	if agent == "omp" {
+		if kind == "interaction_needed" {
+			defaultTitle = "OMP 需要确认"
+		} else {
+			defaultTitle = "OMP 会话总结"
+		}
+	} else if kind == "interaction_needed" {
+		defaultTitle = "Pi 需要确认"
+	}
 	return &api.NativeEventRequest{
-		EventID:         deterministicEventID("pi", payload.SessionID, payload.TurnID, kind, summary),
-		Agent:           "pi",
+		EventID:         deterministicEventID(agent, payload.SessionID, payload.TurnID, kind, summary),
+		Agent:           agent,
 		EventKind:       kind,
 		NativeSessionID: strings.TrimSpace(payload.SessionID),
 		Workdir:         strings.TrimSpace(payload.CWD),
-		Title:           firstNonEmpty(payload.Title, "Pi 会话总结"),
+		Title:           firstNonEmpty(payload.Title, defaultTitle),
 		Summary:         summary,
-		Source:          "pi-ext",
+		Source:          agent + "-ext",
 	}, "", nil
 }

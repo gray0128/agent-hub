@@ -3,6 +3,7 @@ import {
   type ApiScope,
   type EffortLevel,
   HubError,
+  type NativeEventAgentName,
   type NativeEventKind,
   type NodeInboundFrame,
   type NodeStatus,
@@ -18,6 +19,7 @@ import {
 import { validateWebhookUrl } from "./webhook-crypto";
 
 const AGENTS = new Set<AgentName>(["agy", "pi", "omp", "codex", "claude"]);
+const NATIVE_EVENT_AGENTS = new Set<NativeEventAgentName>(["agy", "pi", "omp", "codex", "claude", "grok"]);
 const EFFORTS = new Set<EffortLevel>(["", "off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "auto"]);
 const CATALOG_STATUSES = new Set(["pending", "ready", "fallback"]);
 const EVENT_KINDS = new Set<RunEventKind>([
@@ -307,7 +309,7 @@ export function parsePatchNodeRequest(raw: unknown): {
 
 export interface ParsedNativeEventCreate {
   eventId: string;
-  agent: AgentName;
+  agent: NativeEventAgentName;
   eventKind: NativeEventKind;
   nativeSessionId: string;
   workdir: string;
@@ -328,7 +330,7 @@ export function parseNativeEventCreateRequest(raw: unknown): ParsedNativeEventCr
     throw new HubError(400, "BAD_REQUEST", "Invalid event_id format.");
   }
   const agentRaw = asRequiredString(obj, "agent");
-  if (!AGENTS.has(agentRaw as AgentName)) {
+  if (!NATIVE_EVENT_AGENTS.has(agentRaw as NativeEventAgentName)) {
     throw new HubError(400, "BAD_REQUEST", `Unsupported agent '${agentRaw}'.`);
   }
   const kindRaw = asRequiredString(obj, "event_kind");
@@ -342,7 +344,7 @@ export function parseNativeEventCreateRequest(raw: unknown): ParsedNativeEventCr
   const source = asOptionalString(obj, "source", 64) ?? "cli";
   return {
     eventId,
-    agent: agentRaw as AgentName,
+    agent: agentRaw as NativeEventAgentName,
     eventKind: kindRaw as NativeEventKind,
     nativeSessionId,
     workdir,
