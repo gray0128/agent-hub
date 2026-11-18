@@ -3,6 +3,117 @@
   "$id": "https://ahub.bobocai.win/schemas/ws-frames.schema.json",
   "title": "WebSocketFrame",
   "description": "Discriminated union of all JSON frames exchanged over /ws/node and /ws/stream.",
+  "$defs": {
+    "DeliveriesSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total", "sent", "queued", "failed"],
+      "properties": {
+        "total": { "type": "integer", "minimum": 0 },
+        "sent": { "type": "integer", "minimum": 0 },
+        "queued": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "NativeEventView": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "node_id",
+        "event_id",
+        "agent",
+        "event_kind",
+        "native_session_id",
+        "workdir",
+        "title",
+        "summary",
+        "source",
+        "notify_key_id",
+        "notify_status",
+        "notify_error",
+        "ack_at",
+        "attention_state",
+        "created_at",
+        "updated_at"
+      ],
+      "properties": {
+        "id": { "type": "string", "pattern": "^evt_[A-Za-z0-9]+$" },
+        "node_id": { "type": "string", "minLength": 1 },
+        "event_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "agent": { "type": "string", "enum": ["agy", "pi", "omp", "codex", "claude", "grok"] },
+        "event_kind": { "type": "string", "enum": ["interaction_needed", "turn_summary", "progress"] },
+        "native_session_id": { "type": "string" },
+        "workdir": { "type": "string" },
+        "title": { "type": "string" },
+        "summary": { "type": "string" },
+        "source": { "type": "string" },
+        "notify_key_id": { "type": ["string", "null"] },
+        "notify_status": { "type": "string", "enum": ["none", "queued", "sent", "partial", "failed", "skipped"] },
+        "notify_error": { "type": "string" },
+        "ack_at": { "type": ["string", "null"], "format": "date-time" },
+        "attention_state": { "type": ["string", "null"], "enum": ["open", "acked", "superseded", "stale", null] },
+        "deliveries_summary": { "$ref": "#/$defs/DeliveriesSummary" },
+        "created_at": { "type": "string", "format": "date-time" },
+        "updated_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "NotificationDeliveryRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "source_kind",
+        "source_id",
+        "trigger_event",
+        "node_id",
+        "channel_kind",
+        "channel_id",
+        "channel_label",
+        "target_host",
+        "route_mode",
+        "status",
+        "attempts",
+        "http_status",
+        "error_code",
+        "error_message",
+        "sent_at",
+        "created_at",
+        "updated_at"
+      ],
+      "properties": {
+        "id": { "type": "string", "pattern": "^dlv_[A-Za-z0-9]+$" },
+        "source_kind": { "type": "string", "enum": ["run", "native_event"] },
+        "source_id": { "type": "string", "pattern": "^(run|evt)_[A-Za-z0-9]+$" },
+        "trigger_event": {
+          "type": "string",
+          "enum": [
+            "needs_approval",
+            "done",
+            "failed",
+            "cancelled",
+            "interaction_needed",
+            "turn_summary",
+            "progress"
+          ]
+        },
+        "node_id": { "type": "string", "minLength": 1 },
+        "channel_kind": { "type": "string", "enum": ["bot_webhook", "web_push", "legacy_webhook"] },
+        "channel_id": { "type": "string", "minLength": 1 },
+        "channel_label": { "type": "string" },
+        "target_host": { "type": "string" },
+        "route_mode": { "type": "string", "enum": ["key", "node_default", "web_push", "global_legacy"] },
+        "status": { "type": "string", "enum": ["queued", "sent", "failed", "skipped"] },
+        "attempts": { "type": "integer", "minimum": 0 },
+        "http_status": { "type": ["integer", "null"], "minimum": 100, "maximum": 599 },
+        "error_code": { "type": "string" },
+        "error_message": { "type": "string" },
+        "sent_at": { "type": ["string", "null"], "format": "date-time" },
+        "created_at": { "type": "string", "format": "date-time" },
+        "updated_at": { "type": "string", "format": "date-time" }
+      }
+    }
+  },
   "oneOf": [
     {
       "type": "object",
@@ -196,6 +307,11 @@
         "nodes": { "type": "array", "items": { "type": "object" } },
         "threads": { "type": "array", "items": { "type": "object" } },
         "runs": { "type": "array", "items": { "type": "object" } },
+        "native_events": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/NativeEventView" }
+        },
+        "open_interaction_count": { "type": "integer", "minimum": 0 },
         "ts": { "type": "string", "format": "date-time" }
       }
     },
@@ -225,6 +341,25 @@
         "type": { "const": "error" },
         "code": { "type": "string" },
         "message": { "type": "string" }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "event", "open_interaction_count"],
+      "properties": {
+        "type": { "const": "native_event.upserted" },
+        "event": { "$ref": "#/$defs/NativeEventView" },
+        "open_interaction_count": { "type": "integer", "minimum": 0 }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "delivery"],
+      "properties": {
+        "type": { "const": "delivery.updated" },
+        "delivery": { "$ref": "#/$defs/NotificationDeliveryRecord" }
       }
     }
   ]

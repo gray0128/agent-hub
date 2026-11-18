@@ -3,6 +3,7 @@ import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-
 import { CSS } from "@dnd-kit/utilities";
 import {
   Activity,
+  Bell,
   ChevronDown,
   ChevronRight,
   GitFork,
@@ -10,6 +11,7 @@ import {
   ListOrdered,
   PauseCircle,
   PlayCircle,
+  RefreshCw,
   Search,
   Send,
   Sliders,
@@ -28,7 +30,15 @@ import {
   summarizeRunEvent
 } from "@/lib/utils";
 import type { InspectorTab } from "@/stores/workbench-store";
-import type { ApiKeyRecord, NodeRecord, RunEventItem, RunRecord } from "@/types";
+import type {
+  ApiKeyRecord,
+  DeliverySourceKind,
+  NativeEventView,
+  NodeRecord,
+  NotificationDeliveryRecord,
+  RunEventItem,
+  RunRecord
+} from "@/types";
 import { CopyButton } from "./CopyButton";
 import { NodeStatusDot, RunStatusBadge } from "./StatusBadge";
 
@@ -108,6 +118,19 @@ export interface InspectorPaneProps {
   selectedNode: NodeRecord | null;
   botKeys?: ApiKeyRecord[];
   events: RunEventItem[];
+  canViewDeliveries?: boolean;
+  deliveryTarget?:
+    | { kind: "native_event"; event: NativeEventView }
+    | { kind: "run"; run: RunRecord }
+    | null;
+  deliveries?: NotificationDeliveryRecord[];
+  deliveriesLoading?: boolean;
+  redeliveringIds?: Record<string, boolean>;
+  onRedeliverChannel?: (
+    sourceKind: DeliverySourceKind,
+    sourceId: string,
+    deliveryId?: string
+  ) => void;
   onSelectRun: (runId: string) => void;
   onCancelRun: (runId: string, cascade: boolean) => void;
   onToggleNodeDrain: (node: NodeRecord) => void;
@@ -126,6 +149,12 @@ export function InspectorPane({
   selectedNode,
   botKeys = [],
   events,
+  canViewDeliveries = false,
+  deliveryTarget = null,
+  deliveries = [],
+  deliveriesLoading = false,
+  redeliveringIds = {},
+  onRedeliverChannel,
   onSelectRun,
   onCancelRun,
   onToggleNodeDrain,
@@ -214,13 +243,13 @@ export function InspectorPane({
         className="flex h-full flex-col overflow-hidden"
       >
         <div className="shrink-0 border-b border-border px-2.5 py-1.5">
-          <TabsList className="grid w-full grid-cols-4 h-8">
+          <TabsList className={cn("grid w-full h-8", canViewDeliveries ? "grid-cols-5" : "grid-cols-4")}>
             <TabsTrigger value="events" className="gap-1 px-1 text-[11px]">
-              <Activity className="h-3 w-3 hidden sm:inline" strokeWidth={1.75} aria-hidden="true" />
+              <Activity className="h-3 w-3 hidden xl:inline" strokeWidth={1.75} aria-hidden="true" />
               过程事件
             </TabsTrigger>
             <TabsTrigger value="queue" className="gap-1 px-1 text-[11px] tabular-nums">
-              <ListOrdered className="h-3 w-3 hidden sm:inline" strokeWidth={1.75} aria-hidden="true" />
+              <ListOrdered className="h-3 w-3 hidden xl:inline" strokeWidth={1.75} aria-hidden="true" />
               <span>待跑队列</span>
               <span
                 className={cn(
@@ -232,13 +261,23 @@ export function InspectorPane({
               </span>
             </TabsTrigger>
             <TabsTrigger value="lineage" className="gap-1 px-1 text-[11px]">
-              <GitFork className="h-3 w-3 hidden sm:inline" strokeWidth={1.75} aria-hidden="true" />
+              <GitFork className="h-3 w-3 hidden xl:inline" strokeWidth={1.75} aria-hidden="true" />
               委派拓扑
             </TabsTrigger>
             <TabsTrigger value="control" className="gap-1 px-1 text-[11px]">
-              <Sliders className="h-3 w-3 hidden sm:inline" strokeWidth={1.75} aria-hidden="true" />
+              <Sliders className="h-3 w-3 hidden xl:inline" strokeWidth={1.75} aria-hidden="true" />
               节点控制
             </TabsTrigger>
+            {canViewDeliveries ? (
+              <TabsTrigger
+                value="deliveries"
+                data-testid="inspector-tab-deliveries"
+                className="gap-1 px-1 text-[11px]"
+              >
+                <Bell className="h-3 w-3 hidden xl:inline" strokeWidth={1.75} aria-hidden="true" />
+                投递明细
+              </TabsTrigger>
+            ) : null}
           </TabsList>
         </div>
 
@@ -644,6 +683,147 @@ export function InspectorPane({
             </div>
           )}
         </TabsContent>
+
+        {/* 5. Multi-Channel Notification Deliveries (admin only, strictly 5th tab) */}
+        {canViewDeliveries ? (
+          <TabsContent
+            value="deliveries"
+            className="mt-0 min-h-0 flex-1 flex flex-col overflow-hidden"
+          >
+            <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-border px-3 text-[11px] text-muted-foreground tabular-nums">
+              <span className="truncate font-mono">
+                {deliveryTarget
+                  ? deliveryTarget.kind === "native_event"
+                    ? `${deliveryTarget.event.id} (${deliveryTarget.event.notify_status})`
+                    : `${deliveryTarget.run.id} (${deliveryTarget.run.notify_status})`
+                  : "未选择事件或运行"}
+              </span>
+              {deliveryTarget && deliveries.some((d) => d.status === "failed") && onRedeliverChannel ? (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  data-testid="redeliver-all-failed-btn"
+                  disabled={Boolean(
+                    redeliveringIds[
+                      deliveryTarget.kind === "native_event"
+                        ? deliveryTarget.event.id
+                        : deliveryTarget.run.id
+                    ]
+                  )}
+                  onClick={() =>
+                    onRedeliverChannel(
+                      deliveryTarget.kind,
+                      deliveryTarget.kind === "native_event"
+                        ? deliveryTarget.event.id
+                        : deliveryTarget.run.id
+                    )
+                  }
+                  className="h-6 px-2 text-[11px]"
+                >
+                  <RefreshCw className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
+                  重推失败通道
+                </Button>
+              ) : null}
+            </div>
+
+            {deliveryTarget ? (
+              (() => {
+                const summary =
+                  deliveryTarget.kind === "native_event"
+                    ? deliveryTarget.event.deliveries_summary
+                    : deliveryTarget.run.deliveries_summary;
+                return summary ? (
+                  <div className="flex shrink-0 items-center justify-between gap-2 border-b border-border bg-background/40 px-3 py-1.5 text-[11px] text-muted-foreground tabular-nums">
+                    <span>总计 {summary.total}</span>
+                    <span className="text-[var(--status-done)]">送达 {summary.sent}</span>
+                    <span className="text-[var(--status-running)]">排队 {summary.queued}</span>
+                    <span className="text-[var(--status-failed)]">失败 {summary.failed}</span>
+                  </div>
+                ) : null;
+              })()
+            ) : null}
+
+            <div className="relative min-h-0 flex-1 overflow-y-auto divide-y divide-border">
+              {!deliveryTarget ? (
+                <div className="px-3 py-6 text-center text-xs text-muted-foreground">
+                  选择受控任务或原生活动查看多渠道投递台账
+                </div>
+              ) : deliveriesLoading && deliveries.length === 0 ? (
+                <div className="px-3 py-6 text-center text-xs text-muted-foreground">
+                  投递记录加载中...
+                </div>
+              ) : deliveries.length === 0 ? (
+                <div className="px-3 py-6 text-center text-xs text-muted-foreground">
+                  该记录暂无通知投递通道流水
+                </div>
+              ) : (
+                deliveries.map((d) => {
+                  const statusVariant =
+                    d.status === "sent"
+                      ? "done"
+                      : d.status === "queued"
+                        ? "running"
+                        : d.status === "failed"
+                          ? "failed"
+                          : "outline";
+                  return (
+                    <div
+                      key={d.id}
+                      data-testid={`delivery-row-${d.id}`}
+                      data-delivery-status={d.status}
+                      className="space-y-1.5 px-3 py-2.5 text-xs"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex min-w-0 items-center gap-1.5">
+                          <Badge variant={statusVariant}>{d.status}</Badge>
+                          <span className="truncate font-medium text-foreground">
+                            {d.channel_label || d.channel_id || d.channel_kind}
+                          </span>
+                        </div>
+                        <span className="shrink-0 font-mono text-[10px] text-muted-foreground tabular-nums">
+                          {formatShortTime(d.sent_at ?? d.updated_at)}
+                        </span>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-x-2.5 gap-y-0.5 font-mono text-[10px] text-muted-foreground tabular-nums">
+                        <span>{d.channel_kind}</span>
+                        <span>{d.route_mode}</span>
+                        {d.target_host ? <span>{d.target_host}</span> : null}
+                        <span>触发：{d.trigger_event}</span>
+                        <span>HTTP {d.http_status ?? "--"}</span>
+                        <span>尝试 {d.attempts}</span>
+                      </div>
+
+                      {d.error_code || d.error_message ? (
+                        <div className="font-mono text-[10px] text-[var(--status-failed)] break-all">
+                          [{d.error_code || "ERROR"}] {d.error_message}
+                        </div>
+                      ) : null}
+
+                      {d.status === "failed" && onRedeliverChannel ? (
+                        <div className="pt-0.5">
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            data-testid={`redeliver-btn-${d.id}`}
+                            disabled={Boolean(redeliveringIds[d.id])}
+                            onClick={() => onRedeliverChannel(d.source_kind, d.source_id, d.id)}
+                            className="h-7 px-2 text-[11px]"
+                          >
+                            <RefreshCw className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
+                            {redeliveringIds[d.id] ? "重推中..." : "重推此通道"}
+                          </Button>
+                        </div>
+                      ) : null}
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </TabsContent>
+        ) : null}
       </Tabs>
     </aside>
   );

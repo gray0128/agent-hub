@@ -81,6 +81,8 @@ func Execute(args []string, version string) int {
 		return runRuns(g, subArgs)
 	case "threads":
 		return runThreads(g, subArgs)
+	case "activity":
+		return runActivity(g, subArgs)
 	case "cancel":
 		return runCancel(g, subArgs)
 	case "resolve":
@@ -1380,6 +1382,7 @@ Commands:
   result          Fetch run summary or --full output
   runs            List recent runs
   threads         List threads
+  activity        Inspect read-only native agent activity across nodes (admin only)
   cancel          Cancel a run (or entire tree with --cascade)
   resolve         Mark a needs_approval run resolved and release locks
   native-emit     Emit an official hook or CLI native Agent event for node default Bot notify

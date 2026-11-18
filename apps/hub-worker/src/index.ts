@@ -1,5 +1,6 @@
 import { authenticateRequest, ensureNodeAllowedForClient, requireScope } from "./auth";
 import {
+  ackNativeEvent,
   cancelRun,
   checkpointRunApproval,
   claimRunsForNode,
@@ -9,23 +10,35 @@ import {
   createRun,
   forkThread,
   getApiKeyRawById,
+  getNativeEventById,
+  getPushSubscriptionByIdWithSecret,
   getRunById,
   heartbeatRun,
   listApiKeys,
+  listDeliveriesForRun,
+  listDeliveriesForSource,
+  listNativeEvents,
   listNodes,
   listNodesBoundToNotifyKey,
+  listPushSubscriptions,
   listRunEvents,
   listRuns,
   listThreads,
   mapRunRow,
   patchApiKey,
   patchNode,
+  patchPushSubscription,
   patchQueuedRun,
   patchThread,
+  pruneExpiredNativeActivity,
   reapExpiredLeases,
+  recordPushSubscriptionTestResult,
+  redeliverSourceDeliveries,
   reorderQueuedRuns,
   resolveRunApproval,
-  revokeApiKey
+  revokeApiKey,
+  revokePushSubscription,
+  upsertPushSubscription
 } from "./db";
 import {
   handleBinaryDownload,
@@ -41,32 +54,42 @@ import {
   type ApiScope,
   type Env,
   HubError,
+  type NativeEventRecord,
   type NodeRecord,
+  type NotificationDeliveryRecord,
   type NotifyQueueMessage,
   type RunRecord,
   type RunStatus,
-  type ThreadStatus
+  type ThreadStatus,
+  type WebPushSubscriptionSecret
 } from "./types";
 import { randomToken, sha256Hex } from "./ulid";
 import {
+  parseAckNativeEventRequest,
   parseApprovalCheckpointRequest,
   parseCancelRunRequest,
   parseClaimRequest,
   parseCompleteRequest,
   parseCreateKeyRequest,
+  parseCreatePushSubscriptionRequest,
   parseCreateRunRequest,
   parseForkThreadRequest,
   parseHeartbeatRequest,
+  parseIncludeRevokedQuery,
+  parseListNativeEventsQuery,
   parseNativeEventCreateRequest,
-  parsePatchNodeRequest,
   parsePatchKeyRequest,
+  parsePatchNodeRequest,
+  parsePatchPushSubscriptionRequest,
   parsePatchRunRequest,
   parsePatchThreadRequest,
+  parseRedeliverRequest,
   parseReorderRunsRequest,
   parseResolveRunRequest,
   readJsonBody
 } from "./validation";
-import { decryptWebhookConfig, encryptWebhookConfig } from "./webhook-crypto";
+import { getVapidConfig, isLoopbackPushAllowed, sendWebPushNotification } from "./web-push";
+import { decryptJsonSecret, decryptWebhookConfig, encryptJsonSecret, encryptWebhookConfig } from "./webhook-crypto";
 
 export { NodeHub };
 
@@ -146,6 +169,33 @@ async function broadcastRun(env: Env, run: RunRecord): Promise<void> {
 
 async function broadcastNode(env: Env, node: NodeRecord): Promise<void> {
   await doPost(env, "/internal/broadcast-node", { node }).catch(() => undefined);
+}
+
+async function broadcastNativeEvent(
+  env: Env,
+  event: NativeEventRecord,
+  openInteractionCount?: number
+): Promise<void> {
+  await doPost(env, "/internal/broadcast-native-event", {
+    event,
+    ...(openInteractionCount !== undefined ? { open_interaction_count: openInteractionCount } : {})
+  }).catch(() => undefined);
+}
+
+async function broadcastDelivery(env: Env, delivery: NotificationDeliveryRecord): Promise<void> {
+  await doPost(env, "/internal/broadcast-delivery", { delivery }).catch(() => undefined);
+}
+
+function getNativeEventsRetentionDays(env: Env): number {
+  const raw = env.NATIVE_EVENTS_RETENTION_DAYS?.trim() ?? "";
+  if (!/^\d+$/.test(raw)) {
+    return 30;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
+    return 30;
+  }
+  return Math.min(parsed, 3650);
 }
 
 export default {
@@ -272,6 +322,15 @@ export default {
           }
           const body = parseNativeEventCreateRequest(await readJsonBody(request));
           const result = await createNativeEvent(env.DB, env, nodeId, body);
+          if (!result.deduplicated) {
+            if (result.event.deliveries_summary && result.event.deliveries_summary.total > 0) {
+              const deliveries = await listDeliveriesForSource(env.DB, "native_event", result.event.id);
+              for (const d of deliveries) {
+                ctx.waitUntil(broadcastDelivery(env, d));
+              }
+            }
+            ctx.waitUntil(broadcastNativeEvent(env, result.event));
+          }
           const status = result.deduplicated ? 200 : result.event.notify_status === "queued" ? 202 : 200;
           return Response.json({ ok: true, ...result }, { status });
         }
@@ -668,6 +727,210 @@ export default {
           return Response.json({ ok: true, revoked_at: res.revokedAt });
         }
 
+        // 2.5 Native Activity & Delivery Ledger (admin only)
+        if (request.method === "GET" && pathname === "/api/v1/native-events") {
+          requireScope(principal, ["admin"]);
+          const filters = parseListNativeEventsQuery(url.searchParams);
+          const res = await listNativeEvents(env.DB, filters);
+          return Response.json({
+            ok: true,
+            events: res.events,
+            open_interaction_count: res.openInteractionCount,
+            next_cursor: res.nextCursor
+          });
+        }
+
+        const nativeEventDetailMatch = /^\/api\/v1\/native-events\/([^/]+)$/.exec(pathname);
+        if (request.method === "GET" && nativeEventDetailMatch) {
+          requireScope(principal, ["admin"]);
+          const eventId = decodeURIComponent(nativeEventDetailMatch[1]!);
+          const event = await getNativeEventById(env.DB, eventId);
+          if (!event) {
+            throw new HubError(404, "NOT_FOUND", `Native event '${eventId}' not found.`);
+          }
+          const deliveries = await listDeliveriesForSource(env.DB, "native_event", eventId);
+          return Response.json({ ok: true, event, deliveries });
+        }
+
+        const nativeEventAckMatch = /^\/api\/v1\/native-events\/([^/]+)\/ack$/.exec(pathname);
+        if (request.method === "POST" && nativeEventAckMatch) {
+          requireScope(principal, ["admin"]);
+          const eventId = decodeURIComponent(nativeEventAckMatch[1]!);
+          const body = parseAckNativeEventRequest(await readOptionalJsonBody(request, "AckNativeEvent"));
+          const res = await ackNativeEvent(env.DB, eventId, body.scope);
+          ctx.waitUntil(broadcastNativeEvent(env, res.event, res.openInteractionCount));
+          return Response.json({
+            ok: true,
+            event: res.event,
+            acked_count: res.ackedCount,
+            open_interaction_count: res.openInteractionCount
+          });
+        }
+
+        const nativeEventRedeliverMatch = /^\/api\/v1\/native-events\/([^/]+)\/redeliver$/.exec(pathname);
+        if (request.method === "POST" && nativeEventRedeliverMatch) {
+          requireScope(principal, ["admin"]);
+          const eventId = decodeURIComponent(nativeEventRedeliverMatch[1]!);
+          const body = parseRedeliverRequest(await readOptionalJsonBody(request, "RedeliverNativeEvent"));
+          const res = await redeliverSourceDeliveries(env.DB, env, "native_event", eventId, body.deliveryId);
+          if (res.requeuedCount > 0) {
+            for (const d of res.requeuedDeliveries) {
+              ctx.waitUntil(broadcastDelivery(env, d));
+            }
+            ctx.waitUntil(broadcastNativeEvent(env, res.event, res.openInteractionCount));
+          }
+          return Response.json({
+            ok: true,
+            event: res.event,
+            deliveries: res.deliveries,
+            requeued_count: res.requeuedCount
+          });
+        }
+
+        const runDeliveriesMatch = /^\/api\/v1\/runs\/([^/]+)\/deliveries$/.exec(pathname);
+        if (request.method === "GET" && runDeliveriesMatch) {
+          requireScope(principal, ["admin"]);
+          const runId = decodeURIComponent(runDeliveriesMatch[1]!);
+          const deliveries = await listDeliveriesForRun(env.DB, runId);
+          return Response.json({ ok: true, deliveries });
+        }
+
+        const runRedeliverMatch = /^\/api\/v1\/runs\/([^/]+)\/redeliver$/.exec(pathname);
+        if (request.method === "POST" && runRedeliverMatch) {
+          requireScope(principal, ["admin"]);
+          const runId = decodeURIComponent(runRedeliverMatch[1]!);
+          const body = parseRedeliverRequest(await readOptionalJsonBody(request, "RedeliverRun"));
+          const res = await redeliverSourceDeliveries(env.DB, env, "run", runId, body.deliveryId);
+          if (res.requeuedCount > 0) {
+            for (const d of res.requeuedDeliveries) {
+              ctx.waitUntil(broadcastDelivery(env, d));
+            }
+            ctx.waitUntil(broadcastRun(env, res.run));
+          }
+          return Response.json({
+            ok: true,
+            run: res.run,
+            deliveries: res.deliveries,
+            requeued_count: res.requeuedCount
+          });
+        }
+
+        // 2.6 Web Push Subscriptions (admin only)
+        if (request.method === "GET" && pathname === "/api/v1/push/config") {
+          requireScope(principal, ["admin"]);
+          const vapid = getVapidConfig(env);
+          if (!vapid.enabled) {
+            return Response.json({
+              ok: true,
+              enabled: false,
+              vapid_public_key: null,
+              reason: vapid.reason
+            });
+          }
+          return Response.json({
+            ok: true,
+            enabled: true,
+            vapid_public_key: vapid.config.publicKey
+          });
+        }
+
+        if (request.method === "GET" && pathname === "/api/v1/push-subscriptions") {
+          requireScope(principal, ["admin"]);
+          const includeRevoked = parseIncludeRevokedQuery(url.searchParams);
+          const subscriptions = await listPushSubscriptions(env.DB, includeRevoked);
+          return Response.json({ ok: true, subscriptions });
+        }
+
+        if (request.method === "POST" && pathname === "/api/v1/push-subscriptions") {
+          requireScope(principal, ["admin"]);
+          const body = parseCreatePushSubscriptionRequest(
+            await readJsonBody(request),
+            isLoopbackPushAllowed(env)
+          );
+          const subscriptionCiphertext = await encryptJsonSecret(
+            requireWebhookEncryptionKey(env),
+            body.subscription
+          );
+          const endpointSha256 = await sha256Hex(body.subscription.endpoint);
+          const { subscription, created } = await upsertPushSubscription(env.DB, {
+            label: body.label,
+            endpointSha256,
+            endpointHost: body.endpointHost,
+            subscriptionCiphertext,
+            nodeFilter: body.nodeFilter,
+            eventFilter: body.eventFilter
+          });
+          return Response.json({ ok: true, subscription }, { status: created ? 201 : 200 });
+        }
+
+        const pushSubTestMatch = /^\/api\/v1\/push-subscriptions\/([^/]+)\/test$/.exec(pathname);
+        if (request.method === "POST" && pushSubTestMatch) {
+          requireScope(principal, ["admin"]);
+          const subId = decodeURIComponent(pushSubTestMatch[1]!);
+          const found = await getPushSubscriptionByIdWithSecret(env.DB, subId);
+          if (!found) {
+            throw new HubError(404, "NOT_FOUND", `Push subscription '${subId}' not found.`);
+          }
+          if (found.record.revoked_at !== null) {
+            throw new HubError(
+              409,
+              "INVALID_STATE_TRANSITION",
+              "Cannot test a revoked push subscription."
+            );
+          }
+          const vapid = getVapidConfig(env);
+          if (!vapid.enabled) {
+            throw new HubError(400, "BAD_REQUEST", "VAPID keys are not configured on Worker.");
+          }
+          const secretSub = await decryptJsonSecret<WebPushSubscriptionSecret>(
+            requireWebhookEncryptionKey(env),
+            found.subscriptionCiphertext
+          );
+          const sendResult = await sendWebPushNotification({
+            subscription: secretSub,
+            payload: {
+              v: 1,
+              kind: "test",
+              id: subId,
+              tag: `ahub-test-${subId}`,
+              urgent: false,
+              title: "agent-hub 测试通知",
+              body: `设备 ${found.record.label} Web Push 通道连通正常`,
+              target_url: "/?pane=native",
+              ts: new Date().toISOString()
+            },
+            vapid: vapid.config,
+            urgency: "normal",
+            ttlSeconds: 86400,
+            allowLoopbackForTest: isLoopbackPushAllowed(env)
+          });
+          const subscription = await recordPushSubscriptionTestResult(env.DB, subId, sendResult);
+          return Response.json({
+            ok: true,
+            delivered: sendResult.ok,
+            http_status: sendResult.httpStatus,
+            error_code: sendResult.errorCode,
+            error_message: sendResult.errorMessage,
+            subscription
+          });
+        }
+
+        const pushSubMatch = /^\/api\/v1\/push-subscriptions\/([^/]+)$/.exec(pathname);
+        if (request.method === "PATCH" && pushSubMatch) {
+          requireScope(principal, ["admin"]);
+          const subId = decodeURIComponent(pushSubMatch[1]!);
+          const body = parsePatchPushSubscriptionRequest(await readJsonBody(request));
+          const subscription = await patchPushSubscription(env.DB, subId, body);
+          return Response.json({ ok: true, subscription });
+        }
+
+        if (request.method === "DELETE" && pushSubMatch) {
+          requireScope(principal, ["admin"]);
+          const subId = decodeURIComponent(pushSubMatch[1]!);
+          const res = await revokePushSubscription(env.DB, subId);
+          return Response.json({ ok: true, revoked_at: res.revokedAt });
+        }
+
         // Deterministic admin helper to trigger lease reaping on demand
         if (request.method === "POST" && pathname === "/api/v1/admin/reap-leases") {
           requireScope(principal, ["admin"]);
@@ -694,6 +957,11 @@ export default {
     const reaped = await reapExpiredLeases(env.DB, env);
     for (const r of reaped) {
       ctx.waitUntil(broadcastRun(env, mapRunRow(r, { view: "summary" })));
+    }
+    try {
+      await pruneExpiredNativeActivity(env.DB, getNativeEventsRetentionDays(env), 500);
+    } catch (err) {
+      console.error("[cron] pruneExpiredNativeActivity failed:", err);
     }
   },
 

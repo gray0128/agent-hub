@@ -3,27 +3,40 @@ import { useDraggable } from "@dnd-kit/core";
 import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import {
+  Bell,
   ChevronDown,
   ChevronRight,
   ChevronUp,
   FolderGit2,
   GitBranch,
   GripVertical,
+  Layers,
+  List,
   Pin,
   Plus,
   Search,
   Server
 } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ALL_AGENTS } from "@/lib/capabilities";
 import { cn, formatShortTime } from "@/lib/utils";
-import type { AgentName, NodeRecord, RunRecord, RunStatus, ThreadRecord, WorkspaceEntry } from "@/types";
+import { getNativeSessionKey, groupNativeSessions } from "@/stores/native-activity-store";
+import type { LeftRailTab } from "@/stores/workbench-store";
+import type {
+  AgentName,
+  NativeEventView,
+  NodeRecord,
+  RunRecord,
+  RunStatus,
+  ThreadRecord,
+  WorkspaceEntry
+} from "@/types";
 import { NodeStatusDot } from "./StatusBadge";
 
 type ThreadFilterMode = "all" | "active" | "needs_approval";
-type FleetTabMode = "threads" | "nodes";
 
 function statusDotClass(status?: RunStatus): string {
   switch (status) {
@@ -236,6 +249,23 @@ export interface FleetThreadsPaneProps {
   activeTargetNodeId: string;
   threadQuery: string;
   inDrawer?: boolean;
+  canViewNative?: boolean;
+  leftTab: LeftRailTab;
+  onLeftTabChange: (tab: LeftRailTab) => void;
+  nativeEvents?: NativeEventView[];
+  openInteractionCount?: number;
+  selectedNativeSessionKey?: string | null;
+  selectedNativeEventId?: string | null;
+  nativeViewMode?: "sessions" | "timeline";
+  nativeFilterMode?: "all" | "unacked" | "failed";
+  nativeOnlySelectedNode?: boolean;
+  nativeSearchQuery?: string;
+  onSelectNativeSession?: (sessionKey: string) => void;
+  onSelectNativeEvent?: (eventId: string) => void;
+  onNativeViewModeChange?: (mode: "sessions" | "timeline") => void;
+  onNativeFilterModeChange?: (mode: "all" | "unacked" | "failed") => void;
+  onNativeOnlySelectedNodeChange?: (only: boolean) => void;
+  onNativeSearchQueryChange?: (q: string) => void;
   onThreadQueryChange: (q: string) => void;
   onSelectNode: (nodeId: string) => void;
   onPickWorkspace: (nodeId: string, workdir: string) => void;
@@ -255,6 +285,23 @@ export function FleetThreadsPane({
   activeTargetNodeId,
   threadQuery,
   inDrawer = false,
+  canViewNative = false,
+  leftTab,
+  onLeftTabChange,
+  nativeEvents = [],
+  openInteractionCount = 0,
+  selectedNativeSessionKey = null,
+  selectedNativeEventId = null,
+  nativeViewMode = "sessions",
+  nativeFilterMode = "all",
+  nativeOnlySelectedNode = false,
+  nativeSearchQuery = "",
+  onSelectNativeSession,
+  onSelectNativeEvent,
+  onNativeViewModeChange,
+  onNativeFilterModeChange,
+  onNativeOnlySelectedNodeChange,
+  onNativeSearchQueryChange,
   onThreadQueryChange,
   onSelectNode,
   onPickWorkspace,
@@ -263,7 +310,6 @@ export function FleetThreadsPane({
   onTogglePinThread,
   onForkThread
 }: FleetThreadsPaneProps) {
-  const [leftTab, setLeftTab] = useState<FleetTabMode>("threads");
   const [collapsedNodes, setCollapsedNodes] = useState<Record<string, boolean>>({});
   const [statusFilter, setStatusFilter] = useState<ThreadFilterMode>("all");
   const [onlySelectedNode, setOnlySelectedNode] = useState(false);
@@ -335,6 +381,50 @@ export function FleetThreadsPane({
   const hasExpandedNode = nodesWithWorkspaces.some((n) => !collapsedNodes[n.id]);
   const hasActiveFilter = Boolean(threadQuery.trim() || statusFilter !== "all" || onlySelectedNode);
 
+  const filteredNativeEvents = useMemo(() => {
+    const q = nativeSearchQuery.trim().toLowerCase();
+    return nativeEvents.filter((ev) => {
+      if (nativeOnlySelectedNode && selectedNodeId && ev.node_id !== selectedNodeId) {
+        return false;
+      }
+      if (nativeFilterMode === "unacked" && ev.attention_state !== "open") {
+        return false;
+      }
+      if (
+        nativeFilterMode === "failed" &&
+        ev.notify_status !== "failed" &&
+        ev.notify_status !== "partial"
+      ) {
+        return false;
+      }
+      if (!q) return true;
+      return (
+        ev.title.toLowerCase().includes(q) ||
+        ev.summary.toLowerCase().includes(q) ||
+        ev.node_id.toLowerCase().includes(q) ||
+        ev.agent.toLowerCase().includes(q) ||
+        ev.workdir.toLowerCase().includes(q) ||
+        ev.native_session_id.toLowerCase().includes(q)
+      );
+    });
+  }, [nativeEvents, nativeFilterMode, nativeOnlySelectedNode, nativeSearchQuery, selectedNodeId]);
+
+  const nativeSessions = useMemo(
+    () => groupNativeSessions(filteredNativeEvents),
+    [filteredNativeEvents]
+  );
+
+  const nativeFailedCount = useMemo(
+    () =>
+      nativeEvents.filter((ev) => ev.notify_status === "failed" || ev.notify_status === "partial")
+        .length,
+    [nativeEvents]
+  );
+
+  const hasNativeFilter = Boolean(
+    nativeSearchQuery.trim() || nativeFilterMode !== "all" || nativeOnlySelectedNode
+  );
+
   return (
     <aside
       aria-label="节点与会话列表"
@@ -343,43 +433,70 @@ export function FleetThreadsPane({
     >
       <Tabs
         value={leftTab}
-        onValueChange={(v) => setLeftTab(v as FleetTabMode)}
+        onValueChange={(v) => onLeftTabChange(v as LeftRailTab)}
         className="flex h-full flex-col overflow-hidden"
       >
-        <div className="flex shrink-0 items-center justify-between gap-2 border-b border-border px-2.5 py-1.5">
-          <TabsList className={cn("grid flex-1 grid-cols-2", inDrawer ? "h-10" : "h-8")}>
+        <div className="shrink-0 space-y-1.5 border-b border-border px-2.5 py-1.5">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[11px] font-medium text-muted-foreground">工作区导航</span>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={onNewThread}
+              data-testid="new-thread-btn"
+              className={cn("shrink-0 px-2 text-[11px]", inDrawer ? "h-9" : "h-7")}
+            >
+              <Plus className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
+              新建会话
+            </Button>
+          </div>
+
+          <TabsList
+            className={cn(
+              "grid w-full",
+              canViewNative ? "grid-cols-3" : "grid-cols-2",
+              inDrawer ? "h-10" : "h-8"
+            )}
+          >
             <TabsTrigger
               value="threads"
               data-testid="fleet-tab-threads"
-              className="gap-1.5 px-2 text-xs tabular-nums"
+              className="gap-1 px-1.5 text-[11px] tabular-nums"
             >
-              <span>会话</span>
-              <span className="inline-block min-w-[1.1rem] rounded px-1 text-center text-[10px] leading-tight text-muted-foreground tabular-nums">
+              <span>受控会话</span>
+              <span className="inline-block min-w-[1.1rem] rounded px-0.5 text-center text-[10px] leading-tight text-muted-foreground tabular-nums">
                 {threads.length}
               </span>
             </TabsTrigger>
+            {canViewNative ? (
+              <TabsTrigger
+                value="native"
+                data-testid="fleet-tab-native"
+                className="gap-1 px-1.5 text-[11px] tabular-nums"
+              >
+                <span>原生活动</span>
+                {openInteractionCount > 0 ? (
+                  <span
+                    data-testid="fleet-native-open-badge"
+                    className="inline-block min-w-[1.1rem] rounded bg-[var(--status-approval)]/15 px-1 text-center text-[10px] font-medium leading-tight text-[var(--status-approval)] tabular-nums"
+                  >
+                    {openInteractionCount}
+                  </span>
+                ) : null}
+              </TabsTrigger>
+            ) : null}
             <TabsTrigger
               value="nodes"
               data-testid="fleet-tab-nodes"
-              className="gap-1.5 px-2 text-xs tabular-nums"
+              className="gap-1 px-1.5 text-[11px] tabular-nums"
             >
               <span>节点</span>
-              <span className="inline-block min-w-[1.1rem] rounded px-1 text-center text-[10px] leading-tight text-muted-foreground tabular-nums">
+              <span className="inline-block min-w-[1.1rem] rounded px-0.5 text-center text-[10px] leading-tight text-muted-foreground tabular-nums">
                 {onlineNodeCount}/{nodes.length}
               </span>
             </TabsTrigger>
           </TabsList>
-          <Button
-            type="button"
-            size="sm"
-            variant="outline"
-            onClick={onNewThread}
-            data-testid="new-thread-btn"
-            className={cn("shrink-0 px-2 text-[11px]", inDrawer ? "h-10" : "h-8")}
-          >
-            <Plus className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
-            新建会话
-          </Button>
         </div>
 
         {/* Tab 1: Threads (search + status filter + sortable list) */}
@@ -505,7 +622,253 @@ export function FleetThreadsPane({
           </div>
         </TabsContent>
 
-        {/* Tab 2: Nodes (per-node collapsible workspaces + drag/pick target) */}
+        {/* Tab 2 (admin): Native Activity (session-grouped or flat chronological stream) */}
+        {canViewNative ? (
+          <TabsContent value="native" className="mt-0 min-h-0 flex-1 flex flex-col overflow-hidden">
+            <div className="shrink-0 space-y-1.5 border-b border-border px-2.5 py-2">
+              <div className="flex items-center gap-1.5">
+                <div className="relative flex flex-1 items-center">
+                  <Search
+                    className="pointer-events-none absolute left-2.5 h-3.5 w-3.5 text-muted-foreground"
+                    strokeWidth={1.75}
+                    aria-hidden="true"
+                  />
+                  <Input
+                    aria-label="筛选原生活动"
+                    data-testid="native-search-input"
+                    value={nativeSearchQuery}
+                    onChange={(e) => onNativeSearchQueryChange?.(e.target.value)}
+                    placeholder="搜索标题、摘要、节点或目录..."
+                    className="h-8 pl-8 text-xs"
+                  />
+                </div>
+                <button
+                  type="button"
+                  data-testid="native-view-mode-toggle"
+                  onClick={() =>
+                    onNativeViewModeChange?.(nativeViewMode === "sessions" ? "timeline" : "sessions")
+                  }
+                  title={nativeViewMode === "sessions" ? "切换为按时间平铺流" : "切换为按会话聚合"}
+                  className="inline-flex h-8 shrink-0 items-center gap-1 rounded-[5px] border border-border bg-background/70 px-2 text-[11px] font-medium text-foreground hover:bg-accent cursor-pointer"
+                >
+                  {nativeViewMode === "sessions" ? (
+                    <>
+                      <Layers className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
+                      按会话
+                    </>
+                  ) : (
+                    <>
+                      <List className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
+                      平铺流
+                    </>
+                  )}
+                </button>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-1">
+                <button
+                  type="button"
+                  data-testid="native-filter-all"
+                  aria-pressed={nativeFilterMode === "all"}
+                  onClick={() => onNativeFilterModeChange?.("all")}
+                  className={cn(
+                    "inline-flex h-6 items-center rounded-[4px] border px-2 text-[10px] font-medium transition-colors duration-150 cursor-pointer tabular-nums",
+                    nativeFilterMode === "all"
+                      ? "border-[var(--status-running)]/50 bg-[var(--status-running)]/12 text-foreground"
+                      : "border-border bg-background/50 text-muted-foreground hover:text-foreground"
+                  )}
+                >
+                  全部 {nativeEvents.length}
+                </button>
+                <button
+                  type="button"
+                  data-testid="native-filter-unacked"
+                  aria-pressed={nativeFilterMode === "unacked"}
+                  onClick={() =>
+                    onNativeFilterModeChange?.(
+                      nativeFilterMode === "unacked" ? "all" : "unacked"
+                    )
+                  }
+                  className={cn(
+                    "inline-flex h-6 items-center rounded-[4px] border px-2 text-[10px] font-medium transition-colors duration-150 cursor-pointer tabular-nums",
+                    nativeFilterMode === "unacked"
+                      ? "border-[var(--status-approval)]/60 bg-[var(--status-approval)]/15 text-[var(--status-approval)]"
+                      : "border-border bg-background/50 text-muted-foreground hover:text-foreground"
+                  )}
+                >
+                  待互动 {openInteractionCount}
+                </button>
+                <button
+                  type="button"
+                  data-testid="native-filter-failed"
+                  aria-pressed={nativeFilterMode === "failed"}
+                  onClick={() =>
+                    onNativeFilterModeChange?.(nativeFilterMode === "failed" ? "all" : "failed")
+                  }
+                  className={cn(
+                    "inline-flex h-6 items-center rounded-[4px] border px-2 text-[10px] font-medium transition-colors duration-150 cursor-pointer tabular-nums",
+                    nativeFilterMode === "failed"
+                      ? "border-[var(--status-failed)]/60 bg-[var(--status-failed)]/15 text-[var(--status-failed)]"
+                      : "border-border bg-background/50 text-muted-foreground hover:text-foreground"
+                  )}
+                >
+                  投递失败 {nativeFailedCount}
+                </button>
+                {selectedNodeId ? (
+                  <button
+                    type="button"
+                    data-testid="native-filter-node"
+                    aria-pressed={nativeOnlySelectedNode}
+                    onClick={() => onNativeOnlySelectedNodeChange?.(!nativeOnlySelectedNode)}
+                    className={cn(
+                      "ml-auto inline-flex h-6 items-center rounded-[4px] border px-2 text-[10px] font-mono transition-colors duration-150 cursor-pointer",
+                      nativeOnlySelectedNode
+                        ? "border-foreground/40 bg-accent text-foreground"
+                        : "border-border bg-background/50 text-muted-foreground hover:text-foreground"
+                    )}
+                  >
+                    仅 {selectedNodeId}
+                  </button>
+                ) : null}
+              </div>
+            </div>
+
+            <div className="relative min-h-0 flex-1 overflow-y-auto divide-y divide-border">
+              {filteredNativeEvents.length === 0 ? (
+                <div className="space-y-2 px-3 py-6 text-center text-xs text-muted-foreground text-pretty">
+                  <p>
+                    {hasNativeFilter
+                      ? "当前筛选条件下没有匹配的原生活动记录。尝试切换筛选条件或清除搜索关键字。"
+                      : "暂无本地原生会话记录。请在节点 `node.json` 中启用 `native_notify.enabled` 并安装官方 Hook。"}
+                  </p>
+                  {hasNativeFilter ? (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={() => {
+                        onNativeSearchQueryChange?.("");
+                        onNativeFilterModeChange?.("all");
+                        onNativeOnlySelectedNodeChange?.(false);
+                      }}
+                    >
+                      清除筛选
+                    </Button>
+                  ) : null}
+                </div>
+              ) : nativeViewMode === "sessions" ? (
+                nativeSessions.map((group) => {
+                  const isSelected = selectedNativeSessionKey === group.sessionKey;
+                  const dirTail = group.workdir.split("/").filter(Boolean).pop() || group.workdir;
+                  return (
+                    <button
+                      key={group.sessionKey}
+                      type="button"
+                      data-testid={`native-session-item-${group.sessionKey}`}
+                      onClick={() => onSelectNativeSession?.(group.sessionKey)}
+                      className={cn(
+                        "w-full px-3 py-2 text-left transition-colors duration-150 cursor-pointer",
+                        isSelected
+                          ? "border-l-2 border-l-[var(--status-running)] bg-accent/80 pl-2.5"
+                          : "hover:bg-accent/40"
+                      )}
+                    >
+                      <div className="flex items-center justify-between gap-1.5">
+                        <div className="flex min-w-0 items-center gap-1.5">
+                          <span
+                            className={cn(
+                              "h-2 w-2 shrink-0 rounded-full",
+                              group.openInteractionCount > 0
+                                ? "bg-[var(--status-approval)]"
+                                : group.failedDeliveryCount > 0
+                                  ? "bg-[var(--status-failed)]"
+                                  : "bg-[var(--status-done)]"
+                            )}
+                            aria-hidden="true"
+                          />
+                          <span className="truncate text-xs font-medium text-foreground">
+                            {group.latestEvent.title || dirTail || group.agent}
+                          </span>
+                        </div>
+                        <span className="shrink-0 text-[10px] text-muted-foreground tabular-nums">
+                          {formatShortTime(group.latestEvent.created_at)}
+                        </span>
+                      </div>
+
+                      <div className="mt-0.5 flex items-center justify-between gap-1.5 text-[11px] font-mono text-muted-foreground">
+                        <span className="min-w-0 truncate">
+                          {group.nodeId} · {group.agent}
+                          {dirTail ? ` / ${dirTail}` : ""}
+                        </span>
+                        <span className="flex shrink-0 items-center gap-1 font-sans text-[10px] tabular-nums">
+                          {group.openInteractionCount > 0 ? (
+                            <span className="font-medium text-[var(--status-approval)]">
+                              待互动 {group.openInteractionCount}
+                            </span>
+                          ) : null}
+                          <span className="text-muted-foreground">{group.events.length} 条</span>
+                        </span>
+                      </div>
+                    </button>
+                  );
+                })
+              ) : (
+                filteredNativeEvents.map((ev) => {
+                  const isSelected = selectedNativeEventId === ev.id;
+                  const sKey = getNativeSessionKey(ev);
+                  return (
+                    <button
+                      key={ev.id}
+                      type="button"
+                      data-testid={`native-timeline-item-${ev.id}`}
+                      onClick={() => {
+                        onSelectNativeSession?.(sKey);
+                        onSelectNativeEvent?.(ev.id);
+                      }}
+                      className={cn(
+                        "w-full px-3 py-2 text-left transition-colors duration-150 cursor-pointer",
+                        isSelected
+                          ? "border-l-2 border-l-[var(--status-running)] bg-accent/80 pl-2.5"
+                          : "hover:bg-accent/40"
+                      )}
+                    >
+                      <div className="flex items-center justify-between gap-1.5">
+                        <div className="flex min-w-0 items-center gap-1.5">
+                          {ev.attention_state === "open" ? (
+                            <Badge variant="approval" className="text-[10px]">
+                              待互动
+                            </Badge>
+                          ) : (
+                            <Badge variant="outline" className="font-mono text-[10px]">
+                              {ev.event_kind}
+                            </Badge>
+                          )}
+                          <span className="truncate text-xs font-medium text-foreground">
+                            {ev.title || ev.id}
+                          </span>
+                        </div>
+                        <span className="shrink-0 text-[10px] text-muted-foreground tabular-nums">
+                          {formatShortTime(ev.created_at)}
+                        </span>
+                      </div>
+                      <div className="mt-0.5 flex items-center justify-between gap-1.5 text-[11px] font-mono text-muted-foreground tabular-nums">
+                        <span className="truncate">
+                          {ev.node_id} · {ev.agent}
+                        </span>
+                        <span className="inline-flex shrink-0 items-center gap-1 text-[10px]">
+                          <Bell className="h-2.5 w-2.5" strokeWidth={1.75} aria-hidden="true" />
+                          {ev.notify_status}
+                        </span>
+                      </div>
+                    </button>
+                  );
+                })
+              )}
+            </div>
+          </TabsContent>
+        ) : null}
+
+        {/* Tab 3: Nodes (per-node collapsible workspaces + drag/pick target) */}
         <TabsContent value="nodes" className="mt-0 min-h-0 flex-1 flex flex-col overflow-hidden">
           {nodes.length > 0 ? (
             <div className="flex shrink-0 items-center justify-between gap-2 border-b border-border px-3 py-1.5 text-[11px] text-muted-foreground tabular-nums">

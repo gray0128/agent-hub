@@ -42,6 +42,34 @@ type NodeRecord struct {
 	UpdatedAt                string                 `json:"updated_at"`
 }
 
+type DeliveriesSummary struct {
+	Total  int `json:"total"`
+	Sent   int `json:"sent"`
+	Queued int `json:"queued"`
+	Failed int `json:"failed"`
+}
+
+type NotificationDeliveryRecord struct {
+	ID           string  `json:"id"`
+	SourceKind   string  `json:"source_kind"`
+	SourceID     string  `json:"source_id"`
+	TriggerEvent string  `json:"trigger_event"`
+	NodeID       string  `json:"node_id"`
+	ChannelKind  string  `json:"channel_kind"`
+	ChannelID    string  `json:"channel_id"`
+	ChannelLabel string  `json:"channel_label"`
+	TargetHost   string  `json:"target_host"`
+	RouteMode    string  `json:"route_mode"`
+	Status       string  `json:"status"`
+	Attempts     int     `json:"attempts"`
+	HTTPStatus   *int    `json:"http_status"`
+	ErrorCode    string  `json:"error_code"`
+	ErrorMessage string  `json:"error_message"`
+	SentAt       *string `json:"sent_at"`
+	CreatedAt    string  `json:"created_at"`
+	UpdatedAt    string  `json:"updated_at"`
+}
+
 type NativeEventRequest struct {
 	EventID         string `json:"event_id"`
 	Agent           string `json:"agent"`
@@ -54,27 +82,54 @@ type NativeEventRequest struct {
 }
 
 type NativeEventRecord struct {
-	ID              string  `json:"id"`
-	NodeID          string  `json:"node_id"`
-	EventID         string  `json:"event_id"`
-	Agent           string  `json:"agent"`
-	EventKind       string  `json:"event_kind"`
-	NativeSessionID string  `json:"native_session_id"`
-	Workdir         string  `json:"workdir"`
-	Title           string  `json:"title"`
-	Summary         string  `json:"summary"`
-	Source          string  `json:"source"`
-	NotifyKeyID     *string `json:"notify_key_id"`
-	NotifyStatus    string  `json:"notify_status"`
-	NotifyError     string  `json:"notify_error"`
-	CreatedAt       string  `json:"created_at"`
-	UpdatedAt       string  `json:"updated_at"`
+	ID                string             `json:"id"`
+	NodeID            string             `json:"node_id"`
+	EventID           string             `json:"event_id"`
+	Agent             string             `json:"agent"`
+	EventKind         string             `json:"event_kind"`
+	NativeSessionID   string             `json:"native_session_id"`
+	Workdir           string             `json:"workdir"`
+	Title             string             `json:"title"`
+	Summary           string             `json:"summary"`
+	Source            string             `json:"source"`
+	NotifyKeyID       *string            `json:"notify_key_id"`
+	NotifyStatus      string             `json:"notify_status"`
+	NotifyError       string             `json:"notify_error"`
+	AckAt             *string            `json:"ack_at"`
+	AttentionState    *string            `json:"attention_state"`
+	DeliveriesSummary *DeliveriesSummary `json:"deliveries_summary,omitempty"`
+	CreatedAt         string             `json:"created_at"`
+	UpdatedAt         string             `json:"updated_at"`
 }
 
 type NativeEventResponse struct {
 	OK           bool              `json:"ok"`
 	Event        NativeEventRecord `json:"event"`
 	Deduplicated bool              `json:"deduplicated"`
+}
+
+type NativeEventsCursor struct {
+	BeforeTS string `json:"before_ts"`
+	BeforeID string `json:"before_id"`
+}
+
+type ListNativeEventsOptions struct {
+	NodeID       string
+	Agent        string
+	EventKind    string
+	NotifyStatus string
+	UnackedOnly  bool
+	Query        string
+	Limit        int
+	BeforeTS     string
+	BeforeID     string
+}
+
+type ListNativeEventsResponse struct {
+	OK                   bool                `json:"ok"`
+	Events               []NativeEventRecord `json:"events"`
+	OpenInteractionCount int                 `json:"open_interaction_count"`
+	NextCursor           *NativeEventsCursor `json:"next_cursor"`
 }
 
 type ThreadRecord struct {
@@ -121,10 +176,11 @@ type RunRecord struct {
 	OutputBytes      int     `json:"output_bytes,omitempty"`
 	Truncated        *bool   `json:"truncated,omitempty"`
 	WebhookArmed     *bool   `json:"webhook_armed,omitempty"`
-	ErrorCode        string  `json:"error_code,omitempty"`
-	ErrorMessage     string  `json:"error_message,omitempty"`
-	NotifyStatus     string  `json:"notify_status,omitempty"`
-	LeaseExpiresAt   *string `json:"lease_expires_at,omitempty"`
+	ErrorCode         string             `json:"error_code,omitempty"`
+	ErrorMessage      string             `json:"error_message,omitempty"`
+	NotifyStatus      string             `json:"notify_status,omitempty"`
+	DeliveriesSummary *DeliveriesSummary `json:"deliveries_summary,omitempty"`
+	LeaseExpiresAt    *string            `json:"lease_expires_at,omitempty"`
 	StartedAt        *string `json:"started_at,omitempty"`
 	FinishedAt       *string `json:"finished_at,omitempty"`
 	DurationMs       int64   `json:"duration_ms,omitempty"`

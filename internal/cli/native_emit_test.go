@@ -532,3 +532,137 @@ func TestNativeEmitGrokOmpIdlePromptAndAgyRefinements(t *testing.T) {
 		t.Fatalf("unexpected agy ask_question event: %+v", received[3])
 	}
 }
+
+func TestNativeEmitCLIProgressAndTitleDisambiguation(t *testing.T) {
+	var received []api.NativeEventRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req api.NativeEventRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatal(err)
+		}
+		received = append(received, req)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(api.NativeEventResponse{
+			OK: true,
+			Event: api.NativeEventRecord{
+				ID:           "evt_01PROG",
+				NodeID:       "macmini",
+				EventID:      req.EventID,
+				Agent:        req.Agent,
+				EventKind:    req.EventKind,
+				NotifyStatus: "queued",
+			},
+		})
+	}))
+	defer srv.Close()
+
+	tmpDir := t.TempDir()
+	projectRoot := filepath.Join(tmpDir, "workspace")
+	demoDir := filepath.Join(projectRoot, "demo")
+	if err := os.MkdirAll(demoDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Empty AllowedRoots falls back to ProjectRoots
+	cfgPath := writeTempNodeConfig(t, config.NodeConfig{
+		NodeID:       "macmini",
+		HubURL:       srv.URL,
+		Token:        "ahub_nod_real_token",
+		ProjectRoots: []string{projectRoot},
+		NativeNotify: &config.NativeNotifyConfig{
+			Enabled: true,
+		},
+	})
+
+	t.Setenv("AHUB_RUN_ID", "")
+	t.Setenv("AHUB_DEPTH", "")
+	t.Setenv("AHUB_TOKEN", "ahub_cli_poisoned_token")
+	t.Setenv("AHUB_URL", "http://127.0.0.1:1")
+
+	// 1. --kind progress with --summary - (stdin) & distinct --title produces distinct EventIDs
+	code1, out1 := captureExecute(t, []string{
+		"--json", "native-emit",
+		"--config", cfgPath,
+		"--agent", "codex",
+		"--kind", "progress",
+		"--session-id", "sess_p1",
+		"--dir", demoDir,
+		"--title", "Stage 1/3 token=title_secret_1",
+		"--summary", "-",
+	}, "Completed unit tests with ahub_cli_secret_summary")
+	if code1 != 0 {
+		t.Fatalf("stage 1 progress emit failed: code=%d out=%s", code1, out1)
+	}
+
+	code2, out2 := captureExecute(t, []string{
+		"--json", "native-emit",
+		"--config", cfgPath,
+		"--agent", "codex",
+		"--kind", "progress",
+		"--session-id", "sess_p1",
+		"--dir", demoDir,
+		"--title", "Stage 2/3",
+		"--summary", "-",
+	}, "Completed unit tests with ahub_cli_secret_summary")
+	if code2 != 0 {
+		t.Fatalf("stage 2 progress emit failed: code=%d out=%s", code2, out2)
+	}
+
+	// 2. Omitting --title keeps exact 4-part deterministicEventID
+	code3, out3 := captureExecute(t, []string{
+		"--json", "native-emit",
+		"--config", cfgPath,
+		"--agent", "codex",
+		"--kind", "progress",
+		"--session-id", "sess_p1",
+		"--dir", demoDir,
+		"--summary", "No title progress",
+	}, "")
+	if code3 != 0 {
+		t.Fatalf("no-title progress emit failed: code=%d out=%s", code3, out3)
+	}
+
+	if len(received) != 3 {
+		t.Fatalf("expected 3 received requests, got %d", len(received))
+	}
+	if received[0].EventKind != "progress" || received[0].Source != "cli" {
+		t.Fatalf("unexpected progress req: %+v", received[0])
+	}
+	if strings.Contains(received[0].Title, "title_secret_1") || strings.Contains(received[0].Summary, "secret_summary") {
+		t.Fatalf("expected pre-egress redaction, got %+v", received[0])
+	}
+	if received[0].EventID == received[1].EventID {
+		t.Fatalf("expected distinct EventIDs for distinct --title values, both got %q", received[0].EventID)
+	}
+	expectedNoTitleID := deterministicEventID("cli", "sess_p1", "progress", "No title progress")
+	if received[2].EventID != expectedNoTitleID {
+		t.Fatalf("expected 4-part EventID %q when --title omitted, got %q", expectedNoTitleID, received[2].EventID)
+	}
+
+	// 3. Invalid --kind rejected with ExitBadUsageOrInput (64)
+	codeBadKind, _ := captureExecute(t, []string{
+		"--json", "native-emit",
+		"--config", cfgPath,
+		"--agent", "claude",
+		"--kind", "post_tool_use",
+		"--dir", demoDir,
+		"--summary", "Should fail",
+	}, "")
+	if codeBadKind != api.ExitBadUsageOrInput {
+		t.Fatalf("expected ExitBadUsageOrInput (64) for invalid --kind, got %d", codeBadKind)
+	}
+
+	// 4. AHUB_RUN_ID skip still applies to --kind progress
+	t.Setenv("AHUB_RUN_ID", "run_parent_999")
+	codeSkip, outSkip := captureExecute(t, []string{
+		"--json", "native-emit",
+		"--config", cfgPath,
+		"--agent", "codex",
+		"--kind", "progress",
+		"--dir", demoDir,
+		"--summary", "Should skip",
+	}, "")
+	if codeSkip != 0 || !strings.Contains(outSkip, "inside_ahub_run") {
+		t.Fatalf("expected inside_ahub_run skip for progress, got code=%d out=%s", codeSkip, outSkip)
+	}
+}

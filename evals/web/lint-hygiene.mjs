@@ -106,16 +106,66 @@ for (const file of sourceFiles) {
   }
 }
 
-// Verify tabular-nums discipline across the three main workbench panes
+// Verify tabular-nums discipline across the main workbench panes and dialogs
 for (const pane of [
   "apps/web/src/components/workbench/FleetThreadsPane.tsx",
   "apps/web/src/components/workbench/ConversationPane.tsx",
-  "apps/web/src/components/workbench/InspectorPane.tsx"
+  "apps/web/src/components/workbench/InspectorPane.tsx",
+  "apps/web/src/components/workbench/NativeActivityPane.tsx",
+  "apps/web/src/components/workbench/BrowserNotifyDialog.tsx"
 ]) {
   const paneContent = fs.readFileSync(path.join(repoRoot, pane), "utf8");
   if (!paneContent.includes("tabular-nums")) {
     fail("tabular-nums", `${pane} 未对动态数字/时间戳启用 tabular-nums`);
   }
+}
+
+// Verify zero-backhaul Service Worker (no fetch(), no /api/, unconditional showNotification)
+const swPath = path.join(webDir, "public", "sw.js");
+if (!fs.existsSync(swPath)) {
+  fail("sw-exists", "缺少 apps/web/public/sw.js");
+} else {
+  const swContent = fs.readFileSync(swPath, "utf8");
+  const stripped = swContent.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
+  if (/\bfetch\s*\(/.test(stripped) || /\/api\//.test(stripped)) {
+    fail("sw-no-api-fetch", "apps/web/public/sw.js 严禁调用 fetch() 或请求 /api/（必须保持零回源）");
+  }
+  if (!/self\.registration\.showNotification\s*\(/.test(stripped)) {
+    fail("sw-show-notification", "apps/web/public/sw.js 必须在 push 中调用 self.registration.showNotification()");
+  }
+}
+
+// Verify PWA manifest and index.html credentials link
+const manifestPath = path.join(webDir, "public", "manifest.webmanifest");
+if (!fs.existsSync(manifestPath)) {
+  fail("pwa-manifest", "缺少 apps/web/public/manifest.webmanifest");
+} else {
+  try {
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+    if (manifest.display !== "standalone" || manifest.start_url !== "/") {
+      fail("pwa-manifest", "manifest.webmanifest 必须声明 display=standalone 且 start_url=/");
+    }
+    const icons = Array.isArray(manifest.icons) ? manifest.icons : [];
+    if (icons.length === 0) {
+      fail("pwa-manifest", "manifest.webmanifest 必须包含至少一个图标");
+    }
+    for (const icon of icons) {
+      if (typeof icon?.src === "string" && icon.src.startsWith("/")) {
+        const iconFile = path.join(webDir, "public", icon.src.slice(1));
+        if (!fs.existsSync(iconFile) || fs.statSync(iconFile).size === 0) {
+          fail("pwa-manifest", `缺少或空的 PWA 图标文件: ${icon.src}`);
+        }
+      }
+    }
+  } catch (err) {
+    fail("pwa-manifest", `manifest.webmanifest JSON 解析失败: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+const indexHtmlPath = path.join(webDir, "index.html");
+const indexHtml = fs.readFileSync(indexHtmlPath, "utf8");
+if (!indexHtml.includes("manifest.webmanifest") || !indexHtml.includes('crossorigin="use-credentials"')) {
+  fail("pwa-index-html", 'apps/web/index.html 必须包含 <link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials" />');
 }
 
 if (failures.length > 0) {

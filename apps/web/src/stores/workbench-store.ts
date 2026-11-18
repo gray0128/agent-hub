@@ -4,7 +4,9 @@ import type { AgentName, EffortLevel } from "@/types";
 export type ThemeMode = "dark" | "light";
 export type AuthStatus = "checking" | "authenticated" | "unauthenticated";
 export type AuthScope = "admin" | "client" | "node";
-export type InspectorTab = "events" | "queue" | "lineage" | "control";
+export type LeftRailTab = "threads" | "native" | "nodes";
+export type CenterPaneMode = "controlled" | "native";
+export type InspectorTab = "events" | "queue" | "lineage" | "control" | "deliveries";
 export type StreamStatus = "connecting" | "connected" | "disconnected";
 
 export interface ComposerDraft {
@@ -26,26 +28,34 @@ interface WorkbenchState {
   authKind: string | null;
   authScope: AuthScope | null;
   streamStatus: StreamStatus;
+  leftTab: LeftRailTab;
+  centerMode: CenterPaneMode;
   activeTab: InspectorTab;
   threadQuery: string;
   onboardingOpen: boolean;
   keysDialogOpen: boolean;
+  browserNotifyOpen: boolean;
   mobileLeftOpen: boolean;
   mobileRightOpen: boolean;
   errorBanner: string | null;
+  composerNotice: string | null;
   composer: ComposerDraft;
   setTheme: (theme: ThemeMode) => void;
   toggleTheme: () => void;
   setToken: (token: string) => void;
   setAuthState: (authStatus: AuthStatus, authKind?: string | null, authScope?: AuthScope | null) => void;
   setStreamStatus: (status: StreamStatus) => void;
+  setLeftTab: (tab: LeftRailTab) => void;
+  setCenterMode: (mode: CenterPaneMode) => void;
   setActiveTab: (tab: InspectorTab) => void;
   setThreadQuery: (q: string) => void;
   setOnboardingOpen: (open: boolean) => void;
   setKeysDialogOpen: (open: boolean) => void;
+  setBrowserNotifyOpen: (open: boolean) => void;
   setMobileLeftOpen: (open: boolean) => void;
   setMobileRightOpen: (open: boolean) => void;
   setErrorBanner: (msg: string | null) => void;
+  setComposerNotice: (msg: string | null) => void;
   patchComposer: (patch: Partial<ComposerDraft>) => void;
 }
 
@@ -92,13 +102,17 @@ export const useWorkbenchStore = create<WorkbenchState>((set) => ({
   authKind: null,
   authScope: null,
   streamStatus: "connecting",
+  leftTab: "threads",
+  centerMode: "controlled",
   activeTab: "events",
   threadQuery: "",
   onboardingOpen: false,
   keysDialogOpen: false,
+  browserNotifyOpen: false,
   mobileLeftOpen: false,
   mobileRightOpen: false,
   errorBanner: null,
+  composerNotice: null,
   composer: {
     mode: "reply",
     nodeId: "",
@@ -132,13 +146,17 @@ export const useWorkbenchStore = create<WorkbenchState>((set) => ({
   setAuthState: (authStatus, authKind = null, authScope = null) =>
     set({ authStatus, authKind, authScope }),
   setStreamStatus: (streamStatus) => set({ streamStatus }),
+  setLeftTab: (leftTab) => set({ leftTab }),
+  setCenterMode: (centerMode) => set({ centerMode }),
   setActiveTab: (activeTab) => set({ activeTab }),
   setThreadQuery: (threadQuery) => set({ threadQuery }),
   setOnboardingOpen: (onboardingOpen) => set({ onboardingOpen }),
   setKeysDialogOpen: (keysDialogOpen) => set({ keysDialogOpen }),
+  setBrowserNotifyOpen: (browserNotifyOpen) => set({ browserNotifyOpen }),
   setMobileLeftOpen: (mobileLeftOpen) => set({ mobileLeftOpen }),
   setMobileRightOpen: (mobileRightOpen) => set({ mobileRightOpen }),
   setErrorBanner: (errorBanner) => set({ errorBanner }),
+  setComposerNotice: (composerNotice) => set({ composerNotice }),
   patchComposer: (patch) =>
     set((state) => ({
       composer: { ...state.composer, ...patch }

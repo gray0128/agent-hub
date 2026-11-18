@@ -65,8 +65,10 @@ export interface ConversationPaneProps {
   fullOutputByRunId: Record<string, string>;
   eventsByRunId: Record<string, RunEventItem[]>;
   composer: ComposerDraft;
+  composerNotice?: string | null;
   submitting: boolean;
   onPatchComposer: (patch: Partial<ComposerDraft>) => void;
+  onDismissComposerNotice?: () => void;
   onSelectRun: (runId: string) => void;
   onLoadFullOutput: (runId: string) => void;
   onCancelRun: (runId: string, cascade: boolean) => void;
@@ -85,8 +87,10 @@ export function ConversationPane({
   fullOutputByRunId,
   eventsByRunId,
   composer,
+  composerNotice,
   submitting,
   onPatchComposer,
+  onDismissComposerNotice,
   onSelectRun,
   onLoadFullOutput,
   onCancelRun,
@@ -617,6 +621,25 @@ export function ConversationPane({
           isOver && "bg-[var(--status-running)]/10 border-[var(--status-running)]"
         )}
       >
+        {composerNotice ? (
+          <div
+            role="status"
+            data-testid="composer-notice"
+            className="mb-2 flex items-center justify-between gap-2 rounded-[5px] border border-[var(--status-running)]/35 bg-[var(--status-running)]/10 px-2.5 py-1.5 text-[11px] text-foreground text-pretty"
+          >
+            <span>{composerNotice}</span>
+            {onDismissComposerNotice ? (
+              <button
+                type="button"
+                onClick={onDismissComposerNotice}
+                aria-label="关闭提示"
+                className="shrink-0 text-[10px] text-muted-foreground hover:text-foreground cursor-pointer"
+              >
+                关闭
+              </button>
+            ) : null}
+          </div>
+        ) : null}
         {targetNode?.status === "offline" ? (
           <div className="mb-2 rounded-[5px] border border-[var(--status-approval)]/40 bg-[var(--status-approval)]/10 px-2.5 py-1 text-[11px] text-[var(--status-approval)] text-pretty">
             目标节点当前离线。现在提交的任务将安全进入排队队列，并在节点上线后自动开始执行。

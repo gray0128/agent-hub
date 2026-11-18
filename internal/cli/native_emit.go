@@ -32,7 +32,7 @@ func runNativeEmit(g globalOpts, args []string) int {
 	fs.StringVar(&fromHook, "from-hook", "cli", "official hook adapter: claude|codex|agy|pi|omp|grok|cli")
 	fs.StringVar(&cfgPath, "config", "", "node.json config path")
 	fs.StringVar(&agentFlag, "agent", "", "agent name (agy|pi|omp|codex|claude|grok)")
-	fs.StringVar(&kindFlag, "kind", "", "event kind (interaction_needed|turn_summary)")
+	fs.StringVar(&kindFlag, "kind", "", "event kind (interaction_needed|turn_summary|progress)")
 	fs.StringVar(&eventIDFlag, "event-id", "", "idempotent event id")
 	fs.StringVar(&sessionIDFlag, "session-id", "", "native session id")
 	fs.StringVar(&workdirFlag, "dir", "", "workdir path")
@@ -137,17 +137,35 @@ func runNativeEmit(g globalOpts, args []string) int {
 			}
 			summaryText = raw
 		}
-		if strings.TrimSpace(agentFlag) == "" || strings.TrimSpace(kindFlag) == "" || strings.TrimSpace(summaryText) == "" {
+		trimmedAgent := strings.ToLower(strings.TrimSpace(agentFlag))
+		trimmedKind := strings.TrimSpace(kindFlag)
+		trimmedSession := strings.TrimSpace(sessionIDFlag)
+		trimmedWorkdir := strings.TrimSpace(workdirFlag)
+		trimmedTitle := strings.TrimSpace(titleFlag)
+		trimmedSummary := strings.TrimSpace(summaryText)
+
+		if trimmedAgent == "" || trimmedKind == "" || trimmedSummary == "" {
 			return failUsage(g.JSON, "--agent, --kind, and --summary are required in cli mode")
 		}
+		if !isValidNativeEventAgent(trimmedAgent) {
+			return failUsage(g.JSON, fmt.Sprintf("unsupported --agent %q (expected agy|pi|omp|codex|claude|grok)", trimmedAgent))
+		}
+		if !isValidNativeEventKind(trimmedKind) {
+			return failUsage(g.JSON, fmt.Sprintf("unsupported --kind %q (expected interaction_needed|turn_summary|progress)", trimmedKind))
+		}
+
+		idParts := []string{"cli", trimmedSession, trimmedKind, trimmedSummary}
+		if trimmedTitle != "" {
+			idParts = append(idParts, trimmedTitle)
+		}
 		req = &api.NativeEventRequest{
-			EventID:         deterministicEventID("cli", sessionIDFlag, kindFlag, summaryText),
-			Agent:           strings.TrimSpace(agentFlag),
-			EventKind:       strings.TrimSpace(kindFlag),
-			NativeSessionID: strings.TrimSpace(sessionIDFlag),
-			Workdir:         strings.TrimSpace(workdirFlag),
-			Title:           strings.TrimSpace(titleFlag),
-			Summary:         strings.TrimSpace(summaryText),
+			EventID:         deterministicEventID(idParts...),
+			Agent:           trimmedAgent,
+			EventKind:       trimmedKind,
+			NativeSessionID: trimmedSession,
+			Workdir:         trimmedWorkdir,
+			Title:           trimmedTitle,
+			Summary:         trimmedSummary,
 			Source:          firstNonEmpty(sourceFlag, "cli"),
 		}
 	default:
@@ -197,6 +215,24 @@ func runNativeEmit(g globalOpts, args []string) int {
 		fmt.Printf("Native event %s status=%s deduplicated=%v\n", res.Event.ID, res.Event.NotifyStatus, res.Deduplicated)
 	}
 	return api.ExitOK
+}
+
+func isValidNativeEventAgent(agent string) bool {
+	switch agent {
+	case "agy", "pi", "omp", "codex", "claude", "grok":
+		return true
+	default:
+		return false
+	}
+}
+
+func isValidNativeEventKind(kind string) bool {
+	switch kind {
+	case "interaction_needed", "turn_summary", "progress":
+		return true
+	default:
+		return false
+	}
 }
 
 func emitSkipped(asJSON bool, reason string) int {

@@ -13,6 +13,7 @@ import { arrayMove, sortableKeyboardCoordinates } from "@dnd-kit/sortable";
 import { Group, Panel, Separator } from "react-resizable-panels";
 import {
   AlertCircle,
+  Bell,
   KeyRound,
   Moon,
   PanelLeft,
@@ -23,20 +24,47 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent } from "@/components/ui/sheet";
+import { BrowserNotifyDialog } from "@/components/workbench/BrowserNotifyDialog";
 import { ConversationPane } from "@/components/workbench/ConversationPane";
 import { FleetThreadsPane } from "@/components/workbench/FleetThreadsPane";
 import { InspectorPane } from "@/components/workbench/InspectorPane";
+import { NativeActivityPane } from "@/components/workbench/NativeActivityPane";
 import {
   KeysDialog,
   OnboardingDialog
 } from "@/components/workbench/OnboardingKeysDialogs";
 import { apiClient, ApiClientError } from "@/lib/api-client";
+import {
+  getCurrentDevicePushInfo,
+  initBrowserNotifyCoordinator,
+  mapNativeKindToFilterKey,
+  mapRunStatusToFilterKey,
+  notifyInPageWithDedup,
+  readInPageFallbackPref,
+  writeInPageFallbackPref
+} from "@/lib/browser-notify";
+import { getAvailableAgents, resolveInitialComposerModelAndEffort } from "@/lib/capabilities";
 import { AUTO_FULL_OUTPUT_MAX_BYTES, cn } from "@/lib/utils";
 import { HubStreamClient } from "@/lib/ws-client";
 import { useFleetStore } from "@/stores/fleet-store";
+import {
+  getDeliverySourceKey,
+  getNativeSessionKey,
+  useNativeActivityStore
+} from "@/stores/native-activity-store";
 import { useTaskStore } from "@/stores/task-store";
-import { useWorkbenchStore } from "@/stores/workbench-store";
-import type { NodeRecord, ThreadRecord } from "@/types";
+import {
+  type CenterPaneMode,
+  type InspectorTab,
+  type LeftRailTab,
+  useWorkbenchStore
+} from "@/stores/workbench-store";
+import type {
+  DeliverySourceKind,
+  NativeEventView,
+  NodeRecord,
+  ThreadRecord
+} from "@/types";
 
 declare global {
   interface Window {
@@ -54,6 +82,18 @@ declare global {
         authStatus: string;
         authKind: string | null;
         authScope: string | null;
+        leftTab: LeftRailTab;
+        centerMode: CenterPaneMode;
+        activeTab: InspectorTab;
+        nativeEvents: ReturnType<typeof useNativeActivityStore.getState>["events"];
+        openInteractionCount: number;
+        selectedNativeSessionKey: string | null;
+        selectedNativeEventId: string | null;
+        deliveriesBySourceKey: ReturnType<
+          typeof useNativeActivityStore.getState
+        >["deliveriesBySourceKey"];
+        pushConfig: ReturnType<typeof useNativeActivityStore.getState>["pushConfig"];
+        pushSubscriptions: ReturnType<typeof useNativeActivityStore.getState>["subscriptions"];
       };
     };
   }
@@ -109,36 +149,88 @@ export function App() {
   const authKind = useWorkbenchStore((s) => s.authKind);
   const authScope = useWorkbenchStore((s) => s.authScope);
   const streamStatus = useWorkbenchStore((s) => s.streamStatus);
+  const leftTab = useWorkbenchStore((s) => s.leftTab);
+  const centerMode = useWorkbenchStore((s) => s.centerMode);
   const activeTab = useWorkbenchStore((s) => s.activeTab);
   const threadQuery = useWorkbenchStore((s) => s.threadQuery);
   const onboardingOpen = useWorkbenchStore((s) => s.onboardingOpen);
   const keysDialogOpen = useWorkbenchStore((s) => s.keysDialogOpen);
+  const browserNotifyOpen = useWorkbenchStore((s) => s.browserNotifyOpen);
   const mobileLeftOpen = useWorkbenchStore((s) => s.mobileLeftOpen);
   const mobileRightOpen = useWorkbenchStore((s) => s.mobileRightOpen);
   const errorBanner = useWorkbenchStore((s) => s.errorBanner);
+  const composerNotice = useWorkbenchStore((s) => s.composerNotice);
   const composer = useWorkbenchStore((s) => s.composer);
 
   const toggleTheme = useWorkbenchStore((s) => s.toggleTheme);
   const setToken = useWorkbenchStore((s) => s.setToken);
   const setAuthState = useWorkbenchStore((s) => s.setAuthState);
   const setStreamStatus = useWorkbenchStore((s) => s.setStreamStatus);
+  const setLeftTab = useWorkbenchStore((s) => s.setLeftTab);
+  const setCenterMode = useWorkbenchStore((s) => s.setCenterMode);
   const setActiveTab = useWorkbenchStore((s) => s.setActiveTab);
   const setThreadQuery = useWorkbenchStore((s) => s.setThreadQuery);
   const setOnboardingOpen = useWorkbenchStore((s) => s.setOnboardingOpen);
   const setKeysDialogOpen = useWorkbenchStore((s) => s.setKeysDialogOpen);
+  const setBrowserNotifyOpen = useWorkbenchStore((s) => s.setBrowserNotifyOpen);
   const setMobileLeftOpen = useWorkbenchStore((s) => s.setMobileLeftOpen);
   const setMobileRightOpen = useWorkbenchStore((s) => s.setMobileRightOpen);
   const setErrorBanner = useWorkbenchStore((s) => s.setErrorBanner);
+  const setComposerNotice = useWorkbenchStore((s) => s.setComposerNotice);
   const patchComposer = useWorkbenchStore((s) => s.patchComposer);
+
+  const nativeEvents = useNativeActivityStore((s) => s.events);
+  const openInteractionCount = useNativeActivityStore((s) => s.openInteractionCount);
+  const selectedNativeSessionKey = useNativeActivityStore((s) => s.selectedSessionKey);
+  const selectedNativeEventId = useNativeActivityStore((s) => s.selectedEventId);
+  const nativeViewMode = useNativeActivityStore((s) => s.viewMode);
+  const nativeFilterMode = useNativeActivityStore((s) => s.filterMode);
+  const nativeOnlySelectedNode = useNativeActivityStore((s) => s.onlySelectedNode);
+  const nativeSearchQuery = useNativeActivityStore((s) => s.searchQuery);
+  const deliveriesBySourceKey = useNativeActivityStore((s) => s.deliveriesBySourceKey);
+  const pushConfig = useNativeActivityStore((s) => s.pushConfig);
+  const pushSubscriptions = useNativeActivityStore((s) => s.subscriptions);
+
+  const hydrateNativeEvents = useNativeActivityStore((s) => s.hydrateNativeEvents);
+  const upsertNativeEvent = useNativeActivityStore((s) => s.upsertNativeEvent);
+  const applySessionAck = useNativeActivityStore((s) => s.applySessionAck);
+  const setDeliveries = useNativeActivityStore((s) => s.setDeliveries);
+  const upsertDelivery = useNativeActivityStore((s) => s.upsertDelivery);
+  const setPushConfig = useNativeActivityStore((s) => s.setPushConfig);
+  const setPushSubscriptions = useNativeActivityStore((s) => s.setSubscriptions);
+  const selectNativeSession = useNativeActivityStore((s) => s.selectSession);
+  const selectNativeEvent = useNativeActivityStore((s) => s.selectEvent);
+  const setNativeViewMode = useNativeActivityStore((s) => s.setViewMode);
+  const setNativeFilterMode = useNativeActivityStore((s) => s.setFilterMode);
+  const setNativeOnlySelectedNode = useNativeActivityStore((s) => s.setOnlySelectedNode);
+  const setNativeSearchQuery = useNativeActivityStore((s) => s.setSearchQuery);
+  const resetNativeActivity = useNativeActivityStore((s) => s.reset);
 
   const [submitting, setSubmitting] = useState(false);
   const [dragLabel, setDragLabel] = useState<string | null>(null);
   const [botKeys, setBotKeys] = useState<import("@/types").ApiKeyRecord[]>([]);
+  const [localEndpointShaPrefix, setLocalEndpointShaPrefix] = useState<string | null>(null);
+  const [inPageFallbackEnabled, setInPageFallbackEnabled] = useState<boolean>(() =>
+    readInPageFallbackPref()
+  );
+  const [acknowledgingIds, setAcknowledgingIds] = useState<Record<string, boolean>>({});
+  const [deliveriesLoading, setDeliveriesLoading] = useState(false);
+  const [redeliveringIds, setRedeliveringIds] = useState<Record<string, boolean>>({});
   const wsClientRef = useRef<HubStreamClient | null>(null);
   const hydrationGenRef = useRef<number>(0);
   const inFlightHydrationRef = useRef<Set<string>>(new Set());
   const completedHydrationRef = useRef<Set<string>>(new Set());
+  const localEndpointShaRef = useRef<string | null>(null);
+  const inPageFallbackRef = useRef<boolean>(inPageFallbackEnabled);
   const hasSession = authStatus === "authenticated" || Boolean(token);
+
+  useEffect(() => {
+    localEndpointShaRef.current = localEndpointShaPrefix;
+  }, [localEndpointShaPrefix]);
+
+  useEffect(() => {
+    inPageFallbackRef.current = inPageFallbackEnabled;
+  }, [inPageFallbackEnabled]);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
@@ -152,6 +244,7 @@ export function App() {
         const fleet = useFleetStore.getState();
         const task = useTaskStore.getState();
         const wb = useWorkbenchStore.getState();
+        const native = useNativeActivityStore.getState();
         return {
           nodes: fleet.nodes,
           threads: task.threads,
@@ -164,7 +257,17 @@ export function App() {
           streamStatus: wb.streamStatus,
           authStatus: wb.authStatus,
           authKind: wb.authKind,
-          authScope: wb.authScope
+          authScope: wb.authScope,
+          leftTab: wb.leftTab,
+          centerMode: wb.centerMode,
+          activeTab: wb.activeTab,
+          nativeEvents: native.events,
+          openInteractionCount: native.openInteractionCount,
+          selectedNativeSessionKey: native.selectedSessionKey,
+          selectedNativeEventId: native.selectedEventId,
+          deliveriesBySourceKey: native.deliveriesBySourceKey,
+          pushConfig: native.pushConfig,
+          pushSubscriptions: native.subscriptions
         };
       }
     };
@@ -209,6 +312,96 @@ export function App() {
     }
   }, [patchComposer, selectNode, selectRun, selectThread]);
 
+  const applyTargetUrlNavigation = useCallback(
+    (targetUrl: string) => {
+      try {
+        const url = new URL(targetUrl, window.location.origin);
+        const pane = url.searchParams.get("pane");
+        const session = url.searchParams.get("session");
+        const eventId = url.searchParams.get("event");
+        const runId = url.searchParams.get("run");
+        const threadId = url.searchParams.get("thread");
+        const scope = useWorkbenchStore.getState().authScope;
+
+        if (pane === "native" && scope === "admin") {
+          setLeftTab("native");
+          setCenterMode("native");
+          if (session) selectNativeSession(session);
+          if (eventId) {
+            selectNativeEvent(eventId);
+            const matchedEvent = useNativeActivityStore
+              .getState()
+              .events.find((ev) => ev.id === eventId);
+            if (matchedEvent) {
+              if (!session) {
+                selectNativeSession(getNativeSessionKey(matchedEvent));
+              }
+            } else {
+              void apiClient
+                .fetchNativeEventDetail(token, eventId)
+                .then((res) => {
+                  upsertNativeEvent(res.event);
+                  selectNativeSession(session || getNativeSessionKey(res.event));
+                  setDeliveries(
+                    getDeliverySourceKey("native_event", res.event.id),
+                    res.deliveries
+                  );
+                })
+                .catch(() => {});
+            }
+          }
+          setMobileLeftOpen(false);
+          return;
+        }
+
+        if (runId || threadId) {
+          setLeftTab("threads");
+          setCenterMode("controlled");
+          const curRuns = useTaskStore.getState().runs;
+          const targetRun = runId ? curRuns.find((r) => r.id === runId) : undefined;
+          const targetThreadId = threadId || targetRun?.thread_id;
+          if (targetThreadId) {
+            selectThread(targetThreadId);
+          }
+          if (runId) {
+            selectRun(runId);
+          }
+          setMobileLeftOpen(false);
+        }
+      } catch {
+        // ignore malformed target URLs
+      }
+    },
+    [
+      selectNativeEvent,
+      selectNativeSession,
+      selectRun,
+      selectThread,
+      setCenterMode,
+      setDeliveries,
+      setLeftTab,
+      setMobileLeftOpen,
+      token,
+      upsertNativeEvent
+    ]
+  );
+
+  useEffect(() => {
+    if (typeof navigator === "undefined" || !("serviceWorker" in navigator)) {
+      return;
+    }
+    const onSwMessage = (evt: MessageEvent) => {
+      const data = evt.data as { type?: string; target_url?: string } | null;
+      if (data?.type === "ahub:navigate" && typeof data.target_url === "string") {
+        applyTargetUrlNavigation(data.target_url);
+      }
+    };
+    navigator.serviceWorker.addEventListener("message", onSwMessage);
+    return () => {
+      navigator.serviceWorker.removeEventListener("message", onSwMessage);
+    };
+  }, [applyTargetUrlNavigation]);
+
   // Initial REST hydrate (supports Cloudflare Access same-origin cookie or Bearer token) + live WebSocket subscription
   useEffect(() => {
     let cancelled = false;
@@ -236,6 +429,36 @@ export function App() {
         setErrorBanner(null);
 
         if (meRes.principal.scope === "admin") {
+          initBrowserNotifyCoordinator();
+          void getCurrentDevicePushInfo().then((info) => {
+            if (!cancelled) {
+              setLocalEndpointShaPrefix(info?.endpointSha256Prefix ?? null);
+            }
+          });
+          void Promise.allSettled([
+            apiClient.fetchNativeEvents(token, { limit: 100 }),
+            apiClient.fetchPushConfig(token),
+            apiClient.fetchPushSubscriptions(token, false)
+          ]).then(([nativeRes, cfgRes, subsRes]) => {
+            if (cancelled) return;
+            if (nativeRes.status === "fulfilled") {
+              hydrateNativeEvents(nativeRes.value.events, nativeRes.value.open_interaction_count);
+            }
+            if (cfgRes.status === "fulfilled") {
+              setPushConfig({
+                enabled: cfgRes.value.enabled,
+                vapid_public_key: cfgRes.value.vapid_public_key,
+                ...(cfgRes.value.reason ? { reason: cfgRes.value.reason } : {})
+              });
+            }
+            if (subsRes.status === "fulfilled") {
+              setPushSubscriptions(subsRes.value.subscriptions);
+            }
+            if (window.location.search) {
+              applyTargetUrlNavigation(window.location.href);
+            }
+          });
+
           client = new HubStreamClient(token, {
             onStatusChange: (status) => {
               if (!cancelled) setStreamStatus(status);
@@ -247,13 +470,38 @@ export function App() {
                   setNodes(frame.nodes ?? []);
                   if (frame.threads) setThreads(frame.threads);
                   setRuns(frame.runs ?? []);
+                  hydrateNativeEvents(frame.native_events ?? [], frame.open_interaction_count);
                   syncDefaultSelection();
                   break;
                 case "node.status":
                   upsertNode(frame.node);
                   break;
-                case "run.updated":
+                case "run.updated": {
+                  const prevRun = useTaskStore.getState().runs.find((r) => r.id === frame.run.id);
                   upsertRun(frame.run);
+                  const filterKey = mapRunStatusToFilterKey(frame.run.status);
+                  if (
+                    filterKey &&
+                    prevRun?.status !== frame.run.status &&
+                    (frame.run.status === "needs_approval" || frame.run.status === "failed")
+                  ) {
+                    const nativeState = useNativeActivityStore.getState();
+                    void notifyInPageWithDedup({
+                      eventKey: `ahub-run-${frame.run.id}-${frame.run.status}`,
+                      title: `[${frame.run.node_id} · ${frame.run.agent}] ${
+                        frame.run.status === "needs_approval" ? "等待人工审批" : "任务执行失败"
+                      }`,
+                      body: frame.run.summary || frame.run.error_message || frame.run.id,
+                      targetUrl: `/?run=${encodeURIComponent(frame.run.id)}`,
+                      nodeId: frame.run.node_id,
+                      filterKey,
+                      pushConfig: nativeState.pushConfig,
+                      subscriptions: nativeState.subscriptions,
+                      localEndpointSha256Prefix: localEndpointShaRef.current,
+                      inPageEnabled: inPageFallbackRef.current,
+                      onNavigate: applyTargetUrlNavigation
+                    });
+                  }
                   if (!useTaskStore.getState().threads.some((t) => t.id === frame.run.thread_id)) {
                     void apiClient
                       .fetchThreads(token)
@@ -263,6 +511,7 @@ export function App() {
                       .catch(() => {});
                   }
                   break;
+                }
                 case "run.event":
                   appendEvents(frame.run_id, [
                     {
@@ -276,12 +525,48 @@ export function App() {
                 case "run.events":
                   appendEvents(frame.run_id, frame.events);
                   break;
+                case "native_event.upserted": {
+                  const prevEv = useNativeActivityStore
+                    .getState()
+                    .events.find((e) => e.id === frame.event.id);
+                  upsertNativeEvent(frame.event, frame.open_interaction_count);
+                  const isNewEvent = !prevEv;
+                  if (isNewEvent && frame.event.event_kind === "interaction_needed") {
+                    const nativeState = useNativeActivityStore.getState();
+                    const sKey = getNativeSessionKey(frame.event);
+                    void notifyInPageWithDedup({
+                      eventKey: `ahub-native-${frame.event.id}`,
+                      title: `[${frame.event.node_id} · ${frame.event.agent}] ${
+                        frame.event.title || "需要终端互动确认"
+                      }`,
+                      body: frame.event.summary || frame.event.workdir,
+                      targetUrl: `/?pane=native&session=${encodeURIComponent(sKey)}&event=${encodeURIComponent(frame.event.id)}`,
+                      nodeId: frame.event.node_id,
+                      filterKey: mapNativeKindToFilterKey(frame.event.event_kind),
+                      pushConfig: nativeState.pushConfig,
+                      subscriptions: nativeState.subscriptions,
+                      localEndpointSha256Prefix: localEndpointShaRef.current,
+                      inPageEnabled: inPageFallbackRef.current,
+                      onNavigate: applyTargetUrlNavigation
+                    });
+                  }
+                  break;
+                }
+                case "delivery.updated":
+                  upsertDelivery(frame.delivery);
+                  break;
               }
             }
           });
           wsClientRef.current = client;
           client.start();
         } else {
+          resetNativeActivity();
+          setLeftTab("threads");
+          setCenterMode("controlled");
+          if (useWorkbenchStore.getState().activeTab === "deliveries") {
+            setActiveTab("events");
+          }
           setStreamStatus("disconnected");
         }
       } catch (err) {
@@ -317,13 +602,23 @@ export function App() {
   }, [
     token,
     appendEvents,
+    applyTargetUrlNavigation,
+    hydrateNativeEvents,
+    resetNativeActivity,
+    setActiveTab,
     setAuthState,
+    setCenterMode,
     setErrorBanner,
+    setLeftTab,
     setNodes,
+    setPushConfig,
+    setPushSubscriptions,
     setRuns,
     setStreamStatus,
     setThreads,
     syncDefaultSelection,
+    upsertDelivery,
+    upsertNativeEvent,
     upsertNode,
     upsertRun
   ]);
@@ -434,6 +729,113 @@ export function App() {
     [eventsByRunId, selectedRun]
   );
 
+  const selectedNativeSessionEvents = useMemo(() => {
+    if (nativeViewMode === "timeline") {
+      if (selectedNativeEventId) {
+        const target = nativeEvents.find((e) => e.id === selectedNativeEventId);
+        if (target) {
+          const sKey = getNativeSessionKey(target);
+          return nativeEvents.filter((e) => getNativeSessionKey(e) === sKey);
+        }
+      }
+      return nativeEvents;
+    }
+    if (!selectedNativeSessionKey) {
+      return [];
+    }
+    return nativeEvents.filter((e) => getNativeSessionKey(e) === selectedNativeSessionKey);
+  }, [nativeEvents, nativeViewMode, selectedNativeEventId, selectedNativeSessionKey]);
+
+  const activeNativeEvent = useMemo(() => {
+    if (selectedNativeEventId) {
+      const found = nativeEvents.find((e) => e.id === selectedNativeEventId);
+      if (found) return found;
+    }
+    return selectedNativeSessionEvents[0] ?? null;
+  }, [nativeEvents, selectedNativeEventId, selectedNativeSessionEvents]);
+
+  const deliveryTarget = useMemo(() => {
+    if (authScope !== "admin") return null;
+    if (centerMode === "native" && activeNativeEvent) {
+      return { kind: "native_event" as const, event: activeNativeEvent };
+    }
+    if (selectedRun) {
+      return { kind: "run" as const, run: selectedRun };
+    }
+    return null;
+  }, [activeNativeEvent, authScope, centerMode, selectedRun]);
+
+  const activeDeliveries = useMemo(() => {
+    if (!deliveryTarget) return [];
+    const key =
+      deliveryTarget.kind === "native_event"
+        ? getDeliverySourceKey("native_event", deliveryTarget.event.id)
+        : getDeliverySourceKey("run", deliveryTarget.run.id);
+    return deliveriesBySourceKey[key] ?? [];
+  }, [deliveriesBySourceKey, deliveryTarget]);
+
+  const deliveryTargetKind: DeliverySourceKind | null = deliveryTarget?.kind ?? null;
+  const deliveryTargetId: string | null =
+    deliveryTarget?.kind === "native_event"
+      ? deliveryTarget.event.id
+      : deliveryTarget?.kind === "run"
+        ? deliveryTarget.run.id
+        : null;
+
+  useEffect(() => {
+    if (
+      !hasSession ||
+      authStatus !== "authenticated" ||
+      authScope !== "admin" ||
+      activeTab !== "deliveries" ||
+      !deliveryTargetKind ||
+      !deliveryTargetId
+    ) {
+      return;
+    }
+    let cancelled = false;
+    setDeliveriesLoading(true);
+    if (deliveryTargetKind === "native_event") {
+      const evId = deliveryTargetId;
+      void apiClient
+        .fetchNativeEventDetail(token, evId)
+        .then((res) => {
+          if (cancelled) return;
+          upsertNativeEvent(res.event);
+          setDeliveries(getDeliverySourceKey("native_event", evId), res.deliveries);
+        })
+        .catch(() => {})
+        .finally(() => {
+          if (!cancelled) setDeliveriesLoading(false);
+        });
+    } else {
+      const runId = deliveryTargetId;
+      void apiClient
+        .fetchRunDeliveries(token, runId)
+        .then((res) => {
+          if (cancelled) return;
+          setDeliveries(getDeliverySourceKey("run", runId), res.deliveries);
+        })
+        .catch(() => {})
+        .finally(() => {
+          if (!cancelled) setDeliveriesLoading(false);
+        });
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    activeTab,
+    authScope,
+    authStatus,
+    deliveryTargetId,
+    deliveryTargetKind,
+    hasSession,
+    setDeliveries,
+    token,
+    upsertNativeEvent
+  ]);
+
   const hasLineage = useMemo(() => {
     if (!selectedRun) return false;
     if (selectedRun.depth > 0) return true;
@@ -458,6 +860,8 @@ export function App() {
     if (!thread) return;
     selectThread(thread.id);
     selectNode(thread.node_id);
+    setCenterMode("controlled");
+    setComposerNotice(null);
     const sameBinding =
       thread.node_id === composer.nodeId && thread.agent === composer.agent;
     patchComposer({
@@ -474,6 +878,8 @@ export function App() {
 
   function handlePickWorkspace(nodeId: string, workdir: string) {
     selectNode(nodeId);
+    setCenterMode("controlled");
+    setComposerNotice(null);
     const sameNode = nodeId === composer.nodeId;
     patchComposer({
       mode: "new",
@@ -490,6 +896,9 @@ export function App() {
 
   function handleNewThread() {
     selectThread(null);
+    setLeftTab("threads");
+    setCenterMode("controlled");
+    setComposerNotice(null);
     const targetNode =
       nodes.find((n) => n.id === (composer.nodeId || selectedNodeId)) ?? nodes[0];
     patchComposer({
@@ -498,6 +907,144 @@ export function App() {
       workdir: composer.workdir || targetNode?.workspaces?.[0]?.path || ""
     });
     setMobileLeftOpen(false);
+    window.requestAnimationFrame(() => {
+      document.getElementById("prompt-input")?.focus();
+    });
+  }
+
+  function handleLeftTabChange(nextTab: LeftRailTab) {
+    setLeftTab(nextTab);
+    if (nextTab === "native" && authScope === "admin") {
+      setCenterMode("native");
+    } else if (nextTab === "threads") {
+      setCenterMode("controlled");
+    }
+  }
+
+  function handleSelectNativeSession(sessionKey: string) {
+    selectNativeSession(sessionKey);
+    const match = nativeEvents.find((ev) => getNativeSessionKey(ev) === sessionKey);
+    if (match) {
+      selectNativeEvent(match.id);
+      selectNode(match.node_id);
+    }
+    setLeftTab("native");
+    setCenterMode("native");
+    setMobileLeftOpen(false);
+  }
+
+  function handleSelectNativeEvent(eventId: string) {
+    selectNativeEvent(eventId);
+    const match = nativeEvents.find((ev) => ev.id === eventId);
+    if (match) {
+      selectNativeSession(getNativeSessionKey(match));
+      selectNode(match.node_id);
+    }
+    setLeftTab("native");
+    setCenterMode("native");
+    setMobileLeftOpen(false);
+  }
+
+  async function handleAckNativeEvent(eventId: string, scope: "single" | "session") {
+    if (!hasSession || authScope !== "admin") return;
+    setAcknowledgingIds((prev) => ({ ...prev, [eventId]: true }));
+    try {
+      const res = await apiClient.ackNativeEvent(token, eventId, scope);
+      applySessionAck(res.event, scope, res.open_interaction_count);
+    } catch (err) {
+      setErrorBanner(err instanceof ApiClientError ? err.message : "确认原生活动失败");
+    } finally {
+      setAcknowledgingIds((prev) => {
+        const next = { ...prev };
+        delete next[eventId];
+        return next;
+      });
+    }
+  }
+
+  function handleOpenNativeDeliveries(eventId: string) {
+    selectNativeEvent(eventId);
+    setCenterMode("native");
+    setActiveTab("deliveries");
+    if (!isDesktop) {
+      setMobileRightOpen(true);
+    }
+  }
+
+  async function handleRedeliverChannel(
+    sourceKind: DeliverySourceKind,
+    sourceId: string,
+    deliveryId?: string
+  ) {
+    if (!hasSession || authScope !== "admin") return;
+    const busyKey = deliveryId || sourceId;
+    setRedeliveringIds((prev) => ({ ...prev, [busyKey]: true }));
+    try {
+      if (sourceKind === "native_event") {
+        const res = await apiClient.redeliverNativeEvent(token, sourceId, deliveryId);
+        upsertNativeEvent(res.event);
+        setDeliveries(getDeliverySourceKey("native_event", sourceId), res.deliveries);
+      } else {
+        const res = await apiClient.redeliverRun(token, sourceId, deliveryId);
+        upsertRun(res.run);
+        setDeliveries(getDeliverySourceKey("run", sourceId), res.deliveries);
+      }
+    } catch (err) {
+      setErrorBanner(err instanceof ApiClientError ? err.message : "重推通知失败");
+    } finally {
+      setRedeliveringIds((prev) => {
+        const next = { ...prev };
+        delete next[busyKey];
+        return next;
+      });
+    }
+  }
+
+  function handleCreateControlledRunFromNative(
+    anchorEvent: NativeEventView,
+    sessionEvents: NativeEventView[]
+  ) {
+    const targetNode = nodes.find((n) => n.id === anchorEvent.node_id) ?? null;
+    const available = getAvailableAgents(targetNode);
+    const isGrok = anchorEvent.agent === "grok";
+    const nextAgent: import("@/types").AgentName =
+      anchorEvent.agent !== "grok" && available.includes(anchorEvent.agent)
+        ? anchorEvent.agent
+        : (available[0] ?? "agy");
+    const { model, effort } = resolveInitialComposerModelAndEffort(targetNode, nextAgent);
+    const latestWithSummary =
+      [...sessionEvents].reverse().find((ev) => ev.summary.trim() || ev.title.trim()) ??
+      anchorEvent;
+    const summaryBlock = [latestWithSummary.title, latestWithSummary.summary]
+      .filter((s) => Boolean(s && s.trim()))
+      .join("\n\n")
+      .slice(0, 1200);
+    const prefilledPrompt = [
+      `请基于以下本机原生会话摘要继续处理（来源：${anchorEvent.node_id} · ${anchorEvent.agent}${anchorEvent.workdir ? ` · ${anchorEvent.workdir}` : ""}）：`,
+      "",
+      summaryBlock
+    ]
+      .join("\n")
+      .trim();
+
+    selectThread(null);
+    selectNode(anchorEvent.node_id);
+    setLeftTab("threads");
+    setCenterMode("controlled");
+    patchComposer({
+      mode: "new",
+      nodeId: anchorEvent.node_id,
+      workdir: anchorEvent.workdir || targetNode?.workspaces?.[0]?.path || "",
+      agent: nextAgent,
+      model,
+      effort,
+      prompt: prefilledPrompt
+    });
+    setComposerNotice(
+      isGrok ? "`grok` 暂不支持无头受控执行，已自动切换为该节点可用的受控 Agent。" : null
+    );
+    setMobileLeftOpen(false);
+    setMobileRightOpen(false);
     window.requestAnimationFrame(() => {
       document.getElementById("prompt-input")?.focus();
     });
@@ -787,6 +1334,23 @@ export function App() {
     activeWorkdir: composer.workdir,
     activeTargetNodeId: composer.nodeId,
     threadQuery,
+    canViewNative: authScope === "admin",
+    leftTab,
+    onLeftTabChange: handleLeftTabChange,
+    nativeEvents,
+    openInteractionCount,
+    selectedNativeSessionKey,
+    selectedNativeEventId,
+    nativeViewMode,
+    nativeFilterMode,
+    nativeOnlySelectedNode,
+    nativeSearchQuery,
+    onSelectNativeSession: handleSelectNativeSession,
+    onSelectNativeEvent: handleSelectNativeEvent,
+    onNativeViewModeChange: setNativeViewMode,
+    onNativeFilterModeChange: setNativeFilterMode,
+    onNativeOnlySelectedNodeChange: setNativeOnlySelectedNode,
+    onNativeSearchQueryChange: setNativeSearchQuery,
     onThreadQueryChange: setThreadQuery,
     onSelectNode: selectNode,
     onPickWorkspace: handlePickWorkspace,
@@ -804,6 +1368,12 @@ export function App() {
     selectedNode: selectedNodeForInspector,
     botKeys,
     events: selectedRunEvents,
+    canViewDeliveries: authScope === "admin",
+    deliveryTarget,
+    deliveries: activeDeliveries,
+    deliveriesLoading,
+    redeliveringIds,
+    onRedeliverChannel: authScope === "admin" ? handleRedeliverChannel : undefined,
     onSelectRun: selectRun,
     onCancelRun: handleCancelRun,
     onToggleNodeDrain: handleToggleNodeDrain,
@@ -812,30 +1382,46 @@ export function App() {
     onPickWorkspace: handlePickWorkspace
   };
 
-  const conversationElement = (
-    <ConversationPane
-      nodes={nodes}
-      selectedThread={selectedThread}
-      threadRuns={threadRuns}
-      selectedRunId={selectedRun?.id ?? null}
-      hasLineage={hasLineage}
-      fullOutputByRunId={fullOutputByRunId}
-      eventsByRunId={eventsByRunId}
-      composer={composer}
-      submitting={submitting}
-      onPatchComposer={patchComposer}
-      onSelectRun={selectRun}
-      onLoadFullOutput={handleLoadFullOutput}
-      onCancelRun={handleCancelRun}
-      onResolveRun={handleResolveRun}
-      onForkThread={handleForkThread}
-      onOpenLineage={() => {
-        setActiveTab("lineage");
-        if (!isDesktop) setMobileRightOpen(true);
-      }}
-      onSubmitPrompt={handleSubmitPrompt}
-    />
-  );
+  const conversationElement =
+    authScope === "admin" && centerMode === "native" ? (
+      <NativeActivityPane
+        events={selectedNativeSessionEvents}
+        selectedEventId={activeNativeEvent?.id ?? null}
+        hasActiveFilter={Boolean(
+          nativeSearchQuery.trim() || nativeFilterMode !== "all" || nativeOnlySelectedNode
+        )}
+        acknowledgingIds={acknowledgingIds}
+        onSelectEvent={selectNativeEvent}
+        onAckEvent={handleAckNativeEvent}
+        onOpenDeliveries={handleOpenNativeDeliveries}
+        onCreateControlledRun={handleCreateControlledRunFromNative}
+      />
+    ) : (
+      <ConversationPane
+        nodes={nodes}
+        selectedThread={selectedThread}
+        threadRuns={threadRuns}
+        selectedRunId={selectedRun?.id ?? null}
+        hasLineage={hasLineage}
+        fullOutputByRunId={fullOutputByRunId}
+        eventsByRunId={eventsByRunId}
+        composer={composer}
+        composerNotice={composerNotice}
+        submitting={submitting}
+        onPatchComposer={patchComposer}
+        onDismissComposerNotice={() => setComposerNotice(null)}
+        onSelectRun={selectRun}
+        onLoadFullOutput={handleLoadFullOutput}
+        onCancelRun={handleCancelRun}
+        onResolveRun={handleResolveRun}
+        onForkThread={handleForkThread}
+        onOpenLineage={() => {
+          setActiveTab("lineage");
+          if (!isDesktop) setMobileRightOpen(true);
+        }}
+        onSubmitPrompt={handleSubmitPrompt}
+      />
+    );
 
   return (
     <DndContext
@@ -846,23 +1432,31 @@ export function App() {
     >
       <div className="relative flex h-dvh w-full flex-col overflow-hidden bg-background text-foreground">
         {/* Global slim header bar */}
-        <header className="flex h-12 shrink-0 items-center justify-between gap-2 border-b border-border bg-card px-2 sm:px-3">
-          <div className="flex min-w-0 items-center gap-1.5 sm:gap-2">
+        <header className="flex h-12 shrink-0 items-center justify-between gap-1.5 border-b border-border bg-card px-1.5 sm:gap-2 sm:px-3">
+          <div className="flex min-w-0 items-center gap-1 sm:gap-2">
             <Button
               type="button"
               variant="ghost"
               size="icon"
               onClick={() => setMobileLeftOpen(true)}
-              className="h-11 w-11 md:hidden"
+              className="relative h-11 w-11 shrink-0 md:hidden"
               aria-label="打开节点与会话列表"
               data-testid="mobile-left-trigger"
             >
               <PanelLeft className="h-4 w-4" strokeWidth={1.75} aria-hidden="true" />
+              {authScope === "admin" && openInteractionCount > 0 ? (
+                <span
+                  aria-hidden="true"
+                  className="absolute right-1 top-1 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-[var(--status-approval)] px-1 text-[10px] font-semibold text-black tabular-nums"
+                >
+                  {openInteractionCount}
+                </span>
+              ) : null}
             </Button>
 
-            <div className="flex items-center gap-2 px-1">
-              <span className="h-2 w-2 rounded-full bg-[var(--status-running)]" aria-hidden="true" />
-              <h1 className="truncate font-mono text-sm font-semibold tracking-tight">
+            <div className="flex min-w-0 items-center gap-1.5 px-0.5 sm:px-1">
+              <span className="h-2 w-2 shrink-0 rounded-full bg-[var(--status-running)]" aria-hidden="true" />
+              <h1 className="truncate font-mono text-xs sm:text-sm font-semibold tracking-tight">
                 agent-hub
               </h1>
             </div>
@@ -913,12 +1507,46 @@ export function App() {
             </div>
           </div>
 
-          <div className="flex shrink-0 items-center gap-1 sm:gap-1.5">
+          <div className="flex shrink-0 items-center gap-0.5 sm:gap-1.5">
+            {authScope === "admin" ? (
+              <>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => {
+                    setLeftTab("native");
+                    setNativeFilterMode("unacked");
+                    setCenterMode("native");
+                  }}
+                  data-testid="open-interactions-pill"
+                  className={cn(
+                    "hidden sm:inline-flex min-h-11 min-w-11 px-2.5 md:min-h-8 md:h-8 md:px-2.5 font-mono text-[11px] tabular-nums",
+                    openInteractionCount > 0 &&
+                      "border-[var(--status-approval)]/60 bg-[var(--status-approval)]/12 text-[var(--status-approval)] hover:bg-[var(--status-approval)]/20"
+                  )}
+                >
+                  互动 {openInteractionCount}
+                </Button>
+
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => setBrowserNotifyOpen(true)}
+                  className="h-11 w-11 p-0 sm:w-auto sm:min-h-11 sm:min-w-11 sm:px-2.5 md:min-h-8 md:h-8 md:px-2.5"
+                  aria-label="通知渠道"
+                  data-testid="open-browser-notify-btn"
+                >
+                  <Bell className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
+                  <span className="hidden md:inline">通知渠道</span>
+                </Button>
+              </>
+            ) : null}
+
             <Button
               type="button"
               variant="outline"
               onClick={() => setOnboardingOpen(true)}
-              className="min-h-11 min-w-11 px-2.5 md:min-h-8 md:h-8 md:px-2.5"
+              className="h-11 w-11 p-0 sm:w-auto sm:min-h-11 sm:min-w-11 sm:px-2.5 md:min-h-8 md:h-8 md:px-2.5"
               aria-label="接入节点"
               data-testid="open-onboarding-btn"
             >
@@ -930,7 +1558,7 @@ export function App() {
               type="button"
               variant="outline"
               onClick={() => setKeysDialogOpen(true)}
-              className="min-h-11 min-w-11 px-2.5 md:min-h-8 md:h-8 md:px-2.5"
+              className="h-11 w-11 p-0 sm:w-auto sm:min-h-11 sm:min-w-11 sm:px-2.5 md:min-h-8 md:h-8 md:px-2.5"
               aria-label="API Keys"
               data-testid="open-keys-btn"
             >
@@ -943,7 +1571,7 @@ export function App() {
               variant="ghost"
               size="icon"
               onClick={toggleTheme}
-              className="h-11 w-11 md:h-8 md:w-8"
+              className="h-11 w-11 shrink-0 md:h-8 md:w-8"
               aria-label={theme === "dark" ? "切换浅色主题" : "切换深色主题"}
               data-testid="theme-toggle-btn"
             >
@@ -959,7 +1587,7 @@ export function App() {
               variant="ghost"
               size="icon"
               onClick={() => setMobileRightOpen(true)}
-              className="h-11 w-11 md:hidden"
+              className="h-11 w-11 shrink-0 md:hidden"
               aria-label="打开检视面板"
               data-testid="mobile-right-trigger"
             >
@@ -1048,6 +1676,28 @@ export function App() {
           authenticated={authStatus === "authenticated"}
           authKind={authKind}
         />
+
+        {authScope === "admin" ? (
+          <BrowserNotifyDialog
+            open={browserNotifyOpen}
+            onOpenChange={setBrowserNotifyOpen}
+            token={token}
+            nodes={nodes}
+            pushConfig={pushConfig}
+            subscriptions={pushSubscriptions}
+            localEndpointSha256Prefix={localEndpointShaPrefix}
+            inPageFallbackEnabled={inPageFallbackEnabled}
+            onToggleInPageFallback={(enabled) => {
+              writeInPageFallbackPref(enabled);
+              setInPageFallbackEnabled(enabled);
+            }}
+            onSubscriptionsChange={setPushSubscriptions}
+            onLocalEndpointChange={(prefix) => {
+              localEndpointShaRef.current = prefix;
+              setLocalEndpointShaPrefix(prefix);
+            }}
+          />
+        ) : null}
       </div>
 
       <DragOverlay dropAnimation={null}>

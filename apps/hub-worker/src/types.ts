@@ -22,9 +22,29 @@ export type RunEventKind =
 export type NotifyTarget = "none" | "grok" | "webhook";
 export type NotifyEvent = "done" | "failed" | "cancelled" | "needs_approval";
 export type NotifyStatus = "none" | "queued" | "sent" | "failed";
-export type NativeEventKind = "interaction_needed" | "turn_summary";
-export type NativeEventNotifyStatus = "none" | "queued" | "sent" | "failed" | "skipped";
-export type NotifyRouteMode = "key" | "node_default" | "global_legacy";
+export type NativeEventKind = "interaction_needed" | "turn_summary" | "progress";
+export type NativeEventNotifyStatus = "none" | "queued" | "sent" | "partial" | "failed" | "skipped";
+export type NotifyRouteMode = "key" | "node_default" | "web_push" | "global_legacy";
+export type AttentionState = "open" | "acked" | "superseded" | "stale";
+export type DeliverySourceKind = "run" | "native_event";
+export type DeliveryChannelKind = "bot_webhook" | "web_push" | "legacy_webhook";
+export type DeliveryStatus = "queued" | "sent" | "failed" | "skipped";
+export type DeliveryTriggerEvent =
+  | "needs_approval"
+  | "done"
+  | "failed"
+  | "cancelled"
+  | "interaction_needed"
+  | "turn_summary"
+  | "progress";
+export type PushEventFilterKey =
+  | "run_needs_approval"
+  | "run_failed"
+  | "run_done"
+  | "run_cancelled"
+  | "native_interaction_needed"
+  | "native_turn_summary"
+  | "native_progress";
 
 export type ErrorCode =
   | "UNAUTHORIZED"
@@ -87,6 +107,65 @@ export interface NodeRecord {
   updated_at: string;
 }
 
+export interface DeliveriesSummary {
+  total: number;
+  sent: number;
+  queued: number;
+  failed: number;
+}
+
+export interface NotificationDeliveryRecord {
+  id: string;
+  source_kind: DeliverySourceKind;
+  source_id: string;
+  trigger_event: DeliveryTriggerEvent;
+  node_id: string;
+  channel_kind: DeliveryChannelKind;
+  channel_id: string;
+  channel_label: string;
+  target_host: string;
+  route_mode: NotifyRouteMode;
+  status: DeliveryStatus;
+  attempts: number;
+  http_status: number | null;
+  error_code: string;
+  error_message: string;
+  sent_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface WebPushSubscriptionRecord {
+  id: string;
+  label: string;
+  endpoint_host: string;
+  endpoint_sha256_prefix: string;
+  node_filter: string[];
+  event_filter: PushEventFilterKey[];
+  enabled: boolean;
+  failure_count: number;
+  last_sent_at: string | null;
+  last_error_code: string;
+  last_error_message: string;
+  revoked_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface WebPushSubscriptionSecret {
+  endpoint: string;
+  keys: {
+    p256dh: string;
+    auth: string;
+  };
+}
+
+export interface PushConfigRecord {
+  enabled: boolean;
+  vapid_public_key: string | null;
+  reason?: "VAPID_NOT_CONFIGURED";
+}
+
 export interface NativeEventRecord {
   id: string;
   node_id: string;
@@ -101,9 +180,14 @@ export interface NativeEventRecord {
   notify_key_id: string | null;
   notify_status: NativeEventNotifyStatus;
   notify_error: string;
+  ack_at: string | null;
+  attention_state: AttentionState | null;
+  deliveries_summary?: DeliveriesSummary;
   created_at: string;
   updated_at: string;
 }
+
+export type NativeEventView = NativeEventRecord;
 
 export interface ThreadRecord {
   id: string;
@@ -151,6 +235,7 @@ export interface RunRecord {
   error_code: string;
   error_message: string;
   notify_status: NotifyStatus;
+  deliveries_summary?: DeliveriesSummary;
   lease_expires_at: string | null;
   started_at: string | null;
   finished_at: string | null;
@@ -220,7 +305,15 @@ export interface NativeEventNotifyQueueMessage {
   attempt: number;
 }
 
-export type NotifyQueueMessage = RunNotifyQueueMessage | NativeEventNotifyQueueMessage;
+export interface DeliveryNotifyQueueMessage {
+  kind: "delivery";
+  delivery_id: string;
+}
+
+export type NotifyQueueMessage =
+  | DeliveryNotifyQueueMessage
+  | RunNotifyQueueMessage
+  | NativeEventNotifyQueueMessage;
 
 export interface Env {
   ASSETS?: Fetcher;
@@ -239,6 +332,11 @@ export interface Env {
   WEBHOOK_KEY?: string;
   WEBHOOK_ENCRYPTION_KEY?: string;
   RELEASE_BASE_URL?: string;
+  VAPID_PUBLIC_KEY?: string;
+  VAPID_PRIVATE_JWK?: string;
+  VAPID_SUBJECT?: string;
+  NATIVE_EVENTS_RETENTION_DAYS?: string;
+  ALLOW_LOOPBACK_PUSH_FOR_TEST?: string;
 }
 
 export interface NodeHelloFrame {

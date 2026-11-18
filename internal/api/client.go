@@ -160,6 +160,49 @@ func (c *Client) EmitNativeEvent(ctx context.Context, nodeID string, req NativeE
 	return &res, nil
 }
 
+func (c *Client) ListNativeEvents(ctx context.Context, opts ListNativeEventsOptions) (*ListNativeEventsResponse, error) {
+	q := url.Values{}
+	if opts.NodeID != "" {
+		q.Set("node_id", opts.NodeID)
+	}
+	if opts.Agent != "" {
+		q.Set("agent", opts.Agent)
+	}
+	if opts.EventKind != "" {
+		q.Set("event_kind", opts.EventKind)
+	}
+	if opts.NotifyStatus != "" {
+		q.Set("notify_status", opts.NotifyStatus)
+	}
+	if opts.UnackedOnly {
+		q.Set("unacked_only", "true")
+	}
+	if opts.Query != "" {
+		q.Set("q", opts.Query)
+	}
+	if opts.Limit > 0 {
+		q.Set("limit", strconv.Itoa(opts.Limit))
+	}
+	if opts.BeforeTS != "" {
+		q.Set("before_ts", opts.BeforeTS)
+	}
+	if opts.BeforeID != "" {
+		q.Set("before_id", opts.BeforeID)
+	}
+	path := "/api/v1/native-events"
+	if encoded := q.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	var res ListNativeEventsResponse
+	if _, err := c.doJSON(ctx, http.MethodGet, path, nil, &res, nil); err != nil {
+		return nil, err
+	}
+	if res.Events == nil {
+		res.Events = []NativeEventRecord{}
+	}
+	return &res, nil
+}
+
 func (c *Client) ListRuns(ctx context.Context, nodeID, status string, limit int) ([]RunRecord, error) {
 	q := url.Values{}
 	if nodeID != "" {

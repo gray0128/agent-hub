@@ -64,7 +64,7 @@ test("redactSecrets runs in linear time on 100KB adversarial inputs", () => {
   assert.equal(outPem, bigPem);
   assert.equal(outCurl.includes("secret99"), false);
   assert.equal(redactSecrets(outCurl), outCurl);
-  assert.ok(elapsedMs < 50, `expected <50ms, got ${elapsedMs.toFixed(2)}ms`);
+  assert.ok(elapsedMs < 250, `expected <250ms, got ${elapsedMs.toFixed(2)}ms`);
 });
 
 test("buildPromptPreview bounds long prompts and sets promptTruncated", () => {

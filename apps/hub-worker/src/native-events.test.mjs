@@ -23,9 +23,23 @@ registerHooks({
   }
 });
 
-const { createNativeEvent, enqueueRunNotificationIfNeeded, listNodes, patchNode } = await import("./db.ts");
+const {
+  computeAggregateNotifyStatus,
+  computeAttentionState,
+  createNativeEvent,
+  enqueueRunNotificationIfNeeded,
+  getRunById,
+  listNodes,
+  listRuns,
+  patchNode
+} = await import("./db.ts");
 
-function createControlPlaneMockDb({ nodes = [], keys = [] } = {}) {
+function createControlPlaneMockDb({
+  nodes = [],
+  keys = [],
+  webPushSubscriptions = [],
+  runs: initialRuns = []
+} = {}) {
   const nodeMap = new Map(
     nodes.map((n) => [
       n.id,
@@ -61,7 +75,22 @@ function createControlPlaneMockDb({ nodes = [], keys = [] } = {}) {
     ])
   );
   const nativeEvents = new Map();
-  const runs = new Map();
+  const runs = new Map(initialRuns.map((r) => [r.id, { ...r }]));
+  const webPushMap = new Map(
+    webPushSubscriptions.map((s) => [
+      s.id,
+      {
+        endpoint_host: "fcm.googleapis.com",
+        node_filter_json: "[]",
+        event_filter_json: '["run_needs_approval","run_failed","native_interaction_needed"]',
+        enabled: 1,
+        revoked_at: null,
+        created_at: "2026-11-18T00:00:00.000Z",
+        ...s
+      }
+    ])
+  );
+  const notificationDeliveries = new Map();
 
   function attachJoinedNode(n) {
     const k = n.default_notify_key_id ? keyMap.get(n.default_notify_key_id) ?? null : null;
@@ -81,6 +110,8 @@ function createControlPlaneMockDb({ nodes = [], keys = [] } = {}) {
     keyMap,
     nativeEvents,
     runs,
+    webPushMap,
+    notificationDeliveries,
     prepare(sql) {
       let args = [];
       const stmt = {
@@ -108,11 +139,73 @@ function createControlPlaneMockDb({ nodes = [], keys = [] } = {}) {
           if (sql.includes("FROM native_events WHERE id = ?1")) {
             return nativeEvents.get(args[0]) ?? null;
           }
+          if (sql.includes("SELECT 1 AS hit") && sql.includes("FROM native_events")) {
+            const [nodeId, agent, sessionId, createdAt, id] = args;
+            for (const ev of nativeEvents.values()) {
+              if (
+                ev.node_id === nodeId &&
+                ev.agent === agent &&
+                ev.native_session_id === sessionId &&
+                (ev.created_at > createdAt || (ev.created_at === createdAt && ev.id > id))
+              ) {
+                return { hit: 1 };
+              }
+            }
+            return null;
+          }
+          if (sql.includes("SELECT notify_status FROM runs WHERE id = ?1")) {
+            const r = runs.get(args[0]);
+            return r ? { notify_status: r.notify_status ?? "none" } : null;
+          }
+          if (sql.includes("SELECT * FROM runs WHERE id = ?1")) {
+            return runs.get(args[0]) ?? null;
+          }
           return null;
         },
         async all() {
           if (sql.includes("FROM nodes n")) {
             return { results: Array.from(nodeMap.values()).map(attachJoinedNode) };
+          }
+          if (sql.includes("FROM web_push_subscriptions")) {
+            return {
+              results: Array.from(webPushMap.values()).filter(
+                (s) => s.enabled === 1 && s.revoked_at === null
+              )
+            };
+          }
+          if (sql.includes("FROM notification_deliveries") && sql.includes("GROUP BY source_id")) {
+            const sourceKind = args[0];
+            const idSet = new Set(args.slice(1));
+            const grouped = new Map();
+            for (const d of notificationDeliveries.values()) {
+              if (d.source_kind !== sourceKind || !idSet.has(d.source_id)) continue;
+              const cur = grouped.get(d.source_id) ?? {
+                source_id: d.source_id,
+                total: 0,
+                sent: 0,
+                queued: 0,
+                failed: 0
+              };
+              cur.total += 1;
+              if (d.status === "sent") cur.sent += 1;
+              else if (d.status === "queued") cur.queued += 1;
+              else if (d.status === "failed") cur.failed += 1;
+              grouped.set(d.source_id, cur);
+            }
+            return { results: Array.from(grouped.values()) };
+          }
+          if (
+            sql.includes("FROM notification_deliveries") &&
+            sql.includes("WHERE source_kind = ?1 AND source_id = ?2")
+          ) {
+            return {
+              results: Array.from(notificationDeliveries.values()).filter(
+                (d) => d.source_kind === args[0] && d.source_id === args[1]
+              )
+            };
+          }
+          if (sql.includes("FROM runs")) {
+            return { results: Array.from(runs.values()) };
           }
           return { results: [] };
         },
@@ -148,15 +241,83 @@ function createControlPlaneMockDb({ nodes = [], keys = [] } = {}) {
               notify_key_id: args[10],
               notify_status: args[11],
               notify_error: args[12],
+              ack_at: null,
               created_at: args[13],
               updated_at: args[13]
             };
             nativeEvents.set(row.id, row);
             return { success: true, meta: { changes: 1 } };
           }
-          if (sql.includes("UPDATE runs SET notify_status =")) {
-            const status = sql.includes("'queued'") ? "queued" : "failed";
-            runs.set(args[1], { id: args[1], notify_status: status });
+          if (sql.includes("INSERT OR IGNORE INTO notification_deliveries")) {
+            const isRun = sql.includes("'run'");
+            const sourceKind = isRun ? "run" : "native_event";
+            const [
+              id,
+              sourceId,
+              triggerEvent,
+              nodeId,
+              channelKind,
+              channelId,
+              channelLabel,
+              targetHost,
+              routeMode,
+              now
+            ] = args;
+            for (const existing of notificationDeliveries.values()) {
+              if (
+                existing.source_kind === sourceKind &&
+                existing.source_id === sourceId &&
+                existing.trigger_event === triggerEvent &&
+                existing.channel_kind === channelKind &&
+                existing.channel_id === channelId
+              ) {
+                return { success: true, meta: { changes: 0 } };
+              }
+            }
+            const row = {
+              id,
+              source_kind: sourceKind,
+              source_id: sourceId,
+              trigger_event: triggerEvent,
+              node_id: nodeId,
+              channel_kind: channelKind,
+              channel_id: channelId,
+              channel_label: channelLabel,
+              target_host: targetHost,
+              route_mode: routeMode,
+              status: "queued",
+              attempts: 0,
+              http_status: null,
+              error_code: "",
+              error_message: "",
+              sent_at: null,
+              created_at: now,
+              updated_at: now
+            };
+            notificationDeliveries.set(id, row);
+            return { success: true, meta: { changes: 1 } };
+          }
+          if (sql.includes("UPDATE native_events") && sql.includes("SET notify_status = ?1")) {
+            const ev = nativeEvents.get(args[3]);
+            if (ev) {
+              ev.notify_status = args[0];
+              ev.notify_error = args[1];
+              ev.updated_at = args[2];
+            }
+            return { success: true, meta: { changes: ev ? 1 : 0 } };
+          }
+          if (sql.includes("UPDATE runs SET notify_status = 'failed'")) {
+            const existing = runs.get(args[1]) ?? { id: args[1] };
+            existing.notify_status = "failed";
+            existing.updated_at = args[0];
+            runs.set(args[1], existing);
+            return { success: true, meta: { changes: 1 } };
+          }
+          if (sql.includes("UPDATE runs SET notify_status = ?1")) {
+            const existing = runs.get(args[2]) ?? { id: args[2] };
+            existing.notify_status = args[0];
+            existing.updated_at = args[1];
+            runs.set(args[2], existing);
             return { success: true, meta: { changes: 1 } };
           }
           return { success: true, meta: { changes: 1 } };
@@ -210,7 +371,7 @@ test("patchNode validates node-bound default Bot channel and supports clean unbi
   assert.equal(unbound.default_notify_valid, undefined);
 });
 
-test("createNativeEvent deduplicates by (node_id, event_id), redacts secrets, skips unbound, and fails closed when revoked", async () => {
+test("createNativeEvent deduplicates by (node_id, event_id), redacts secrets, fans out deliveries, and fails closed when revoked", async () => {
   const queued = [];
   const env = {
     GROK_WEBHOOK_URL: "https://global.example.com/must-not-be-used",
@@ -237,7 +398,7 @@ test("createNativeEvent deduplicates by (node_id, event_id), redacts secrets, sk
     ]
   });
 
-  // 1. Valid bound node -> queues once, redacts summary, second call deduplicates
+  // 1. Valid bound node -> creates delivery & queues once, redacts summary, second call deduplicates
   const first = await createNativeEvent(db, env, "macmini", {
     eventId: "claude:sess_1:Notification:abcdef",
     agent: "claude",
@@ -250,11 +411,19 @@ test("createNativeEvent deduplicates by (node_id, event_id), redacts secrets, sk
   });
   assert.equal(first.deduplicated, false);
   assert.equal(first.event.notify_status, "queued");
+  assert.equal(first.event.ack_at, null);
+  assert.equal(first.event.attention_state, "open");
+  assert.deepEqual(first.event.deliveries_summary, { total: 1, sent: 0, queued: 1, failed: 0 });
   assert.equal(first.event.title.includes("raw_title_secret"), false);
   assert.equal(first.event.summary.includes("rawtoken12345"), false);
   assert.equal(first.event.summary.includes("ahub_cli_[REDACTED]"), true);
   assert.equal(queued.length, 1);
-  assert.equal(queued[0].kind, "native_event");
+  assert.equal(queued[0].kind, "delivery");
+  const dlv0 = db.notificationDeliveries.get(queued[0].delivery_id);
+  assert.equal(dlv0.source_kind, "native_event");
+  assert.equal(dlv0.source_id, first.event.id);
+  assert.equal(dlv0.channel_kind, "bot_webhook");
+  assert.equal(dlv0.route_mode, "node_default");
 
   const dup = await createNativeEvent(db, env, "macmini", {
     eventId: "claude:sess_1:Notification:abcdef",
@@ -282,8 +451,10 @@ test("createNativeEvent deduplicates by (node_id, event_id), redacts secrets, sk
   });
   assert.equal(grokEv.deduplicated, false);
   assert.equal(grokEv.event.agent, "grok");
+  assert.equal(grokEv.event.attention_state, null);
   assert.equal(grokEv.event.notify_status, "queued");
   assert.equal(queued.length, 2);
+  assert.equal(queued[1].kind, "delivery");
 
   const grokDup = await createNativeEvent(db, env, "macmini", {
     eventId: "grok:sess_g1:Stop:1234567890",
@@ -299,7 +470,7 @@ test("createNativeEvent deduplicates by (node_id, event_id), redacts secrets, sk
   assert.equal(grokDup.event.id, grokEv.event.id);
   assert.equal(queued.length, 2);
 
-  // 2. Unbound node -> skipped without global fallback
+  // 2. Unbound node without Web Push -> skipped without global fallback
   const unbound = await createNativeEvent(db, env, "mbp", {
     eventId: "codex:t1:turn1:turn_summary",
     agent: "codex",
@@ -314,7 +485,7 @@ test("createNativeEvent deduplicates by (node_id, event_id), redacts secrets, sk
   assert.equal(unbound.event.notify_error, "NODE_DEFAULT_CHANNEL_UNBOUND");
   assert.equal(queued.length, 2);
 
-  // 3. Revoked bound key -> fails closed without enqueueing or global fallback
+  // 3. Revoked bound key without Web Push -> fails closed without enqueueing or global fallback
   db.keyMap.get("key_bot_1").revoked_at = "2026-11-17T10:00:00.000Z";
   const revoked = await createNativeEvent(db, env, "macmini", {
     eventId: "claude:sess_1:Stop:fedcba987654",
@@ -331,7 +502,59 @@ test("createNativeEvent deduplicates by (node_id, event_id), redacts secrets, sk
   assert.equal(queued.length, 2);
 });
 
-test("enqueueRunNotificationIfNeeded routes Web/CLI root runs via node default channel, skips depth>0 and unbound nodes, and avoids double-push", async () => {
+test("createNativeEvent delivers to Web Push when node has no default Bot channel", async () => {
+  const queued = [];
+  const env = {
+    NOTIFY_QUEUE: {
+      async send(msg) {
+        queued.push(msg);
+      }
+    }
+  };
+  const db = createControlPlaneMockDb({
+    nodes: [{ id: "mbp", default_notify_key_id: null }],
+    webPushSubscriptions: [
+      {
+        id: "wps_01MBP",
+        label: "MacBook Chrome",
+        endpoint_host: "fcm.googleapis.com",
+        node_filter_json: '["mbp"]',
+        event_filter_json: '["native_interaction_needed"]',
+        enabled: 1
+      },
+      {
+        id: "wps_02OTHER",
+        label: "MacMini Safari",
+        endpoint_host: "web.push.apple.com",
+        node_filter_json: '["macmini"]',
+        event_filter_json: '["native_interaction_needed"]',
+        enabled: 1
+      }
+    ]
+  });
+
+  const res = await createNativeEvent(db, env, "mbp", {
+    eventId: "claude:sess_wp:Notification:11112222",
+    agent: "claude",
+    eventKind: "interaction_needed",
+    nativeSessionId: "sess_wp",
+    workdir: "/workspace/demo",
+    title: "Confirm push",
+    summary: "Allow push?",
+    source: "claude-hook"
+  });
+  assert.equal(res.event.notify_status, "queued");
+  assert.equal(res.event.notify_error, "");
+  assert.deepEqual(res.event.deliveries_summary, { total: 1, sent: 0, queued: 1, failed: 0 });
+  assert.equal(queued.length, 1);
+  assert.equal(queued[0].kind, "delivery");
+  const dlv = db.notificationDeliveries.get(queued[0].delivery_id);
+  assert.equal(dlv.channel_kind, "web_push");
+  assert.equal(dlv.channel_id, "wps_01MBP");
+  assert.equal(dlv.route_mode, "web_push");
+});
+
+test("enqueueRunNotificationIfNeeded routes Web/CLI root runs, enforces client depth=0 and depth>=1 Web Push boundaries", async () => {
   const queued = [];
   const env = {
     GROK_WEBHOOK_URL: "https://global.example.com/must-not-bypass",
@@ -388,8 +611,9 @@ test("enqueueRunNotificationIfNeeded routes Web/CLI root runs via node default c
   const sentRoot = await enqueueRunNotificationIfNeeded(db, env, baseRun, "done");
   assert.equal(sentRoot, true);
   assert.equal(queued.length, 1);
-  assert.equal(queued[0].route_mode, "node_default");
-  assert.equal(queued[0].target, "grok");
+  assert.equal(queued[0].kind, "delivery");
+  assert.equal(db.notificationDeliveries.get(queued[0].delivery_id).route_mode, "node_default");
+  assert.equal(db.notificationDeliveries.get(queued[0].delivery_id).channel_kind, "bot_webhook");
 
   // Client key run with target="none" -> MUST NOT leak to node_default
   const sentClientNoNotify = await enqueueRunNotificationIfNeeded(
@@ -410,8 +634,7 @@ test("enqueueRunNotificationIfNeeded routes Web/CLI root runs via node default c
   );
   assert.equal(sentAdminNoNotify, true);
   assert.equal(queued.length, 2);
-  assert.equal(queued[1].route_mode, "node_default");
-  assert.equal(queued[1].target, "grok");
+  assert.equal(db.notificationDeliveries.get(queued[1].delivery_id).route_mode, "node_default");
 
   // Admin key run with explicit target="grok" -> node_default when bound, global_legacy when unbound
   const sentAdminBoundExplicit = await enqueueRunNotificationIfNeeded(
@@ -427,7 +650,7 @@ test("enqueueRunNotificationIfNeeded routes Web/CLI root runs via node default c
   );
   assert.equal(sentAdminBoundExplicit, true);
   assert.equal(queued.length, 3);
-  assert.equal(queued[2].route_mode, "node_default");
+  assert.equal(db.notificationDeliveries.get(queued[2].delivery_id).route_mode, "node_default");
 
   const sentAdminUnboundExplicit = await enqueueRunNotificationIfNeeded(
     db,
@@ -443,7 +666,8 @@ test("enqueueRunNotificationIfNeeded routes Web/CLI root runs via node default c
   );
   assert.equal(sentAdminUnboundExplicit, true);
   assert.equal(queued.length, 4);
-  assert.equal(queued[3].route_mode, "global_legacy");
+  assert.equal(db.notificationDeliveries.get(queued[3].delivery_id).route_mode, "global_legacy");
+  assert.equal(db.notificationDeliveries.get(queued[3].delivery_id).channel_kind, "legacy_webhook");
 
   // Child run (depth=1) with target="none" -> skipped (no child notification storm)
   const sentChild = await enqueueRunNotificationIfNeeded(
@@ -479,7 +703,325 @@ test("enqueueRunNotificationIfNeeded routes Web/CLI root runs via node default c
   );
   assert.equal(sentBot, true);
   assert.equal(queued.length, 5);
-  assert.equal(queued[4].route_mode, "key");
+  assert.equal(db.notificationDeliveries.get(queued[4].delivery_id).route_mode, "key");
+
+  // Now add an active admin Web Push subscription listening to all run events
+  db.webPushMap.set("wps_admin_1", {
+    id: "wps_admin_1",
+    label: "Admin Browser",
+    endpoint_host: "fcm.googleapis.com",
+    node_filter_json: "[]",
+    event_filter_json: '["run_needs_approval","run_failed","run_done","run_cancelled"]',
+    enabled: 1,
+    revoked_at: null,
+    created_at: "2026-11-18T00:00:00.000Z"
+  });
+
+  // client depth=0 target="none": done & cancelled MUST stay silent on Web Push; needs_approval & failed notify Web Push
+  assert.equal(
+    await enqueueRunNotificationIfNeeded(
+      db,
+      env,
+      { ...baseRun, id: "run_cli_done", created_by_key_id: "key_bot_2", status: "done" },
+      "done"
+    ),
+    false
+  );
+  assert.equal(
+    await enqueueRunNotificationIfNeeded(
+      db,
+      env,
+      { ...baseRun, id: "run_cli_cancel", created_by_key_id: "key_bot_2", status: "cancelled" },
+      "cancelled"
+    ),
+    false
+  );
+  assert.equal(queued.length, 5);
+
+  assert.equal(
+    await enqueueRunNotificationIfNeeded(
+      db,
+      env,
+      { ...baseRun, id: "run_cli_approval", created_by_key_id: "key_bot_2", status: "needs_approval" },
+      "needs_approval"
+    ),
+    true
+  );
+  assert.equal(queued.length, 6);
+  assert.equal(db.notificationDeliveries.get(queued[5].delivery_id).channel_kind, "web_push");
+  assert.equal(db.notificationDeliveries.get(queued[5].delivery_id).trigger_event, "needs_approval");
+
+  assert.equal(
+    await enqueueRunNotificationIfNeeded(
+      db,
+      env,
+      { ...baseRun, id: "run_cli_failed", created_by_key_id: "key_bot_2", status: "failed" },
+      "failed"
+    ),
+    true
+  );
+  assert.equal(queued.length, 7);
+  assert.equal(db.notificationDeliveries.get(queued[6].delivery_id).channel_kind, "web_push");
+  assert.equal(db.notificationDeliveries.get(queued[6].delivery_id).trigger_event, "failed");
+
+  // depth >= 1 (even admin or client with failed/needs_approval) MUST remain silent on Web Push & never hit node_default
+  assert.equal(
+    await enqueueRunNotificationIfNeeded(
+      db,
+      env,
+      { ...baseRun, id: "run_depth1_admin", depth: 1, created_by_key_id: "key_admin_1", status: "failed" },
+      "failed"
+    ),
+    false
+  );
+  assert.equal(
+    await enqueueRunNotificationIfNeeded(
+      db,
+      env,
+      {
+        ...baseRun,
+        id: "run_depth1_admin_grok",
+        depth: 1,
+        created_by_key_id: "key_admin_1",
+        status: "failed",
+        notify_policy_json: JSON.stringify({ target: "grok" })
+      },
+      "failed"
+    ),
+    true
+  );
+  assert.equal(queued.length, 8);
+  assert.equal(db.notificationDeliveries.get(queued[7].delivery_id).route_mode, "global_legacy");
+});
+
+test("computeAttentionState handles acked, same-ms ULID supersession, empty session, stale, and open", () => {
+  const nowMs = Date.parse("2026-11-18T12:00:00.000Z");
+
+  // Non-interaction -> null
+  assert.equal(
+    computeAttentionState(
+      {
+        id: "evt_01A",
+        node_id: "macmini",
+        agent: "claude",
+        event_kind: "turn_summary",
+        native_session_id: "sess_1",
+        ack_at: null,
+        created_at: "2026-11-18T11:00:00.000Z"
+      },
+      [],
+      nowMs
+    ),
+    null
+  );
+
+  // acked beats superseded
+  assert.equal(
+    computeAttentionState(
+      {
+        id: "evt_01A",
+        node_id: "macmini",
+        agent: "claude",
+        event_kind: "interaction_needed",
+        native_session_id: "sess_1",
+        ack_at: "2026-11-18T11:30:00.000Z",
+        created_at: "2026-11-18T11:00:00.000Z"
+      },
+      [
+        {
+          id: "evt_01B",
+          node_id: "macmini",
+          agent: "claude",
+          native_session_id: "sess_1",
+          created_at: "2026-11-18T11:00:00.000Z"
+        }
+      ],
+      nowMs
+    ),
+    "acked"
+  );
+
+  // Same-millisecond tie-break using monotonic ULID id
+  assert.equal(
+    computeAttentionState(
+      {
+        id: "evt_01AAA",
+        node_id: "macmini",
+        agent: "claude",
+        event_kind: "interaction_needed",
+        native_session_id: "sess_1",
+        ack_at: null,
+        created_at: "2026-11-18T11:00:00.000Z"
+      },
+      [
+        {
+          id: "evt_01AAB",
+          node_id: "macmini",
+          agent: "claude",
+          native_session_id: "sess_1",
+          created_at: "2026-11-18T11:00:00.000Z"
+        }
+      ],
+      nowMs
+    ),
+    "superseded"
+  );
+
+  // Empty native_session_id is never auto-superseded
+  assert.equal(
+    computeAttentionState(
+      {
+        id: "evt_01AAA",
+        node_id: "macmini",
+        agent: "claude",
+        event_kind: "interaction_needed",
+        native_session_id: "",
+        ack_at: null,
+        created_at: "2026-11-18T11:00:00.000Z"
+      },
+      [
+        {
+          id: "evt_01AAB",
+          node_id: "macmini",
+          agent: "claude",
+          native_session_id: "",
+          created_at: "2026-11-18T11:05:00.000Z"
+        }
+      ],
+      nowMs
+    ),
+    "open"
+  );
+
+  // Stale (> 24h) vs Open (<= 24h)
+  assert.equal(
+    computeAttentionState(
+      {
+        id: "evt_01OLD",
+        node_id: "macmini",
+        agent: "claude",
+        event_kind: "interaction_needed",
+        native_session_id: "sess_old",
+        ack_at: null,
+        created_at: "2026-11-17T11:59:59.999Z"
+      },
+      [],
+      nowMs
+    ),
+    "stale"
+  );
+  assert.equal(
+    computeAttentionState(
+      {
+        id: "evt_01FRESH",
+        node_id: "macmini",
+        agent: "claude",
+        event_kind: "interaction_needed",
+        native_session_id: "sess_fresh",
+        ack_at: null,
+        created_at: "2026-11-17T12:00:00.000Z"
+      },
+      [],
+      nowMs
+    ),
+    "open"
+  );
+});
+
+test("computeAggregateNotifyStatus preserves Run schema compatibility and attaches deliveries_summary", async () => {
+  assert.equal(
+    computeAggregateNotifyStatus("native_event", [], { nodeDefaultNotifyKeyId: null }).notifyStatus,
+    "skipped"
+  );
+  assert.equal(
+    computeAggregateNotifyStatus("native_event", [], {
+      nodeDefaultNotifyKeyId: "key_1",
+      nodeDefaultNotifyValid: false
+    }).notifyStatus,
+    "failed"
+  );
+  assert.equal(
+    computeAggregateNotifyStatus("native_event", [{ status: "sent" }, { status: "queued" }]).notifyStatus,
+    "queued"
+  );
+  const partialNative = computeAggregateNotifyStatus("native_event", [
+    { status: "sent" },
+    { status: "failed", error_code: "PUSH_UPSTREAM_TIMEOUT" }
+  ]);
+  assert.equal(partialNative.notifyStatus, "partial");
+  assert.deepEqual(partialNative.deliveriesSummary, { total: 2, sent: 1, queued: 0, failed: 1 });
+
+  const mixedRun = computeAggregateNotifyStatus("run", [
+    { status: "sent" },
+    { status: "failed", error_code: "PUSH_UPSTREAM_TIMEOUT" }
+  ]);
+  assert.equal(mixedRun.notifyStatus, "sent");
+  assert.deepEqual(mixedRun.deliveriesSummary, { total: 2, sent: 1, queued: 0, failed: 1 });
+
+  const db = createControlPlaneMockDb({
+    runs: [
+      {
+        id: "run_sum_1",
+        thread_id: "thr_1",
+        root_run_id: "run_sum_1",
+        parent_run_id: null,
+        depth: 0,
+        max_depth: 1,
+        node_id: "macmini",
+        workdir: "/workspace/demo",
+        agent: "agy",
+        model: "",
+        effort: "",
+        sandbox: 1,
+        timeout_sec: 900,
+        prompt: "hello",
+        status: "done",
+        priority_order: 100,
+        resolved_model: "",
+        resolved_effort: "",
+        native_session_id: null,
+        remote_control_url: "",
+        summary: "ok",
+        output_md: "ok",
+        output_bytes: 2,
+        error_code: "",
+        error_message: "",
+        notify_status: "sent",
+        lease_expires_at: null,
+        started_at: null,
+        finished_at: null,
+        duration_ms: 10,
+        created_at: "2026-11-18T00:00:00.000Z",
+        updated_at: "2026-11-18T00:00:00.000Z"
+      }
+    ]
+  });
+  db.notificationDeliveries.set("dlv_1", {
+    id: "dlv_1",
+    source_kind: "run",
+    source_id: "run_sum_1",
+    status: "sent"
+  });
+  db.notificationDeliveries.set("dlv_2", {
+    id: "dlv_2",
+    source_kind: "run",
+    source_id: "run_sum_1",
+    status: "failed"
+  });
+
+  const adminPrincipal = {
+    kind: "api_key",
+    scope: "admin",
+    keyId: "key_admin",
+    boundNodeId: null,
+    allowedNodes: [],
+    allowUnsandboxed: true,
+    maxDepthLimit: 2
+  };
+  const single = await getRunById(db, adminPrincipal, "run_sum_1", "summary", 16384);
+  assert.deepEqual(single.deliveries_summary, { total: 2, sent: 1, queued: 0, failed: 1 });
+  const listed = await listRuns(db, adminPrincipal, { limit: 10 });
+  assert.deepEqual(listed[0].deliveries_summary, { total: 2, sent: 1, queued: 0, failed: 1 });
 });
 
 test("listNodes exposes default_notify metadata only for admin principals", async () => {
@@ -528,4 +1070,76 @@ test("listNodes exposes default_notify metadata only for admin principals", asyn
   assert.equal(macClient.default_notify_key_name, undefined);
   assert.equal(macClient.default_notify_webhook_host, undefined);
   assert.equal(macClient.default_notify_valid, undefined);
+});
+
+test("createNativeEvent progress routes to native_progress push and supersedes prior interaction_needed", async () => {
+  const queued = [];
+  const env = {
+    NOTIFY_QUEUE: {
+      async send(msg) {
+        queued.push(msg);
+      }
+    }
+  };
+  const db = createControlPlaneMockDb({
+    nodes: [{ id: "macmini", default_notify_key_id: null }],
+    webPushSubscriptions: [
+      {
+        id: "wps_01PROG",
+        label: "Progress Push",
+        endpoint_host: "fcm.googleapis.com",
+        node_filter_json: '["macmini"]',
+        event_filter_json: '["native_progress"]',
+        enabled: 1
+      }
+    ]
+  });
+
+  const first = await createNativeEvent(db, env, "macmini", {
+    eventId: "claude:sess_prog:Notification:11112222",
+    agent: "claude",
+    eventKind: "interaction_needed",
+    nativeSessionId: "sess_prog",
+    workdir: "~/workspace/demo",
+    title: "Need confirmation",
+    summary: "Proceed?",
+    source: "claude-hook"
+  });
+  assert.equal(first.event.attention_state, "open");
+  assert.equal(queued.length, 0);
+
+  await new Promise((resolve) => setTimeout(resolve, 3));
+
+  const prog = await createNativeEvent(db, env, "macmini", {
+    eventId: "cli:sess_prog:progress:33334444",
+    agent: "claude",
+    eventKind: "progress",
+    nativeSessionId: "sess_prog",
+    workdir: "~/workspace/demo",
+    title: "Stage 2/3",
+    summary: "Unit suite green",
+    source: "cli"
+  });
+  assert.equal(prog.event.event_kind, "progress");
+  assert.equal(prog.event.attention_state, null);
+  assert.equal(prog.event.notify_status, "queued");
+  assert.equal(queued.length, 1);
+
+  const firstRow = db.nativeEvents.get(first.event.id);
+  const progRow = db.nativeEvents.get(prog.event.id);
+  assert.equal(
+    computeAttentionState(firstRow, [firstRow, progRow]),
+    "superseded"
+  );
+  assert.deepEqual(
+    computeAggregateNotifyStatus("native_event", [], {
+      nodeDefaultNotifyKeyId: "key_1",
+      nodeDefaultNotifyValid: true
+    }),
+    {
+      notifyStatus: "skipped",
+      notifyError: "NO_MATCHING_CHANNELS",
+      deliveriesSummary: { total: 0, sent: 0, queued: 0, failed: 0 }
+    }
+  );
 });

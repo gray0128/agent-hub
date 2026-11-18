@@ -24,12 +24,18 @@ registerHooks({
 });
 
 const {
+  parseAckNativeEventRequest,
   parseApprovalCheckpointRequest,
+  parseCreatePushSubscriptionRequest,
   parseCreateRunRequest,
+  parseIncludeRevokedQuery,
+  parseListNativeEventsQuery,
   parseNativeEventCreateRequest,
   parseNodeWsFrame,
   parsePatchNodeRequest,
+  parsePatchPushSubscriptionRequest,
   parsePatchRunRequest,
+  parseRedeliverRequest,
   parseResolveRunRequest
 } = await import("./validation.ts");
 
@@ -231,4 +237,109 @@ test("parsePatchNodeRequest and parseNativeEventCreateRequest validate default_n
       }),
     /Unsupported agent/
   );
+
+  const progressEv = parseNativeEventCreateRequest({
+    event_id: "cli:sess_1:progress:1234abcd",
+    agent: "claude",
+    event_kind: "progress",
+    native_session_id: "sess_1",
+    workdir: "~/workspace/demo",
+    title: "Stage 1/3",
+    summary: "Schema check passed",
+    source: "cli"
+  });
+  assert.equal(progressEv.eventKind, "progress");
+});
+
+test("M3 admin query, ack, redeliver, and push-subscription parsers enforce contracts", () => {
+  const q = parseListNativeEventsQuery(
+    new URLSearchParams("node_id=macmini&agent=claude&event_kind=progress&notify_status=partial&unacked_only=true&limit=250&q=deploy")
+  );
+  assert.equal(q.nodeId, "macmini");
+  assert.equal(q.agent, "claude");
+  assert.equal(q.eventKind, "progress");
+  assert.equal(q.notifyStatus, "partial");
+  assert.equal(q.unackedOnly, true);
+  assert.equal(q.limit, 100);
+  assert.equal(q.q, "deploy");
+
+  assert.throws(
+    () => parseListNativeEventsQuery(new URLSearchParams("before_id=evt_01ABC")),
+    /requires 'before_ts'/
+  );
+  assert.throws(
+    () => parseListNativeEventsQuery(new URLSearchParams("unacked_only=maybe")),
+    /unacked_only/
+  );
+  assert.throws(
+    () => parseListNativeEventsQuery(new URLSearchParams("limit=abc")),
+    /limit/
+  );
+
+  assert.deepEqual(parseAckNativeEventRequest(undefined), { scope: "single" });
+  assert.deepEqual(parseAckNativeEventRequest({ scope: "session" }), { scope: "session" });
+  assert.throws(() => parseAckNativeEventRequest({ scope: "all" }), /scope/);
+
+  assert.deepEqual(parseRedeliverRequest(undefined), {});
+  assert.deepEqual(parseRedeliverRequest({ delivery_id: "dlv_01ABCDEF" }), { deliveryId: "dlv_01ABCDEF" });
+  assert.throws(() => parseRedeliverRequest({ delivery_id: "bad_id" }), /delivery_id/);
+
+  assert.equal(parseIncludeRevokedQuery(new URLSearchParams("")), false);
+  assert.equal(parseIncludeRevokedQuery(new URLSearchParams("include_revoked=true")), true);
+  assert.throws(() => parseIncludeRevokedQuery(new URLSearchParams("include_revoked=1")), /include_revoked/);
+
+  const validP256dh = Buffer.concat([Buffer.from([0x04]), Buffer.alloc(64, 0x11)]).toString("base64url");
+  const validAuth = Buffer.alloc(16, 0x22).toString("base64url");
+  const sub = parseCreatePushSubscriptionRequest(
+    {
+      label: "MacBook Chrome",
+      subscription: {
+        endpoint: "https://fcm.googleapis.com/fcm/send/sub123",
+        keys: { p256dh: validP256dh, auth: validAuth }
+      },
+      node_filter: ["macmini", "macmini", "mbp"]
+    },
+    false
+  );
+  assert.equal(sub.endpointHost, "fcm.googleapis.com");
+  assert.deepEqual(sub.nodeFilter, ["macmini", "mbp"]);
+  assert.deepEqual(sub.eventFilter, ["run_needs_approval", "run_failed", "native_interaction_needed"]);
+
+  assert.throws(
+    () =>
+      parseCreatePushSubscriptionRequest(
+        {
+          label: "Loopback Blocked",
+          subscription: {
+            endpoint: "http://127.0.0.1:8080/push",
+            keys: { p256dh: validP256dh, auth: validAuth }
+          }
+        },
+        false
+      ),
+    /https/
+  );
+  assert.throws(
+    () =>
+      parseCreatePushSubscriptionRequest(
+        {
+          label: "Bad Filter",
+          subscription: {
+            endpoint: "https://fcm.googleapis.com/fcm/send/sub123",
+            keys: { p256dh: validP256dh, auth: validAuth }
+          },
+          event_filter: ["unknown_event"]
+        },
+        false
+      ),
+    /Invalid event filter key/
+  );
+
+  assert.throws(() => parsePatchPushSubscriptionRequest({}), /at least one field/);
+  const patchedSub = parsePatchPushSubscriptionRequest({
+    enabled: false,
+    event_filter: ["native_interaction_needed", "native_progress"]
+  });
+  assert.equal(patchedSub.enabled, false);
+  assert.deepEqual(patchedSub.eventFilter, ["native_interaction_needed", "native_progress"]);
 });

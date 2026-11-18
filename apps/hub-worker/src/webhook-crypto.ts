@@ -7,7 +7,7 @@ export interface WebhookConfig {
   key?: string;
 }
 
-function toBase64Url(bytes: Uint8Array): string {
+export function toBase64Url(bytes: Uint8Array): string {
   let binary = "";
   for (let i = 0; i < bytes.length; i += 1) {
     binary += String.fromCharCode(bytes[i]!);
@@ -15,7 +15,7 @@ function toBase64Url(bytes: Uint8Array): string {
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
-function fromBase64Url(value: string): Uint8Array {
+export function fromBase64Url(value: string): Uint8Array<ArrayBuffer> {
   if (!value || /[^A-Za-z0-9\-_]/.test(value)) {
     throw new Error("Invalid base64url segment");
   }
@@ -74,41 +74,32 @@ async function deriveAesKey(
   return crypto.subtle.importKey("raw", digest, { name: "AES-GCM" }, false, usages);
 }
 
-export async function encryptWebhookConfig(
+export async function encryptJsonSecret<T>(
   secretMaterial: string,
-  payload: WebhookConfig
-): Promise<{ ciphertext: string; host: string }> {
-  const parsedUrl = validateWebhookUrl(payload.url);
-  const trimmedKey = payload.key?.trim();
-  const normalized: WebhookConfig = {
-    url: parsedUrl.toString(),
-    ...(trimmedKey ? { key: trimmedKey } : {})
-  };
+  payload: T
+): Promise<string> {
   const aesKey = await deriveAesKey(secretMaterial, ["encrypt"]);
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const encrypted = await crypto.subtle.encrypt(
     { name: "AES-GCM", iv },
     aesKey,
-    encoder.encode(JSON.stringify(normalized))
+    encoder.encode(JSON.stringify(payload))
   );
-  return {
-    ciphertext: `${PREFIX_V1}:${toBase64Url(iv)}:${toBase64Url(new Uint8Array(encrypted))}`,
-    host: parsedUrl.host
-  };
+  return `${PREFIX_V1}:${toBase64Url(iv)}:${toBase64Url(new Uint8Array(encrypted))}`;
 }
 
-export async function decryptWebhookConfig(
+export async function decryptJsonSecret<T = unknown>(
   secretMaterial: string,
   ciphertext: string
-): Promise<WebhookConfig> {
+): Promise<T> {
   const parts = ciphertext.trim().split(":");
   if (parts.length !== 3 || parts[0] !== PREFIX_V1) {
-    throw new Error("Unsupported encrypted webhook payload format");
+    throw new Error("Unsupported encrypted payload format");
   }
   const iv = fromBase64Url(parts[1]!);
   const encryptedBytes = fromBase64Url(parts[2]!);
   if (iv.length !== 12 || encryptedBytes.length === 0) {
-    throw new Error("Malformed encrypted webhook payload");
+    throw new Error("Malformed encrypted payload");
   }
   const aesKey = await deriveAesKey(secretMaterial, ["decrypt"]);
   const ivBuf = new Uint8Array(iv.length);
@@ -120,7 +111,31 @@ export async function decryptWebhookConfig(
     aesKey,
     ctBuf
   );
-  const raw = JSON.parse(decoder.decode(decrypted)) as unknown;
+  return JSON.parse(decoder.decode(decrypted)) as T;
+}
+
+export async function encryptWebhookConfig(
+  secretMaterial: string,
+  payload: WebhookConfig
+): Promise<{ ciphertext: string; host: string }> {
+  const parsedUrl = validateWebhookUrl(payload.url);
+  const trimmedKey = payload.key?.trim();
+  const normalized: WebhookConfig = {
+    url: parsedUrl.toString(),
+    ...(trimmedKey ? { key: trimmedKey } : {})
+  };
+  const ciphertext = await encryptJsonSecret(secretMaterial, normalized);
+  return {
+    ciphertext,
+    host: parsedUrl.host
+  };
+}
+
+export async function decryptWebhookConfig(
+  secretMaterial: string,
+  ciphertext: string
+): Promise<WebhookConfig> {
+  const raw = await decryptJsonSecret<unknown>(secretMaterial, ciphertext);
   if (!raw || typeof raw !== "object" || typeof (raw as { url?: unknown }).url !== "string") {
     throw new Error("Decrypted webhook payload missing url");
   }

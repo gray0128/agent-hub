@@ -165,10 +165,122 @@ CREATE INDEX IF NOT EXISTS idx_native_events_node_created
   ON native_events (node_id, created_at DESC);
 ```
 
+### 1.1 原生活动扩展与多渠道投递账本迁移（`migrations/0006_native_activity_and_web_push.sql`）
+
+为在不破坏 `0001`–`0005` 既有兼容性前提下引入 `progress` 事件、人工确认 `ack_at`、浏览器 Web Push 订阅表与多渠道投递明细账本，`0006` 迁移按如下 DDL 演进：
+
+```sql
+PRAGMA foreign_keys = ON;
+
+-- 1. 重建 native_events：扩展 event_kind 支持 'progress'，新增人工确认时间 ack_at 与多通道聚合状态 'partial'
+CREATE TABLE native_events_v2 (
+  id TEXT PRIMARY KEY,                              -- evt_<ulid>
+  node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+  event_id TEXT NOT NULL,                           -- (node_id, event_id) 幂等键
+  agent TEXT NOT NULL CHECK (agent IN ('agy', 'pi', 'omp', 'codex', 'claude', 'grok')),
+  event_kind TEXT NOT NULL CHECK (event_kind IN ('interaction_needed', 'turn_summary', 'progress')),
+  native_session_id TEXT NOT NULL DEFAULT '',
+  workdir TEXT NOT NULL DEFAULT '',
+  title TEXT NOT NULL DEFAULT '',
+  summary TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT '',
+  notify_key_id TEXT REFERENCES api_keys(id) ON DELETE SET NULL,
+  notify_status TEXT NOT NULL DEFAULT 'none'
+    CHECK (notify_status IN ('none', 'queued', 'sent', 'partial', 'failed', 'skipped')),
+  notify_error TEXT NOT NULL DEFAULT '',
+  ack_at TEXT,                                      -- 人工在控制台点击「标记已处理」的 RFC 3339 UTC 时间
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (node_id, event_id)
+);
+
+INSERT INTO native_events_v2 (
+  id, node_id, event_id, agent, event_kind, native_session_id, workdir,
+  title, summary, source, notify_key_id, notify_status, notify_error,
+  ack_at, created_at, updated_at
+)
+SELECT
+  id, node_id, event_id, agent, event_kind, native_session_id, workdir,
+  title, summary, source, notify_key_id, notify_status, notify_error,
+  NULL, created_at, updated_at
+FROM native_events;
+
+DROP TABLE native_events;
+ALTER TABLE native_events_v2 RENAME TO native_events;
+
+CREATE INDEX IF NOT EXISTS idx_native_events_created
+  ON native_events (created_at DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_native_events_node_created
+  ON native_events (node_id, created_at DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_native_events_session
+  ON native_events (node_id, agent, native_session_id, created_at DESC)
+  WHERE native_session_id != '';
+
+-- 2. 浏览器 Web Push 订阅注册表（仅限 admin 作用域管理，端点与 ECDH 密钥经 AES-256-GCM 密文落库）
+CREATE TABLE IF NOT EXISTS web_push_subscriptions (
+  id TEXT PRIMARY KEY,                              -- wps_<ulid>
+  label TEXT NOT NULL,                              -- 设备显示名，如 "MacBook Chrome" / "iPhone PWA"
+  endpoint_sha256 TEXT NOT NULL UNIQUE,             -- 64 位小写十六进制 SHA-256，用于同浏览器幂等续订去重
+  endpoint_host TEXT NOT NULL,                      -- 脱敏展示主机名，如 web.push.apple.com / fcm.googleapis.com
+  subscription_ciphertext TEXT NOT NULL,            -- AES-256-GCM 加密的 {endpoint, keys:{p256dh, auth}}
+  node_filter_json TEXT NOT NULL DEFAULT '[]',      -- 空数组表示接收全部节点；非空如 ["macmini","mbp"]
+  event_filter_json TEXT NOT NULL DEFAULT '["run_needs_approval","run_failed","native_interaction_needed"]',
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+  failure_count INTEGER NOT NULL DEFAULT 0 CHECK (failure_count >= 0),
+  last_sent_at TEXT,
+  last_error_code TEXT NOT NULL DEFAULT '',
+  last_error_message TEXT NOT NULL DEFAULT '',
+  revoked_at TEXT,                                  -- 收到 404/410 Gone 或用户主动解绑时写入
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_web_push_active
+  ON web_push_subscriptions (enabled)
+  WHERE revoked_at IS NULL AND enabled = 1;
+
+-- 3. 统一多渠道通知投递明细账本（覆盖受控 Run 与原生活动 NativeEvent）
+CREATE TABLE IF NOT EXISTS notification_deliveries (
+  id TEXT PRIMARY KEY,                              -- dlv_<ulid>
+  source_kind TEXT NOT NULL CHECK (source_kind IN ('run', 'native_event')),
+  source_id TEXT NOT NULL,                          -- run_<ulid> 或 evt_<ulid>
+  trigger_event TEXT NOT NULL,                      -- needs_approval / done / failed / cancelled / interaction_needed / turn_summary / progress
+  node_id TEXT NOT NULL,
+  channel_kind TEXT NOT NULL CHECK (channel_kind IN ('bot_webhook', 'web_push', 'legacy_webhook')),
+  channel_id TEXT NOT NULL,                         -- key_<ulid> / wps_<ulid> / 'global_legacy'
+  channel_label TEXT NOT NULL,                      -- 脱敏渠道名，如 "grok-bot-macmini" / "MacBook Safari"
+  target_host TEXT NOT NULL,                        -- 脱敏主机名，如 hooks.x.ai / web.push.apple.com
+  route_mode TEXT NOT NULL DEFAULT 'node_default'
+    CHECK (route_mode IN ('key', 'node_default', 'web_push', 'global_legacy')),
+  status TEXT NOT NULL DEFAULT 'queued'
+    CHECK (status IN ('queued', 'sent', 'failed', 'skipped')),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  http_status INTEGER,
+  error_code TEXT NOT NULL DEFAULT '',
+  error_message TEXT NOT NULL DEFAULT '',
+  sent_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (source_kind, source_id, trigger_event, channel_kind, channel_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_deliveries_source
+  ON notification_deliveries (source_kind, source_id, created_at ASC);
+
+CREATE INDEX IF NOT EXISTS idx_deliveries_status_updated
+  ON notification_deliveries (status, updated_at DESC)
+  WHERE status IN ('queued', 'failed');
+```
+
 ### 字段语义与容量边界
 
 - 所有时间字段统一使用 RFC 3339 UTC 字符串（精度至毫秒，例如 `2026-11-13T04:15:30.123Z`），确保按字典序比较与索引扫描结果一致。
 - `runs.output_md` 在 D1 单行安全上限内截断保留前 900 KB（D1 单行限制为 1 MB）；超出部分在后续阶段可写入 `artifact_r2_key`，并在 `output_bytes` 记录原始字节总长。
+- `runs.notify_status` D1 列继续保持 `('none', 'queued', 'sent', 'failed')` 枚举以向后兼容调用端 CLI 与 Schema；对外 REST / WebSocket 返回的 `RunRecord` 额外附带可选 `deliveries_summary: { total, sent, queued, failed }` 精确暴露多通道投递计数。
+- `native_events.title` 与 `native_events.summary` 在节点端预脱敏与云端二次脱敏后，分别截断至 `<= 200` 字符与 `<= 4000` 字符。
+- `web_push_subscriptions.subscription_ciphertext` 采用与 `api_keys.notify_webhook_ciphertext` 相同的 `AES-256-GCM` 格式（`v1:<iv_b64url>:<ct_b64url>`，以 `WEBHOOK_ENCRYPTION_KEY` 加密），明文为 `{ endpoint, keys: { p256dh, auth } }`。
 - `threads.sort_order` 与 `runs.priority_order` 使用 IEEE 754 `REAL`（如中点插值法或批量整数重编号），以支持前端 `@dnd-kit` 单次拖拽调整顺序而不必重写全表。
 
 ## 2. 状态机定义与合法迁移
@@ -237,3 +349,57 @@ stateDiagram-v2
    - 在节点守护进程本地，额外维护 `map[string]struct{}`（以规范化 `filepath.Clean(workdir)` 为键）的本地互斥锁，双重确保同一目录同一时刻最多只有一个子进程在运行。
 3. **认领 SQL 选单规则**：
    在满足 `status = 'queued'` 且其 `(node_id, workdir)` 当前无活跃任务的候选中，按 `priority_order ASC, created_at ASC` 选取前 `K` 个（`K = max_concurrency - active_runs_count`），逐条以 CAS 锁定认领。
+
+## 5. 原生活动注意力状态与多渠道投递聚合契约
+
+### 5.1 `attention_state` 确定性推导规则
+
+D1 查询层与 Web Store 共享同一纯函数逻辑推导每条 `native_events` 的 `attention_state`：
+
+- 当 `event_kind !== 'interaction_needed'` 时，`attention_state` 恒为 `null`。
+- 当 `event_kind === 'interaction_needed'` 时，严格按以下优先级顺序求值：
+  1. **`acked`**：`ack_at !== null`。
+  2. **`superseded`**：`native_session_id !== ''` 且存在另一条相同 `(node_id, agent, native_session_id)` 的 `native_events` 记录满足字典序 `(other.created_at > current.created_at) OR (other.created_at === current.created_at AND other.id > current.id)`（以 `(created_at, id)` 消除同毫秒并列歧义；`native_session_id === ''` 时绝不自动覆盖）。
+  3. **`stale`**：不满足前两条，且 `now - Date.parse(created_at) > 24 小时`（`86,400,000 ms`）。
+  4. **`open`**：其余情况。**仅 `attention_state === 'open'` 的记录计入 `open_interaction_count`**。
+
+### 5.2 `deliveries_summary` 与汇总状态矩阵（`computeAggregateNotifyStatus`）
+
+针对任意 `(source_kind, source_id)`，控制面从 `notification_deliveries` 聚合 `deliveries_summary = { total, sent, queued, failed }`，并按以下确定性规则更新外层 `notify_status`：
+
+1. **零匹配投递记录（`total === 0`）**：
+   - `native_events`：若 `node.default_notify_key_id == null`，保留 `notify_status = 'skipped'`、`notify_error = 'NODE_DEFAULT_CHANNEL_UNBOUND'`；若节点已绑定 `default_notify_key_id` 但该 Key 已吊销/无权/无加密 Webhook，保留 `notify_status = 'failed'`、`notify_error = 'DEFAULT_CHANNEL_INVALID_OR_REVOKED'`。
+   - `runs`：当 `notify.target === 'none'` 时保持 `notify_status = 'none'`（仅人工 / `admin` 发起 `depth = 0` 任务且节点绑定了失效 `default_notify_key_id` 时保留 `'failed'`）；当显式 `--notify` 目标未能通过 Fail-Closed 校验时保留 `'failed'`。
+2. **存在至少一条投递记录（`total >= 1`）**：
+   - 存在任意 `queued > 0` -> `'queued'`。
+   - `sent > 0 && failed === 0` -> `'sent'`。
+   - `sent > 0 && failed > 0` -> `native_events.notify_status` 置为 `'partial'`；`runs.notify_status` 为严格兼容既有限定枚举保持 `'sent'`，并由 `deliveries_summary` 精确暴露 `failed` 数量。
+   - `sent === 0 && failed > 0` -> `'failed'`（`native_events.notify_error` 写入首条失败投递的 `error_code`）。
+   - 全部记录为 `'skipped'` -> `native_events` 置为 `'skipped'`，`runs` 置为 `'none'`。
+
+### 5.3 订阅过滤键映射（`event_filter_json` 与 `trigger_event`）及路由矩阵
+
+`web_push_subscriptions.event_filter_json` 使用带来源前缀的订阅键，投递账本 `notification_deliveries.trigger_event` 使用无前缀事件名，二者一一映射如下：
+
+| `event_filter_json` 订阅键 | `trigger_event` 值 | `source_kind` | 默认勾选（新订阅） |
+| --- | --- | --- | --- |
+| `run_needs_approval` | `needs_approval` | `run` | 是 |
+| `run_failed` | `failed` | `run` | 是 |
+| `run_done` | `done` | `run` | 否 |
+| `run_cancelled` | `cancelled` | `run` | 否 |
+| `native_interaction_needed` | `interaction_needed` | `native_event` | 是 |
+| `native_turn_summary` | `turn_summary` | `native_event` | 否 |
+| `native_progress` | `progress` | `native_event` | 否 |
+
+新注册订阅的默认 `event_filter_json` 为 `["run_needs_approval", "run_failed", "native_interaction_needed"]`。Bot Webhook 与 Web Push 双通道路由边界如下：
+
+| 事件来源 | Bot Webhook 路由规则 | 浏览器 Web Push 路由规则 |
+| --- | --- | --- |
+| `native_events` | 按 `nodes.default_notify_key_id` Fail-Closed；未绑定时仅跳过 Bot 通道，**不阻断 Web Push 通道** | 匹配 `enabled = 1 AND revoked_at IS NULL`、`node_filter_json`（空数组为全部节点）及 `native_<event_kind>` |
+| 人工 / `admin` 发起的 `runs`（`depth = 0`） | 按 `--notify` 或 `nodes.default_notify_key_id`（`node_default -> global_legacy`）路由 | 匹配 `node_filter_json` 与 `run_<status>` |
+| `client` Key 发起的 `runs`（`depth = 0`） | 仅当显式传 `--notify` 时锁定发起方 `client` Key 自身 Webhook（`target = 'none'` 时不发 Bot 回调） | 仅向匹配 `node_filter_json` 的管理员订阅推送 `needs_approval` 与 `failed`（`done` / `cancelled` 绝不触发） |
+| 衍生子任务 `runs`（`depth >= 1`） | 禁止落入 `node_default` | 静默（不向管理员推送 Web Push，防止子任务通知风暴） |
+
+### 5.4 原生活动与投递账本留存清理契约（Cron）
+
+每分钟执行的 Cron Trigger（`scheduled`）除调用 `reapExpiredLeases` 外，按环境变量 `NATIVE_EVENTS_RETENTION_DAYS`（默认 `30` 天）分批（如单次上限 `500` 条）滚动删除 `created_at < now - retentionDays` 的过期 `native_events` 与 `notification_deliveries` 记录；受控 `threads` / `runs` 保持现有留存策略不变，且清理失败仅记录日志而绝不阻塞租约巡检。

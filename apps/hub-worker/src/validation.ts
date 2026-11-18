@@ -5,17 +5,21 @@ import {
   HubError,
   type NativeEventAgentName,
   type NativeEventKind,
+  type NativeEventNotifyStatus,
   type NodeInboundFrame,
   type NodeStatus,
   type NotifyEvent,
   type NotifyPolicy,
   type NotifyTarget,
+  type PushEventFilterKey,
   type RunEventInput,
   type RunEventKind,
   type RunStatus,
   type ThreadStatus,
+  type WebPushSubscriptionSecret,
   type WorkspaceEntry
 } from "./types";
+import { validatePushEndpointUrl, validateSubscriptionKeys } from "./web-push";
 import { validateWebhookUrl } from "./webhook-crypto";
 
 const AGENTS = new Set<AgentName>(["agy", "pi", "omp", "codex", "claude"]);
@@ -32,12 +36,36 @@ const EVENT_KINDS = new Set<RunEventKind>([
 ]);
 const NOTIFY_TARGETS = new Set<NotifyTarget>(["none", "grok", "webhook"]);
 const NOTIFY_EVENTS = new Set<NotifyEvent>(["done", "failed", "cancelled", "needs_approval"]);
-const NATIVE_EVENT_KINDS = new Set<NativeEventKind>(["interaction_needed", "turn_summary"]);
+const NATIVE_EVENT_KINDS = new Set<NativeEventKind>(["interaction_needed", "turn_summary", "progress"]);
+const NATIVE_NOTIFY_STATUSES = new Set<NativeEventNotifyStatus>([
+  "none",
+  "queued",
+  "sent",
+  "partial",
+  "failed",
+  "skipped"
+]);
+const PUSH_EVENT_FILTER_KEYS = new Set<PushEventFilterKey>([
+  "run_needs_approval",
+  "run_failed",
+  "run_done",
+  "run_cancelled",
+  "native_interaction_needed",
+  "native_turn_summary",
+  "native_progress"
+]);
+export const DEFAULT_PUSH_EVENT_FILTER: readonly PushEventFilterKey[] = [
+  "run_needs_approval",
+  "run_failed",
+  "native_interaction_needed"
+];
 const NODE_ID_RE = /^[a-z0-9][a-z0-9_-]*$/;
 const THREAD_ID_RE = /^thr_[A-Za-z0-9]+$/;
 const RUN_ID_RE = /^run_[A-Za-z0-9]+$/;
 const KEY_ID_RE = /^key_[A-Za-z0-9]{8,64}$/;
 const NATIVE_EVENT_ID_RE = /^[A-Za-z0-9_.:-]{8,128}$/;
+const NATIVE_EVENT_ROW_ID_RE = /^evt_[A-Za-z0-9]+$/;
+const DELIVERY_ID_RE = /^dlv_[A-Za-z0-9]+$/;
 
 function asRecord(raw: unknown, context: string): Record<string, unknown> {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
@@ -988,4 +1016,297 @@ export function parseNodeWsFrame(raw: unknown): NodeInboundFrame {
     default:
       throw new HubError(400, "BAD_REQUEST", `Unsupported frame type '${type}'`);
   }
+}
+
+export interface ParsedListNativeEventsQuery {
+  nodeId?: string;
+  agent?: NativeEventAgentName;
+  eventKind?: NativeEventKind;
+  notifyStatus?: NativeEventNotifyStatus;
+  unackedOnly: boolean;
+  q?: string;
+  limit: number;
+  beforeTs?: string;
+  beforeId?: string;
+}
+
+export function parseListNativeEventsQuery(searchParams: URLSearchParams): ParsedListNativeEventsQuery {
+  const nodeId = searchParams.get("node_id")?.trim() || undefined;
+  if (nodeId !== undefined && !NODE_ID_RE.test(nodeId)) {
+    throw new HubError(400, "BAD_REQUEST", "Invalid node_id format.");
+  }
+
+  const agentRaw = searchParams.get("agent")?.trim() || undefined;
+  let agent: NativeEventAgentName | undefined;
+  if (agentRaw !== undefined) {
+    if (!NATIVE_EVENT_AGENTS.has(agentRaw as NativeEventAgentName)) {
+      throw new HubError(400, "BAD_REQUEST", `Unsupported agent '${agentRaw}'.`);
+    }
+    agent = agentRaw as NativeEventAgentName;
+  }
+
+  const kindRaw = searchParams.get("event_kind")?.trim() || undefined;
+  let eventKind: NativeEventKind | undefined;
+  if (kindRaw !== undefined) {
+    if (!NATIVE_EVENT_KINDS.has(kindRaw as NativeEventKind)) {
+      throw new HubError(400, "BAD_REQUEST", `Invalid event_kind '${kindRaw}'.`);
+    }
+    eventKind = kindRaw as NativeEventKind;
+  }
+
+  const statusRaw = searchParams.get("notify_status")?.trim() || undefined;
+  let notifyStatus: NativeEventNotifyStatus | undefined;
+  if (statusRaw !== undefined) {
+    if (!NATIVE_NOTIFY_STATUSES.has(statusRaw as NativeEventNotifyStatus)) {
+      throw new HubError(400, "BAD_REQUEST", `Invalid notify_status '${statusRaw}'.`);
+    }
+    notifyStatus = statusRaw as NativeEventNotifyStatus;
+  }
+
+  const unackedRaw = searchParams.get("unacked_only")?.trim();
+  let unackedOnly = false;
+  if (unackedRaw !== undefined && unackedRaw !== "") {
+    if (unackedRaw === "true") {
+      unackedOnly = true;
+    } else if (unackedRaw === "false") {
+      unackedOnly = false;
+    } else {
+      throw new HubError(400, "BAD_REQUEST", "Query 'unacked_only' must be 'true' or 'false'.");
+    }
+  }
+
+  const qTrimmed = searchParams.get("q")?.trim();
+  if (qTrimmed && qTrimmed.length > 256) {
+    throw new HubError(400, "BAD_REQUEST", "Query 'q' exceeds max length 256.");
+  }
+  const q = qTrimmed || undefined;
+
+  const limitRaw = searchParams.get("limit")?.trim();
+  let limit = 50;
+  if (limitRaw !== undefined && limitRaw !== "") {
+    if (!/^-?\d+$/.test(limitRaw)) {
+      throw new HubError(400, "BAD_REQUEST", "Query 'limit' must be an integer.");
+    }
+    const parsedLimit = Number.parseInt(limitRaw, 10);
+    if (!Number.isSafeInteger(parsedLimit)) {
+      throw new HubError(400, "BAD_REQUEST", "Query 'limit' must be a finite integer.");
+    }
+    limit = Math.min(Math.max(parsedLimit, 1), 100);
+  }
+
+  const beforeTs = searchParams.get("before_ts")?.trim() || undefined;
+  if (beforeTs !== undefined) {
+    if (beforeTs.length > 64 || Number.isNaN(Date.parse(beforeTs))) {
+      throw new HubError(400, "BAD_REQUEST", "Query 'before_ts' must be a valid RFC 3339 timestamp.");
+    }
+  }
+
+  const beforeId = searchParams.get("before_id")?.trim() || undefined;
+  if (beforeId !== undefined) {
+    if (!beforeTs) {
+      throw new HubError(400, "BAD_REQUEST", "Query 'before_id' requires 'before_ts'.");
+    }
+    if (!NATIVE_EVENT_ROW_ID_RE.test(beforeId)) {
+      throw new HubError(400, "BAD_REQUEST", "Invalid before_id format.");
+    }
+  }
+
+  return {
+    nodeId,
+    agent,
+    eventKind,
+    notifyStatus,
+    unackedOnly,
+    q,
+    limit,
+    beforeTs,
+    beforeId
+  };
+}
+
+export function parseAckNativeEventRequest(raw: unknown): { scope: "single" | "session" } {
+  if (raw === undefined || raw === null) {
+    return { scope: "single" };
+  }
+  const obj = asRecord(raw, "AckNativeEventRequest");
+  rejectUnknownKeys(obj, ["scope"], "AckNativeEventRequest");
+  const scopeRaw = asOptionalString(obj, "scope");
+  if (scopeRaw === undefined) {
+    return { scope: "single" };
+  }
+  if (scopeRaw !== "single" && scopeRaw !== "session") {
+    throw new HubError(400, "BAD_REQUEST", `Invalid ack scope '${scopeRaw}' (expected 'single' or 'session').`);
+  }
+  return { scope: scopeRaw };
+}
+
+export function parseRedeliverRequest(raw: unknown): { deliveryId?: string } {
+  if (raw === undefined || raw === null) {
+    return {};
+  }
+  const obj = asRecord(raw, "RedeliverRequest");
+  rejectUnknownKeys(obj, ["delivery_id"], "RedeliverRequest");
+  const deliveryId = asOptionalString(obj, "delivery_id", 128);
+  if (deliveryId !== undefined) {
+    const trimmed = deliveryId.trim();
+    if (!DELIVERY_ID_RE.test(trimmed)) {
+      throw new HubError(400, "BAD_REQUEST", "Invalid delivery_id format.");
+    }
+    return { deliveryId: trimmed };
+  }
+  return {};
+}
+
+export function parseIncludeRevokedQuery(searchParams: URLSearchParams): boolean {
+  const raw = searchParams.get("include_revoked")?.trim();
+  if (raw === undefined || raw === "") {
+    return false;
+  }
+  if (raw === "true") {
+    return true;
+  }
+  if (raw === "false") {
+    return false;
+  }
+  throw new HubError(400, "BAD_REQUEST", "Query 'include_revoked' must be 'true' or 'false'.");
+}
+
+function parseNodeFilter(raw: unknown): string[] {
+  if (!Array.isArray(raw)) {
+    throw new HubError(400, "BAD_REQUEST", "node_filter must be an array.");
+  }
+  if (raw.length > 100) {
+    throw new HubError(400, "BAD_REQUEST", "node_filter exceeds max length 100.");
+  }
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    if (typeof item !== "string" || !NODE_ID_RE.test(item)) {
+      throw new HubError(400, "BAD_REQUEST", "Invalid node ID in node_filter.");
+    }
+    if (!seen.has(item)) {
+      seen.add(item);
+      out.push(item);
+    }
+  }
+  return out;
+}
+
+function parseEventFilter(raw: unknown): PushEventFilterKey[] {
+  if (!Array.isArray(raw)) {
+    throw new HubError(400, "BAD_REQUEST", "event_filter must be an array.");
+  }
+  if (raw.length > 32) {
+    throw new HubError(400, "BAD_REQUEST", "event_filter exceeds max length 32.");
+  }
+  const out: PushEventFilterKey[] = [];
+  const seen = new Set<PushEventFilterKey>();
+  for (const item of raw) {
+    if (typeof item !== "string" || !PUSH_EVENT_FILTER_KEYS.has(item as PushEventFilterKey)) {
+      throw new HubError(400, "BAD_REQUEST", `Invalid event filter key '${String(item)}'.`);
+    }
+    const key = item as PushEventFilterKey;
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(key);
+    }
+  }
+  return out;
+}
+
+export interface ParsedCreatePushSubscription {
+  label: string;
+  subscription: WebPushSubscriptionSecret;
+  endpointHost: string;
+  nodeFilter: string[];
+  eventFilter: PushEventFilterKey[];
+}
+
+export function parseCreatePushSubscriptionRequest(
+  raw: unknown,
+  allowLoopbackForTest: boolean
+): ParsedCreatePushSubscription {
+  const obj = asRecord(raw, "CreatePushSubscriptionRequest");
+  rejectUnknownKeys(
+    obj,
+    ["label", "subscription", "node_filter", "event_filter"],
+    "CreatePushSubscriptionRequest"
+  );
+  const label = asRequiredString(obj, "label", 1, 128).trim();
+  if (!label) {
+    throw new HubError(400, "BAD_REQUEST", "Field 'label' must not be empty.");
+  }
+
+  const subObj = asRecord(obj["subscription"], "subscription");
+  rejectUnknownKeys(subObj, ["endpoint", "keys"], "subscription");
+  const endpointRaw = asRequiredString(subObj, "endpoint", 1, 2048);
+
+  const keysObj = asRecord(subObj["keys"], "subscription.keys");
+  rejectUnknownKeys(keysObj, ["p256dh", "auth"], "subscription.keys");
+  const p256dh = asRequiredString(keysObj, "p256dh", 1, 256).trim();
+  const auth = asRequiredString(keysObj, "auth", 1, 128).trim();
+
+  let parsedUrl: URL;
+  try {
+    parsedUrl = validatePushEndpointUrl(endpointRaw, allowLoopbackForTest);
+    validateSubscriptionKeys({ p256dh, auth });
+  } catch (err) {
+    throw new HubError(400, "BAD_REQUEST", err instanceof Error ? err.message : "Invalid push subscription.");
+  }
+
+  const nodeFilter = obj["node_filter"] !== undefined ? parseNodeFilter(obj["node_filter"]) : [];
+  const eventFilter =
+    obj["event_filter"] !== undefined
+      ? parseEventFilter(obj["event_filter"])
+      : [...DEFAULT_PUSH_EVENT_FILTER];
+
+  return {
+    label,
+    subscription: {
+      endpoint: parsedUrl.toString(),
+      keys: { p256dh, auth }
+    },
+    endpointHost: parsedUrl.host,
+    nodeFilter,
+    eventFilter
+  };
+}
+
+export interface ParsedPatchPushSubscription {
+  label?: string;
+  enabled?: boolean;
+  nodeFilter?: string[];
+  eventFilter?: PushEventFilterKey[];
+}
+
+export function parsePatchPushSubscriptionRequest(raw: unknown): ParsedPatchPushSubscription {
+  const obj = asRecord(raw, "PatchPushSubscriptionRequest");
+  rejectUnknownKeys(
+    obj,
+    ["label", "enabled", "node_filter", "event_filter"],
+    "PatchPushSubscriptionRequest"
+  );
+  if (Object.keys(obj).length === 0) {
+    throw new HubError(400, "BAD_REQUEST", "PatchPushSubscriptionRequest must specify at least one field.");
+  }
+
+  const out: ParsedPatchPushSubscription = {};
+  if (obj["label"] !== undefined) {
+    const label = asRequiredString(obj, "label", 1, 128).trim();
+    if (!label) {
+      throw new HubError(400, "BAD_REQUEST", "Field 'label' must not be empty.");
+    }
+    out.label = label;
+  }
+  const enabled = asOptionalBoolean(obj, "enabled");
+  if (enabled !== undefined) {
+    out.enabled = enabled;
+  }
+  if (obj["node_filter"] !== undefined) {
+    out.nodeFilter = parseNodeFilter(obj["node_filter"]);
+  }
+  if (obj["event_filter"] !== undefined) {
+    out.eventFilter = parseEventFilter(obj["event_filter"]);
+  }
+  return out;
 }

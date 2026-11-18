@@ -1,12 +1,21 @@
 import type {
   ApiKeyRecord,
   CreateRunPayload,
+  NativeEventAgentName,
+  NativeEventKind,
+  NativeEventNotifyStatus,
+  NativeEventView,
   NodeRecord,
   NodeStatus,
+  NotificationDeliveryRecord,
+  PushConfigRecord,
+  PushEventFilterKey,
+  PushSubscriptionTestResponse,
   RunEventItem,
   RunRecord,
   ThreadRecord,
-  ThreadStatus
+  ThreadStatus,
+  WebPushSubscriptionRecord
 } from "@/types";
 
 export class ApiClientError extends Error {
@@ -225,6 +234,179 @@ export const apiClient = {
       `/api/v1/keys/${encodeURIComponent(keyId)}`,
       token,
       { method: "DELETE" }
+    );
+  },
+
+  fetchNativeEvents(
+    token: string,
+    params: {
+      node_id?: string;
+      agent?: NativeEventAgentName;
+      event_kind?: NativeEventKind;
+      notify_status?: NativeEventNotifyStatus;
+      unacked_only?: boolean;
+      q?: string;
+      limit?: number;
+      before_ts?: string;
+      before_id?: string;
+    } = {}
+  ) {
+    const sp = new URLSearchParams();
+    if (params.node_id) sp.set("node_id", params.node_id);
+    if (params.agent) sp.set("agent", params.agent);
+    if (params.event_kind) sp.set("event_kind", params.event_kind);
+    if (params.notify_status) sp.set("notify_status", params.notify_status);
+    if (params.unacked_only !== undefined) {
+      sp.set("unacked_only", params.unacked_only ? "true" : "false");
+    }
+    if (params.q) sp.set("q", params.q);
+    if (params.limit !== undefined) sp.set("limit", String(params.limit));
+    if (params.before_ts) sp.set("before_ts", params.before_ts);
+    if (params.before_id) sp.set("before_id", params.before_id);
+    const qs = sp.toString();
+    return requestJson<{
+      ok: true;
+      events: NativeEventView[];
+      open_interaction_count: number;
+      next_cursor: { before_ts: string; before_id: string } | null;
+    }>(`/api/v1/native-events${qs ? `?${qs}` : ""}`, token);
+  },
+
+  fetchNativeEventDetail(token: string, eventId: string) {
+    return requestJson<{
+      ok: true;
+      event: NativeEventView;
+      deliveries: NotificationDeliveryRecord[];
+    }>(`/api/v1/native-events/${encodeURIComponent(eventId)}`, token);
+  },
+
+  ackNativeEvent(token: string, eventId: string, scope: "single" | "session" = "single") {
+    return requestJson<{
+      ok: true;
+      event: NativeEventView;
+      acked_count: number;
+      open_interaction_count: number;
+    }>(`/api/v1/native-events/${encodeURIComponent(eventId)}/ack`, token, {
+      method: "POST",
+      body: JSON.stringify({ scope })
+    });
+  },
+
+  redeliverNativeEvent(token: string, eventId: string, deliveryId?: string) {
+    return requestJson<{
+      ok: true;
+      event: NativeEventView;
+      deliveries: NotificationDeliveryRecord[];
+      requeued_count: number;
+    }>(`/api/v1/native-events/${encodeURIComponent(eventId)}/redeliver`, token, {
+      method: "POST",
+      body: JSON.stringify(deliveryId ? { delivery_id: deliveryId } : {})
+    });
+  },
+
+  fetchRunDeliveries(token: string, runId: string) {
+    return requestJson<{ ok: true; deliveries: NotificationDeliveryRecord[] }>(
+      `/api/v1/runs/${encodeURIComponent(runId)}/deliveries`,
+      token
+    );
+  },
+
+  redeliverRun(token: string, runId: string, deliveryId?: string) {
+    return requestJson<{
+      ok: true;
+      run: RunRecord;
+      deliveries: NotificationDeliveryRecord[];
+      requeued_count: number;
+    }>(`/api/v1/runs/${encodeURIComponent(runId)}/redeliver`, token, {
+      method: "POST",
+      body: JSON.stringify(deliveryId ? { delivery_id: deliveryId } : {})
+    });
+  },
+
+  fetchPushConfig(token: string) {
+    return requestJson<{ ok: true } & PushConfigRecord>("/api/v1/push/config", token);
+  },
+
+  fetchPushSubscriptions(token: string, includeRevoked = false) {
+    return requestJson<{ ok: true; subscriptions: WebPushSubscriptionRecord[] }>(
+      `/api/v1/push-subscriptions?include_revoked=${includeRevoked ? "true" : "false"}`,
+      token
+    );
+  },
+
+  createPushSubscription(
+    token: string,
+    body: {
+      label: string;
+      subscription: {
+        endpoint: string;
+        keys: {
+          p256dh: string;
+          auth: string;
+        };
+      };
+      node_filter?: string[];
+      event_filter?: PushEventFilterKey[];
+    }
+  ) {
+    const cleanPayload = {
+      label: body.label,
+      subscription: {
+        endpoint: body.subscription.endpoint,
+        keys: {
+          p256dh: body.subscription.keys.p256dh,
+          auth: body.subscription.keys.auth
+        }
+      },
+      ...(body.node_filter !== undefined ? { node_filter: body.node_filter } : {}),
+      ...(body.event_filter !== undefined ? { event_filter: body.event_filter } : {})
+    };
+    return requestJson<{ ok: true; subscription: WebPushSubscriptionRecord }>(
+      "/api/v1/push-subscriptions",
+      token,
+      {
+        method: "POST",
+        body: JSON.stringify(cleanPayload)
+      }
+    );
+  },
+
+  patchPushSubscription(
+    token: string,
+    subscriptionId: string,
+    patch: {
+      label?: string;
+      enabled?: boolean;
+      node_filter?: string[];
+      event_filter?: PushEventFilterKey[];
+    }
+  ) {
+    return requestJson<{ ok: true; subscription: WebPushSubscriptionRecord }>(
+      `/api/v1/push-subscriptions/${encodeURIComponent(subscriptionId)}`,
+      token,
+      {
+        method: "PATCH",
+        body: JSON.stringify(patch)
+      }
+    );
+  },
+
+  revokePushSubscription(token: string, subscriptionId: string) {
+    return requestJson<{ ok: true; revoked_at: string }>(
+      `/api/v1/push-subscriptions/${encodeURIComponent(subscriptionId)}`,
+      token,
+      { method: "DELETE" }
+    );
+  },
+
+  testPushSubscription(token: string, subscriptionId: string) {
+    return requestJson<PushSubscriptionTestResponse>(
+      `/api/v1/push-subscriptions/${encodeURIComponent(subscriptionId)}/test`,
+      token,
+      {
+        method: "POST",
+        body: JSON.stringify({})
+      }
     );
   }
 };

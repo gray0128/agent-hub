@@ -20,7 +20,7 @@
 | **动效引擎** | `motion` | 统一从 `"motion/react"` 导入 `motion`、`AnimatePresence`、`MotionConfig` | `framer-motion`（旧包名）、`gsap`、`react-spring`、`@formkit/auto-animate` |
 | **分栏布局** | `react-resizable-panels`（v4） | 用于桌面端三栏控制台布局与尺寸持久化 | `allotment`、`react-split`、手写 `mousedown` 拖拽分割条 |
 | **拖拽交互** | `@dnd-kit/core`、`@dnd-kit/sortable`、`@dnd-kit/utilities`、`@dnd-kit/modifiers` | 仅用于三处受控列表/队列编排 | `react-beautiful-dnd`、`@hello-pangea/dnd`、`react-dnd`、`sortablejs` |
-| **状态管理** | `zustand` | 拆分 `fleet`、`task`、`workbench` 三个 Store | `redux`、`@reduxjs/toolkit`、`jotai`、`recoil`、`mobx`、`valtio` |
+| **状态管理** | `zustand` | 拆分 `fleet`、`task`、`workbench`、`native-activity` 四个 Store；浏览器推送协调器 `apps/web/src/lib/browser-notify.ts` 与 `public/sw.js` 仅使用浏览器原生 Push / Notification / `navigator.locks` / `BroadcastChannel` API，**零新增第三方依赖** | `redux`、`@reduxjs/toolkit`、`jotai`、`recoil`、`mobx`、`valtio` |
 | **Markdown 与代码** | `react-markdown` + `remark-gfm` | 渲染任务输出 `output_md` 与行内代码 | 不引入重型富文本编辑器 |
 
 ## 2. 视觉语言与设计工程细节（`radix-nova` 控制台美学）
@@ -42,13 +42,15 @@
 | 结构分割线 `--border` | `oklch(1 0 0 / 0.09)` | `oklch(0 0 0 / 0.09)` | 分栏分隔条、列表项边界、选中态边框 |
 | 状态 `online` / `done` | `oklch(0.72 0.17 155)` | `oklch(0.55 0.16 155)` | 在线圆点、任务完成标识 |
 | 状态 `running` / `claimed` | `oklch(0.68 0.16 245)` | `oklch(0.54 0.18 245)` | 执行中脉冲指示与活动进度 |
-| 状态 `needs_approval` | `oklch(0.78 0.16 75)` | `oklch(0.62 0.17 65)` | 人工审批横幅与待放行提示 |
+| 状态 `needs_approval` | `oklch(0.78 0.16 75)` | `oklch(0.62 0.17 65)` | 人工审批横幅、待放行提示、待处理原生互动（`attention_state === "open"`）与部分送达态（`partial`）；`acked` / `superseded` / `stale` 降级为中性/次级文本 |
 | 状态 `failed` | `oklch(0.64 0.21 25)` | `oklch(0.55 0.21 25)` | 失败徽标与危险操作按钮 |
 | 状态 `queued` / `offline` / `cancelled` | `oklch(0.62 0.01 260)` | `oklch(0.52 0.01 260)` | 排队中、离线与已取消态 |
 
 ### 2.3 排版与微交互规范
 
-- **字体平滑与等宽对齐**：根节点设置 `-webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;`。所有动态更新数字（运行耗时、队列计数、字节大小、时间戳、租约倒计时）统一施加 `tabular-nums`（`font-variant-numeric: tabular-nums`），防止数字刷新时引发横向抖动。
+- **字体平滑与等宽对齐**：根节点设置 `-webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;`。所有动态更新数字（运行耗时、队列计数、字节大小、时间戳、租约倒计时，以及新增 `NativeActivityPane.tsx`、`BrowserNotifyDialog.tsx`、`InspectorPane`「投递明细」与顶栏「互动」计数徽标）统一施加 `tabular-nums`（`font-variant-numeric: tabular-nums`），防止数字刷新时引发横向抖动。
+- **网络调用与 Service Worker 边界（L1/L2 门禁）**：全仓前端仅允许 `apps/web/src/lib/api-client.ts` 调用 `fetch(`，任何组件、Store 或 `public/sw.js` 均严禁直接发起裸 `fetch`（`sw.js` 严禁请求 `/api/`，保持零回源）。
+- **移动端触控与零溢出约束**：在 `< 768px`（含 `390×844` 基准视口）下，顶栏全部可见按钮（含新增「通知渠道」触发按钮）均须保持 `>= 44×44px` 触控热区（如 `min-h-11 min-w-11 md:min-h-8 md:h-8`），且页面横向溢出始终为 `0`（`document.documentElement.scrollWidth <= document.documentElement.clientWidth`）。
 - **标题与正文折行**：标题设置 `text-wrap: balance`，长段提示文案设置 `text-wrap: pretty`。节点 ID、工作区路径、`run_id`、模型名称与事件日志流统一使用等宽字体（`font-mono`）。
 - **同心圆角法则**：所有嵌套容器遵循 `outer_radius = inner_radius + padding`（例如外框 `rounded-lg` `8px` 配 `p-1` `4px` 时，内按钮用 `rounded-sm` `4px`）。
 - **克制的 `motion/react` 动效**：
@@ -66,46 +68,64 @@
 使用 `react-resizable-panels` 的 `PanelGroup`（`direction="horizontal"`，`autoSaveId="ahub-workbench-layout"`）构建工作台：
 
 ```text
-┌───────────────────────────────────────────────────────────────────────────────┐
-│ 顶部极简指令条 (44px): ahub Logo | 机群在线统计 3/4 | ⌘K 命令面板 | WS 状态 | 主题 │
-├──────────────────┬───────────────────────────────────────┬────────────────────┤
-│ 左栏 (18% ~ 24%) │ 中栏 (44% ~ 56%)                      │ 右栏 (24% ~ 34%)   │
-│ 可折叠           │                                       │ 可按需折叠         │
-│                  │ [会话头: 节点 / 目录 / Agent / 血统树]  │                    │
-│ [Tab: 会话|节点] │ ------------------------------------- │ Tab 1: 实时事件流  │
-│ + 新建会话       │ [Run #1 对话与结果卡片]                │   (run_events +    │
-│                  │ [Run #2 needs_approval 放行横幅]       │    租约倒计时 +    │
-│ 会话 Tab (默认): │ [Run #3 执行中实时预览]                │    衍生血统关系)   │
-│  搜索 / 状态筛选 │                                       │                    │
-│  可拖拽会话列表  │ ------------------------------------- │ Tab 2: 节点排队甲板│
-│ 节点 Tab:        │ [底部多机任务派发台 Composer]          │   (同机队列拖拽)  │
-│  节点可折叠目录  │  节点 -> 目录 -> Agent -> 模型@思考强度 │                    │
-│  在线与并发状态  │  多行输入框 + ⌘Enter 提交              │ Tab 3: 凭证与设置  │
-└──────────────────┴───────────────────────────────────────┴────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│ 顶部极简指令条 (44px): ahub Logo | 在线 3/4 | 互动 2 | [通知渠道: 状态] | WS 状态 | 主题 │
+├────────────────────────┬───────────────────────────────────────┬───────────────────────┤
+│ 左栏 (18% ~ 24%)       │ 中栏 (44% ~ 56%)                      │ 右栏 (24% ~ 34%)      │
+│ 可折叠                 │                                       │ 可按需折叠            │
+│                        │ [受控会话头 或 原生会话头+快捷接管栏] │                       │
+│ [受控会话|原生活动•2|节点]│ ------------------------------------- │ Tab 1: 过程事件       │
+│ + 新建会话             │ 受控态 (ConversationPane):            │ Tab 2: 待跑队列       │
+│                        │  [Run 卡片 + 审批横幅 + Composer]     │ Tab 3: 委派拓扑       │
+│ 受控会话 Tab (默认):   │                                       │ Tab 4: 节点控制       │
+│  搜索 / 状态筛选 / 拖拽│ 原生态 (NativeActivityPane):          │ Tab 5: 投递明细       │
+│ 原生活动 Tab (admin):  │  [互动提醒 / 里程碑 / 回合总结]       │  (deliveries_summary  │
+│  会话聚合 / 平铺流切换 │  [只读边界提示，无伪终端输入框]       │   + 单通道失败重推)   │
+│ 节点 Tab:              │                                       │                       │
+│  节点目录与并发状态    │                                       │                       │
+└────────────────────────┴───────────────────────────────────────┴───────────────────────┘
 ```
 
 #### 各栏职责细则
 
-1. **左栏：Fleet & Threads Rail**
-   - 顶部栏提供「`会话`」（默认激活，展示会话总数）与「`节点`」（展示在线/总数）双标签页切换以及「`+ 新建会话`」按钮。
-   - **「会话」标签页**：全高展示关键词搜索框、状态筛选胶囊（`全部` / `进行中` / `待审批` / `仅 <当前节点>`）与可拖拽排序的会话线程列表（支持置顶与分叉操作）。
-   - **「节点」标签页**：全高展示机群节点列表（在线状态、`active_runs_count / max_concurrency`、可用 Agent 徽标与工作目录数），顶部提供集群目录汇总及一键全部收起/展开开关；每个节点均支持独立收起/展开其下的工作目录列表（点击目录切换为新建会话目标目录，或直接拖拽工作目录至中栏派发台）。
-2. **中栏：Thread Timeline & Task Composer**
-   - 顶部栏展示当前 `Thread` 绑定的 `node_id`、`project_key`、`agent`、`native_session_id` 短 ID；若当前选中的 `Run` 存在父任务或子任务，显示可点击切换的血统面包屑及「级联取消整棵树」按钮。
+1. **左栏：`FleetThreadsPane`（机群、受控会话与原生活动）**
+   - 顶部栏扩展为三标签页切换以及「`+ 新建会话`」按钮：
+     - 「`受控会话`」（`data-testid="fleet-tab-threads"`，默认激活，保留兼容既有 CDP 选择器）：全高展示关键词搜索框、状态筛选胶囊（`全部` / `进行中` / `待审批` / `仅 <当前节点>`）与可拖拽排序的会话线程列表（支持置顶与分叉操作）。
+     - 「`原生活动`」（`data-testid="fleet-tab-native"`，**仅 `authScope === "admin"` 时加载并展示**；`client` Scope 视图隐藏/禁用该标签页且绝不请求 `/api/v1/native-events`）：当 `openInteractionCount > 0` 时显示琥珀色 `tabular-nums` 计数徽标；默认按 `(node_id, agent, native_session_id || workdir)` 聚合成「原生会话条目」（避免同一会话刷屏），支持一键切换「按时间平铺流」视图，提供关键词搜索框与 `全部` / `待互动` / `投递失败` / `仅 <当前节点>` 筛选胶囊。
+     - 「`节点`」（`data-testid="fleet-tab-nodes"`，保留既有选择器）：全高展示机群节点列表（在线状态、`active_runs_count / max_concurrency`、可用 Agent 徽标与工作目录数），顶部提供集群目录汇总及一键全部收起/展开开关；每个节点均支持独立收起/展开其下的工作目录列表（点击目录切换为新建会话目标目录，或直接拖拽工作目录至中栏派发台）。
+2. **中栏：`ConversationPane`（受控对话台）与 `NativeActivityPane`（原生活动详情流）**
+   - **受控会话态（`ConversationPane`）**：顶部栏展示当前 `Thread` 绑定的 `node_id`、`project_key`、`agent`、`native_session_id` 短 ID；若当前选中的 `Run` 存在父任务或子任务，显示可点击切换的血统面包屑及「级联取消整棵树」按钮。
    - 中间消息流按时间正序排列该 `Thread` 下的所有 `Run`：展示经控制面脱敏与截断的 Prompt 预览（`<= 1200` 字符；绝不展示未脱敏凭据）、实际命中模型与思考强度、独立计时耗时与正文输出。其中常规体量输出（`output_bytes <= 128 KB`）自动水合完整 `output_md` 从头渲染，并在前端对超长正文（`> 4000` 字符或 `> 60` 行）默认折叠高度，支持一键「展开全文 / 收起长输出」与完整复制；超大输出（`> 128 KB`）先自动水合 `16 KB` 尾部预览，并在正文上方展示显式截断提示条与「加载完整输出」按钮按需拉取全文；在正文尚未水合就绪时显式标注加载态与「末行摘要：」，禁止将单行 `summary` 冒充完整输出。当 `status === 'needs_approval'` 时在顶部渲染高对比度琥珀色操作条，提供一键打开 `remote_control_url` 审批按钮与「标记已放行」按钮（调用 `POST /api/v1/runs/:id/resolve` 解除工作目录租约并流转为 `done`）。
    - 底部「多机任务派发台（Composer）」：选择已有 `Thread` 时锁定物理绑定的 `node_id`、`workdir` 与 `agent`（同时提供「切换至新建会话」开关）；新建会话与续聊参数均基于所选节点实时上报的 `node.capabilities.agents` 驱动「`node` -> `agent` -> `model` -> `effort`」四级联动：仅展示目标节点已启用且可用的 Agent；模型列表来自所选 Agent 的实时目录 `models[]`，同时支持「跟随节点默认」及在离线或目录未知时手动输入模型 ID（当所选 Agent 为 `agy` 且节点尚未返回显式默认模型或处于离线/兜底态时，派发台默认对齐 `gemini-4-hydrogen` 与 `high`）；推理强度依据当前模型声明的 `efforts[]` 过滤展示（含 `ultra`、`auto` 等节点档位），对于 `efforts` 为空的独立模型（如 `gemini-pro-orchestrator`）自动禁用强度选择并将 `effort` 置空；支持 `⌘Enter` / `Ctrl+Enter` 提交与草稿本地自动保存。
-3. **右栏：Live Inspector & Queue Deck**
-   - **Tab 1 实时事件流**：订阅当前选中 `Run` 的 `run_events`，以等宽时间线展示 `status`、`tool_use`、`turn_end`、`stderr_warn`，并实时计算 `lease_expires_at` 剩余秒数。
-   - **Tab 2 节点排队甲板（及 Tab 4 节点控制）**：按节点与 `workdir` 分组展示待执行的 `queued` 任务与当前持锁占用目录，支持直接拖拽排序或跨节点改派；「节点控制」标签页展示节点在线态、并发上限调整、排空开关、**默认 Bot 通知通道绑定**（**仅当 `authScope === "admin"` 时**展示 `<Select>` 绑定/解绑任意有效且允许该节点的 `client` Key，并实时提示「通道失效/已吊销」徽标；`client` Scope 登录后隐藏该绑定控件且不请求 `GET /api/v1/keys`，服务端同步省略 `default_notify_*` 字段），以及已上报工作区筛选、路径复制与一键派发。
-   - **Tab 3 凭证与接入设置（及顶部「接入节点」弹窗）**：仅当当前用户具备 `admin` 权限（`authScope === "admin"`）时才调用 `GET /api/v1/keys` 并支持签发与编辑 `api_keys`（选 `client`、`node` 或 `admin` Scope）；其中 `client` Key 支持多选或留空设置「允许调度节点（`allowed_nodes`）」以及配置该 Bot 专属的「Webhook URL」与「Webhook Key」（支持 `1 Node <-> 1 Bot`、`N Nodes -> 1 Bot` 与 `M Bots <-> N Nodes` 组合映射，列表中脱敏展示已绑定节点列表及 `Webhook: <host>` 徽标并支持在线编辑）；「接入节点与客户端配置」弹窗与 Key 管理弹窗同时支持两类自举体验：
-     - **节点接入（`node`）**：一键复制发给节点本地 Agent 的一句话自举提示词（指向 `${HUB_URL}/dl/bootstrap.md`，签发节点 Token 后自动预填）、终端兜底安装命令（`${HUB_URL}/dl/install.sh` 配合 `ahub node init --token-stdin` 与 `ahub node service install --activate`）及各平台零依赖二进制直链（`/dl/ahub-<os>-<arch>`）。
-     - **Bot / 纯调用端接入（`client`）**：在顶部弹窗「`接入 Bot / Skill`」标签页与 Key 管理弹窗（新签发 `client` Key 后及既有有效 `client` Key 编辑面板中）提供一键复制「无密版 Bot 自举提示词（配合 `AHUB_TOKEN` Secret，指向 `${HUB_URL}/dl/client-bootstrap.md`）」、「一步带密钥隔离自举提示词（基于 `AHUB_CONFIG_DIR=~/.config/ahub-bots/<slug>` + `--token-stdin`）」与「Grok Bot Webhook Routine 异步回调指令（要求 Bot 在下发任务时直接向用户展示指令原文，异步回调按需引用 `ahub_run_completed` 中的脱敏截断预览 `prompt_preview` / `prompt_truncated` 而不调 `ahub result` 回拉 `prompt`，并按只读通知规则处理节点原生事件 `ahub_native_event` 的 `event_kind`、`title`、`summary` 与 `action_required: "notify_user_only"`，严禁将原生事件视为自动审批放行或自动回复指令）」；任何已保存 Key 视图与弹窗提示词均**严禁**暴露 Webhook URL 路径或 Bearer Key 原文。
+   - **原生活动态（`NativeActivityPane.tsx`）**：当左栏处于「`原生活动`」并选中原生会话或事件时，中栏切换为只读 `NativeActivityPane`（**严禁渲染伪终端输入/发送框**，底部展示诚实物理边界提示：「原生会话运行在节点本机终端中，不支持从云端向交互式 TTY 注入指令或强杀进程。」）。
+     - 头部操作栏：按 `agent` 生成精确本机终端续接命令一键复制（`claude --resume <sid>`、`agy --conversation <sid>`、`codex resume <sid>`、`pi --session <sid>`、`omp --resume=<sid>`、`grok` 提示；无 `native_session_id` 时回退 `cd <workdir> && <agent>`）；「携带摘要新建受控任务」按钮切回受控派发台预填 `nodeId`、`workdir` 与脱敏摘要（若原 `agent === "grok"`，自动回退该节点首个可用受控 Agent 并明确提示原因）。
+     - 时间线条目：按时间正序展示所属会话下的 `interaction_needed`、`progress`、`turn_summary`；正文复用 `.ahub-markdown`（`react-markdown` + `remark-gfm`）与超长折叠（`> 4000` 字符或 `> 60` 行默认折叠并支持展开/复制）；`interaction_needed` 按派生 `attention_state` 渲染：`open` 渲染琥珀色左边框与「标记已处理」按钮（调用 `POST /api/v1/native-events/:id/ack`，支持 `single` / `session` 范围），`acked` / `superseded` / `stale`（`> 24h`）降级展示。
+3. **右栏：`InspectorPane` 与顶栏弹窗**
+   - 右栏五个标签页必须严格保持以下 DOM 顺序（以兼容 CDP `:nth-of-type(1|2|4)` 既有选择器）：
+   - **Tab 1（`events` / `:nth-of-type(1)`）过程事件**：订阅当前选中 `Run` 的 `run_events`，以等宽时间线展示 `status`、`tool_use`、`turn_end`、`stderr_warn`，并实时计算 `lease_expires_at` 剩余秒数。
+   - **Tab 2（`queue` / `:nth-of-type(2)`）待跑队列**：按节点与 `workdir` 分组展示待执行的 `queued` 任务与当前持锁占用目录，支持直接拖拽排序或跨节点改派。
+   - **Tab 3（`lineage` / `:nth-of-type(3)`）委派拓扑**：展示当前 `Run` 所属 `root_run_id` 的父子委派树与深度。
+   - **Tab 4（`control` / `:nth-of-type(4)`）节点控制**：展示节点在线态、并发上限调整、排空开关、**默认 Bot 通知通道绑定**（**仅当 `authScope === "admin"` 时**展示 `<Select>` 绑定/解绑任意有效且允许该节点的 `client` Key，并实时提示「通道失效/已吊销」徽标；`client` Scope 登录后隐藏该绑定控件且不请求 `GET /api/v1/keys`，服务端同步省略 `default_notify_*` 字段），以及已上报工作区筛选、路径复制与一键派发。
+   - **Tab 5（`deliveries` / `:nth-of-type(5)`，必须为第 5 个标签页）投递明细**：依据当前聚焦对象（受控 `Run` 调 `GET /api/v1/runs/:id/deliveries`，或原生事件调 `GET /api/v1/native-events/:id`；**仅限 `authScope === "admin"` 请求**）展示 `deliveries_summary`（`tabular-nums`）与逐渠道 `NotificationDeliveryRecord` 明细行（`channel_label`、`channel_kind`、脱敏 `target_host`、`route_mode`、`status`、`http_status`、`attempts`、`error_code`、`error_message`、`sent_at`），并对 `status === "failed"` 的行提供单通道「重推此通道」按钮（分别调用 `POST /api/v1/native-events/:id/redeliver` 或 `POST /api/v1/runs/:id/redeliver`，仅传入 `{ delivery_id }`）。
+   - **顶栏「通知渠道」弹窗（`BrowserNotifyDialog.tsx`）**：由顶栏按钮（`data-testid="open-browser-notify-btn"`，紧邻 `互动 N` 胶囊；`authScope !== "admin"` 时隐藏）触发，展示当前浏览器三态健康度（`Web Push 已激活（离线可达）` / `仅页内提醒（未配置 VAPID 或 iOS 未添加主屏幕）` / `浏览器权限已拒绝（附恢复指引）`）；支持仅在用户点击手势内发起 `Notification.requestPermission()` -> `navigator.serviceWorker.register('/sw.js')` -> `pushManager.subscribe()` -> `POST /api/v1/push-subscriptions`（经 `apiClient`），新订阅默认勾选 `["run_needs_approval", "run_failed", "native_interaction_needed"]`，并提供按设备勾选 `native_turn_summary`、`native_progress`、`run_done`、`run_cancelled` 与 `node_filter`，以及全部已注册设备列表（`enabled` 开关、重命名、「发送测试通知」回显 HTTP 状态码、解绑吊销）。
+   - **顶栏「凭证与接入」弹窗（`KeysDialog` / `OnboardingDialog`）**：仅当当前用户具备 `admin` 权限（`authScope === "admin"`）时才调用 `GET /api/v1/keys` 并支持签发与编辑 `api_keys`（选 `client`、`node` 或 `admin` Scope）；其中 `client` Key 支持多选或留空设置「允许调度节点（`allowed_nodes`）」以及配置该 Bot 专属的「Webhook URL」与「Webhook Key」（支持 `1 Node <-> 1 Bot`、`N Nodes -> 1 Bot` 与 `M Bots <-> N Nodes` 组合映射，列表中脱敏展示已绑定节点列表及 `Webhook: <host>` 徽标并支持在线编辑）；弹窗同时提供「节点接入（`node`）」与「Bot / 纯调用端接入（`client`）」自举提示词（后者要求 Bot 仅作只读转达 `ahub_native_event` 的 `event_kind`、`title`、`summary` 与 `action_required: "notify_user_only"`，严禁将原生事件视为自动审批放行或自动回复指令）；任何已保存 Key 视图与弹窗提示词均**严禁**暴露 Webhook URL 路径或 Bearer Key 原文。
 
 ### 3.2 移动端响应式降级（`< 768px`）
 
-- 隐藏三栏分割线，主屏幕专注渲染中栏「当前会话消息流 + 底部紧贴派发台」。
+- 隐藏三栏分割线，主屏幕专注渲染中栏「当前会话消息流 + 底部紧贴派发台」（或「原生活动详情流」）。
 - 顶部导航条提供「节点与会话」及「队列与流」两个抽屉触发按钮，使用 `shadcn/ui` `Sheet` 组件从左右滑出。
-- 全部可交互按钮、Tab 与列表项在移动端保持至少 `44×44px` 触控热区，确保无外部 Bot 时仅靠手机浏览器即可顺畅完成派单、审批与取消操作。
+- 全部可交互按钮（含顶栏「通知渠道」触发按钮）、Tab 与列表项在移动端保持至少 `44×44px` 触控热区，页面横向溢出为 `0`，确保无外部 Bot 时仅靠手机浏览器即可顺畅完成派单、审批与原生活动确认。
+
+### 3.3 PWA 清单、零回源 Service Worker 与双模式浏览器通知协调
+
+- **PWA 清单与 iOS Access 凭据透传**：`apps/web/index.html` 声明 `<link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials" />`，确保受 Cloudflare Access 保护域名下的 iOS Safari 主屏幕安装流程携带同源 `CF_Authorization` Cookie；`apps/web/public/manifest.webmanifest` 定义 `name`、`short_name`、`start_url: "/"`、`display: "standalone"` 与 `icons`（`public/icons/*`）。
+- **零回源 Service Worker（`apps/web/public/sw.js`）**：
+  - `push` 事件仅调用 `event.data?.json()` 本地解析随帧下发的 RFC 8291 加密载荷（**严禁调用 `fetch('/api/...')`**），避免 Cloudflare Access Cookie 过期时后台唤醒回源失败。
+  - 每次 `push` 事件**必须无条件调用** `event.waitUntil(self.registration.showNotification(title, { body, tag, data: { target_url, kind, id } }))`，满足 Safari / APNs 对可见通知的强制要求，防止推送权限被吊销。
+  - `notificationclick` 事件优先查找并聚焦同源已有客户端窗口（如通过 `client.focus()` + `navigate(target_url)` 或消息定位），无可用窗口时调用 `clients.openWindow(target_url)` 深链定位（`/?pane=native&session=...&event=...` 或 `/?thread=...&run=...`）。
+- **双模式浏览器通知协调器（`apps/web/src/lib/browser-notify.ts`）**：
+  - 当当前设备已启用且激活 Web Push 主通道时，自动抑制同源页内 `window.Notification` 重复弹窗（由 Web Push + `tag` 唯一负责系统级提示）。
+  - 当尚未配置 VAPID、未订阅 Web Push 或处于仅页内提醒降级模式时，利用 `navigator.locks.request("ahub-notify-" + eventKey, { ifAvailable: true }, ...)` 与 `BroadcastChannel("ahub-notify-dedup")` 协调多标签页，确保同一事件在多开标签页中至多弹出一次页内系统通知。
 
 ## 4. `@dnd-kit` 三处高价值拖拽交互规格
 
@@ -128,66 +148,120 @@
 
 ## 5. `zustand` 状态切片契约
 
-前端状态强制拆分为三个职责单一的 Store，避免单一大对象引发全局重渲染：
+前端状态强制拆分为四个职责单一的 Store，避免单一大对象引发全局重渲染：
 
 ```ts
-// 1. 机群与连接状态切片 (apps/web/src/stores/fleet-store.ts)
+// 1. 机群与节点目录切片 (apps/web/src/stores/fleet-store.ts)
 export interface FleetState {
-  nodesById: Record<string, NodeRecord>;
-  nodeOrder: string[];
-  wsStatus: "connecting" | "connected" | "reconnecting" | "disconnected";
-  lastSyncedAt: string | null;
-  hydrateNodes: (nodes: NodeRecord[]) => void;
-  upsertNodeStatus: (node: Partial<NodeRecord> & { id: string }) => void;
-  setWsStatus: (status: FleetState["wsStatus"]) => void;
+  nodes: NodeRecord[];
+  selectedNodeId: string | null;
+  setNodes: (nodes: NodeRecord[]) => void;
+  upsertNode: (node: NodeRecord) => void;
+  selectNode: (nodeId: string | null) => void;
 }
 
-// 2. 会话、任务与事件流切片 (apps/web/src/stores/task-store.ts)
+// 2. 受控会话、任务与事件流切片 (apps/web/src/stores/task-store.ts)
 export interface TaskState {
-  threadsById: Record<string, ThreadRecord>;
-  threadIds: string[];
-  runsById: Record<string, RunRecord>;
-  runIdsByThread: Record<string, string[]>;
+  threads: ThreadRecord[];
+  runs: RunRecord[];
   // 单任务事件流本地保留上限 500 条，防止长时间驻留内存泄漏
-  eventsByRunId: Record<string, RunEventRecord[]>;
-  hydrateInitial: (threads: ThreadRecord[], runs: RunRecord[]) => void;
-  applyRunUpdate: (run: RunRecord) => void;
-  appendRunEvent: (event: RunEventRecord) => void;
-  reorderQueuedRuns: (nodeId: string, orderedRunIds: string[]) => void;
+  eventsByRunId: Record<string, RunEventItem[]>;
+  fullOutputByRunId: Record<string, string>;
+  selectedThreadId: string | null;
+  selectedRunId: string | null;
+  setThreads: (threads: ThreadRecord[]) => void;
+  upsertThread: (thread: ThreadRecord) => void;
+  setRuns: (runs: RunRecord[]) => void;
+  upsertRun: (run: RunRecord) => void;
+  appendEvents: (runId: string, incoming: RunEventItem[]) => void;
+  setFullOutput: (runId: string, outputMd: string) => void;
+  selectThread: (threadId: string | null) => void;
+  selectRun: (runId: string | null) => void;
 }
 
-// 3. 工作台视图与草稿切片 (apps/web/src/stores/workbench-store.ts, 使用 persist 中间件)
+// 3. 工作台视图、鉴权与草稿切片 (apps/web/src/stores/workbench-store.ts)
+export type InspectorTab = "events" | "queue" | "lineage" | "control" | "deliveries";
+export type LeftRailTab = "threads" | "native" | "nodes";
+
 export interface WorkbenchState {
-  theme: "dark" | "light" | "system";
+  theme: "dark" | "light";
+  token: string;
   authStatus: "checking" | "authenticated" | "unauthenticated";
   authKind: string | null;
   authScope: "admin" | "client" | "node" | null;
-  activeThreadId: string | null;
-  activeRunId: string | null;
-  selectedNodeFilter: string | null;
-  inspectorTab: "events" | "queue" | "keys";
-  composerDraftByThread: Record<string, string>;
+  streamStatus: "connecting" | "connected" | "disconnected";
+  leftTab: LeftRailTab;
+  activeTab: InspectorTab;
+  threadQuery: string;
+  onboardingOpen: boolean;
+  keysDialogOpen: boolean;
+  browserNotifyOpen: boolean;
+  mobileLeftOpen: boolean;
+  mobileRightOpen: boolean;
+  errorBanner: string | null;
+  composer: ComposerDraft;
+  setTheme: (theme: "dark" | "light") => void;
+  toggleTheme: () => void;
+  setToken: (token: string) => void;
   setAuthState: (
-    status: WorkbenchState["authStatus"],
-    kind?: string | null,
-    scope?: WorkbenchState["authScope"]
+    authStatus: WorkbenchState["authStatus"],
+    authKind?: string | null,
+    authScope?: WorkbenchState["authScope"]
   ) => void;
-  setActiveThread: (threadId: string | null) => void;
-  setActiveRun: (runId: string | null) => void;
-  setInspectorTab: (tab: WorkbenchState["inspectorTab"]) => void;
-  setComposerDraft: (key: string, text: string) => void;
+  setStreamStatus: (status: WorkbenchState["streamStatus"]) => void;
+  setLeftTab: (tab: LeftRailTab) => void;
+  setActiveTab: (tab: InspectorTab) => void;
+  setThreadQuery: (q: string) => void;
+  setOnboardingOpen: (open: boolean) => void;
+  setKeysDialogOpen: (open: boolean) => void;
+  setBrowserNotifyOpen: (open: boolean) => void;
+  setMobileLeftOpen: (open: boolean) => void;
+  setMobileRightOpen: (open: boolean) => void;
+  setErrorBanner: (msg: string | null) => void;
+  patchComposer: (patch: Partial<ComposerDraft>) => void;
+}
+
+// 4. 原生活动与多渠道投递切片 (apps/web/src/stores/native-activity-store.ts)
+export interface NativeActivityState {
+  events: NativeEventView[];
+  openInteractionCount: number;
+  selectedSessionKey: string | null;
+  selectedEventId: string | null;
+  viewMode: "sessions" | "timeline";
+  filterMode: "all" | "unacked" | "failed";
+  onlySelectedNode: boolean;
+  searchQuery: string;
+  deliveriesBySourceKey: Record<string, NotificationDeliveryRecord[]>;
+  pushConfig: PushConfigRecord | null;
+  subscriptions: WebPushSubscriptionRecord[];
+  hydrateNativeEvents: (events: NativeEventView[], openCount?: number) => void;
+  upsertNativeEvent: (event: NativeEventView, openCount?: number) => void;
+  setDeliveries: (sourceKey: string, deliveries: NotificationDeliveryRecord[]) => void;
+  upsertDelivery: (delivery: NotificationDeliveryRecord) => void;
+  setPushConfig: (config: PushConfigRecord | null) => void;
+  setSubscriptions: (subscriptions: WebPushSubscriptionRecord[]) => void;
+  selectSession: (sessionKey: string | null) => void;
+  selectEvent: (eventId: string | null) => void;
+  setViewMode: (mode: NativeActivityState["viewMode"]) => void;
+  setFilterMode: (mode: NativeActivityState["filterMode"]) => void;
+  setOnlySelectedNode: (only: boolean) => void;
+  setSearchQuery: (q: string) => void;
 }
 ```
 
-### 无本地 Token 时的 Cloudflare Access 会话探测
+> 纯推导辅助函数 `deriveNativeAttentionState(event, allEvents, nowMs)` 与后端 `02-data-and-state-contracts.md` §5.1 保持逐字一致：当 `event_kind === "interaction_needed"` 时按 `acked` (`ack_at !== null`) -> `superseded` (`native_session_id !== ""` 且同 `(node_id, agent, native_session_id)` 存在更大 `(created_at, id)`) -> `stale` (`> 24h`) -> `open` 顺序推导，前端在收到新事件或 `ack` 后可即时重算无幽灵红点。
 
-- 页面加载时即使 `localStorage` 中不存在 `ahub-token`，工作台也必须主动发起同源会话探测（`GET /api/v1/auth/me` 配合初始 REST 拉取，`credentials: "same-origin"`），以无缝激活 Cloudflare Access 登录态（同源 `CF_Authorization` Cookie）并建立 `/ws/stream` 连接；`GET /api/v1/auth/me` 同时回填 `authKind` 与 `authScope`（`principal.scope`），仅当 `authScope === "admin"` 时发起 `GET /api/v1/keys` 并开放节点默认 Bot 通知通道配置与 Key 管理界面。
+### 无本地 Token 时的 Cloudflare Access 会话探测与 `client` Scope 隔离
+
+- 页面加载时即使 `localStorage` 中不存在 `ahub-token`，工作台也必须主动发起同源会话探测（`GET /api/v1/auth/me` 配合初始 REST 拉取，`credentials: "same-origin"`），以无缝激活 Cloudflare Access 登录态（同源 `CF_Authorization` Cookie）并建立 `/ws/stream` 连接；`GET /api/v1/auth/me` 同时回填 `authKind` 与 `authScope`（`principal.scope`）。
+- **严格 `admin` Scope 门禁**：仅当 `authScope === "admin"` 时连接全局 `/ws/stream` 并发起 `GET /api/v1/keys`、`GET /api/v1/native-events`、`GET /api/v1/push/config`、`GET /api/v1/push-subscriptions` 与 `GET /api/v1/runs/:id/deliveries`；当 `authScope === "client"` 时，前端保持 `streamStatus === "disconnected"`、隐藏原生活动与通知渠道入口，且**零触发上述管理员请求（控制台与网络层零 `403` / 零报错）**。
 - 仅当后端明确返回 `401 UNAUTHORIZED` 时，将 `authStatus` 置为 `"unauthenticated"`、停止 WebSocket 自动重连循环，并提示用户在「接入节点 -> Token 登录」配置访问 Token。
 
 ### 增量同步与断线补偿规则
 
-- WebSocket `/ws/stream` 收到 `snapshot` 帧时调用 `hydrateNodes` 与 `hydrateInitial` 全量对齐；每次重连成功后必须重新校准一次 `lastSyncedAt`，避免断网期间遗漏终态变更。
-- `appendRunEvent` 依据 `event.seq` 进行严格去重与单调排序，超过 `500` 条时从头部裁掉早期日志并保留「已归档更早事件，点击加载」提示。
+- WebSocket `/ws/stream` 收到 `snapshot` 帧时调用 `setNodes`、`setThreads`、`setRuns` 与 `hydrateNativeEvents(frame.native_events ?? [], frame.open_interaction_count)` 全量对齐；每次重连成功后重新拉取并校准一次，避免断网期间遗漏终态或原生活动变更。
+- 收到 `native_event.upserted` 时调用 `upsertNativeEvent(frame.event, frame.open_interaction_count)`；收到 `delivery.updated` 时调用 `upsertDelivery(frame.delivery)` 同步更新投递明细；收到 `run.updated` 时调用 `upsertRun(frame.run)` 同步刷新 `notify_status` 与 `deliveries_summary`。
+- `appendEvents` 依据 `event.seq` 进行严格去重与单调排序，超过 `500` 条时从头部裁掉早期日志并保留「已归档更早事件，点击加载」提示。
 
 ## 6. 受控界面文案规范
 
@@ -196,6 +270,11 @@ export interface WorkbenchState {
 | 空状态：工作台首次使用 | 「尚未创建任务。请在底部选择节点与项目目录并输入指令。」 |
 | 空状态：筛选无结果 | 「当前筛选条件下没有匹配的会话或任务。尝试清除节点或状态筛选条件。」 |
 | 空状态：目标节点离线 | 「目标节点当前离线。现在提交的任务将安全进入排队队列，并在节点上线后自动开始执行。」 |
+| 空状态：原生活动首次使用 | 「暂无本地原生会话记录。请在节点 `node.json` 中启用 `native_notify.enabled` 并安装官方 Hook。」 |
+| 空状态：原生活动筛选无结果 | 「当前筛选条件下没有匹配的原生活动记录。尝试切换筛选条件或清除搜索关键字。」 |
+| 原生活动只读物理边界提示 | 「原生会话运行在节点本机终端中，不支持从云端向交互式 TTY 注入指令或强杀进程。」 |
+| `grok` 新建受控任务回退提示 | 「`grok` 暂不支持无头受控执行，已自动切换为该节点可用的受控 Agent。」 |
+| 浏览器通知权限被拒恢复指引 | 「浏览器通知权限已被拒绝，请在浏览器站点设置中重新允许通知后刷新页面。」 |
 | 权限受限提示 | 「当前凭证无权查看系统密钥管理。请使用管理员账号通过 Cloudflare Access 登录。」 |
 | 危险操作：取消运行中任务 | 「确认取消任务？系统将立即向目标节点发送进程组终止信号（SIGTERM），已产生的本地文件改动不会自动回滚。」 |
 | 危险操作：级联取消任务树 | 「确认级联取消整棵任务树？此操作将同步终止该主任务及其衍生出的全部排队与运行中子任务。」 |

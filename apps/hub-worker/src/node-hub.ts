@@ -2,13 +2,17 @@ import { DurableObject } from "cloudflare:workers";
 import {
   appendRunEvents,
   applyRunStateFrame,
+  countOpenNativeInteractions,
   enqueueRunNotificationIfNeeded,
+  getDeliveriesSummaryMap,
   getNodeById,
+  listNativeEvents,
   listNodes,
   listRuns,
   listThreads,
   mapRunRow,
   renewNodePingLeases,
+  type RunRow,
   sanitizeNodeForScope,
   setNodeOffline,
   upsertNodeHello
@@ -18,7 +22,9 @@ import {
   type AuthPrincipal,
   type Env,
   HubError,
+  type NativeEventRecord,
   type NodeRecord,
+  type NotificationDeliveryRecord,
   type RunRecord
 } from "./types";
 import { nowIso } from "./ulid";
@@ -48,6 +54,35 @@ interface Waiter {
 }
 
 const TERMINAL_OR_PAUSE = new Set(["done", "failed", "cancelled", "needs_approval"]);
+
+export async function buildStreamSnapshotPayload(
+  db: D1Database,
+  principal: AuthPrincipal,
+  runId: string | null
+): Promise<Record<string, unknown>> {
+  const isGlobalAdminStream = principal.scope === "admin" && !runId;
+  const [nodes, threads, runs, nativeSnapshot] = await Promise.all([
+    listNodes(db, principal),
+    runId ? Promise.resolve([]) : listThreads(db, principal, { limit: 100 }),
+    listRuns(db, principal, { limit: 100 }),
+    isGlobalAdminStream ? listNativeEvents(db, { limit: 100 }) : Promise.resolve(null)
+  ]);
+  const filteredRuns = runId ? runs.filter((r) => r.id === runId) : runs;
+
+  return {
+    type: "snapshot",
+    nodes,
+    threads,
+    runs: filteredRuns,
+    ...(nativeSnapshot
+      ? {
+          native_events: nativeSnapshot.events,
+          open_interaction_count: nativeSnapshot.openInteractionCount
+        }
+      : {}),
+    ts: nowIso()
+  };
+}
 
 export class NodeHub extends DurableObject<Env> {
   private waiters = new Map<string, Set<Waiter>>();
@@ -98,10 +133,15 @@ export class NodeHub extends DurableObject<Env> {
     filter?: { runId?: string; nodeId?: string }
   ): void {
     const adminEncoded = JSON.stringify(payload);
+    const adminGlobalOnly =
+      payload.type === "native_event.upserted" || payload.type === "delivery.updated";
     let clientEncoded: string | null = null;
     for (const ws of this.ctx.getWebSockets("stream")) {
       const att = ws.deserializeAttachment() as StreamWsAttachment | null;
       if (!att) continue;
+      if (adminGlobalOnly && (att.scope !== "admin" || Boolean(att.runId))) {
+        continue;
+      }
       if (att.runId && filter?.runId && att.runId !== filter.runId) {
         continue;
       }
@@ -192,20 +232,8 @@ export class NodeHub extends DurableObject<Env> {
       };
       server.serializeAttachment(attachment);
 
-      const [nodes, threads, runs] = await Promise.all([
-        listNodes(this.env.DB, principal),
-        runId ? Promise.resolve([]) : listThreads(this.env.DB, principal, { limit: 100 }),
-        listRuns(this.env.DB, principal, { limit: 100 })
-      ]);
-      const filteredRuns = runId ? runs.filter((r) => r.id === runId) : runs;
-
-      this.sendJson(server, {
-        type: "snapshot",
-        nodes,
-        threads,
-        runs: filteredRuns,
-        ts: nowIso()
-      });
+      const snapshot = await buildStreamSnapshotPayload(this.env.DB, principal, runId);
+      this.sendJson(server, snapshot);
 
       const responseHeaders = new Headers();
       const proto = request.headers.get("Sec-WebSocket-Protocol");
@@ -265,6 +293,32 @@ export class NodeHub extends DurableObject<Env> {
     if (request.method === "POST" && url.pathname === "/internal/broadcast-node") {
       const body = (await request.json()) as { node: NodeRecord };
       this.broadcastToStream({ type: "node.status", node: body.node }, { nodeId: body.node.id });
+      return Response.json({ ok: true });
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal/broadcast-native-event") {
+      const body = (await request.json()) as {
+        event: NativeEventRecord;
+        open_interaction_count?: number;
+      };
+      const openInteractionCount =
+        typeof body.open_interaction_count === "number"
+          ? body.open_interaction_count
+          : await countOpenNativeInteractions(this.env.DB);
+      this.broadcastToStream({
+        type: "native_event.upserted",
+        event: body.event,
+        open_interaction_count: openInteractionCount
+      });
+      return Response.json({ ok: true });
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal/broadcast-delivery") {
+      const body = (await request.json()) as { delivery: NotificationDeliveryRecord };
+      this.broadcastToStream({
+        type: "delivery.updated",
+        delivery: body.delivery
+      });
       return Response.json({ ok: true });
     }
 
@@ -430,10 +484,23 @@ export class NodeHub extends DurableObject<Env> {
           }
         );
         if (updated) {
+          let runRowForBroadcast: RunRow = updated;
+          let deliveriesSummary;
           if (frame.status === "needs_approval") {
             await enqueueRunNotificationIfNeeded(this.env.DB, this.env, updated, "needs_approval");
+            runRowForBroadcast =
+              (await this.env.DB.prepare(`SELECT * FROM runs WHERE id = ?1`).bind(updated.id).first<RunRow>()) ??
+              updated;
+            deliveriesSummary = (
+              await getDeliveriesSummaryMap(this.env.DB, "run", [runRowForBroadcast.id])
+            ).get(runRowForBroadcast.id);
           }
-          const runRecord = mapRunRow(updated, { view: "summary", tailBytes: 16384, promptMode: "preview" });
+          const runRecord = mapRunRow(runRowForBroadcast, {
+            view: "summary",
+            tailBytes: 16384,
+            promptMode: "preview",
+            deliveriesSummary
+          });
           this.broadcastToStream(
             { type: "run.updated", run: runRecord },
             { runId: runRecord.id, nodeId: runRecord.node_id }

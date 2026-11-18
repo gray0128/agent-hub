@@ -1,13 +1,31 @@
+import {
+  getDeliveryById,
+  getNativeEventById,
+  mapRunRow,
+  parseNotifyPolicy,
+  recomputeSourceNotifyStatus,
+  type RunRow
+} from "./db";
 import { buildPromptPreview, redactSecrets } from "./redact";
 import {
   type ApiScope,
+  type DeliveryNotifyQueueMessage,
+  type DeliveriesSummary,
+  type DeliverySourceKind,
   type Env,
   type NativeEventNotifyQueueMessage,
   type NotifyQueueMessage,
-  type RunNotifyQueueMessage
+  type RunNotifyQueueMessage,
+  type WebPushSubscriptionSecret
 } from "./types";
 import { nowIso } from "./ulid";
-import { decryptWebhookConfig } from "./webhook-crypto";
+import {
+  getVapidConfig,
+  isLoopbackPushAllowed,
+  sendWebPushNotification,
+  type WebPushNotificationPayload
+} from "./web-push";
+import { decryptJsonSecret, decryptWebhookConfig } from "./webhook-crypto";
 
 interface RunWebhookRow {
   id: string;
@@ -24,7 +42,9 @@ interface RunWebhookRow {
   duration_ms: number;
   remote_control_url: string;
   summary: string;
+  error_message?: string;
   output_bytes: number;
+  notify_policy_json?: string;
   created_by_key_id: string | null;
   key_scope: ApiScope | null;
   key_revoked_at: string | null;
@@ -54,6 +74,15 @@ interface NativeEventWebhookRow {
   node_key_revoked_at: string | null;
   node_key_allowed_nodes_json: string | null;
   node_key_webhook_ciphertext: string | null;
+}
+
+interface WebPushSubscriptionDbRow {
+  id: string;
+  label: string;
+  endpoint_host: string;
+  subscription_ciphertext: string;
+  enabled: number;
+  revoked_at: string | null;
 }
 
 interface ResolvedWebhookTarget {
@@ -119,6 +148,24 @@ async function resolveNodeDefaultWebhook(
   }
 }
 
+function resolveGlobalLegacyWebhook(target: "grok" | "webhook", env: Env): ResolvedWebhookTarget | null {
+  const fallbackUrl =
+    target === "grok"
+      ? env.GROK_WEBHOOK_URL?.trim()
+      : (env.WEBHOOK_URL?.trim() || env.GROK_WEBHOOK_URL?.trim());
+  if (!fallbackUrl) {
+    return null;
+  }
+  const fallbackKey =
+    target === "grok"
+      ? env.GROK_WEBHOOK_KEY?.trim()
+      : (env.WEBHOOK_KEY?.trim() || env.GROK_WEBHOOK_KEY?.trim());
+  return {
+    url: fallbackUrl,
+    ...(fallbackKey ? { key: fallbackKey } : {})
+  };
+}
+
 async function resolveRunWebhookTarget(
   row: RunWebhookRow,
   body: RunNotifyQueueMessage,
@@ -167,27 +214,13 @@ async function resolveRunWebhookTarget(
     }
   }
 
-  const fallbackUrl =
-    body.target === "grok"
-      ? env.GROK_WEBHOOK_URL?.trim()
-      : (env.WEBHOOK_URL?.trim() || env.GROK_WEBHOOK_URL?.trim());
-  if (!fallbackUrl) {
-    return null;
-  }
-  const fallbackKey =
-    body.target === "grok"
-      ? env.GROK_WEBHOOK_KEY?.trim()
-      : (env.WEBHOOK_KEY?.trim() || env.GROK_WEBHOOK_KEY?.trim());
-  return {
-    url: fallbackUrl,
-    ...(fallbackKey ? { key: fallbackKey } : {})
-  };
+  return resolveGlobalLegacyWebhook(body.target === "grok" ? "grok" : "webhook", env);
 }
 
 async function deliverWebhookPost(
   resolved: ResolvedWebhookTarget,
   payload: unknown
-): Promise<"ok" | "retry_or_fail"> {
+): Promise<{ ok: boolean; httpStatus: number | null; errorMessage: string }> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json"
   };
@@ -200,55 +233,28 @@ async function deliverWebhookPost(
       headers,
       body: JSON.stringify(payload)
     });
-    return resp.ok ? "ok" : "retry_or_fail";
-  } catch {
-    return "retry_or_fail";
+    if (resp.ok) {
+      await resp.body?.cancel().catch(() => undefined);
+      return { ok: true, httpStatus: resp.status, errorMessage: "" };
+    }
+    const text = await resp.text().catch(() => "");
+    return {
+      ok: false,
+      httpStatus: resp.status,
+      errorMessage: text.trim().slice(0, 300) || `Webhook returned HTTP ${resp.status}.`
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      httpStatus: null,
+      errorMessage: err instanceof Error ? err.message.slice(0, 300) : String(err).slice(0, 300)
+    };
   }
 }
 
-async function processRunNotifyMessage(
-  message: Message<NotifyQueueMessage>,
-  body: RunNotifyQueueMessage,
-  env: Env
-): Promise<void> {
-  const row = await env.DB.prepare(
-    `SELECT r.id, r.thread_id, r.root_run_id, r.node_id, r.workdir, r.agent, r.status,
-            r.prompt, r.resolved_model, r.resolved_effort, r.native_session_id, r.duration_ms,
-            r.remote_control_url, r.summary, r.output_bytes, r.created_by_key_id,
-            k.scope AS key_scope,
-            k.revoked_at AS key_revoked_at,
-            k.notify_webhook_ciphertext AS key_webhook_ciphertext,
-            n.default_notify_key_id AS node_default_key_id,
-            nk.scope AS node_key_scope,
-            nk.revoked_at AS node_key_revoked_at,
-            nk.allowed_nodes_json AS node_key_allowed_nodes_json,
-            nk.notify_webhook_ciphertext AS node_key_webhook_ciphertext
-     FROM runs r
-     LEFT JOIN api_keys k ON k.id = r.created_by_key_id
-     LEFT JOIN nodes n ON n.id = r.node_id
-     LEFT JOIN api_keys nk ON nk.id = n.default_notify_key_id
-     WHERE r.id = ?1
-     LIMIT 1`
-  )
-    .bind(body.run_id)
-    .first<RunWebhookRow>();
-
-  if (!row) {
-    message.ack();
-    return;
-  }
-
-  const resolved = await resolveRunWebhookTarget(row, body, env);
-  if (!resolved) {
-    await env.DB.prepare(`UPDATE runs SET notify_status = 'failed', updated_at = ?1 WHERE id = ?2`)
-      .bind(nowIso(), body.run_id)
-      .run();
-    message.ack();
-    return;
-  }
-
+function buildRunWebhookPayload(row: RunWebhookRow, env: Env): Record<string, unknown> {
   const { promptPreview, promptTruncated } = buildPromptPreview(row.prompt ?? "", 1200);
-  const payload = {
+  return {
     event: "ahub_run_completed",
     hub_url: env.HUB_PUBLIC_URL || "https://ahub.bobocai.win",
     run_id: row.id,
@@ -269,9 +275,576 @@ async function processRunNotifyMessage(
     output_bytes: row.output_bytes,
     fetch_full_cmd: `ahub result ${row.id} --full --json`
   };
+}
 
+function buildNativeEventWebhookPayload(row: NativeEventWebhookRow, env: Env): Record<string, unknown> {
+  return {
+    event: "ahub_native_event",
+    hub_url: env.HUB_PUBLIC_URL || "https://ahub.bobocai.win",
+    native_event_id: row.id,
+    event_id: row.event_id,
+    node_id: row.node_id,
+    agent: row.agent,
+    event_kind: row.event_kind,
+    native_session_id: row.native_session_id,
+    workdir: row.workdir,
+    title: redactSecrets(row.title),
+    summary: redactSecrets(row.summary),
+    source: row.source,
+    action_required: "notify_user_only",
+    created_at: row.created_at
+  };
+}
+
+async function doBroadcast(env: Env, path: string, payload: unknown): Promise<void> {
+  if (!env.NODE_HUB) return;
+  try {
+    const id = env.NODE_HUB.idFromName("global");
+    const stub = env.NODE_HUB.get(id);
+    await stub.fetch(`https://node-hub${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+  } catch (err) {
+    console.warn(`[notify] DO broadcast ${path} failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+async function broadcastDeliveryAndParent(
+  env: Env,
+  deliveryId: string,
+  sourceKind: DeliverySourceKind,
+  sourceId: string,
+  deliveriesSummary?: DeliveriesSummary
+): Promise<void> {
+  if (!env.NODE_HUB) return;
+  const freshDelivery = await getDeliveryById(env.DB, deliveryId);
+  if (freshDelivery) {
+    await doBroadcast(env, "/internal/broadcast-delivery", { delivery: freshDelivery });
+  }
+  if (!deliveriesSummary) return;
+
+  if (sourceKind === "run") {
+    const freshRun = await env.DB.prepare(`SELECT * FROM runs WHERE id = ?1 LIMIT 1`)
+      .bind(sourceId)
+      .first<RunRow>();
+    if (freshRun) {
+      await doBroadcast(env, "/internal/broadcast-run", {
+        run: mapRunRow(freshRun, {
+          view: "summary",
+          tailBytes: 16384,
+          promptMode: "preview",
+          deliveriesSummary
+        })
+      });
+    }
+    return;
+  }
+
+  const freshEvent = await getNativeEventById(env.DB, sourceId);
+  if (freshEvent) {
+    await doBroadcast(env, "/internal/broadcast-native-event", { event: freshEvent });
+  }
+}
+
+async function loadRunWebhookRow(db: D1Database, runId: string): Promise<RunWebhookRow | null> {
+  return db
+    .prepare(
+      `SELECT r.id, r.thread_id, r.root_run_id, r.node_id, r.workdir, r.agent, r.status,
+              r.prompt, r.resolved_model, r.resolved_effort, r.native_session_id, r.duration_ms,
+              r.remote_control_url, r.summary, r.error_message, r.output_bytes, r.notify_policy_json,
+              r.created_by_key_id,
+              k.scope AS key_scope,
+              k.revoked_at AS key_revoked_at,
+              k.notify_webhook_ciphertext AS key_webhook_ciphertext,
+              n.default_notify_key_id AS node_default_key_id,
+              nk.scope AS node_key_scope,
+              nk.revoked_at AS node_key_revoked_at,
+              nk.allowed_nodes_json AS node_key_allowed_nodes_json,
+              nk.notify_webhook_ciphertext AS node_key_webhook_ciphertext
+       FROM runs r
+       LEFT JOIN api_keys k ON k.id = r.created_by_key_id
+       LEFT JOIN nodes n ON n.id = r.node_id
+       LEFT JOIN api_keys nk ON nk.id = n.default_notify_key_id
+       WHERE r.id = ?1
+       LIMIT 1`
+    )
+    .bind(runId)
+    .first<RunWebhookRow>();
+}
+
+async function loadNativeEventWebhookRow(
+  db: D1Database,
+  nativeEventId: string
+): Promise<NativeEventWebhookRow | null> {
+  return db
+    .prepare(
+      `SELECT e.id, e.node_id, e.event_id, e.agent, e.event_kind, e.native_session_id,
+              e.workdir, e.title, e.summary, e.source, e.notify_key_id, e.created_at,
+              n.default_notify_key_id AS node_default_key_id,
+              nk.scope AS node_key_scope,
+              nk.revoked_at AS node_key_revoked_at,
+              nk.allowed_nodes_json AS node_key_allowed_nodes_json,
+              nk.notify_webhook_ciphertext AS node_key_webhook_ciphertext
+       FROM native_events e
+       LEFT JOIN nodes n ON n.id = e.node_id
+       LEFT JOIN api_keys nk ON nk.id = n.default_notify_key_id
+       WHERE e.id = ?1
+       LIMIT 1`
+    )
+    .bind(nativeEventId)
+    .first<NativeEventWebhookRow>();
+}
+
+async function markDeliveryFailedAndAck(
+  message: Message<NotifyQueueMessage>,
+  env: Env,
+  delivery: { id: string; source_kind: DeliverySourceKind; source_id: string },
+  attempts: number,
+  httpStatus: number | null,
+  errorCode: string,
+  errorMessage: string
+): Promise<void> {
+  const now = nowIso();
+  await env.DB.prepare(
+    `UPDATE notification_deliveries
+     SET status = 'failed', attempts = ?1, http_status = ?2, error_code = ?3, error_message = ?4, updated_at = ?5
+     WHERE id = ?6`
+  )
+    .bind(attempts, httpStatus, errorCode, errorMessage.slice(0, 300), now, delivery.id)
+    .run();
+  const agg = await recomputeSourceNotifyStatus(env.DB, delivery.source_kind, delivery.source_id);
+  await broadcastDeliveryAndParent(env, delivery.id, delivery.source_kind, delivery.source_id, agg.deliveriesSummary);
+  message.ack();
+}
+
+async function processDeliveryWebhook(
+  message: Message<NotifyQueueMessage>,
+  delivery: {
+    id: string;
+    source_kind: DeliverySourceKind;
+    source_id: string;
+    route_mode: string;
+    channel_id: string;
+    attempts: number;
+  },
+  env: Env
+): Promise<void> {
+  const nextAttempts = delivery.attempts + 1;
+  let resolved: ResolvedWebhookTarget | null = null;
+  let payload: Record<string, unknown> | null = null;
+
+  if (delivery.source_kind === "run") {
+    const row = await loadRunWebhookRow(env.DB, delivery.source_id);
+    if (!row) {
+      message.ack();
+      return;
+    }
+    if (delivery.route_mode === "key") {
+      if (row.created_by_key_id === delivery.channel_id && row.key_revoked_at === null) {
+        const ciphertext = row.key_webhook_ciphertext?.trim() ?? "";
+        if (ciphertext) {
+          try {
+            resolved = await decryptWebhookConfig(env.WEBHOOK_ENCRYPTION_KEY ?? "", ciphertext);
+          } catch {
+            resolved = null;
+          }
+        }
+      }
+    } else if (delivery.route_mode === "node_default") {
+      resolved = await resolveNodeDefaultWebhook(
+        `run=${row.id}`,
+        row.node_id,
+        delivery.channel_id,
+        row.node_default_key_id ?? null,
+        row.node_key_scope ?? null,
+        row.node_key_revoked_at ?? null,
+        row.node_key_allowed_nodes_json ?? null,
+        row.node_key_webhook_ciphertext ?? null,
+        env
+      );
+    } else if (delivery.route_mode === "global_legacy") {
+      const policy = parseNotifyPolicy(row.notify_policy_json ?? "{}");
+      const target = policy.target === "webhook" ? "webhook" : "grok";
+      resolved = resolveGlobalLegacyWebhook(target, env);
+    }
+    payload = buildRunWebhookPayload(row, env);
+  } else {
+    const row = await loadNativeEventWebhookRow(env.DB, delivery.source_id);
+    if (!row) {
+      message.ack();
+      return;
+    }
+    resolved = await resolveNodeDefaultWebhook(
+      `native_event=${row.id}`,
+      row.node_id,
+      delivery.channel_id,
+      row.node_default_key_id ?? null,
+      row.node_key_scope ?? null,
+      row.node_key_revoked_at ?? null,
+      row.node_key_allowed_nodes_json ?? null,
+      row.node_key_webhook_ciphertext ?? null,
+      env
+    );
+    payload = buildNativeEventWebhookPayload(row, env);
+  }
+
+  if (!resolved) {
+    await markDeliveryFailedAndAck(
+      message,
+      env,
+      delivery,
+      nextAttempts,
+      null,
+      "CHANNEL_UNBOUND_OR_REVOKED",
+      "Webhook channel is unbound, revoked, or cannot be decrypted."
+    );
+    return;
+  }
+
+  const result = await deliverWebhookPost(resolved, payload);
+  const now = nowIso();
+  if (result.ok) {
+    await env.DB.prepare(
+      `UPDATE notification_deliveries
+       SET status = 'sent', attempts = ?1, http_status = ?2, error_code = '', error_message = '', sent_at = ?3, updated_at = ?3
+       WHERE id = ?4`
+    )
+      .bind(nextAttempts, result.httpStatus, now, delivery.id)
+      .run();
+    const agg = await recomputeSourceNotifyStatus(env.DB, delivery.source_kind, delivery.source_id);
+    await broadcastDeliveryAndParent(env, delivery.id, delivery.source_kind, delivery.source_id, agg.deliveriesSummary);
+    message.ack();
+    return;
+  }
+
+  if (message.attempts >= 5) {
+    await markDeliveryFailedAndAck(
+      message,
+      env,
+      delivery,
+      nextAttempts,
+      result.httpStatus,
+      "WEBHOOK_DELIVERY_FAILED",
+      result.errorMessage
+    );
+    return;
+  }
+
+  await env.DB.prepare(
+    `UPDATE notification_deliveries
+     SET attempts = ?1, http_status = ?2, error_code = 'WEBHOOK_DELIVERY_FAILED', error_message = ?3, updated_at = ?4
+     WHERE id = ?5`
+  )
+    .bind(nextAttempts, result.httpStatus, result.errorMessage.slice(0, 300), now, delivery.id)
+    .run();
+  await broadcastDeliveryAndParent(env, delivery.id, delivery.source_kind, delivery.source_id);
+  message.retry({ delaySeconds: Math.min(30, 2 ** message.attempts) });
+}
+
+async function processDeliveryWebPush(
+  message: Message<NotifyQueueMessage>,
+  delivery: {
+    id: string;
+    source_kind: DeliverySourceKind;
+    source_id: string;
+    trigger_event: string;
+    channel_id: string;
+    attempts: number;
+  },
+  env: Env
+): Promise<void> {
+  const nextAttempts = delivery.attempts + 1;
+  const sub = await env.DB.prepare(
+    `SELECT id, label, endpoint_host, subscription_ciphertext, enabled, revoked_at
+     FROM web_push_subscriptions
+     WHERE id = ?1
+     LIMIT 1`
+  )
+    .bind(delivery.channel_id)
+    .first<WebPushSubscriptionDbRow>();
+
+  if (!sub || sub.revoked_at !== null || sub.enabled !== 1) {
+    const code = sub?.revoked_at !== null && sub ? "SUBSCRIPTION_EXPIRED" : "CHANNEL_UNBOUND_OR_REVOKED";
+    await markDeliveryFailedAndAck(
+      message,
+      env,
+      delivery,
+      nextAttempts,
+      null,
+      code,
+      "Web Push subscription is missing, disabled, or revoked."
+    );
+    return;
+  }
+
+  const vapidState = getVapidConfig(env);
+  if (!vapidState.enabled) {
+    await markDeliveryFailedAndAck(
+      message,
+      env,
+      delivery,
+      nextAttempts,
+      null,
+      "VAPID_NOT_CONFIGURED",
+      "VAPID keys are not configured on Worker."
+    );
+    return;
+  }
+
+  let secretSub: WebPushSubscriptionSecret;
+  try {
+    secretSub = await decryptJsonSecret<WebPushSubscriptionSecret>(
+      env.WEBHOOK_ENCRYPTION_KEY ?? "",
+      sub.subscription_ciphertext
+    );
+  } catch (err) {
+    await markDeliveryFailedAndAck(
+      message,
+      env,
+      delivery,
+      nextAttempts,
+      null,
+      "CHANNEL_UNBOUND_OR_REVOKED",
+      err instanceof Error ? err.message : "Failed to decrypt Web Push subscription."
+    );
+    return;
+  }
+
+  let pushPayload: WebPushNotificationPayload;
+  const now = nowIso();
+  if (delivery.source_kind === "native_event") {
+    const ev = await env.DB.prepare(
+      `SELECT id, node_id, agent, event_kind, native_session_id, workdir, title, summary, created_at
+       FROM native_events
+       WHERE id = ?1
+       LIMIT 1`
+    )
+      .bind(delivery.source_id)
+      .first<{
+        id: string;
+        node_id: string;
+        agent: string;
+        event_kind: string;
+        native_session_id: string;
+        workdir: string;
+        title: string;
+        summary: string;
+        created_at: string;
+      }>();
+    if (!ev) {
+      message.ack();
+      return;
+    }
+    const urgent = ev.event_kind === "interaction_needed";
+    const fallbackTitle =
+      ev.event_kind === "interaction_needed"
+        ? "需要人工确认"
+        : ev.event_kind === "progress"
+          ? "阶段进展"
+          : "回合完成";
+    const cleanTitle = redactSecrets(ev.title).trim();
+    const title = `[${ev.node_id} · ${ev.agent}] ${cleanTitle || fallbackTitle}`;
+    const cleanSummary = redactSecrets(ev.summary).trim();
+    const bodyText = ev.workdir
+      ? `${ev.workdir}: ${cleanSummary || cleanTitle || fallbackTitle}`
+      : cleanSummary || title;
+    const sessionKey = ev.native_session_id
+      ? `${ev.node_id}:${ev.agent}:${ev.native_session_id}`
+      : `${ev.node_id}:${ev.agent}:${ev.workdir}`;
+    pushPayload = {
+      v: 1,
+      kind: "native_event",
+      id: ev.id,
+      tag: `ahub-native-${ev.id}`,
+      urgent,
+      title,
+      body: bodyText,
+      target_url: `/?pane=native&session=${encodeURIComponent(sessionKey)}&event=${encodeURIComponent(ev.id)}`,
+      ts: ev.created_at
+    };
+  } else {
+    const run = await env.DB.prepare(`SELECT * FROM runs WHERE id = ?1 LIMIT 1`)
+      .bind(delivery.source_id)
+      .first<RunRow>();
+    if (!run) {
+      message.ack();
+      return;
+    }
+    const trigger = delivery.trigger_event;
+    const urgent = trigger === "needs_approval" || trigger === "failed";
+    const labelMap: Record<string, string> = {
+      needs_approval: "需要人工审批",
+      failed: "任务执行失败",
+      done: "任务已完成",
+      cancelled: "任务已取消"
+    };
+    const statusLabel = labelMap[trigger] ?? run.status;
+    const title = `[${run.node_id} · ${run.agent}] ${statusLabel}`;
+    const rawBody =
+      run.summary.trim() ||
+      run.error_message.trim() ||
+      buildPromptPreview(run.prompt ?? "", 200).promptPreview ||
+      run.workdir;
+    pushPayload = {
+      v: 1,
+      kind: "run",
+      id: run.id,
+      tag: `ahub-run-${run.id}`,
+      urgent,
+      title,
+      body: redactSecrets(rawBody),
+      target_url: `/?run=${encodeURIComponent(run.id)}`,
+      ts: now
+    };
+  }
+
+  const pushResult = await sendWebPushNotification({
+    subscription: secretSub,
+    payload: pushPayload,
+    vapid: vapidState.config,
+    urgency: pushPayload.urgent ? "high" : "normal",
+    ttlSeconds: 86400,
+    allowLoopbackForTest: isLoopbackPushAllowed(env)
+  });
+
+  const finishedNow = nowIso();
+  if (pushResult.outcome === "sent") {
+    await env.DB.prepare(
+      `UPDATE web_push_subscriptions
+       SET failure_count = 0, last_sent_at = ?1, last_error_code = '', last_error_message = '', updated_at = ?1
+       WHERE id = ?2`
+    )
+      .bind(finishedNow, sub.id)
+      .run();
+    await env.DB.prepare(
+      `UPDATE notification_deliveries
+       SET status = 'sent', attempts = ?1, http_status = ?2, error_code = '', error_message = '', sent_at = ?3, updated_at = ?3
+       WHERE id = ?4`
+    )
+      .bind(nextAttempts, pushResult.httpStatus, finishedNow, delivery.id)
+      .run();
+    const agg = await recomputeSourceNotifyStatus(env.DB, delivery.source_kind, delivery.source_id);
+    await broadcastDeliveryAndParent(env, delivery.id, delivery.source_kind, delivery.source_id, agg.deliveriesSummary);
+    message.ack();
+    return;
+  }
+
+  if (pushResult.outcome === "expired") {
+    await env.DB.prepare(
+      `UPDATE web_push_subscriptions
+       SET revoked_at = COALESCE(revoked_at, ?1), enabled = 0, last_error_code = 'SUBSCRIPTION_EXPIRED', last_error_message = ?2, updated_at = ?1
+       WHERE id = ?3`
+    )
+      .bind(finishedNow, pushResult.errorMessage.slice(0, 300), sub.id)
+      .run();
+    await markDeliveryFailedAndAck(
+      message,
+      env,
+      delivery,
+      nextAttempts,
+      pushResult.httpStatus,
+      "SUBSCRIPTION_EXPIRED",
+      pushResult.errorMessage
+    );
+    return;
+  }
+
+  if (pushResult.outcome === "rejected") {
+    await env.DB.prepare(
+      `UPDATE web_push_subscriptions
+       SET failure_count = failure_count + 1, last_error_code = ?1, last_error_message = ?2, updated_at = ?3
+       WHERE id = ?4`
+    )
+      .bind(pushResult.errorCode, pushResult.errorMessage.slice(0, 300), finishedNow, sub.id)
+      .run();
+    await markDeliveryFailedAndAck(
+      message,
+      env,
+      delivery,
+      nextAttempts,
+      pushResult.httpStatus,
+      pushResult.errorCode,
+      pushResult.errorMessage
+    );
+    return;
+  }
+
+  // outcome === "retry"
+  if (message.attempts >= 5) {
+    await env.DB.prepare(
+      `UPDATE web_push_subscriptions
+       SET failure_count = failure_count + 1, last_error_code = 'PUSH_UPSTREAM_TIMEOUT', last_error_message = ?1, updated_at = ?2
+       WHERE id = ?3`
+    )
+      .bind(pushResult.errorMessage.slice(0, 300), finishedNow, sub.id)
+      .run();
+    await markDeliveryFailedAndAck(
+      message,
+      env,
+      delivery,
+      nextAttempts,
+      pushResult.httpStatus,
+      "PUSH_UPSTREAM_TIMEOUT",
+      pushResult.errorMessage
+    );
+    return;
+  }
+
+  await env.DB.prepare(
+    `UPDATE notification_deliveries
+     SET attempts = ?1, http_status = ?2, error_code = 'PUSH_UPSTREAM_TIMEOUT', error_message = ?3, updated_at = ?4
+     WHERE id = ?5`
+  )
+    .bind(nextAttempts, pushResult.httpStatus, pushResult.errorMessage.slice(0, 300), finishedNow, delivery.id)
+    .run();
+  await broadcastDeliveryAndParent(env, delivery.id, delivery.source_kind, delivery.source_id);
+  message.retry({ delaySeconds: Math.min(30, 2 ** message.attempts) });
+}
+
+async function processDeliveryMessage(
+  message: Message<NotifyQueueMessage>,
+  body: DeliveryNotifyQueueMessage,
+  env: Env
+): Promise<void> {
+  const delivery = await getDeliveryById(env.DB, body.delivery_id);
+  if (!delivery || delivery.status === "sent" || delivery.status === "skipped") {
+    message.ack();
+    return;
+  }
+
+  if (delivery.channel_kind === "web_push") {
+    await processDeliveryWebPush(message, delivery, env);
+    return;
+  }
+
+  await processDeliveryWebhook(message, delivery, env);
+}
+
+async function processRunNotifyMessage(
+  message: Message<NotifyQueueMessage>,
+  body: RunNotifyQueueMessage,
+  env: Env
+): Promise<void> {
+  const row = await loadRunWebhookRow(env.DB, body.run_id);
+  if (!row) {
+    message.ack();
+    return;
+  }
+
+  const resolved = await resolveRunWebhookTarget(row, body, env);
+  if (!resolved) {
+    await env.DB.prepare(`UPDATE runs SET notify_status = 'failed', updated_at = ?1 WHERE id = ?2`)
+      .bind(nowIso(), body.run_id)
+      .run();
+    message.ack();
+    return;
+  }
+
+  const payload = buildRunWebhookPayload(row, env);
   const outcome = await deliverWebhookPost(resolved, payload);
-  if (outcome === "ok") {
+  if (outcome.ok) {
     await env.DB.prepare(`UPDATE runs SET notify_status = 'sent', updated_at = ?1 WHERE id = ?2`)
       .bind(nowIso(), body.run_id)
       .run();
@@ -293,23 +866,7 @@ async function processNativeEventNotifyMessage(
   body: NativeEventNotifyQueueMessage,
   env: Env
 ): Promise<void> {
-  const row = await env.DB.prepare(
-    `SELECT e.id, e.node_id, e.event_id, e.agent, e.event_kind, e.native_session_id,
-            e.workdir, e.title, e.summary, e.source, e.notify_key_id, e.created_at,
-            n.default_notify_key_id AS node_default_key_id,
-            nk.scope AS node_key_scope,
-            nk.revoked_at AS node_key_revoked_at,
-            nk.allowed_nodes_json AS node_key_allowed_nodes_json,
-            nk.notify_webhook_ciphertext AS node_key_webhook_ciphertext
-     FROM native_events e
-     LEFT JOIN nodes n ON n.id = e.node_id
-     LEFT JOIN api_keys nk ON nk.id = n.default_notify_key_id
-     WHERE e.id = ?1
-     LIMIT 1`
-  )
-    .bind(body.native_event_id)
-    .first<NativeEventWebhookRow>();
-
+  const row = await loadNativeEventWebhookRow(env.DB, body.native_event_id);
   if (!row) {
     message.ack();
     return;
@@ -338,25 +895,9 @@ async function processNativeEventNotifyMessage(
     return;
   }
 
-  const payload = {
-    event: "ahub_native_event",
-    hub_url: env.HUB_PUBLIC_URL || "https://ahub.bobocai.win",
-    native_event_id: row.id,
-    event_id: row.event_id,
-    node_id: row.node_id,
-    agent: row.agent,
-    event_kind: row.event_kind,
-    native_session_id: row.native_session_id,
-    workdir: row.workdir,
-    title: redactSecrets(row.title),
-    summary: redactSecrets(row.summary),
-    source: row.source,
-    action_required: "notify_user_only",
-    created_at: row.created_at
-  };
-
+  const payload = buildNativeEventWebhookPayload(row, env);
   const outcome = await deliverWebhookPost(resolved, payload);
-  if (outcome === "ok") {
+  if (outcome.ok) {
     await env.DB.prepare(
       `UPDATE native_events SET notify_status = 'sent', notify_error = '', updated_at = ?1 WHERE id = ?2`
     )
@@ -385,7 +926,9 @@ export async function processNotifyBatch(
 ): Promise<void> {
   for (const message of batch.messages) {
     const body = message.body;
-    if (body.kind === "native_event") {
+    if (body.kind === "delivery") {
+      await processDeliveryMessage(message, body, env);
+    } else if (body.kind === "native_event") {
       await processNativeEventNotifyMessage(message, body, env);
     } else {
       await processRunNotifyMessage(message, body, env);

@@ -76,6 +76,7 @@ class CDPClient {
     this.ws = new WebSocket(wsUrl);
     this.nextId = 1;
     this.pending = new Map();
+    this.eventHandlers = new Map();
     this.consoleErrors = [];
     this.exceptions = [];
     this.opened = new Promise((resolve, reject) => {
@@ -91,6 +92,11 @@ class CDPClient {
         else resolve(msg.result);
         return;
       }
+      if (msg.method && this.eventHandlers.has(msg.method)) {
+        for (const fn of this.eventHandlers.get(msg.method)) {
+          fn(msg.params);
+        }
+      }
       if (msg.method === "Runtime.consoleAPICalled") {
         const type = msg.params?.type;
         if (type === "error") {
@@ -102,6 +108,12 @@ class CDPClient {
         this.exceptions.push(details?.exception?.description ?? details?.text ?? "Unknown exception");
       }
     });
+  }
+
+  onEvent(method, handler) {
+    const list = this.eventHandlers.get(method) ?? [];
+    list.push(handler);
+    this.eventHandlers.set(method, list);
   }
 
   async connect() {
@@ -286,6 +298,274 @@ function toBase64Url(buf) {
     .replace(/=+$/g, "");
 }
 
+function fromBase64Url(str) {
+  const padded = str.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (str.length % 4)) % 4);
+  return new Uint8Array(Buffer.from(padded, "base64"));
+}
+
+function concatBytes(...parts) {
+  let total = 0;
+  for (const p of parts) total += p.length;
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const p of parts) {
+    out.set(p, offset);
+    offset += p.length;
+  }
+  return out;
+}
+
+async function hmacSha256(keyBytes, dataBytes) {
+  const key = await crypto.webcrypto.subtle.importKey(
+    "raw",
+    keyBytes,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  return new Uint8Array(await crypto.webcrypto.subtle.sign("HMAC", key, dataBytes));
+}
+
+async function decryptAes128GcmFrame(frame, uaKeyPair, authBytes) {
+  if (frame.length <= 86) {
+    throw new Error(`Push frame too short: ${frame.length}`);
+  }
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const salt = frame.slice(0, 16);
+  const asPublicRaw = frame.slice(21, 86);
+  const ciphertext = frame.slice(86);
+
+  const uaPublicRaw = new Uint8Array(
+    await crypto.webcrypto.subtle.exportKey("raw", uaKeyPair.publicKey)
+  );
+  const asPublicKey = await crypto.webcrypto.subtle.importKey(
+    "raw",
+    asPublicRaw,
+    { name: "ECDH", namedCurve: "P-256" },
+    false,
+    []
+  );
+  const ecdhSecret = new Uint8Array(
+    await crypto.webcrypto.subtle.deriveBits(
+      { name: "ECDH", public: asPublicKey },
+      uaKeyPair.privateKey,
+      256
+    )
+  );
+  const prkKey = await hmacSha256(authBytes, ecdhSecret);
+  const ikm = await hmacSha256(
+    prkKey,
+    concatBytes(encoder.encode("WebPush: info\0"), uaPublicRaw, asPublicRaw, new Uint8Array([0x01]))
+  );
+  const prk = await hmacSha256(salt, ikm);
+  const cek = (
+    await hmacSha256(
+      prk,
+      concatBytes(encoder.encode("Content-Encoding: aes128gcm\0"), new Uint8Array([0x01]))
+    )
+  ).slice(0, 16);
+  const nonce = (
+    await hmacSha256(
+      prk,
+      concatBytes(encoder.encode("Content-Encoding: nonce\0"), new Uint8Array([0x01]))
+    )
+  ).slice(0, 12);
+
+  const cekKey = await crypto.webcrypto.subtle.importKey(
+    "raw",
+    cek,
+    { name: "AES-GCM" },
+    false,
+    ["decrypt"]
+  );
+  const padded = new Uint8Array(
+    await crypto.webcrypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, cekKey, ciphertext)
+  );
+  let end = padded.length;
+  while (end > 0 && padded[end - 1] === 0x00) {
+    end -= 1;
+  }
+  if (end === 0 || padded[end - 1] !== 0x02) {
+    throw new Error("Invalid RFC 8291 padding delimiter");
+  }
+  return JSON.parse(decoder.decode(padded.slice(0, end - 1)));
+}
+
+async function createVapidMaterial() {
+  const keyPair = await crypto.webcrypto.subtle.generateKey(
+    { name: "ECDSA", namedCurve: "P-256" },
+    true,
+    ["sign", "verify"]
+  );
+  const privateJwk = JSON.stringify(await crypto.webcrypto.subtle.exportKey("jwk", keyPair.privateKey));
+  const publicKey = toBase64Url(
+    new Uint8Array(await crypto.webcrypto.subtle.exportKey("raw", keyPair.publicKey))
+  );
+  return {
+    keyPair,
+    publicKey,
+    privateJwk,
+    subject: "mailto:ops@bobocai.win"
+  };
+}
+
+async function createUaSubscriptionMaterial() {
+  const uaKeyPair = await crypto.webcrypto.subtle.generateKey(
+    { name: "ECDH", namedCurve: "P-256" },
+    true,
+    ["deriveBits"]
+  );
+  const uaPubRaw = new Uint8Array(
+    await crypto.webcrypto.subtle.exportKey("raw", uaKeyPair.publicKey)
+  );
+  const authBytes = crypto.getRandomValues(new Uint8Array(16));
+  return {
+    uaKeyPair,
+    authBytes,
+    p256dh: toBase64Url(uaPubRaw),
+    auth: toBase64Url(authBytes)
+  };
+}
+
+async function createMockPushGateway(vapidMaterial, uaMaterial) {
+  const port = await getFreePort();
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const requests = [];
+  const state = { statusOverride: 201 };
+
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", async () => {
+      const bodyBytes = new Uint8Array(Buffer.concat(chunks));
+      const status = state.statusOverride;
+      let vapidVerified = false;
+      let payload = null;
+      let error = null;
+
+      try {
+        const authHeader = String(req.headers.authorization || "");
+        const match = /^vapid t=([^,]+), k=(.+)$/.exec(authHeader);
+        if (match && match[2] === vapidMaterial.publicKey) {
+          const [h, p, s] = match[1].split(".");
+          const claims = JSON.parse(Buffer.from(fromBase64Url(p)).toString("utf8"));
+          if (claims.aud === baseUrl) {
+            vapidVerified = await crypto.webcrypto.subtle.verify(
+              { name: "ECDSA", hash: "SHA-256" },
+              vapidMaterial.keyPair.publicKey,
+              fromBase64Url(s),
+              new TextEncoder().encode(`${h}.${p}`)
+            );
+          }
+        }
+        payload = await decryptAes128GcmFrame(
+          bodyBytes,
+          uaMaterial.uaKeyPair,
+          uaMaterial.authBytes
+        );
+      } catch (err) {
+        error = err instanceof Error ? err.message : String(err);
+      }
+
+      requests.push({
+        method: req.method,
+        url: req.url,
+        status,
+        vapidVerified,
+        payload,
+        error
+      });
+
+      res.writeHead(status, { "Content-Type": "text/plain" });
+      res.end(`mock-push-${status}`);
+    });
+  });
+
+  await new Promise((resolve) => server.listen(port, "127.0.0.1", resolve));
+  return { server, baseUrl, port, requests, state };
+}
+
+function buildEvalInitScript(mockPushEndpoint, p256dh, auth) {
+  return `
+    window.__AHUB_CLS__ = 0;
+    window.__AHUB_CLS_SOURCES__ = [];
+    window.__AHUB_CAPTURED_NOTIFS__ = [];
+    new PerformanceObserver((list) => {
+      for (const entry of list.getEntries()) {
+        if (!entry.hadRecentInput) {
+          window.__AHUB_CLS__ += entry.value;
+          window.__AHUB_CLS_SOURCES__.push({
+            value: entry.value,
+            nodes: (entry.sources || []).map(s => s.node ? (s.node.tagName + '#' + s.node.id + '.' + (s.node.className || '')) : 'null')
+          });
+        }
+      }
+    }).observe({ type: "layout-shift", buffered: true });
+
+    (() => {
+      const OrigNotif = window.Notification;
+      if (typeof OrigNotif === "function") {
+        const WrappedNotif = function(title, options) {
+          window.__AHUB_CAPTURED_NOTIFS__.push({
+            title: String(title || ""),
+            body: String(options?.body || ""),
+            tag: String(options?.tag || ""),
+            ts: Date.now()
+          });
+          return new OrigNotif(title, options);
+        };
+        WrappedNotif.prototype = OrigNotif.prototype;
+        Object.defineProperty(WrappedNotif, "permission", {
+          get() { return OrigNotif.permission; }
+        });
+        WrappedNotif.requestPermission = (...args) => OrigNotif.requestPermission(...args);
+        window.Notification = WrappedNotif;
+      }
+
+      const MOCK_KEY = "__ahub_eval_mock_push_active__";
+      function makeMockSub() {
+        const endpoint = ${JSON.stringify(mockPushEndpoint)};
+        const p256dhB64 = ${JSON.stringify(p256dh)};
+        const authB64 = ${JSON.stringify(auth)};
+        function b64uToBuf(str) {
+          const pad = str.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (str.length % 4)) % 4);
+          const bin = atob(pad);
+          const arr = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i += 1) arr[i] = bin.charCodeAt(i);
+          return arr.buffer;
+        }
+        return {
+          endpoint,
+          expirationTime: null,
+          getKey(name) {
+            if (name === "p256dh") return b64uToBuf(p256dhB64);
+            if (name === "auth") return b64uToBuf(authB64);
+            return null;
+          },
+          toJSON() {
+            return { endpoint, expirationTime: null, keys: { p256dh: p256dhB64, auth: authB64 } };
+          },
+          async unsubscribe() {
+            localStorage.removeItem(MOCK_KEY);
+            return true;
+          }
+        };
+      }
+
+      if (typeof window.PushManager === "function" && window.PushManager.prototype) {
+        window.PushManager.prototype.getSubscription = async function() {
+          return localStorage.getItem(MOCK_KEY) === "1" ? makeMockSub() : null;
+        };
+        window.PushManager.prototype.subscribe = async function() {
+          localStorage.setItem(MOCK_KEY, "1");
+          return makeMockSub();
+        };
+      }
+    })();
+  `;
+}
+
 async function createAccessTestServer(expectedAud) {
   const keyPair = await crypto.webcrypto.subtle.generateKey(
     {
@@ -383,7 +663,9 @@ async function assertViewportContainment(cdp, label) {
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ahub-cdp-eval-"));
 const children = [];
 let cdpClient = null;
+let cdpTab2 = null;
 let jwksServer = null;
+let mockPushGateway = null;
 
 try {
   fs.mkdirSync(screenshotDir, { recursive: true });
@@ -422,6 +704,10 @@ try {
   const accessAud = "cdp-eval-access-aud";
   const accessMaterial = await createAccessTestServer(accessAud);
   jwksServer = accessMaterial.server;
+  const vapidMaterial = await createVapidMaterial();
+  const uaMaterial = await createUaSubscriptionMaterial();
+  mockPushGateway = await createMockPushGateway(vapidMaterial, uaMaterial);
+  const mockPushEndpoint = `${mockPushGateway.baseUrl}/push/cdp-device-1`;
 
   const wranglerProc = spawn(
     "pnpm",
@@ -448,7 +734,15 @@ try {
       "--var",
       "LEASE_TTL_SECONDS:30",
       "--var",
-      "WEBHOOK_ENCRYPTION_KEY:cdp-eval-master-secret-32bytes!!"
+      "WEBHOOK_ENCRYPTION_KEY:cdp-eval-master-secret-32bytes!!",
+      "--var",
+      `VAPID_PUBLIC_KEY:${vapidMaterial.publicKey}`,
+      "--var",
+      `VAPID_PRIVATE_JWK:${vapidMaterial.privateJwk}`,
+      "--var",
+      `VAPID_SUBJECT:${vapidMaterial.subject}`,
+      "--var",
+      "ALLOW_LOOPBACK_PUSH_FOR_TEST:true"
     ],
     {
       cwd: workerDir,
@@ -705,22 +999,27 @@ try {
   await cdpClient.connect();
   await cdpClient.setViewport(1440, 900, false);
 
+  let swRegistrationId = null;
+  cdpClient.onEvent("ServiceWorker.workerRegistrationUpdated", (params) => {
+    for (const reg of params?.registrations ?? []) {
+      if (!reg.isDeleted && typeof reg.scopeURL === "string" && reg.scopeURL.startsWith(hubUrl)) {
+        swRegistrationId = reg.registrationId;
+      }
+    }
+  });
+  await cdpClient.send("ServiceWorker.enable");
+  await cdpClient.send("Browser.grantPermissions", {
+    origin: hubUrl,
+    permissions: ["notifications"]
+  });
+
+  const evalInitScript = buildEvalInitScript(
+    mockPushEndpoint,
+    uaMaterial.p256dh,
+    uaMaterial.auth
+  );
   await cdpClient.send("Page.addScriptToEvaluateOnNewDocument", {
-    source: `
-      window.__AHUB_CLS__ = 0;
-      window.__AHUB_CLS_SOURCES__ = [];
-      new PerformanceObserver((list) => {
-        for (const entry of list.getEntries()) {
-          if (!entry.hadRecentInput) {
-            window.__AHUB_CLS__ += entry.value;
-            window.__AHUB_CLS_SOURCES__.push({
-              value: entry.value,
-              nodes: (entry.sources || []).map(s => s.node ? (s.node.tagName + '#' + s.node.id + '.' + (s.node.className || '')) : 'null')
-            });
-          }
-        }
-      }).observe({ type: "layout-shift", buffered: true });
-    `
+    source: evalInitScript
   });
 
   await cdpClient.send("Page.navigate", { url: `${hubUrl}/?token=${adminToken}` });
@@ -1470,6 +1769,382 @@ try {
     });
   }
 
+  // M4 Step A: 2-tab in-page notification dedup via navigator.locks + BroadcastChannel
+  const tab2Target = await cdpClient.send("Target.createTarget", { url: "about:blank" });
+  const tab2Info = (await (await fetch(`http://127.0.0.1:${cdpPort}/json/list`)).json()).find(
+    (t) => t.id === tab2Target.targetId
+  );
+  if (!tab2Info) {
+    throw new Error("Failed to locate CDP target for Tab 2");
+  }
+  cdpTab2 = new CDPClient(tab2Info.webSocketDebuggerUrl);
+  await cdpTab2.connect();
+  await cdpTab2.send("Page.addScriptToEvaluateOnNewDocument", { source: evalInitScript });
+  await cdpTab2.send("Page.navigate", { url: `${hubUrl}/?token=${adminToken}` });
+  for (let i = 0; i < 40; i++) {
+    const ok2 = await cdpTab2.evalJS(`window.__AHUB_EVAL__?.getState()?.streamStatus === "connected"`);
+    if (ok2) break;
+    if (i === 39) throw new Error("Tab 2 failed to connect /ws/stream in time");
+    await sleep(200);
+  }
+  await cdpClient.evalJS(`window.__AHUB_CAPTURED_NOTIFS__ = []`);
+  await cdpTab2.evalJS(`window.__AHUB_CAPTURED_NOTIFS__ = []`);
+
+  const e1Res = await apiJson(hubUrl, macKey.token, "/api/v1/nodes/macmini/native-events", {
+    method: "POST",
+    body: JSON.stringify({
+      event_id: "cdp-native-evt-1",
+      agent: "claude",
+      event_kind: "interaction_needed",
+      native_session_id: "sess_cdp_1",
+      workdir: wsAlpha,
+      title: "确认执行数据库迁移",
+      summary: "检测到 schema 变更，请确认是否继续迁移。",
+      source: "hook:Notification"
+    })
+  });
+  const e1Id = e1Res.event.id;
+
+  for (let i = 0; i < 30; i++) {
+    const c1 = await cdpClient.evalJS(
+      `window.__AHUB_EVAL__.getState().nativeEvents.some(e => e.id === ${JSON.stringify(e1Id)})`
+    );
+    const c2 = await cdpTab2.evalJS(
+      `window.__AHUB_EVAL__.getState().nativeEvents.some(e => e.id === ${JSON.stringify(e1Id)})`
+    );
+    if (c1 && c2) break;
+    if (i === 29) throw new Error("E1 did not propagate to both tabs over /ws/stream");
+    await sleep(150);
+  }
+  await sleep(350);
+  const tab1NotifsA = await cdpClient.evalJS(`window.__AHUB_CAPTURED_NOTIFS__`);
+  const tab2NotifsA = await cdpTab2.evalJS(`window.__AHUB_CAPTURED_NOTIFS__`);
+  if (tab1NotifsA.length + tab2NotifsA.length !== 1) {
+    throw new Error(
+      `Expected exactly 1 in-page notification across 2 tabs via navigator.locks + BroadcastChannel, got tab1=${tab1NotifsA.length} tab2=${tab2NotifsA.length}`
+    );
+  }
+
+  // M4 Step B: Web Push subscription, test notification, active-push in-page suppression, and sw.js delivery
+  await cdpClient.clickSelector('[data-testid="open-browser-notify-btn"]');
+  for (let i = 0; i < 20; i++) {
+    if (await cdpClient.evalJS(`Boolean(document.querySelector('[data-testid="browser-notify-dialog"]'))`)) {
+      break;
+    }
+    await sleep(100);
+  }
+  await cdpClient.clickSelector('[data-testid="enable-browser-push-btn"]');
+  let createdSub = null;
+  for (let i = 0; i < 30; i++) {
+    createdSub = await cdpClient.evalJS(`
+      (() => {
+        const s = window.__AHUB_EVAL__.getState();
+        const health = document.querySelector('[data-testid="browser-notify-health"]')?.getAttribute("data-health-status");
+        if (s.pushSubscriptions.length === 1 && health === "active") {
+          return s.pushSubscriptions[0];
+        }
+        return null;
+      })()
+    `);
+    if (createdSub) break;
+    if (i === 29) throw new Error("Web Push subscription did not reach active state");
+    await sleep(150);
+  }
+  if (!createdSub.endpoint_host.startsWith("127.0.0.1:")) {
+    throw new Error(`Expected mock push endpoint_host, got ${createdSub.endpoint_host}`);
+  }
+
+  mockPushGateway.requests.length = 0;
+  await cdpClient.clickSelector(`[data-testid="test-push-sub-${createdSub.id}"]`);
+  for (let i = 0; i < 25; i++) {
+    const testText = await cdpClient.evalJS(
+      `document.querySelector('[data-testid="test-push-result-${createdSub.id}"]')?.textContent ?? ""`
+    );
+    if (testText.includes("201") && mockPushGateway.requests.length === 1) break;
+    if (i === 24) throw new Error(`Test push notification failed: text=${testText} reqs=${JSON.stringify(mockPushGateway.requests)}`);
+    await sleep(150);
+  }
+  if (!mockPushGateway.requests[0].vapidVerified || mockPushGateway.requests[0].payload?.kind !== "test") {
+    throw new Error(`Test push payload/VAPID invalid: ${JSON.stringify(mockPushGateway.requests[0])}`);
+  }
+
+  await cdpClient.clickSelector('[data-testid="browser-notify-dialog"] button[aria-label="关闭"]');
+  await sleep(200);
+  mockPushGateway.requests.length = 0;
+  await cdpClient.evalJS(`window.__AHUB_CAPTURED_NOTIFS__ = []`);
+  await cdpTab2.evalJS(`window.__AHUB_CAPTURED_NOTIFS__ = []`);
+
+  // Sync subscription state into Tab 2 before E2 arrives so Tab 2 knows Web Push is active on this browser origin too
+  await cdpTab2.evalJS(`localStorage.setItem("__ahub_eval_mock_push_active__", "1")`);
+  await cdpTab2.send("Page.reload");
+  for (let i = 0; i < 40; i++) {
+    const ready2 = await cdpTab2.evalJS(
+      `window.__AHUB_EVAL__?.getState()?.streamStatus === "connected" && window.__AHUB_EVAL__?.getState()?.pushSubscriptions?.length === 1`
+    );
+    if (ready2) break;
+    if (i === 39) throw new Error("Tab 2 timed out waiting for streamStatus === connected after Page.reload");
+    await sleep(200);
+  }
+
+  const e2Res = await apiJson(hubUrl, macKey.token, "/api/v1/nodes/macmini/native-events", {
+    method: "POST",
+    body: JSON.stringify({
+      event_id: "cdp-native-evt-2",
+      agent: "claude",
+      event_kind: "interaction_needed",
+      native_session_id: "sess_cdp_2",
+      workdir: wsBeta,
+      title: "确认生产回滚指令",
+      summary: "等待管理员确认是否回滚发布。",
+      source: "hook:Notification"
+    })
+  });
+  const e2Id = e2Res.event.id;
+
+  for (let i = 0; i < 60; i++) {
+    if (mockPushGateway.requests.length >= 1) break;
+    if (i === 59) throw new Error("Timed out waiting for Web Push delivery of E2 on mock Push gateway");
+    await sleep(200);
+  }
+  const e2Push = mockPushGateway.requests[0];
+  if (!e2Push.vapidVerified || e2Push.payload?.kind !== "native_event" || e2Push.payload?.id !== e2Id) {
+    throw new Error(`Unexpected Web Push payload for E2: ${JSON.stringify(e2Push)}`);
+  }
+  await sleep(300);
+  const tab1NotifsB = await cdpClient.evalJS(`window.__AHUB_CAPTURED_NOTIFS__`);
+  const tab2NotifsB = await cdpTab2.evalJS(`window.__AHUB_CAPTURED_NOTIFS__`);
+  if (tab1NotifsB.length + tab2NotifsB.length !== 0) {
+    throw new Error(
+      `Expected active Web Push to suppress in-page Notification, got tab1=${tab1NotifsB.length} tab2=${tab2NotifsB.length}`
+    );
+  }
+
+  // Deliver encrypted-decrypted payload to Chromium's real sw.js and verify reg.getNotifications()
+  if (!swRegistrationId) {
+    throw new Error("Missing ServiceWorker registrationId for sw.js push verification");
+  }
+  await cdpClient.send("ServiceWorker.deliverPushMessage", {
+    origin: `${hubUrl}/`,
+    registrationId: swRegistrationId,
+    data: JSON.stringify(e2Push.payload)
+  });
+  let swShown = false;
+  for (let i = 0; i < 20; i++) {
+    swShown = await cdpClient.evalJS(`
+      (async () => {
+        const reg = await navigator.serviceWorker.getRegistration("/");
+        const notifs = reg ? await reg.getNotifications() : [];
+        return notifs.some(n => n.tag === ${JSON.stringify(e2Push.payload.tag)} && n.title === ${JSON.stringify(e2Push.payload.title)});
+      })()
+    `);
+    if (swShown) break;
+    await sleep(150);
+  }
+  if (!swShown) {
+    throw new Error("Real sw.js push handler did not call showNotification for E2 payload");
+  }
+
+  cdpTab2.close();
+  cdpTab2 = null;
+  await cdpClient.send("Target.closeTarget", { targetId: tab2Target.targetId });
+
+  // M4 Step C: NativeActivityPane read-only UI, same-session superseded convergence, ack, & grok takeover
+  await cdpClient.clickSelector('[data-testid="fleet-tab-native"]');
+  await sleep(200);
+  const nativePaneCheck = await cdpClient.evalJS(`({
+    hasPane: Boolean(document.querySelector('[data-testid="native-activity-pane"]')),
+    fakeInputs: document.querySelectorAll('[data-testid="native-activity-pane"] textarea, [data-testid="native-activity-pane"] form').length,
+    openCount: window.__AHUB_EVAL__.getState().openInteractionCount,
+    resumeCmd: document.querySelector('[data-testid="native-resume-cmd-preview"]')?.textContent ?? ""
+  })`);
+  if (
+    !nativePaneCheck.hasPane ||
+    nativePaneCheck.fakeInputs !== 0 ||
+    nativePaneCheck.openCount !== 2 ||
+    !nativePaneCheck.resumeCmd.includes("claude --resume")
+  ) {
+    throw new Error(`NativeActivityPane check failed: ${JSON.stringify(nativePaneCheck)}`);
+  }
+
+  await sleep(25);
+  const e3Res = await apiJson(hubUrl, macKey.token, "/api/v1/nodes/macmini/native-events", {
+    method: "POST",
+    body: JSON.stringify({
+      event_id: "cdp-native-evt-3",
+      agent: "claude",
+      event_kind: "turn_summary",
+      native_session_id: "sess_cdp_1",
+      workdir: wsAlpha,
+      title: "完成 schema 预检",
+      summary: "已自动跳过无关表并完成迁移检查。",
+      source: "hook:Stop"
+    })
+  });
+  const e3Id = e3Res.event.id;
+  for (let i = 0; i < 30; i++) {
+    const conv = await cdpClient.evalJS(`
+      (() => {
+        const s = window.__AHUB_EVAL__.getState();
+        const e1 = s.nativeEvents.find(e => e.id === ${JSON.stringify(e1Id)});
+        const e3 = s.nativeEvents.find(e => e.id === ${JSON.stringify(e3Id)});
+        return { e1State: e1?.attention_state, hasE3: Boolean(e3), openCount: s.openInteractionCount };
+      })()
+    `);
+    if (conv.hasE3 && conv.e1State === "superseded" && conv.openCount === 1) break;
+    if (i === 29) throw new Error(`Expected E1 to converge to superseded & openCount=1, got ${JSON.stringify(conv)}`);
+    await sleep(150);
+  }
+
+  await cdpClient.clickSelector('[data-testid="native-session-item-macmini:claude:sess_cdp_2"]');
+  await sleep(200);
+  await cdpClient.clickSelector(`[data-testid="ack-native-event-${e2Id}"]`);
+  for (let i = 0; i < 25; i++) {
+    const acked = await cdpClient.evalJS(`
+      (() => {
+        const s = window.__AHUB_EVAL__.getState();
+        const e2 = s.nativeEvents.find(e => e.id === ${JSON.stringify(e2Id)});
+        const rowAttr = document.querySelector('[data-testid="native-event-row-${e2Id}"]')?.getAttribute("data-attention-state");
+        return { state: e2?.attention_state, rowAttr, openCount: s.openInteractionCount };
+      })()
+    `);
+    if (acked.state === "acked" && acked.rowAttr === "acked" && acked.openCount === 0) break;
+    if (i === 24) throw new Error(`Ack convergence failed for E2: ${JSON.stringify(acked)}`);
+    await sleep(150);
+  }
+
+  // Test grok native event takeover fallback notice
+  const grokRes = await apiJson(hubUrl, macKey.token, "/api/v1/nodes/macmini/native-events", {
+    method: "POST",
+    body: JSON.stringify({
+      event_id: "cdp-native-evt-grok",
+      agent: "grok",
+      event_kind: "turn_summary",
+      native_session_id: "",
+      workdir: wsAlpha,
+      title: "Grok 本地排查结论",
+      summary: "定位到编译参数缺失。",
+      source: "hook:Stop"
+    })
+  });
+  const grokSessionKey = `macmini:grok:${wsAlpha}`;
+  for (let i = 0; i < 25; i++) {
+    if (
+      await cdpClient.evalJS(
+        `Boolean(document.querySelector('[data-testid="native-session-item-${grokSessionKey}"]'))`
+      )
+    ) {
+      break;
+    }
+    await sleep(150);
+  }
+  await cdpClient.clickSelector(`[data-testid="native-session-item-${grokSessionKey}"]`);
+  await sleep(200);
+  await cdpClient.clickSelector('[data-testid="native-to-controlled-btn"]');
+  await sleep(250);
+  const takeoverState = await cdpClient.evalJS(`({
+    centerMode: window.__AHUB_EVAL__.getState().centerMode,
+    composer: window.__AHUB_EVAL__.getState().composer,
+    notice: document.querySelector('[data-testid="composer-notice"]')?.textContent ?? ""
+  })`);
+  if (
+    takeoverState.centerMode !== "controlled" ||
+    takeoverState.composer.mode !== "new" ||
+    takeoverState.composer.nodeId !== "macmini" ||
+    takeoverState.composer.agent === "grok" ||
+    !takeoverState.composer.prompt.includes("定位到编译参数缺失") ||
+    !takeoverState.notice.includes("grok")
+  ) {
+    throw new Error(`Grok takeover fallback check failed: ${JSON.stringify(takeoverState)}`);
+  }
+
+  // M4 Step D: InspectorPane Tab 5 投递明细 & single-channel 403 -> 201 redeliver UI==D1 parity
+  mockPushGateway.state.statusOverride = 403;
+  const e4Res = await apiJson(hubUrl, macKey.token, "/api/v1/nodes/macmini/native-events", {
+    method: "POST",
+    body: JSON.stringify({
+      event_id: "cdp-native-evt-4",
+      agent: "claude",
+      event_kind: "interaction_needed",
+      native_session_id: "sess_cdp_4",
+      workdir: wsAlpha,
+      title: "验证单通道失败重推",
+      summary: "模拟推送网关返回 403 后人工重推。",
+      source: "hook:Notification"
+    })
+  });
+  const e4Id = e4Res.event.id;
+  let failedDelivery = null;
+  for (let i = 0; i < 60; i++) {
+    const detail = await apiJson(hubUrl, adminToken, `/api/v1/native-events/${e4Id}`);
+    failedDelivery = detail.deliveries.find(
+      (d) => d.channel_kind === "web_push" && d.status === "failed"
+    );
+    if (failedDelivery) break;
+    if (i === 59) throw new Error(`Expected E4 web_push delivery to fail with 403, got ${JSON.stringify(detail)}`);
+    await sleep(200);
+  }
+  if (failedDelivery.http_status !== 403 || failedDelivery.error_code !== "PUSH_REJECTED_403") {
+    throw new Error(`Unexpected failed delivery metadata: ${JSON.stringify(failedDelivery)}`);
+  }
+
+  await cdpClient.send("Network.enable");
+  const e4DetailRequests = [];
+  cdpClient.onEvent("Network.requestWillBeSent", (params) => {
+    const req = params?.request;
+    if (req?.method === "GET" && req?.url === `${hubUrl}/api/v1/native-events/${e4Id}`) {
+      e4DetailRequests.push(req.url);
+    }
+  });
+
+  await cdpClient.clickSelector('[data-testid="fleet-tab-native"]');
+  await sleep(200);
+  await cdpClient.clickSelector('[data-testid="native-session-item-macmini:claude:sess_cdp_4"]');
+  await sleep(200);
+  await cdpClient.clickSelector('[data-testid="inspector-pane"] [role="tab"]:nth-of-type(5)');
+  for (let i = 0; i < 25; i++) {
+    const dlvDom = await cdpClient.evalJS(`({
+      status: document.querySelector('[data-testid="delivery-row-${failedDelivery.id}"]')?.getAttribute("data-delivery-status"),
+      text: document.querySelector('[data-testid="delivery-row-${failedDelivery.id}"]')?.textContent ?? "",
+      hasRedeliver: Boolean(document.querySelector('[data-testid="redeliver-btn-${failedDelivery.id}"]'))
+    })`);
+    if (dlvDom.status === "failed" && dlvDom.text.includes("403") && dlvDom.hasRedeliver) break;
+    if (i === 24) throw new Error(`InspectorPane Tab 5 did not render failed 403 delivery: ${JSON.stringify(dlvDom)}`);
+    await sleep(150);
+  }
+  await sleep(1000);
+  if (e4DetailRequests.length === 0 || e4DetailRequests.length > 3) {
+    throw new Error(
+      `Expected bounded GET /api/v1/native-events/${e4Id} requests while Tab 5 is open (1..3), got ${e4DetailRequests.length}`
+    );
+  }
+
+  mockPushGateway.state.statusOverride = 201;
+  mockPushGateway.requests.length = 0;
+  await cdpClient.clickSelector(`[data-testid="redeliver-btn-${failedDelivery.id}"]`);
+  for (let i = 0; i < 60; i++) {
+    const domStatus = await cdpClient.evalJS(
+      `document.querySelector('[data-testid="delivery-row-${failedDelivery.id}"]')?.getAttribute("data-delivery-status")`
+    );
+    const domText = await cdpClient.evalJS(
+      `document.querySelector('[data-testid="delivery-row-${failedDelivery.id}"]')?.textContent ?? ""`
+    );
+    if (domStatus === "sent" && domText.includes("201")) break;
+    if (i === 59) throw new Error(`Single-channel redeliver did not converge to sent/201 in DOM: status=${domStatus} text=${domText}`);
+    await sleep(200);
+  }
+  const apiE4After = await apiJson(hubUrl, adminToken, `/api/v1/native-events/${e4Id}`);
+  const apiDlvAfter = apiE4After.deliveries.find((d) => d.id === failedDelivery.id);
+  if (apiDlvAfter?.status !== "sent" || apiDlvAfter?.http_status !== 201 || mockPushGateway.requests.length !== 1) {
+    throw new Error(`UI!=D1 parity mismatch after redeliver: ${JSON.stringify({ apiDlvAfter, reqCount: mockPushGateway.requests.length })}`);
+  }
+
+  // Ack E4 and restore Threads/Events tabs before mobile & client-scope checks
+  await cdpClient.clickSelector(`[data-testid="ack-native-event-${e4Id}"]`);
+  await sleep(200);
+  await cdpClient.clickSelector('[data-testid="fleet-tab-threads"]');
+  await cdpClient.clickSelector('[data-testid="inspector-pane"] [role="tab"]:nth-of-type(1)');
+  await sleep(200);
+
   // Mobile 390x844 responsiveness + tap target check + drawer screenshot 5
   await cdpClient.setViewport(390, 844, true);
   await sleep(300);
@@ -1502,7 +2177,24 @@ try {
   // Screenshot 5: mobile-drawer-open.png
   await cdpClient.screenshot(path.join(screenshotDir, "mobile-drawer-open.png"));
 
-  // Verify client-scope UI login omits admin-only default Bot notify controls with zero console/HTTP errors
+  // Also verify NativeActivityPane mobile 390x844 has 0px horizontal overflow
+  await cdpClient.clickSelector('[data-testid="fleet-tab-native"]');
+  await sleep(200);
+  await cdpClient.clickSelector(`[data-testid="native-session-item-macmini:claude:sess_cdp_4"]`);
+  await sleep(250);
+  await assertViewportContainment(cdpClient, "mobile-390x844-native-pane");
+
+  // Verify client-scope UI login omits admin-only default Bot notify, Native Activity, and Push controls with zero console/403 errors
+  const forbiddenResponses = [];
+  await cdpClient.send("Network.enable");
+  cdpClient.onEvent("Network.responseReceived", (params) => {
+    const st = params?.response?.status;
+    const url = params?.response?.url ?? "";
+    if (st === 403 && url.startsWith(hubUrl)) {
+      forbiddenResponses.push({ status: st, url });
+    }
+  });
+
   const clientScopeKey = await apiJson(hubUrl, adminToken, "/api/v1/keys", {
     method: "POST",
     body: JSON.stringify({ name: "cdp-client-scope", scope: "client", allowed_nodes: [] })
@@ -1528,10 +2220,24 @@ try {
   await sleep(200);
   const clientInspectorCheck = await cdpClient.evalJS(`({
     hasNotifySelect: Boolean(document.querySelector('[data-testid="node-default-notify-select"]')),
-    hasNotifyBadge: Boolean(document.querySelector('[data-testid="node-notify-valid-badge"]') || document.querySelector('[data-testid="node-notify-invalid-badge"]'))
+    hasNotifyBadge: Boolean(document.querySelector('[data-testid="node-notify-valid-badge"]') || document.querySelector('[data-testid="node-notify-invalid-badge"]')),
+    hasFleetNativeTab: Boolean(document.querySelector('[data-testid="fleet-tab-native"]')),
+    hasBrowserNotifyBtn: Boolean(document.querySelector('[data-testid="open-browser-notify-btn"]')),
+    hasInteractionsPill: Boolean(document.querySelector('[data-testid="open-interactions-pill"]')),
+    hasDeliveriesTab: Boolean(document.querySelector('[data-testid="inspector-tab-deliveries"]'))
   })`);
-  if (clientInspectorCheck.hasNotifySelect || clientInspectorCheck.hasNotifyBadge) {
-    throw new Error(`Expected client scope InspectorPane to hide admin notify controls, got ${JSON.stringify(clientInspectorCheck)}`);
+  if (
+    clientInspectorCheck.hasNotifySelect ||
+    clientInspectorCheck.hasNotifyBadge ||
+    clientInspectorCheck.hasFleetNativeTab ||
+    clientInspectorCheck.hasBrowserNotifyBtn ||
+    clientInspectorCheck.hasInteractionsPill ||
+    clientInspectorCheck.hasDeliveriesTab
+  ) {
+    throw new Error(`Expected client scope to hide all admin-only controls, got ${JSON.stringify(clientInspectorCheck)}`);
+  }
+  if (forbiddenResponses.length > 0) {
+    throw new Error(`Expected zero 403 network responses in client scope, got ${JSON.stringify(forbiddenResponses)}`);
   }
   if (cdpClient.consoleErrors.length > 0) {
     throw new Error(`Expected zero console errors in client-scoped UI, got ${JSON.stringify(cdpClient.consoleErrors)}`);
@@ -1595,7 +2301,11 @@ try {
     `L2 CDP Runtime Eval PASSED: UI==D1 parity ok, flood ring-buffer=${floodCount}, stream CLS=${floodCls}, DnD priority_order persisted, mobile overflow=0, zero-token CF Access cookie ok, 5 screenshots written to ${screenshotDir}`
   );
 } finally {
+  if (cdpTab2) cdpTab2.close();
   if (cdpClient) cdpClient.close();
+  if (mockPushGateway) {
+    await new Promise((resolve) => mockPushGateway.server.close(() => resolve()));
+  }
   if (jwksServer) {
     await new Promise((resolve) => jwksServer.close(() => resolve()));
   }

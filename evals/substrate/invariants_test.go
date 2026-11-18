@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/gray0128/agent-hub/internal/api"
 	"github.com/gray0128/agent-hub/internal/config"
 	"github.com/gray0128/agent-hub/internal/daemon"
@@ -1692,5 +1693,246 @@ func TestInvariant_NodeDefaultNotifyAndNativeEventsIsolation(t *testing.T) {
 	case stray := <-h.webhookCh:
 		t.Fatalf("revoked channel leaked to global webhook: %+v", stray)
 	case <-time.After(350 * time.Millisecond):
+	}
+
+	// 7. M3 E2E: /ws/stream admin snapshot & broadcast isolation, --kind progress, 12-route 403 matrix, ahub activity --json, ack & superseded
+	wsCtx, wsCancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer wsCancel()
+
+	adminWS, err := adminClient.DialWebSocket(wsCtx, "/ws/stream")
+	if err != nil {
+		t.Fatalf("admin DialWebSocket failed: %v", err)
+	}
+	defer adminWS.Close(websocket.StatusNormalClosure, "done")
+
+	_, adminSnapRaw, err := adminWS.Read(wsCtx)
+	if err != nil {
+		t.Fatalf("adminWS read snapshot failed: %v", err)
+	}
+	var adminSnap map[string]interface{}
+	if err := json.Unmarshal(adminSnapRaw, &adminSnap); err != nil {
+		t.Fatalf("decode admin snapshot: %v", err)
+	}
+	if adminSnap["type"] != "snapshot" {
+		t.Fatalf("expected snapshot frame, got %+v", adminSnap["type"])
+	}
+	if _, hasNE := adminSnap["native_events"]; !hasNE {
+		t.Fatalf("expected admin global snapshot to contain native_events")
+	}
+	if _, hasCnt := adminSnap["open_interaction_count"]; !hasCnt {
+		t.Fatalf("expected admin global snapshot to contain open_interaction_count")
+	}
+
+	clientWSClient := api.NewClient(h.hubURL, botBTok)
+	clientWS, err := clientWSClient.DialWebSocket(wsCtx, "/ws/stream?run_id="+botBRunEnv.Run.ID)
+	if err != nil {
+		t.Fatalf("client DialWebSocket failed: %v", err)
+	}
+	defer clientWS.Close(websocket.StatusNormalClosure, "done")
+
+	_, clientSnapRaw, err := clientWS.Read(wsCtx)
+	if err != nil {
+		t.Fatalf("clientWS read snapshot failed: %v", err)
+	}
+	var clientSnap map[string]interface{}
+	if err := json.Unmarshal(clientSnapRaw, &clientSnap); err != nil {
+		t.Fatalf("decode client snapshot: %v", err)
+	}
+	if _, hasNE := clientSnap["native_events"]; hasNE {
+		t.Fatalf("client snapshot leaked native_events: %s", string(clientSnapRaw))
+	}
+	if _, hasCnt := clientSnap["open_interaction_count"]; hasCnt {
+		t.Fatalf("client snapshot leaked open_interaction_count: %s", string(clientSnapRaw))
+	}
+
+	// Emit --kind progress via ahub native-emit
+	emitProgCmd := exec.Command(
+		h.ahubBin, "--json", "native-emit",
+		"--config", nativeCfgPath,
+		"--agent", "claude",
+		"--kind", "progress",
+		"--session-id", "sess_m3_sub",
+		"--dir", wsMac,
+		"--title", "Phase 1/2",
+		"--summary", "Compiled substrate",
+	)
+	emitProgCmd.Env = append(os.Environ(), "AHUB_CONFIG_DIR="+h.configDir)
+	progOut, err := emitProgCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("native-emit --kind progress failed: %v\n%s", err, string(progOut))
+	}
+	var progEnv api.NativeEventResponse
+	if err := json.Unmarshal(progOut, &progEnv); err != nil {
+		t.Fatalf("decode progress json: %v (%s)", err, string(progOut))
+	}
+	if progEnv.Event.EventKind != "progress" {
+		t.Fatalf("expected event_kind=progress, got %+v", progEnv.Event)
+	}
+
+	// Verify adminWS receives native_event.upserted for progress while clientWS stays silent
+	sawProgressFrame := false
+	readDeadline := time.Now().Add(6 * time.Second)
+	for time.Now().Before(readDeadline) && !sawProgressFrame {
+		rCtx, rCancel := context.WithTimeout(wsCtx, 2*time.Second)
+		_, msgRaw, rErr := adminWS.Read(rCtx)
+		rCancel()
+		if rErr != nil {
+			break
+		}
+		var frame map[string]interface{}
+		if json.Unmarshal(msgRaw, &frame) == nil && frame["type"] == "native_event.upserted" {
+			evMap, _ := frame["event"].(map[string]interface{})
+			if evMap["id"] == progEnv.Event.ID && evMap["event_kind"] == "progress" {
+				sawProgressFrame = true
+			}
+		}
+	}
+	if !sawProgressFrame {
+		t.Fatalf("admin global /ws/stream did not receive native_event.upserted for %s", progEnv.Event.ID)
+	}
+
+	cReadCtx, cReadCancel := context.WithTimeout(wsCtx, 300*time.Millisecond)
+	_, cMsgRaw, cReadErr := clientWS.Read(cReadCtx)
+	cReadCancel()
+	if cReadErr == nil {
+		var cFrame map[string]interface{}
+		_ = json.Unmarshal(cMsgRaw, &cFrame)
+		if cFrame["type"] == "native_event.upserted" || cFrame["type"] == "delivery.updated" {
+			t.Fatalf("client /ws/stream leaked %v frame: %s", cFrame["type"], string(cMsgRaw))
+		}
+	}
+
+	// Probe all 12 admin endpoints with client and node tokens -> strict 403 FORBIDDEN_SCOPE
+	adminProbes := []struct {
+		method string
+		path   string
+		body   interface{}
+	}{
+		{http.MethodGet, "/api/v1/native-events", nil},
+		{http.MethodGet, "/api/v1/native-events/" + progEnv.Event.ID, nil},
+		{http.MethodPost, "/api/v1/native-events/" + progEnv.Event.ID + "/ack", map[string]string{"scope": "single"}},
+		{http.MethodPost, "/api/v1/native-events/" + progEnv.Event.ID + "/redeliver", map[string]interface{}{}},
+		{http.MethodGet, "/api/v1/runs/" + botBRunEnv.Run.ID + "/deliveries", nil},
+		{http.MethodPost, "/api/v1/runs/" + botBRunEnv.Run.ID + "/redeliver", map[string]interface{}{}},
+		{http.MethodGet, "/api/v1/push/config", nil},
+		{http.MethodGet, "/api/v1/push-subscriptions", nil},
+		{http.MethodPost, "/api/v1/push-subscriptions", map[string]interface{}{}},
+		{http.MethodPatch, "/api/v1/push-subscriptions/wps_missing", map[string]interface{}{"enabled": false}},
+		{http.MethodDelete, "/api/v1/push-subscriptions/wps_missing", nil},
+		{http.MethodPost, "/api/v1/push-subscriptions/wps_missing/test", map[string]interface{}{}},
+	}
+	for _, tok := range []string{botBTok, macTok} {
+		for _, p := range adminProbes {
+			stProbe, rawProbe := doJSON(p.method, p.path, tok, p.body)
+			if stProbe != http.StatusForbidden || !strings.Contains(string(rawProbe), "FORBIDDEN_SCOPE") {
+				t.Fatalf("expected 403 FORBIDDEN_SCOPE for %s %s, got (%d) %s", p.method, p.path, stProbe, string(rawProbe))
+			}
+		}
+	}
+
+	// ahub activity --json: admin exits 0, client & node exit 78
+	runActivityCLI := func(tok string, extra ...string) (int, []byte) {
+		args := append([]string{"--url", h.hubURL, "--token", tok, "--json", "activity"}, extra...)
+		cmd := exec.Command(h.ahubBin, args...)
+		cmd.Env = append(os.Environ(), "AHUB_CONFIG_DIR="+t.TempDir())
+		out, err := cmd.Output()
+		if err == nil {
+			return 0, out
+		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return exitErr.ExitCode(), out
+		}
+		t.Fatalf("exec ahub activity failed: %v", err)
+		return 1, out
+	}
+
+	actCode, actOut := runActivityCLI(adminKeyTok, "--node", "macmini", "--limit", "20")
+	if actCode != 0 {
+		t.Fatalf("admin ahub activity failed with exit %d: %s", actCode, string(actOut))
+	}
+	var actRes api.ListNativeEventsResponse
+	if err := json.Unmarshal(bytes.TrimSpace(actOut), &actRes); err != nil {
+		t.Fatalf("ahub activity --json must emit single JSON object, got %v (%s)", err, string(actOut))
+	}
+	if !actRes.OK || len(actRes.Events) < 3 {
+		t.Fatalf("unexpected activity events: %+v", actRes)
+	}
+
+	for _, unprivTok := range []string{botBTok, macTok} {
+		deniedCode, deniedOut := runActivityCLI(unprivTok)
+		if deniedCode != api.ExitPolicyDenied {
+			t.Fatalf("expected exit 78 for unprivileged ahub activity, got %d (%s)", deniedCode, string(deniedOut))
+		}
+	}
+
+	// Ack + superseded convergence E2E
+	emitInteraction := func(sid, eid string) api.NativeEventRecord {
+		c := exec.Command(
+			h.ahubBin, "--json", "native-emit",
+			"--config", nativeCfgPath,
+			"--agent", "claude",
+			"--kind", "interaction_needed",
+			"--session-id", sid,
+			"--dir", wsMac,
+			"--title", "Need confirmation",
+			"--summary", "Approve step?",
+			"--event-id", eid,
+		)
+		c.Env = append(os.Environ(), "AHUB_CONFIG_DIR="+h.configDir)
+		out, err := c.CombinedOutput()
+		if err != nil {
+			t.Fatalf("emit interaction %s failed: %v\n%s", eid, err, string(out))
+		}
+		var env api.NativeEventResponse
+		if err := json.Unmarshal(out, &env); err != nil {
+			t.Fatal(err)
+		}
+		return env.Event
+	}
+
+	ackTarget := emitInteraction("sess_ack_sub", "sub_ack_evt_1")
+	supTarget := emitInteraction("sess_sup_sub", "sub_sup_evt_1")
+
+	stAck, rawAck := doJSON(http.MethodPost, "/api/v1/native-events/"+ackTarget.ID+"/ack", adminKeyTok, map[string]string{"scope": "single"})
+	if stAck != http.StatusOK || !strings.Contains(string(rawAck), `"attention_state":"acked"`) {
+		t.Fatalf("ack failed (%d): %s", stAck, string(rawAck))
+	}
+
+	// Emit progress on sess_sup_sub (10ms later to guarantee distinct created_at) -> supersedes supTarget
+	time.Sleep(15 * time.Millisecond)
+	supProgCmd := exec.Command(
+		h.ahubBin, "--json", "native-emit",
+		"--config", nativeCfgPath,
+		"--agent", "claude",
+		"--kind", "progress",
+		"--session-id", "sess_sup_sub",
+		"--dir", wsMac,
+		"--title", "Continued",
+		"--summary", "User responded locally",
+		"--event-id", "sub_sup_prog_2",
+	)
+	supProgCmd.Env = append(os.Environ(), "AHUB_CONFIG_DIR="+h.configDir)
+	if out, err := supProgCmd.CombinedOutput(); err != nil {
+		t.Fatalf("emit progress supersede failed: %v\n%s", err, string(out))
+	}
+
+	stSupGet, rawSupGet := doJSON(http.MethodGet, "/api/v1/native-events/"+supTarget.ID, adminKeyTok, nil)
+	if stSupGet != http.StatusOK || !strings.Contains(string(rawSupGet), `"attention_state":"superseded"`) {
+		t.Fatalf("expected superseded attention_state on %s, got (%d): %s", supTarget.ID, stSupGet, string(rawSupGet))
+	}
+
+	unackedCode, unackedOut := runActivityCLI(adminKeyTok, "--unacked")
+	if unackedCode != 0 {
+		t.Fatalf("activity --unacked failed (%d): %s", unackedCode, string(unackedOut))
+	}
+	var unackedRes api.ListNativeEventsResponse
+	if err := json.Unmarshal(bytes.TrimSpace(unackedOut), &unackedRes); err != nil {
+		t.Fatal(err)
+	}
+	for _, ev := range unackedRes.Events {
+		if ev.ID == ackTarget.ID || ev.ID == supTarget.ID {
+			t.Fatalf("expected acked/superseded event %s excluded from --unacked, got %+v", ev.ID, ev)
+		}
 	}
 }

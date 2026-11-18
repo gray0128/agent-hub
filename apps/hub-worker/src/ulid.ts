@@ -25,7 +25,7 @@ export function newUlid(): string {
   return tsPart + randPart;
 }
 
-export function newId(prefix: "key" | "thr" | "run" | "evt"): string {
+export function newId(prefix: "key" | "thr" | "run" | "evt" | "wps" | "dlv"): string {
   return `${prefix}_${newUlid()}`;
 }
 

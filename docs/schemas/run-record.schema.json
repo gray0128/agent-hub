@@ -5,6 +5,19 @@
   "description": "Standard run object returned by REST API and ahub --json CLI commands.",
   "type": "object",
   "additionalProperties": false,
+  "$defs": {
+    "DeliveriesSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total", "sent", "queued", "failed"],
+      "properties": {
+        "total": { "type": "integer", "minimum": 0 },
+        "sent": { "type": "integer", "minimum": 0 },
+        "queued": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 }
+      }
+    }
+  },
   "required": [
     "id",
     "thread_id",
@@ -129,6 +142,9 @@
     "notify_status": {
       "type": "string",
       "enum": ["none", "queued", "sent", "failed"]
+    },
+    "deliveries_summary": {
+      "$ref": "#/$defs/DeliveriesSummary"
     },
     "lease_expires_at": {
       "type": ["string", "null"],

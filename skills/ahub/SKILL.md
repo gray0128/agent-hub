@@ -47,3 +47,9 @@ Use the `ahub` CLI as the sole interface to `agent-hub`. Do not hand-craft HTTP 
    - On `done`, `failed`, `cancelled`, or `needs_approval`, report `thread_id` / `run_id` and `summary` (or `remote_control_url`).
    - Do **not** call `ahub result` to fetch `prompt` post-completion; `ahub_run_completed` callbacks may reference redacted `prompt_preview` only as a fallback.
    - **Mandatory redaction**: Never output raw tokens, passwords, bearer credentials, API keys, or webhook secrets when displaying any prompt or output; mask sensitive values before replying.
+
+6. **Native activity & progress milestones** (no `workdir` locks):
+   - Read-only inspect (`admin` only; `client` exits `78` `FORBIDDEN_SCOPE`):
+     `ahub activity [--node <id>] [--agent <a>] [--kind interaction_needed|turn_summary|progress] [--unacked] [--limit 20] [--json]`
+   - Long-task milestone (never mount `PostToolUse` hooks):
+     `ahub native-emit --agent <a> --kind progress --session-id <sid> --dir "$PWD" --title "<t>" --summary -`

@@ -88,7 +88,8 @@ function mergeRunRecordWithMeta(
         prompt: existing.prompt ?? incoming.prompt,
         output_preview: existing.output_preview ?? incoming.output_preview,
         output_md: existing.output_md ?? incoming.output_md,
-        truncated: existing.truncated ?? incoming.truncated
+        truncated: existing.truncated ?? incoming.truncated,
+        deliveries_summary: existing.deliveries_summary ?? incoming.deliveries_summary
       },
       outputInvalidated: false
     };
@@ -116,7 +117,8 @@ function mergeRunRecordWithMeta(
       prompt: incoming.prompt ?? existing.prompt,
       output_preview: nextOutputPreview,
       output_md: nextOutputMd,
-      truncated: nextTruncated
+      truncated: nextTruncated,
+      deliveries_summary: incoming.deliveries_summary ?? existing.deliveries_summary
     },
     outputInvalidated: outputChanged && incoming.output_md === undefined
   };

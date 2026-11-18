@@ -4,7 +4,13 @@ import {
   type AgentName,
   type ApiKeyRecord,
   type ApiScope,
+  type AttentionState,
   type AuthPrincipal,
+  type DeliveriesSummary,
+  type DeliveryChannelKind,
+  type DeliverySourceKind,
+  type DeliveryStatus,
+  type DeliveryTriggerEvent,
   type EffortLevel,
   type Env,
   HubError,
@@ -14,11 +20,13 @@ import {
   type NativeEventRecord,
   type NodeRecord,
   type NodeStatus,
+  type NotificationDeliveryRecord,
   type NotifyEvent,
   type NotifyPolicy,
-  type NotifyQueueMessage,
   type NotifyRouteMode,
   type NotifyStatus,
+  type NotifyTarget,
+  type PushEventFilterKey,
   type RunEventInput,
   type RunEventKind,
   type RunEventRecord,
@@ -26,6 +34,7 @@ import {
   type RunStatus,
   type ThreadRecord,
   type ThreadStatus,
+  type WebPushSubscriptionRecord,
   type WorkspaceEntry
 } from "./types";
 import { newId, nowIso, sanitizeTailPreview, truncateUtf8Bytes } from "./ulid";
@@ -35,6 +44,7 @@ import {
   type ParsedNativeEventCreate,
   type ResolveRunInput
 } from "./validation";
+import { type WebPushSendResult } from "./web-push";
 
 const MAX_OUTPUT_MD_BYTES = 900 * 1024;
 
@@ -75,6 +85,52 @@ interface NativeEventRow {
   notify_key_id: string | null;
   notify_status: NativeEventNotifyStatus;
   notify_error: string;
+  ack_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface DeliveryRow {
+  id: string;
+  source_kind: DeliverySourceKind;
+  source_id: string;
+  trigger_event: DeliveryTriggerEvent;
+  node_id: string;
+  channel_kind: DeliveryChannelKind;
+  channel_id: string;
+  channel_label: string;
+  target_host: string;
+  route_mode: NotifyRouteMode;
+  status: DeliveryStatus;
+  attempts: number;
+  http_status: number | null;
+  error_code: string;
+  error_message: string;
+  sent_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface WebPushSubscriptionMatch {
+  id: string;
+  label: string;
+  endpoint_host: string;
+}
+
+interface WebPushSubscriptionRow {
+  id: string;
+  label: string;
+  endpoint_sha256: string;
+  endpoint_host: string;
+  subscription_ciphertext: string;
+  node_filter_json: string;
+  event_filter_json: string;
+  enabled: number;
+  failure_count: number;
+  last_sent_at: string | null;
+  last_error_code: string;
+  last_error_message: string;
+  revoked_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -246,8 +302,204 @@ export function mapNodeRow(row: NodeRow): NodeRecord {
   return record;
 }
 
-export function mapNativeEventRow(row: NativeEventRow): NativeEventRecord {
+const INTERACTION_STALE_MS = 86_400_000;
+
+export function computeAttentionState(
+  event: {
+    id: string;
+    node_id: string;
+    agent: NativeEventAgentName;
+    event_kind: NativeEventKind;
+    native_session_id: string;
+    ack_at: string | null;
+    created_at: string;
+  },
+  sameSessionEvents: ReadonlyArray<{
+    id: string;
+    node_id: string;
+    agent: NativeEventAgentName;
+    native_session_id: string;
+    created_at: string;
+  }>,
+  nowMs = Date.now()
+): AttentionState | null {
+  if (event.event_kind !== "interaction_needed") {
+    return null;
+  }
+  if (event.ack_at !== null) {
+    return "acked";
+  }
+  if (event.native_session_id !== "") {
+    const superseded = sameSessionEvents.some(
+      (other) =>
+        other.id !== event.id &&
+        other.node_id === event.node_id &&
+        other.agent === event.agent &&
+        other.native_session_id === event.native_session_id &&
+        (other.created_at > event.created_at ||
+          (other.created_at === event.created_at && other.id > event.id))
+    );
+    if (superseded) {
+      return "superseded";
+    }
+  }
+  const createdMs = Date.parse(event.created_at);
+  if (Number.isFinite(createdMs) && nowMs - createdMs > INTERACTION_STALE_MS) {
+    return "stale";
+  }
+  return "open";
+}
+
+export function summarizeDeliveries(
+  deliveries: ReadonlyArray<{ status: DeliveryStatus }>
+): DeliveriesSummary {
+  let sent = 0;
+  let queued = 0;
+  let failed = 0;
+  for (const d of deliveries) {
+    if (d.status === "sent") sent += 1;
+    else if (d.status === "queued") queued += 1;
+    else if (d.status === "failed") failed += 1;
+  }
   return {
+    total: deliveries.length,
+    sent,
+    queued,
+    failed
+  };
+}
+
+export function computeAggregateNotifyStatus(
+  sourceKind: "native_event",
+  deliveries: ReadonlyArray<{ status: DeliveryStatus; error_code?: string }>,
+  options?: {
+    nodeDefaultNotifyKeyId?: string | null;
+    nodeDefaultNotifyValid?: boolean;
+  }
+): { notifyStatus: NativeEventNotifyStatus; notifyError: string; deliveriesSummary: DeliveriesSummary };
+export function computeAggregateNotifyStatus(
+  sourceKind: "run",
+  deliveries: ReadonlyArray<{ status: DeliveryStatus; error_code?: string }>,
+  options?: {
+    currentNotifyStatus?: NotifyStatus;
+    failClosedWithoutDeliveries?: boolean;
+  }
+): { notifyStatus: NotifyStatus; notifyError: string; deliveriesSummary: DeliveriesSummary };
+export function computeAggregateNotifyStatus(
+  sourceKind: DeliverySourceKind,
+  deliveries: ReadonlyArray<{ status: DeliveryStatus; error_code?: string }>,
+  options: {
+    nodeDefaultNotifyKeyId?: string | null;
+    nodeDefaultNotifyValid?: boolean;
+    currentNotifyStatus?: NotifyStatus;
+    failClosedWithoutDeliveries?: boolean;
+  } = {}
+): { notifyStatus: NativeEventNotifyStatus | NotifyStatus; notifyError: string; deliveriesSummary: DeliveriesSummary } {
+  const deliveriesSummary = summarizeDeliveries(deliveries);
+  if (deliveriesSummary.total === 0) {
+    if (sourceKind === "native_event") {
+      if (!options.nodeDefaultNotifyKeyId) {
+        return {
+          notifyStatus: "skipped",
+          notifyError: "NODE_DEFAULT_CHANNEL_UNBOUND",
+          deliveriesSummary
+        };
+      }
+      if (!options.nodeDefaultNotifyValid) {
+        return {
+          notifyStatus: "failed",
+          notifyError: "DEFAULT_CHANNEL_INVALID_OR_REVOKED",
+          deliveriesSummary
+        };
+      }
+      return {
+        notifyStatus: "skipped",
+        notifyError: "NO_MATCHING_CHANNELS",
+        deliveriesSummary
+      };
+    }
+    return {
+      notifyStatus: options.failClosedWithoutDeliveries ? "failed" : (options.currentNotifyStatus ?? "none"),
+      notifyError: "",
+      deliveriesSummary
+    };
+  }
+
+  if (deliveriesSummary.queued > 0) {
+    return { notifyStatus: "queued", notifyError: "", deliveriesSummary };
+  }
+  if (deliveriesSummary.sent > 0 && deliveriesSummary.failed === 0) {
+    return { notifyStatus: "sent", notifyError: "", deliveriesSummary };
+  }
+  if (deliveriesSummary.sent > 0 && deliveriesSummary.failed > 0) {
+    return {
+      notifyStatus: sourceKind === "native_event" ? "partial" : "sent",
+      notifyError: "",
+      deliveriesSummary
+    };
+  }
+  if (deliveriesSummary.sent === 0 && deliveriesSummary.failed > 0) {
+    const firstErr = deliveries.find((d) => d.status === "failed" && d.error_code)?.error_code || "DELIVERY_FAILED";
+    return {
+      notifyStatus: "failed",
+      notifyError: firstErr,
+      deliveriesSummary
+    };
+  }
+  return {
+    notifyStatus: sourceKind === "native_event" ? "skipped" : "none",
+    notifyError: "",
+    deliveriesSummary
+  };
+}
+
+export function mapDeliveryRow(row: DeliveryRow): NotificationDeliveryRecord {
+  return {
+    id: row.id,
+    source_kind: row.source_kind,
+    source_id: row.source_id,
+    trigger_event: row.trigger_event,
+    node_id: row.node_id,
+    channel_kind: row.channel_kind,
+    channel_id: row.channel_id,
+    channel_label: row.channel_label,
+    target_host: row.target_host,
+    route_mode: row.route_mode,
+    status: row.status,
+    attempts: row.attempts,
+    http_status: row.http_status ?? null,
+    error_code: row.error_code,
+    error_message: row.error_message,
+    sent_at: row.sent_at ?? null,
+    created_at: row.created_at,
+    updated_at: row.updated_at
+  };
+}
+
+export function mapNativeEventRow(
+  row: NativeEventRow,
+  options?: {
+    attentionState?: AttentionState | null;
+    deliveriesSummary?: DeliveriesSummary;
+  }
+): NativeEventRecord {
+  const ackAt = row.ack_at ?? null;
+  const attentionState =
+    options?.attentionState !== undefined
+      ? options.attentionState
+      : computeAttentionState(
+          {
+            id: row.id,
+            node_id: row.node_id,
+            agent: row.agent,
+            event_kind: row.event_kind,
+            native_session_id: row.native_session_id,
+            ack_at: ackAt,
+            created_at: row.created_at
+          },
+          []
+        );
+  const record: NativeEventRecord = {
     id: row.id,
     node_id: row.node_id,
     event_id: row.event_id,
@@ -261,9 +513,15 @@ export function mapNativeEventRow(row: NativeEventRow): NativeEventRecord {
     notify_key_id: row.notify_key_id ?? null,
     notify_status: row.notify_status,
     notify_error: row.notify_error,
+    ack_at: ackAt,
+    attention_state: attentionState,
     created_at: row.created_at,
     updated_at: row.updated_at
   };
+  if (options?.deliveriesSummary !== undefined) {
+    record.deliveries_summary = options.deliveriesSummary;
+  }
+  return record;
 }
 
 export function mapThreadRow(row: ThreadRow): ThreadRecord {
@@ -305,6 +563,7 @@ export function mapRunRow(
     tailBytes?: number;
     promptMode?: RunPromptMode;
     webhookArmed?: boolean;
+    deliveriesSummary?: DeliveriesSummary;
   } = {}
 ): RunRecord {
   const view = options.view ?? "summary";
@@ -352,6 +611,9 @@ export function mapRunRow(
   }
   if (options.webhookArmed !== undefined) {
     record.webhook_armed = options.webhookArmed;
+  }
+  if (options.deliveriesSummary !== undefined) {
+    record.deliveries_summary = options.deliveriesSummary;
   }
   if (view === "full") {
     record.output_md = row.output_md;
@@ -1158,6 +1420,196 @@ function shouldNotifyOnEvent(policy: NotifyPolicy, event: NotifyEvent): boolean 
   return policy.events.includes(event);
 }
 
+function resolveLegacyWebhookHost(env: Env, target: NotifyTarget): string {
+  const raw =
+    target === "grok"
+      ? env.GROK_WEBHOOK_URL?.trim()
+      : (env.WEBHOOK_URL?.trim() || env.GROK_WEBHOOK_URL?.trim());
+  if (!raw) return "";
+  try {
+    return new URL(raw).host;
+  } catch {
+    return "";
+  }
+}
+
+export async function listMatchingWebPushSubscriptions(
+  db: D1Database,
+  nodeId: string,
+  filterKey: PushEventFilterKey
+): Promise<WebPushSubscriptionMatch[]> {
+  const res = await db
+    .prepare(
+      `SELECT id, label, endpoint_host, node_filter_json, event_filter_json
+       FROM web_push_subscriptions
+       WHERE enabled = 1 AND revoked_at IS NULL
+       ORDER BY created_at ASC`
+    )
+    .all<{
+      id: string;
+      label: string;
+      endpoint_host: string;
+      node_filter_json: string;
+      event_filter_json: string;
+    }>();
+
+  const matches: WebPushSubscriptionMatch[] = [];
+  for (const row of res.results ?? []) {
+    const nodeFilter = parseStringArray(row.node_filter_json);
+    const eventFilter = parseStringArray(row.event_filter_json);
+    const nodeMatch = nodeFilter.length === 0 || nodeFilter.includes(nodeId);
+    const eventMatch = eventFilter.includes(filterKey);
+    if (nodeMatch && eventMatch) {
+      matches.push({
+        id: row.id,
+        label: row.label,
+        endpoint_host: row.endpoint_host
+      });
+    }
+  }
+  return matches;
+}
+
+export async function getDeliveriesSummaryMap(
+  db: D1Database,
+  sourceKind: DeliverySourceKind,
+  sourceIds: string[]
+): Promise<Map<string, DeliveriesSummary>> {
+  const map = new Map<string, DeliveriesSummary>();
+  const uniqueIds = Array.from(new Set(sourceIds.filter((id) => Boolean(id))));
+  if (uniqueIds.length === 0) {
+    return map;
+  }
+  const chunkSize = 50;
+  for (let i = 0; i < uniqueIds.length; i += chunkSize) {
+    const chunk = uniqueIds.slice(i, i + chunkSize);
+    const placeholders = chunk.map((_, idx) => `?${idx + 2}`).join(", ");
+    const res = await db
+      .prepare(
+        `SELECT source_id,
+                COUNT(*) AS total,
+                COALESCE(SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END), 0) AS sent,
+                COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0) AS queued,
+                COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed
+         FROM notification_deliveries
+         WHERE source_kind = ?1 AND source_id IN (${placeholders})
+         GROUP BY source_id`
+      )
+      .bind(sourceKind, ...chunk)
+      .all<{
+        source_id: string;
+        total: number;
+        sent: number;
+        queued: number;
+        failed: number;
+      }>();
+    for (const row of res.results ?? []) {
+      map.set(row.source_id, {
+        total: Number(row.total ?? 0),
+        sent: Number(row.sent ?? 0),
+        queued: Number(row.queued ?? 0),
+        failed: Number(row.failed ?? 0)
+      });
+    }
+  }
+  return map;
+}
+
+export async function listDeliveriesForSource(
+  db: D1Database,
+  sourceKind: DeliverySourceKind,
+  sourceId: string
+): Promise<NotificationDeliveryRecord[]> {
+  const res = await db
+    .prepare(
+      `SELECT * FROM notification_deliveries
+       WHERE source_kind = ?1 AND source_id = ?2
+       ORDER BY created_at ASC, id ASC`
+    )
+    .bind(sourceKind, sourceId)
+    .all<DeliveryRow>();
+  return (res.results ?? []).map(mapDeliveryRow);
+}
+
+export async function getDeliveryById(
+  db: D1Database,
+  deliveryId: string
+): Promise<NotificationDeliveryRecord | null> {
+  const row = await db
+    .prepare(`SELECT * FROM notification_deliveries WHERE id = ?1 LIMIT 1`)
+    .bind(deliveryId)
+    .first<DeliveryRow>();
+  return row ? mapDeliveryRow(row) : null;
+}
+
+export async function recomputeSourceNotifyStatus(
+  db: D1Database,
+  sourceKind: DeliverySourceKind,
+  sourceId: string
+): Promise<{ notifyStatus: string; notifyError: string; deliveriesSummary: DeliveriesSummary }> {
+  const deliveriesRes = await db
+    .prepare(
+      `SELECT status, error_code
+       FROM notification_deliveries
+       WHERE source_kind = ?1 AND source_id = ?2
+       ORDER BY created_at ASC, id ASC`
+    )
+    .bind(sourceKind, sourceId)
+    .all<{ status: DeliveryStatus; error_code: string }>();
+  const deliveries = deliveriesRes.results ?? [];
+  const now = nowIso();
+
+  if (sourceKind === "native_event") {
+    let nodeDefaultNotifyKeyId: string | null = null;
+    let nodeDefaultNotifyValid = false;
+    if (deliveries.length === 0) {
+      const evRow = await db
+        .prepare(`SELECT node_id FROM native_events WHERE id = ?1 LIMIT 1`)
+        .bind(sourceId)
+        .first<{ node_id: string }>();
+      if (evRow) {
+        const node = await getNodeById(db, evRow.node_id);
+        nodeDefaultNotifyKeyId = node?.default_notify_key_id ?? null;
+        nodeDefaultNotifyValid = Boolean(node?.default_notify_valid);
+      }
+    }
+    const agg = computeAggregateNotifyStatus("native_event", deliveries, {
+      nodeDefaultNotifyKeyId,
+      nodeDefaultNotifyValid
+    });
+    await db
+      .prepare(
+        `UPDATE native_events
+         SET notify_status = ?1, notify_error = ?2, updated_at = ?3
+         WHERE id = ?4`
+      )
+      .bind(agg.notifyStatus, agg.notifyError, now, sourceId)
+      .run();
+    return agg;
+  }
+
+  const runRow = await db
+    .prepare(`SELECT notify_status FROM runs WHERE id = ?1 LIMIT 1`)
+    .bind(sourceId)
+    .first<{ notify_status: NotifyStatus }>();
+  const agg = computeAggregateNotifyStatus("run", deliveries, {
+    currentNotifyStatus: runRow?.notify_status ?? "none"
+  });
+  await db
+    .prepare(`UPDATE runs SET notify_status = ?1, updated_at = ?2 WHERE id = ?3`)
+    .bind(agg.notifyStatus, now, sourceId)
+    .run();
+  return agg;
+}
+
+interface DeliveryCandidate {
+  channelKind: DeliveryChannelKind;
+  channelId: string;
+  channelLabel: string;
+  targetHost: string;
+  routeMode: NotifyRouteMode;
+}
+
 export async function enqueueRunNotificationIfNeeded(
   db: D1Database,
   env: Env,
@@ -1165,66 +1617,383 @@ export async function enqueueRunNotificationIfNeeded(
   event: NotifyEvent
 ): Promise<boolean> {
   const policy = parseNotifyPolicy(run.notify_policy_json);
-  let target = policy.target;
-  let routeMode: NotifyRouteMode = "key";
 
   let isAdminOrHuman = true;
+  let creatorKey: { scope: ApiScope; name: string; notify_webhook_host: string } | null = null;
   if (run.created_by_key_id) {
-    const keyRow = await db
-      .prepare(`SELECT scope FROM api_keys WHERE id = ?1 LIMIT 1`)
+    creatorKey = await db
+      .prepare(`SELECT scope, name, notify_webhook_host FROM api_keys WHERE id = ?1 LIMIT 1`)
       .bind(run.created_by_key_id)
-      .first<{ scope: ApiScope }>();
-    isAdminOrHuman = keyRow?.scope === "admin";
+      .first<{ scope: ApiScope; name: string; notify_webhook_host: string }>();
+    isAdminOrHuman = creatorKey?.scope === "admin";
   }
 
-  if (target === "none") {
-    if (run.depth !== 0 || !isAdminOrHuman) {
-      return false;
+  const node = await getNodeById(db, run.node_id);
+  const candidates: DeliveryCandidate[] = [];
+  let botInvalidFailClosed = false;
+
+  if (policy.target === "none") {
+    if (run.depth === 0 && isAdminOrHuman && node?.default_notify_key_id) {
+      if (!node.default_notify_valid) {
+        botInvalidFailClosed = true;
+      } else {
+        candidates.push({
+          channelKind: "bot_webhook",
+          channelId: node.default_notify_key_id,
+          channelLabel: node.default_notify_key_name || node.default_notify_key_id,
+          targetHost: node.default_notify_webhook_host || "",
+          routeMode: "node_default"
+        });
+      }
     }
-    const node = await getNodeById(db, run.node_id);
-    if (!node?.default_notify_key_id) {
-      return false;
+  } else if (shouldNotifyOnEvent(policy, event)) {
+    if (!isAdminOrHuman && run.created_by_key_id) {
+      candidates.push({
+        channelKind: "bot_webhook",
+        channelId: run.created_by_key_id,
+        channelLabel: creatorKey?.name || run.created_by_key_id,
+        targetHost: creatorKey?.notify_webhook_host || "",
+        routeMode: "key"
+      });
+    } else if (run.depth === 0 && node?.default_notify_key_id) {
+      if (!node.default_notify_valid) {
+        botInvalidFailClosed = true;
+      } else {
+        candidates.push({
+          channelKind: "bot_webhook",
+          channelId: node.default_notify_key_id,
+          channelLabel: node.default_notify_key_name || node.default_notify_key_id,
+          targetHost: node.default_notify_webhook_host || "",
+          routeMode: "node_default"
+        });
+      }
+    } else {
+      candidates.push({
+        channelKind: "legacy_webhook",
+        channelId: "global_legacy",
+        channelLabel: policy.target === "grok" ? "global-grok-webhook" : "global-webhook",
+        targetHost: resolveLegacyWebhookHost(env, policy.target),
+        routeMode: "global_legacy"
+      });
     }
-    if (!node.default_notify_valid) {
+  }
+
+  if (run.depth === 0 && (isAdminOrHuman || event === "needs_approval" || event === "failed")) {
+    const filterKey = `run_${event}` as PushEventFilterKey;
+    const pushSubs = await listMatchingWebPushSubscriptions(db, run.node_id, filterKey);
+    for (const sub of pushSubs) {
+      candidates.push({
+        channelKind: "web_push",
+        channelId: sub.id,
+        channelLabel: sub.label,
+        targetHost: sub.endpoint_host,
+        routeMode: "web_push"
+      });
+    }
+  }
+
+  if (candidates.length === 0) {
+    if (botInvalidFailClosed) {
       await db
         .prepare(`UPDATE runs SET notify_status = 'failed', updated_at = ?1 WHERE id = ?2`)
         .bind(nowIso(), run.id)
         .run();
-      return false;
     }
-    target = "grok";
-    routeMode = "node_default";
-  } else {
-    if (!shouldNotifyOnEvent(policy, event)) {
-      return false;
-    }
-    if (!isAdminOrHuman) {
-      routeMode = "key";
-    } else {
-      const node = await getNodeById(db, run.node_id);
-      routeMode = node?.default_notify_key_id ? "node_default" : "global_legacy";
+    return false;
+  }
+
+  const now = nowIso();
+  let enqueuedAny = false;
+  for (const cand of candidates) {
+    const dlvId = newId("dlv");
+    const res = await db
+      .prepare(
+        `INSERT OR IGNORE INTO notification_deliveries (
+           id, source_kind, source_id, trigger_event, node_id,
+           channel_kind, channel_id, channel_label, target_host, route_mode,
+           status, attempts, http_status, error_code, error_message, sent_at, created_at, updated_at
+         ) VALUES (
+           ?1, 'run', ?2, ?3, ?4,
+           ?5, ?6, ?7, ?8, ?9,
+           'queued', 0, NULL, '', '', NULL, ?10, ?10
+         )`
+      )
+      .bind(
+        dlvId,
+        run.id,
+        event as DeliveryTriggerEvent,
+        run.node_id,
+        cand.channelKind,
+        cand.channelId,
+        cand.channelLabel,
+        cand.targetHost,
+        cand.routeMode,
+        now
+      )
+      .run();
+    if ((res.meta.changes ?? 0) === 1) {
+      await env.NOTIFY_QUEUE.send({ kind: "delivery", delivery_id: dlvId });
+      enqueuedAny = true;
     }
   }
 
-  const msg: NotifyQueueMessage = {
-    kind: "run",
-    run_id: run.id,
-    thread_id: run.thread_id,
-    root_run_id: run.root_run_id,
-    node_id: run.node_id,
-    workdir: run.workdir,
-    agent: run.agent,
-    status: run.status,
-    target,
-    route_mode: routeMode,
-    attempt: 1
-  };
-  await env.NOTIFY_QUEUE.send(msg);
-  await db
-    .prepare(`UPDATE runs SET notify_status = 'queued', updated_at = ?1 WHERE id = ?2`)
-    .bind(nowIso(), run.id)
-    .run();
-  return true;
+  await recomputeSourceNotifyStatus(db, "run", run.id);
+  return enqueuedAny;
+}
+
+async function hasSupersedingNativeEvent(db: D1Database, row: NativeEventRow): Promise<boolean> {
+  if (row.event_kind !== "interaction_needed" || (row.ack_at ?? null) !== null || !row.native_session_id) {
+    return false;
+  }
+  const hit = await db
+    .prepare(
+      `SELECT 1 AS hit
+       FROM native_events
+       WHERE node_id = ?1
+         AND agent = ?2
+         AND native_session_id = ?3
+         AND (created_at > ?4 OR (created_at = ?4 AND id > ?5))
+       LIMIT 1`
+    )
+    .bind(row.node_id, row.agent, row.native_session_id, row.created_at, row.id)
+    .first<{ hit: number }>();
+  return Boolean(hit);
+}
+
+export async function hydrateNativeEventRow(
+  db: D1Database,
+  row: NativeEventRow,
+  nowMs = Date.now()
+): Promise<NativeEventRecord> {
+  const [superseded, summaryMap] = await Promise.all([
+    hasSupersedingNativeEvent(db, row),
+    getDeliveriesSummaryMap(db, "native_event", [row.id])
+  ]);
+  const ackAt = row.ack_at ?? null;
+  const attentionState = computeAttentionState(
+    {
+      id: row.id,
+      node_id: row.node_id,
+      agent: row.agent,
+      event_kind: row.event_kind,
+      native_session_id: row.native_session_id,
+      ack_at: ackAt,
+      created_at: row.created_at
+    },
+    superseded
+      ? [
+          {
+            id: `${row.id}Z`,
+            node_id: row.node_id,
+            agent: row.agent,
+            native_session_id: row.native_session_id,
+            created_at: "9999-12-31T23:59:59.999Z"
+          }
+        ]
+      : [],
+    nowMs
+  );
+  return mapNativeEventRow(row, {
+    attentionState,
+    deliveriesSummary: summaryMap.get(row.id)
+  });
+}
+
+export async function countOpenNativeInteractions(
+  db: D1Database,
+  nowMs = Date.now()
+): Promise<number> {
+  const cutoffIso = new Date(nowMs - INTERACTION_STALE_MS).toISOString();
+  const row = await db
+    .prepare(
+      `SELECT COUNT(*) AS cnt
+       FROM native_events e
+       WHERE e.event_kind = 'interaction_needed'
+         AND e.ack_at IS NULL
+         AND e.created_at >= ?1
+         AND NOT EXISTS (
+           SELECT 1 FROM native_events newer
+           WHERE e.native_session_id != ''
+             AND newer.node_id = e.node_id
+             AND newer.agent = e.agent
+             AND newer.native_session_id = e.native_session_id
+             AND (
+               newer.created_at > e.created_at
+               OR (newer.created_at = e.created_at AND newer.id > e.id)
+             )
+         )`
+    )
+    .bind(cutoffIso)
+    .first<{ cnt: number }>();
+  return Number(row?.cnt ?? 0);
+}
+
+export async function getNativeEventById(
+  db: D1Database,
+  id: string,
+  nowMs = Date.now()
+): Promise<NativeEventRecord | null> {
+  const row = await db
+    .prepare(`SELECT * FROM native_events WHERE id = ?1 LIMIT 1`)
+    .bind(id)
+    .first<NativeEventRow>();
+  if (!row) {
+    return null;
+  }
+  return hydrateNativeEventRow(db, row, nowMs);
+}
+
+export async function listNativeEvents(
+  db: D1Database,
+  filters: {
+    nodeId?: string;
+    agent?: NativeEventAgentName;
+    eventKind?: NativeEventKind;
+    notifyStatus?: NativeEventNotifyStatus;
+    unackedOnly?: boolean;
+    q?: string;
+    limit?: number;
+    beforeTs?: string;
+    beforeId?: string;
+    nowMs?: number;
+  } = {}
+): Promise<{
+  events: NativeEventRecord[];
+  openInteractionCount: number;
+  nextCursor: { before_ts: string; before_id: string } | null;
+}> {
+  const nowMs = filters.nowMs ?? Date.now();
+  const limit = Math.min(Math.max(filters.limit ?? 50, 1), 100);
+  const where: string[] = [];
+  const binds: unknown[] = [];
+
+  if (filters.nodeId) {
+    binds.push(filters.nodeId);
+    where.push(`e.node_id = ?${binds.length}`);
+  }
+  if (filters.agent) {
+    binds.push(filters.agent);
+    where.push(`e.agent = ?${binds.length}`);
+  }
+  if (filters.eventKind) {
+    binds.push(filters.eventKind);
+    where.push(`e.event_kind = ?${binds.length}`);
+  }
+  if (filters.notifyStatus) {
+    binds.push(filters.notifyStatus);
+    where.push(`e.notify_status = ?${binds.length}`);
+  }
+  if (filters.unackedOnly) {
+    const cutoffIso = new Date(nowMs - INTERACTION_STALE_MS).toISOString();
+    binds.push(cutoffIso);
+    where.push(`e.event_kind = 'interaction_needed'`);
+    where.push(`e.ack_at IS NULL`);
+    where.push(`e.created_at >= ?${binds.length}`);
+    where.push(
+      `NOT EXISTS (
+         SELECT 1 FROM native_events newer
+         WHERE e.native_session_id != ''
+           AND newer.node_id = e.node_id
+           AND newer.agent = e.agent
+           AND newer.native_session_id = e.native_session_id
+           AND (
+             newer.created_at > e.created_at
+             OR (newer.created_at = e.created_at AND newer.id > e.id)
+           )
+       )`
+    );
+  }
+  if (filters.q) {
+    binds.push(`%${filters.q}%`);
+    const p = `?${binds.length}`;
+    where.push(`(e.title LIKE ${p} OR e.summary LIKE ${p} OR e.workdir LIKE ${p} OR e.native_session_id LIKE ${p})`);
+  }
+  if (filters.beforeTs && filters.beforeId) {
+    binds.push(filters.beforeTs, filters.beforeId);
+    const tsParam = `?${binds.length - 1}`;
+    const idParam = `?${binds.length}`;
+    where.push(`(e.created_at < ${tsParam} OR (e.created_at = ${tsParam} AND e.id < ${idParam}))`);
+  } else if (filters.beforeTs) {
+    binds.push(filters.beforeTs);
+    where.push(`e.created_at < ?${binds.length}`);
+  }
+
+  binds.push(limit + 1);
+  const sql = `SELECT e.*,
+                      CASE WHEN e.event_kind = 'interaction_needed'
+                                AND e.ack_at IS NULL
+                                AND e.native_session_id != ''
+                                AND EXISTS (
+                                  SELECT 1 FROM native_events newer
+                                  WHERE newer.node_id = e.node_id
+                                    AND newer.agent = e.agent
+                                    AND newer.native_session_id = e.native_session_id
+                                    AND (
+                                      newer.created_at > e.created_at
+                                      OR (newer.created_at = e.created_at AND newer.id > e.id)
+                                    )
+                                )
+                           THEN 1 ELSE 0 END AS is_superseded
+               FROM native_events e
+               ${where.length ? "WHERE " + where.join(" AND ") : ""}
+               ORDER BY e.created_at DESC, e.id DESC
+               LIMIT ?${binds.length}`;
+
+  const [res, openInteractionCount] = await Promise.all([
+    db.prepare(sql).bind(...binds).all<NativeEventRow & { is_superseded?: number }>(),
+    countOpenNativeInteractions(db, nowMs)
+  ]);
+
+  const rawRows = res.results ?? [];
+  const hasMore = rawRows.length > limit;
+  const pageRows = hasMore ? rawRows.slice(0, limit) : rawRows;
+  const summaryMap = await getDeliveriesSummaryMap(
+    db,
+    "native_event",
+    pageRows.map((r) => r.id)
+  );
+
+  const events = pageRows.map((row) => {
+    const ackAt = row.ack_at ?? null;
+    const attentionState = computeAttentionState(
+      {
+        id: row.id,
+        node_id: row.node_id,
+        agent: row.agent,
+        event_kind: row.event_kind,
+        native_session_id: row.native_session_id,
+        ack_at: ackAt,
+        created_at: row.created_at
+      },
+      row.is_superseded === 1
+        ? [
+            {
+              id: `${row.id}Z`,
+              node_id: row.node_id,
+              agent: row.agent,
+              native_session_id: row.native_session_id,
+              created_at: "9999-12-31T23:59:59.999Z"
+            }
+          ]
+        : [],
+      nowMs
+    );
+    return mapNativeEventRow(row, {
+      attentionState,
+      deliveriesSummary: summaryMap.get(row.id)
+    });
+  });
+
+  const last = pageRows[pageRows.length - 1];
+  const nextCursor =
+    hasMore && last
+      ? {
+          before_ts: last.created_at,
+          before_id: last.id
+        }
+      : null;
+
+  return { events, openInteractionCount, nextCursor };
 }
 
 export async function createNativeEvent(
@@ -1238,7 +2007,7 @@ export async function createNativeEvent(
     .bind(nodeId, input.eventId)
     .first<NativeEventRow>();
   if (existing) {
-    return { event: mapNativeEventRow(existing), deduplicated: true };
+    return { event: await hydrateNativeEventRow(db, existing), deduplicated: true };
   }
 
   const node = await getNodeById(db, nodeId);
@@ -1251,28 +2020,33 @@ export async function createNativeEvent(
   const id = newId("evt");
   const now = nowIso();
 
-  let notifyKeyId: string | null = node.default_notify_key_id ?? null;
+  const notifyKeyId: string | null = node.default_notify_key_id ?? null;
+  const hasValidBot = Boolean(notifyKeyId && node.default_notify_valid);
+  const botInvalid = Boolean(notifyKeyId && !node.default_notify_valid);
+  const pushFilterKey = `native_${input.eventKind}` as PushEventFilterKey;
+  const pushSubs = await listMatchingWebPushSubscriptions(db, nodeId, pushFilterKey);
+
   let notifyStatus: NativeEventNotifyStatus = "skipped";
   let notifyError = "";
 
-  if (!notifyKeyId) {
-    notifyStatus = "skipped";
-    notifyError = "NODE_DEFAULT_CHANNEL_UNBOUND";
-  } else if (!node.default_notify_valid) {
+  if (hasValidBot || pushSubs.length > 0) {
+    notifyStatus = "queued";
+  } else if (botInvalid) {
     notifyStatus = "failed";
     notifyError = "DEFAULT_CHANNEL_INVALID_OR_REVOKED";
   } else {
-    notifyStatus = "queued";
+    notifyStatus = "skipped";
+    notifyError = "NODE_DEFAULT_CHANNEL_UNBOUND";
   }
 
   const insertRes = await db
     .prepare(
       `INSERT OR IGNORE INTO native_events (
          id, node_id, event_id, agent, event_kind, native_session_id, workdir,
-         title, summary, source, notify_key_id, notify_status, notify_error, created_at, updated_at
+         title, summary, source, notify_key_id, notify_status, notify_error, ack_at, created_at, updated_at
        ) VALUES (
          ?1, ?2, ?3, ?4, ?5, ?6, ?7,
-         ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14
+         ?8, ?9, ?10, ?11, ?12, ?13, NULL, ?14, ?14
        )`
     )
     .bind(
@@ -1299,24 +2073,67 @@ export async function createNativeEvent(
       .bind(nodeId, input.eventId)
       .first<NativeEventRow>();
     if (raced) {
-      return { event: mapNativeEventRow(raced), deduplicated: true };
+      return { event: await hydrateNativeEventRow(db, raced), deduplicated: true };
     }
   }
 
-  if (notifyStatus === "queued") {
-    await env.NOTIFY_QUEUE.send({
-      kind: "native_event",
-      native_event_id: id,
-      node_id: nodeId,
-      attempt: 1
+  const candidates: DeliveryCandidate[] = [];
+  if (hasValidBot && notifyKeyId) {
+    candidates.push({
+      channelKind: "bot_webhook",
+      channelId: notifyKeyId,
+      channelLabel: node.default_notify_key_name || notifyKeyId,
+      targetHost: node.default_notify_webhook_host || "",
+      routeMode: "node_default"
     });
+  }
+  for (const sub of pushSubs) {
+    candidates.push({
+      channelKind: "web_push",
+      channelId: sub.id,
+      channelLabel: sub.label,
+      targetHost: sub.endpoint_host,
+      routeMode: "web_push"
+    });
+  }
+
+  for (const cand of candidates) {
+    const dlvId = newId("dlv");
+    const dlvRes = await db
+      .prepare(
+        `INSERT OR IGNORE INTO notification_deliveries (
+           id, source_kind, source_id, trigger_event, node_id,
+           channel_kind, channel_id, channel_label, target_host, route_mode,
+           status, attempts, http_status, error_code, error_message, sent_at, created_at, updated_at
+         ) VALUES (
+           ?1, 'native_event', ?2, ?3, ?4,
+           ?5, ?6, ?7, ?8, ?9,
+           'queued', 0, NULL, '', '', NULL, ?10, ?10
+         )`
+      )
+      .bind(
+        dlvId,
+        id,
+        input.eventKind as DeliveryTriggerEvent,
+        nodeId,
+        cand.channelKind,
+        cand.channelId,
+        cand.channelLabel,
+        cand.targetHost,
+        cand.routeMode,
+        now
+      )
+      .run();
+    if ((dlvRes.meta.changes ?? 0) === 1) {
+      await env.NOTIFY_QUEUE.send({ kind: "delivery", delivery_id: dlvId });
+    }
   }
 
   const created = await db
     .prepare(`SELECT * FROM native_events WHERE id = ?1 LIMIT 1`)
     .bind(id)
     .first<NativeEventRow>();
-  return { event: mapNativeEventRow(created!), deduplicated: false };
+  return { event: await hydrateNativeEventRow(db, created!), deduplicated: false };
 }
 
 export async function completeRun(
@@ -2042,9 +2859,19 @@ export async function listRuns(
                ORDER BY created_at DESC
                LIMIT ?${binds.length}`;
   const res = await db.prepare(sql).bind(...binds).all<RunRow>();
-  return (res.results ?? [])
-    .filter((r) => isNodeVisibleToPrincipal(principal, r.node_id))
-    .map((r) => mapRunRow(r, { view: "list", promptMode: "preview" }));
+  const visible = (res.results ?? []).filter((r) => isNodeVisibleToPrincipal(principal, r.node_id));
+  const summaryMap = await getDeliveriesSummaryMap(
+    db,
+    "run",
+    visible.map((r) => r.id)
+  );
+  return visible.map((r) =>
+    mapRunRow(r, {
+      view: "list",
+      promptMode: "preview",
+      deliveriesSummary: summaryMap.get(r.id)
+    })
+  );
 }
 
 export async function getRunById(
@@ -2059,10 +2886,12 @@ export async function getRunById(
     throw new HubError(404, "NOT_FOUND", `Run '${runId}' not found.`);
   }
   ensureRunAccessible(principal, row);
+  const summaryMap = await getDeliveriesSummaryMap(db, "run", [row.id]);
   return mapRunRow(row, {
     view,
     tailBytes,
-    promptMode: view === "full" ? "full_redacted" : "preview"
+    promptMode: view === "full" ? "full_redacted" : "preview",
+    deliveriesSummary: summaryMap.get(row.id)
   });
 }
 
@@ -2343,4 +3172,575 @@ export async function reapExpiredLeases(db: D1Database, env: Env): Promise<RunRo
   }
 
   return reaped;
+}
+
+function mapWebPushSubscriptionRow(row: WebPushSubscriptionRow): WebPushSubscriptionRecord {
+  return {
+    id: row.id,
+    label: row.label,
+    endpoint_host: row.endpoint_host,
+    endpoint_sha256_prefix: row.endpoint_sha256.slice(0, 12),
+    node_filter: parseStringArray(row.node_filter_json),
+    event_filter: parseStringArray(row.event_filter_json) as PushEventFilterKey[],
+    enabled: row.enabled === 1,
+    failure_count: Number(row.failure_count ?? 0),
+    last_sent_at: row.last_sent_at ?? null,
+    last_error_code: row.last_error_code ?? "",
+    last_error_message: row.last_error_message ?? "",
+    revoked_at: row.revoked_at ?? null,
+    created_at: row.created_at,
+    updated_at: row.updated_at
+  };
+}
+
+export async function listDeliveriesForRun(
+  db: D1Database,
+  runId: string
+): Promise<NotificationDeliveryRecord[]> {
+  const runRow = await db
+    .prepare(`SELECT id FROM runs WHERE id = ?1 LIMIT 1`)
+    .bind(runId)
+    .first<{ id: string }>();
+  if (!runRow) {
+    throw new HubError(404, "NOT_FOUND", `Run '${runId}' not found.`);
+  }
+  return listDeliveriesForSource(db, "run", runId);
+}
+
+export async function ackNativeEvent(
+  db: D1Database,
+  eventId: string,
+  scope: "single" | "session"
+): Promise<{ event: NativeEventRecord; ackedCount: number; openInteractionCount: number }> {
+  const target = await db
+    .prepare(`SELECT * FROM native_events WHERE id = ?1 LIMIT 1`)
+    .bind(eventId)
+    .first<NativeEventRow>();
+  if (!target) {
+    throw new HubError(404, "NOT_FOUND", `Native event '${eventId}' not found.`);
+  }
+
+  const now = nowIso();
+  let ackRes: D1Result;
+  if (scope === "session" && target.native_session_id !== "") {
+    ackRes = await db
+      .prepare(
+        `UPDATE native_events
+         SET ack_at = ?1, updated_at = ?1
+         WHERE node_id = ?2
+           AND agent = ?3
+           AND native_session_id = ?4
+           AND event_kind = 'interaction_needed'
+           AND ack_at IS NULL`
+      )
+      .bind(now, target.node_id, target.agent, target.native_session_id)
+      .run();
+  } else {
+    ackRes = await db
+      .prepare(
+        `UPDATE native_events
+         SET ack_at = ?1, updated_at = ?1
+         WHERE id = ?2
+           AND event_kind = 'interaction_needed'
+           AND ack_at IS NULL`
+      )
+      .bind(now, eventId)
+      .run();
+  }
+
+  const ackedCount = Number(ackRes.meta.changes ?? 0);
+  const [event, openInteractionCount] = await Promise.all([
+    getNativeEventById(db, eventId),
+    countOpenNativeInteractions(db)
+  ]);
+  return {
+    event: event!,
+    ackedCount,
+    openInteractionCount
+  };
+}
+
+export async function redeliverSourceDeliveries(
+  db: D1Database,
+  env: Env,
+  sourceKind: "native_event",
+  sourceId: string,
+  deliveryId?: string
+): Promise<{
+  event: NativeEventRecord;
+  deliveries: NotificationDeliveryRecord[];
+  requeuedCount: number;
+  requeuedDeliveries: NotificationDeliveryRecord[];
+  openInteractionCount: number;
+}>;
+export async function redeliverSourceDeliveries(
+  db: D1Database,
+  env: Env,
+  sourceKind: "run",
+  sourceId: string,
+  deliveryId?: string
+): Promise<{
+  run: RunRecord;
+  deliveries: NotificationDeliveryRecord[];
+  requeuedCount: number;
+  requeuedDeliveries: NotificationDeliveryRecord[];
+}>;
+export async function redeliverSourceDeliveries(
+  db: D1Database,
+  env: Env,
+  sourceKind: DeliverySourceKind,
+  sourceId: string,
+  deliveryId?: string
+): Promise<
+  | {
+      event: NativeEventRecord;
+      deliveries: NotificationDeliveryRecord[];
+      requeuedCount: number;
+      requeuedDeliveries: NotificationDeliveryRecord[];
+      openInteractionCount: number;
+    }
+  | {
+      run: RunRecord;
+      deliveries: NotificationDeliveryRecord[];
+      requeuedCount: number;
+      requeuedDeliveries: NotificationDeliveryRecord[];
+    }
+> {
+  if (sourceKind === "native_event") {
+    const evRow = await db
+      .prepare(`SELECT id FROM native_events WHERE id = ?1 LIMIT 1`)
+      .bind(sourceId)
+      .first<{ id: string }>();
+    if (!evRow) {
+      throw new HubError(404, "NOT_FOUND", `Native event '${sourceId}' not found.`);
+    }
+  } else {
+    const runRow = await db
+      .prepare(`SELECT id FROM runs WHERE id = ?1 LIMIT 1`)
+      .bind(sourceId)
+      .first<{ id: string }>();
+    if (!runRow) {
+      throw new HubError(404, "NOT_FOUND", `Run '${sourceId}' not found.`);
+    }
+  }
+
+  let targets: DeliveryRow[];
+  if (deliveryId) {
+    const one = await db
+      .prepare(
+        `SELECT * FROM notification_deliveries
+         WHERE id = ?1 AND source_kind = ?2 AND source_id = ?3
+         LIMIT 1`
+      )
+      .bind(deliveryId, sourceKind, sourceId)
+      .first<DeliveryRow>();
+    if (!one) {
+      throw new HubError(
+        404,
+        "NOT_FOUND",
+        `Delivery '${deliveryId}' for ${sourceKind} '${sourceId}' not found.`
+      );
+    }
+    targets = [one];
+  } else {
+    const failedRes = await db
+      .prepare(
+        `SELECT * FROM notification_deliveries
+         WHERE source_kind = ?1 AND source_id = ?2 AND status = 'failed'
+         ORDER BY created_at ASC, id ASC`
+      )
+      .bind(sourceKind, sourceId)
+      .all<DeliveryRow>();
+    targets = failedRes.results ?? [];
+  }
+
+  const targetIdSet = new Set(targets.map((t) => t.id));
+  if (targets.length > 0) {
+    const now = nowIso();
+    for (const row of targets) {
+      await db
+        .prepare(
+          `UPDATE notification_deliveries
+           SET status = 'queued',
+               http_status = NULL,
+               error_code = '',
+               error_message = '',
+               updated_at = ?1
+           WHERE id = ?2`
+        )
+        .bind(now, row.id)
+        .run();
+      await env.NOTIFY_QUEUE.send({ kind: "delivery", delivery_id: row.id });
+    }
+    await recomputeSourceNotifyStatus(db, sourceKind, sourceId);
+  }
+
+  const deliveries = await listDeliveriesForSource(db, sourceKind, sourceId);
+  const requeuedDeliveries = deliveries.filter((d) => targetIdSet.has(d.id));
+
+  if (sourceKind === "native_event") {
+    const [event, openInteractionCount] = await Promise.all([
+      getNativeEventById(db, sourceId),
+      countOpenNativeInteractions(db)
+    ]);
+    return {
+      event: event!,
+      deliveries,
+      requeuedCount: targets.length,
+      requeuedDeliveries,
+      openInteractionCount
+    };
+  }
+
+  const [freshRun, summaryMap] = await Promise.all([
+    db.prepare(`SELECT * FROM runs WHERE id = ?1 LIMIT 1`).bind(sourceId).first<RunRow>(),
+    getDeliveriesSummaryMap(db, "run", [sourceId])
+  ]);
+  return {
+    run: mapRunRow(freshRun!, {
+      view: "summary",
+      tailBytes: 16384,
+      promptMode: "preview",
+      deliveriesSummary: summaryMap.get(sourceId)
+    }),
+    deliveries,
+    requeuedCount: targets.length,
+    requeuedDeliveries
+  };
+}
+
+export async function listPushSubscriptions(
+  db: D1Database,
+  includeRevoked = false
+): Promise<WebPushSubscriptionRecord[]> {
+  const sql = includeRevoked
+    ? `SELECT * FROM web_push_subscriptions ORDER BY created_at DESC, id DESC`
+    : `SELECT * FROM web_push_subscriptions WHERE revoked_at IS NULL ORDER BY created_at DESC, id DESC`;
+  const res = await db.prepare(sql).all<WebPushSubscriptionRow>();
+  return (res.results ?? []).map(mapWebPushSubscriptionRow);
+}
+
+export async function upsertPushSubscription(
+  db: D1Database,
+  input: {
+    label: string;
+    endpointSha256: string;
+    endpointHost: string;
+    subscriptionCiphertext: string;
+    nodeFilter: string[];
+    eventFilter: PushEventFilterKey[];
+  }
+): Promise<{ subscription: WebPushSubscriptionRecord; created: boolean }> {
+  const now = nowIso();
+  const nodeFilterJson = JSON.stringify(input.nodeFilter);
+  const eventFilterJson = JSON.stringify(input.eventFilter);
+
+  const existing = await db
+    .prepare(`SELECT id FROM web_push_subscriptions WHERE endpoint_sha256 = ?1 LIMIT 1`)
+    .bind(input.endpointSha256)
+    .first<{ id: string }>();
+
+  if (existing) {
+    await db
+      .prepare(
+        `UPDATE web_push_subscriptions
+         SET label = ?1,
+             endpoint_host = ?2,
+             subscription_ciphertext = ?3,
+             node_filter_json = ?4,
+             event_filter_json = ?5,
+             enabled = 1,
+             failure_count = 0,
+             last_error_code = '',
+             last_error_message = '',
+             revoked_at = NULL,
+             updated_at = ?6
+         WHERE id = ?7`
+      )
+      .bind(
+        input.label,
+        input.endpointHost,
+        input.subscriptionCiphertext,
+        nodeFilterJson,
+        eventFilterJson,
+        now,
+        existing.id
+      )
+      .run();
+    const updated = await db
+      .prepare(`SELECT * FROM web_push_subscriptions WHERE id = ?1 LIMIT 1`)
+      .bind(existing.id)
+      .first<WebPushSubscriptionRow>();
+    return {
+      subscription: mapWebPushSubscriptionRow(updated!),
+      created: false
+    };
+  }
+
+  const id = newId("wps");
+  await db
+    .prepare(
+      `INSERT INTO web_push_subscriptions (
+         id, label, endpoint_sha256, endpoint_host, subscription_ciphertext,
+         node_filter_json, event_filter_json, enabled, failure_count,
+         last_sent_at, last_error_code, last_error_message, revoked_at, created_at, updated_at
+       ) VALUES (
+         ?1, ?2, ?3, ?4, ?5,
+         ?6, ?7, 1, 0,
+         NULL, '', '', NULL, ?8, ?8
+       )
+       ON CONFLICT(endpoint_sha256) DO UPDATE SET
+         label = excluded.label,
+         endpoint_host = excluded.endpoint_host,
+         subscription_ciphertext = excluded.subscription_ciphertext,
+         node_filter_json = excluded.node_filter_json,
+         event_filter_json = excluded.event_filter_json,
+         enabled = 1,
+         failure_count = 0,
+         last_error_code = '',
+         last_error_message = '',
+         revoked_at = NULL,
+         updated_at = excluded.updated_at`
+    )
+    .bind(
+      id,
+      input.label,
+      input.endpointSha256,
+      input.endpointHost,
+      input.subscriptionCiphertext,
+      nodeFilterJson,
+      eventFilterJson,
+      now
+    )
+    .run();
+
+  const row = await db
+    .prepare(`SELECT * FROM web_push_subscriptions WHERE endpoint_sha256 = ?1 LIMIT 1`)
+    .bind(input.endpointSha256)
+    .first<WebPushSubscriptionRow>();
+  return {
+    subscription: mapWebPushSubscriptionRow(row!),
+    created: row!.id === id
+  };
+}
+
+export async function patchPushSubscription(
+  db: D1Database,
+  id: string,
+  patch: {
+    label?: string;
+    enabled?: boolean;
+    nodeFilter?: string[];
+    eventFilter?: PushEventFilterKey[];
+  }
+): Promise<WebPushSubscriptionRecord> {
+  const existing = await db
+    .prepare(`SELECT * FROM web_push_subscriptions WHERE id = ?1 LIMIT 1`)
+    .bind(id)
+    .first<WebPushSubscriptionRow>();
+  if (!existing) {
+    throw new HubError(404, "NOT_FOUND", `Push subscription '${id}' not found.`);
+  }
+  if (existing.revoked_at !== null) {
+    throw new HubError(409, "INVALID_STATE_TRANSITION", "Cannot modify a revoked push subscription.");
+  }
+
+  const now = nowIso();
+  const sets: string[] = [];
+  const binds: unknown[] = [];
+
+  if (patch.label !== undefined) {
+    binds.push(patch.label);
+    sets.push(`label = ?${binds.length}`);
+  }
+  if (patch.enabled !== undefined) {
+    binds.push(patch.enabled ? 1 : 0);
+    sets.push(`enabled = ?${binds.length}`);
+  }
+  if (patch.nodeFilter !== undefined) {
+    binds.push(JSON.stringify(patch.nodeFilter));
+    sets.push(`node_filter_json = ?${binds.length}`);
+  }
+  if (patch.eventFilter !== undefined) {
+    binds.push(JSON.stringify(patch.eventFilter));
+    sets.push(`event_filter_json = ?${binds.length}`);
+  }
+
+  binds.push(now);
+  sets.push(`updated_at = ?${binds.length}`);
+  binds.push(id);
+
+  await db
+    .prepare(
+      `UPDATE web_push_subscriptions
+       SET ${sets.join(", ")}
+       WHERE id = ?${binds.length} AND revoked_at IS NULL`
+    )
+    .bind(...binds)
+    .run();
+
+  const updated = await db
+    .prepare(`SELECT * FROM web_push_subscriptions WHERE id = ?1 LIMIT 1`)
+    .bind(id)
+    .first<WebPushSubscriptionRow>();
+  return mapWebPushSubscriptionRow(updated!);
+}
+
+export async function revokePushSubscription(
+  db: D1Database,
+  id: string
+): Promise<{ revokedAt: string }> {
+  const existing = await db
+    .prepare(`SELECT id, revoked_at FROM web_push_subscriptions WHERE id = ?1 LIMIT 1`)
+    .bind(id)
+    .first<{ id: string; revoked_at: string | null }>();
+  if (!existing) {
+    throw new HubError(404, "NOT_FOUND", `Push subscription '${id}' not found.`);
+  }
+  const now = existing.revoked_at ?? nowIso();
+  if (!existing.revoked_at) {
+    await db
+      .prepare(
+        `UPDATE web_push_subscriptions
+         SET revoked_at = ?1, enabled = 0, updated_at = ?1
+         WHERE id = ?2`
+      )
+      .bind(now, id)
+      .run();
+  }
+  return { revokedAt: now };
+}
+
+export async function getPushSubscriptionByIdWithSecret(
+  db: D1Database,
+  id: string
+): Promise<{ record: WebPushSubscriptionRecord; subscriptionCiphertext: string } | null> {
+  const row = await db
+    .prepare(`SELECT * FROM web_push_subscriptions WHERE id = ?1 LIMIT 1`)
+    .bind(id)
+    .first<WebPushSubscriptionRow>();
+  if (!row) {
+    return null;
+  }
+  return {
+    record: mapWebPushSubscriptionRow(row),
+    subscriptionCiphertext: row.subscription_ciphertext
+  };
+}
+
+export async function recordPushSubscriptionTestResult(
+  db: D1Database,
+  id: string,
+  result: WebPushSendResult
+): Promise<WebPushSubscriptionRecord> {
+  const now = nowIso();
+  const snippet = result.errorMessage.slice(0, 300);
+
+  if (result.outcome === "sent") {
+    await db
+      .prepare(
+        `UPDATE web_push_subscriptions
+         SET failure_count = 0,
+             last_sent_at = ?1,
+             last_error_code = '',
+             last_error_message = '',
+             updated_at = ?1
+         WHERE id = ?2`
+      )
+      .bind(now, id)
+      .run();
+  } else if (result.outcome === "expired") {
+    await db
+      .prepare(
+        `UPDATE web_push_subscriptions
+         SET revoked_at = COALESCE(revoked_at, ?1),
+             enabled = 0,
+             last_error_code = 'SUBSCRIPTION_EXPIRED',
+             last_error_message = ?2,
+             updated_at = ?1
+         WHERE id = ?3`
+      )
+      .bind(now, snippet, id)
+      .run();
+  } else {
+    await db
+      .prepare(
+        `UPDATE web_push_subscriptions
+         SET failure_count = failure_count + 1,
+             last_error_code = ?1,
+             last_error_message = ?2,
+             updated_at = ?3
+         WHERE id = ?4`
+      )
+      .bind(result.errorCode, snippet, now, id)
+      .run();
+  }
+
+  const updated = await db
+    .prepare(`SELECT * FROM web_push_subscriptions WHERE id = ?1 LIMIT 1`)
+    .bind(id)
+    .first<WebPushSubscriptionRow>();
+  return mapWebPushSubscriptionRow(updated!);
+}
+
+export async function pruneExpiredNativeActivity(
+  db: D1Database,
+  retentionDays = 30,
+  batchLimit = 500,
+  nowMs = Date.now()
+): Promise<{ deletedEvents: number; deletedDeliveries: number }> {
+  const days =
+    Number.isFinite(retentionDays) && retentionDays >= 1
+      ? Math.min(Math.floor(retentionDays), 3650)
+      : 30;
+  const limit =
+    Number.isFinite(batchLimit) && batchLimit >= 1
+      ? Math.min(Math.floor(batchLimit), 1000)
+      : 500;
+  const cutoffIso = new Date(nowMs - days * 86_400_000).toISOString();
+
+  const results = await db.batch([
+    db
+      .prepare(
+        `DELETE FROM notification_deliveries
+         WHERE source_kind = 'native_event'
+           AND source_id IN (
+             SELECT id FROM native_events
+             WHERE created_at < ?1
+             ORDER BY created_at ASC, id ASC
+             LIMIT ?2
+           )`
+      )
+      .bind(cutoffIso, limit),
+    db
+      .prepare(
+        `DELETE FROM native_events
+         WHERE id IN (
+           SELECT id FROM native_events
+           WHERE created_at < ?1
+           ORDER BY created_at ASC, id ASC
+           LIMIT ?2
+         )`
+      )
+      .bind(cutoffIso, limit),
+    db
+      .prepare(
+        `DELETE FROM notification_deliveries
+         WHERE id IN (
+           SELECT id FROM notification_deliveries
+           WHERE created_at < ?1
+           ORDER BY created_at ASC, id ASC
+           LIMIT ?2
+         )`
+      )
+      .bind(cutoffIso, limit)
+  ]);
+
+  const deletedNativeDeliveries = Number(results[0]?.meta?.changes ?? 0);
+  const deletedEvents = Number(results[1]?.meta?.changes ?? 0);
+  const deletedOlderDeliveries = Number(results[2]?.meta?.changes ?? 0);
+  return {
+    deletedEvents,
+    deletedDeliveries: deletedNativeDeliveries + deletedOlderDeliveries
+  };
 }

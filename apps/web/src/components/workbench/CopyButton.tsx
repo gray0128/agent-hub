@@ -25,6 +25,7 @@ export interface CopyButtonProps {
   title?: string;
   variant?: "ghost" | "outline";
   className?: string;
+  testId?: string;
   onClickCapture?: (e: React.MouseEvent<HTMLButtonElement>) => void;
 }
 
@@ -36,6 +37,7 @@ export function CopyButton({
   title,
   variant = "ghost",
   className,
+  testId,
   onClickCapture
 }: CopyButtonProps) {
   const [status, setStatus] = useState<"idle" | "copied" | "failed">("idle");
@@ -99,6 +101,7 @@ export function CopyButton({
         onClick={handleCopy}
         aria-label={visibleText ? undefined : ariaLabel ?? "复制内容"}
         title={status === "copied" ? "已复制" : status === "failed" ? "复制失败" : title ?? ariaLabel ?? label}
+        data-testid={testId}
         data-copied={status === "copied" ? "" : undefined}
         data-failed={status === "failed" ? "" : undefined}
         className={cn(

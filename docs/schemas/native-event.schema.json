@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ahub.bobocai.win/schemas/native-event.schema.json",
+  "title": "NativeEventView",
+  "description": "Read-only native agent activity record returned by REST API, /ws/stream, and ahub activity --json.",
+  "type": "object",
+  "additionalProperties": false,
+  "$defs": {
+    "DeliveriesSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total", "sent", "queued", "failed"],
+      "properties": {
+        "total": { "type": "integer", "minimum": 0 },
+        "sent": { "type": "integer", "minimum": 0 },
+        "queued": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 }
+      }
+    }
+  },
+  "required": [
+    "id",
+    "node_id",
+    "event_id",
+    "agent",
+    "event_kind",
+    "native_session_id",
+    "workdir",
+    "title",
+    "summary",
+    "source",
+    "notify_key_id",
+    "notify_status",
+    "notify_error",
+    "ack_at",
+    "attention_state",
+    "created_at",
+    "updated_at"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^evt_[A-Za-z0-9]+$"
+    },
+    "node_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "event_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "agent": {
+      "type": "string",
+      "enum": ["agy", "pi", "omp", "codex", "claude", "grok"]
+    },
+    "event_kind": {
+      "type": "string",
+      "enum": ["interaction_needed", "turn_summary", "progress"]
+    },
+    "native_session_id": {
+      "type": "string"
+    },
+    "workdir": {
+      "type": "string"
+    },
+    "title": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "source": {
+      "type": "string"
+    },
+    "notify_key_id": {
+      "type": ["string", "null"]
+    },
+    "notify_status": {
+      "type": "string",
+      "enum": ["none", "queued", "sent", "partial", "failed", "skipped"]
+    },
+    "notify_error": {
+      "type": "string"
+    },
+    "ack_at": {
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "attention_state": {
+      "type": ["string", "null"],
+      "enum": ["open", "acked", "superseded", "stale", null]
+    },
+    "deliveries_summary": {
+      "$ref": "#/$defs/DeliveriesSummary"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}
