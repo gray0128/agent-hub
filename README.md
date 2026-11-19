@@ -1,4 +1,4 @@
-# agent-hub
+# <img src="apps/web/public/icons/icon.svg" width="28" height="28" alt="" valign="middle" /> agent-hub
 
 `agent-hub` 是面向多设备、多本地 Coding Agent 的云端任务中心与跨机调度底座。云端控制面运行于 Cloudflare（Workers、Static Assets、D1、Durable Objects WebSocket Hibernation 与 Queues，默认实例域名 `https://ahub.bobocai.win`，可通过 `AHUB_URL` 自定义），边缘节点与调用端统一使用零外部依赖的 Go 静态单二进制 `ahub`。本文档说明节点自举安装与更新方式、仓库结构与规格文档索引。
 

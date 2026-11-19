@@ -120,6 +120,49 @@ for (const pane of [
   }
 }
 
+const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+function readPngDimensions(filePath) {
+  const buf = fs.readFileSync(filePath);
+  if (buf.length < 24 || !buf.subarray(0, 8).equals(PNG_MAGIC) || buf.toString("ascii", 12, 16) !== "IHDR") {
+    return null;
+  }
+  return {
+    width: buf.readUInt32BE(16),
+    height: buf.readUInt32BE(20)
+  };
+}
+
+function assertPublicAssetRef(srcPath, checkName, expectedSizes) {
+  if (typeof srcPath !== "string" || !srcPath.startsWith("/")) {
+    fail(checkName, `图标引用必须以 / 开头: ${String(srcPath)}`);
+    return;
+  }
+  const diskFile = path.join(webDir, "public", srcPath.slice(1));
+  if (!fs.existsSync(diskFile) || fs.statSync(diskFile).size === 0) {
+    fail(checkName, `缺少或空的静态图标文件: ${srcPath}`);
+    return;
+  }
+  if (srcPath.endsWith(".png")) {
+    const dims = readPngDimensions(diskFile);
+    if (!dims) {
+      fail(checkName, `无效的 PNG 文件头或缺少 IHDR: ${srcPath}`);
+      return;
+    }
+    if (expectedSizes) {
+      const m = /^(\d+)x(\d+)$/.exec(expectedSizes.trim());
+      if (!m || dims.width !== Number(m[1]) || dims.height !== Number(m[2])) {
+        fail(checkName, `${srcPath} 真实尺寸 ${dims.width}x${dims.height} 与声明 sizes="${expectedSizes}" 不符`);
+      }
+    }
+  } else if (srcPath.endsWith(".ico")) {
+    const buf = fs.readFileSync(diskFile);
+    if (buf.length < 22 || buf.readUInt16LE(0) !== 0 || buf.readUInt16LE(2) !== 1 || buf.readUInt16LE(4) < 1) {
+      fail(checkName, `无效的 ICO 文件结构: ${srcPath}`);
+    }
+  }
+}
+
 // Verify zero-backhaul Service Worker (no fetch(), no /api/, unconditional showNotification)
 const swPath = path.join(webDir, "public", "sw.js");
 if (!fs.existsSync(swPath)) {
@@ -133,6 +176,10 @@ if (!fs.existsSync(swPath)) {
   if (!/self\.registration\.showNotification\s*\(/.test(stripped)) {
     fail("sw-show-notification", "apps/web/public/sw.js 必须在 push 中调用 self.registration.showNotification()");
   }
+  const iconMatch = /\bicon\s*:\s*["']([^"']+)["']/.exec(stripped);
+  const badgeMatch = /\bbadge\s*:\s*["']([^"']+)["']/.exec(stripped);
+  assertPublicAssetRef(iconMatch?.[1], "sw-notification-icon", "192x192");
+  assertPublicAssetRef(badgeMatch?.[1], "sw-notification-badge", "96x96");
 }
 
 // Verify PWA manifest and index.html credentials link
@@ -149,13 +196,15 @@ if (!fs.existsSync(manifestPath)) {
     if (icons.length === 0) {
       fail("pwa-manifest", "manifest.webmanifest 必须包含至少一个图标");
     }
+    let hasMaskable = false;
     for (const icon of icons) {
-      if (typeof icon?.src === "string" && icon.src.startsWith("/")) {
-        const iconFile = path.join(webDir, "public", icon.src.slice(1));
-        if (!fs.existsSync(iconFile) || fs.statSync(iconFile).size === 0) {
-          fail("pwa-manifest", `缺少或空的 PWA 图标文件: ${icon.src}`);
-        }
+      assertPublicAssetRef(icon?.src, "pwa-manifest", icon?.sizes);
+      if (typeof icon?.purpose === "string" && icon.purpose.split(/\s+/).includes("maskable")) {
+        hasMaskable = true;
       }
+    }
+    if (!hasMaskable) {
+      fail("pwa-manifest-maskable", "manifest.webmanifest 必须包含至少一个 purpose=maskable 图标");
     }
   } catch (err) {
     fail("pwa-manifest", `manifest.webmanifest JSON 解析失败: ${err instanceof Error ? err.message : String(err)}`);
@@ -169,6 +218,18 @@ if (!indexHtml.includes("manifest.webmanifest") || !indexHtml.includes('crossori
 }
 if (!/<meta[^>]*name=["']viewport["'][^>]*viewport-fit=cover/i.test(indexHtml)) {
   fail("mobile-viewport-fit", 'apps/web/index.html 的 viewport meta 必须声明 viewport-fit=cover');
+}
+const iconLinkMatches = [...indexHtml.matchAll(/<link\b([^>]*\brel=["'](?:icon|apple-touch-icon)["'][^>]*)>/gi)];
+if (iconLinkMatches.length === 0) {
+  fail("index-html-icons", "apps/web/index.html 必须声明至少一个 icon 或 apple-touch-icon");
+} else {
+  for (const m of iconLinkMatches) {
+    const attrs = m[1];
+    const hrefMatch = /\bhref=["']([^"']+)["']/i.exec(attrs);
+    const sizesMatch = /\bsizes=["']([^"']+)["']/i.exec(attrs);
+    const expectedSize = hrefMatch?.[1]?.endsWith(".png") ? sizesMatch?.[1] : undefined;
+    assertPublicAssetRef(hrefMatch?.[1], "index-html-icons", expectedSize);
+  }
 }
 
 if (failures.length > 0) {

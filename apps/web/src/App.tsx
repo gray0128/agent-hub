@@ -34,6 +34,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Sheet, SheetContent } from "@/components/ui/sheet";
 import { BrowserNotifyDialog } from "@/components/workbench/BrowserNotifyDialog";
+import { BrandMark } from "@/components/workbench/BrandMark";
 import { ConversationPane } from "@/components/workbench/ConversationPane";
 import { FleetThreadsPane } from "@/components/workbench/FleetThreadsPane";
 import { InspectorPane } from "@/components/workbench/InspectorPane";
@@ -1537,15 +1538,9 @@ export function App() {
               </Button>
 
               <div className="flex min-w-0 items-center gap-1.5 px-0.5 sm:px-1">
-                <span
-                  data-testid="brand-stream-dot"
-                  className={cn(
-                    "h-2 w-2 shrink-0 rounded-full",
-                    streamStatus === "connected" && "bg-[var(--status-done)]",
-                    streamStatus === "connecting" && "bg-[var(--status-running)] animate-pulse",
-                    streamStatus === "disconnected" && "bg-[var(--status-failed)]"
-                  )}
-                  aria-hidden="true"
+                <BrandMark
+                  streamStatus={streamStatus}
+                  className="h-[18px] w-[18px] shrink-0 text-foreground"
                 />
                 <h1 className="truncate font-mono text-xs sm:text-sm font-semibold tracking-tight">
                   agent-hub

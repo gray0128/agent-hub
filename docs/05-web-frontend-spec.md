@@ -114,7 +114,7 @@
 
 - 隐藏三栏分割线，主屏幕专注渲染中栏「当前会话消息流 + 底部紧贴派发台」（或「原生活动详情流」）。
 - **顶部导航条**：
-  - 保留左抽屉触发器（存在 `openInteractionCount > 0` 时展示琥珀色 `tabular-nums` 角标）、随 `streamStatus` 实时变色的品牌连接指示圆点、`sm:hidden` 在线节点计数摘要、通知渠道直达按钮（保障移动端单次点击手势兼容 Safari Web Push 订阅）、以及右抽屉触发器（存在 `approval > 0` 时展示琥珀色待审批角标，否则存在 `running + queued > 0` 时展示蓝色活跃角标）。
+  - 保留左抽屉触发器（存在 `openInteractionCount > 0` 时展示琥珀色 `tabular-nums` 角标）、内嵌实时 `streamStatus` 状态核心的品牌几何图标（`BrandMark`，保留 `data-testid="brand-stream-dot"`）、`sm:hidden` 在线节点计数摘要、通知渠道直达按钮（保障移动端单次点击手势兼容 Safari Web Push 订阅）、以及右抽屉触发器（存在 `approval > 0` 时展示琥珀色待审批角标，否则存在 `running + queued > 0` 时展示蓝色活跃角标）。
   - 在 `< 640px` 窄屏下，将「接入节点」「API Keys」「主题切换」三个低频管理/外观入口收拢进顶栏右侧「更多」菜单（`DropdownMenu`，触发按钮与菜单项均满足 `>= 44px` 高度），避免窄屏顶栏拥挤；`>= 640px` 维持既有独立按钮展示。
 - **左右响应式抽屉（`shadcn/ui` `Sheet`）**：
   - 左抽屉（`FleetThreadsPane`）与右抽屉（`InspectorPane`）适配安全区内边距；左抽屉在移动端禁用工作区芯片拖拽（保留点击直选工作区，防止与竖向滚动手势冲突），在分叉会话成功后自动收起抽屉并切至新分支受控对话流。
@@ -126,10 +126,10 @@
 
 ### 3.3 PWA 清单、零回源 Service Worker 与双模式浏览器通知协调
 
-- **PWA 清单与 iOS Access 凭据透传**：`apps/web/index.html` 声明 `<link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials" />`，确保受 Cloudflare Access 保护域名下的 iOS Safari 主屏幕安装流程携带同源 `CF_Authorization` Cookie；`apps/web/public/manifest.webmanifest` 定义 `name`、`short_name`、`start_url: "/"`、`display: "standalone"` 与 `icons`（`public/icons/*`）。
+- **PWA 清单、全平台图标与 iOS Access 凭据透传**：`apps/web/index.html` 声明 `<link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials" />`，确保受 Cloudflare Access 保护域名下的 iOS Safari 主屏幕安装流程携带同源 `CF_Authorization` Cookie，并配置向量图标 `/icons/icon.svg`、双分辨率 `/favicon.ico`（`16×16` + `32×32`，避免 SPA 回退返回 `index.html`）以及满铺不透明正方形 `/icons/apple-touch-icon.png`（`180×180`，防止 iOS 主屏幕出现黑色圆角填底）；`apps/web/public/manifest.webmanifest` 定义 `name`、`short_name`、`start_url: "/"`、`display: "standalone"` 与 `icons`（含 `any` 尺寸 `icon-192.png`、`icon-512.png`、`icon.svg` 与 `purpose: "maskable"` 安全区图标 `icon-maskable-512.png`，统一由 `apps/web/scripts/generate-icons.mjs` 确定性生成）。
 - **零回源 Service Worker（`apps/web/public/sw.js`）**：
   - `push` 事件仅调用 `event.data?.json()` 本地解析随帧下发的 RFC 8291 加密载荷（**严禁调用 `fetch('/api/...')`**），避免 Cloudflare Access Cookie 过期时后台唤醒回源失败。
-  - 每次 `push` 事件**必须无条件调用** `event.waitUntil(self.registration.showNotification(title, { body, tag, data: { target_url, kind, id } }))`，满足 Safari / APNs 对可见通知的强制要求，防止推送权限被吊销。
+  - 每次 `push` 事件**必须无条件调用** `event.waitUntil(self.registration.showNotification(title, { body, tag, icon: "/icons/icon-192.png", badge: "/icons/badge-96.png", data: { target_url, kind, id } }))`，其中 `badge` 使用透明背景纯白单色剪影（`96×96`）以适配移动端状态栏 Alpha 遮罩，满足 Safari / APNs 对可见通知的强制要求，防止推送权限被吊销。
   - `notificationclick` 事件优先查找并聚焦同源已有客户端窗口（如通过 `client.focus()` + `navigate(target_url)` 或消息定位），无可用窗口时调用 `clients.openWindow(target_url)` 深链定位（`/?pane=native&session=...&event=...` 或 `/?thread=...&run=...`）。
 - **双模式浏览器通知协调器（`apps/web/src/lib/browser-notify.ts`）**：
   - 当当前设备已启用且激活 Web Push 主通道时，自动抑制同源页内 `window.Notification` 重复弹窗（由 Web Push + `tag` 唯一负责系统级提示）。
