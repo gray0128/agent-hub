@@ -1,0 +1,156 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ahub.bobocai.win/schemas/plan-create.schema.json",
+  "title": "CreatePlanRequest",
+  "description": "Request payload for POST /api/v1/plans (coarse-grained cross-machine DAG orchestration).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["nodes"],
+  "$defs": {
+    "PlanNodeSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "node_id", "workdir", "agent", "prompt"],
+      "not": {
+        "required": ["scheduled_at", "in_sec"]
+      },
+      "properties": {
+        "key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+          "description": "Unique node key within the plan."
+        },
+        "node_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-z0-9][a-z0-9_-]*$",
+          "description": "Target execution node identifier."
+        },
+        "workdir": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "description": "Project short key or absolute path on the target node."
+        },
+        "agent": {
+          "type": "string",
+          "enum": ["agy", "pi", "omp", "codex", "claude"],
+          "description": "Local agent adapter to execute the prompt."
+        },
+        "model": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Model alias or provider/model identifier."
+        },
+        "effort": {
+          "type": "string",
+          "enum": ["", "off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "auto"],
+          "description": "Reasoning or thinking effort level."
+        },
+        "sandbox": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether sandbox mode is enabled when supported by the target agent."
+        },
+        "timeout_sec": {
+          "type": "integer",
+          "minimum": 10,
+          "maximum": 7200,
+          "default": 900,
+          "description": "Execution timeout in seconds."
+        },
+        "prompt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200000,
+          "description": "Task instructions passed to the target agent."
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 160,
+          "description": "Optional thread title for this node's created thread."
+        },
+        "depends_on": {
+          "type": "array",
+          "maxItems": 10,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^([a-z0-9][a-z0-9_-]{0,63}|run_[A-Za-z0-9]+)$"
+          },
+          "description": "Upstream plan node keys or existing run_... IDs that must reach 'done' before this node becomes queued."
+        },
+        "scheduled_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Optional UTC RFC 3339 timestamp (+60s to +7d) before which the run remains 'waiting'."
+        },
+        "in_sec": {
+          "type": "integer",
+          "minimum": 60,
+          "maximum": 604800,
+          "description": "Relative delay in seconds (+60s to +7d), mutually exclusive with scheduled_at."
+        },
+        "priority_order": {
+          "type": "number",
+          "description": "Optional explicit queue ordering weight once queued."
+        },
+        "notify": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "target": {
+              "type": "string",
+              "enum": ["none", "grok", "webhook"],
+              "default": "none"
+            },
+            "events": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": ["done", "failed", "cancelled", "needs_approval"]
+              },
+              "uniqueItems": true
+            }
+          }
+        }
+      }
+    }
+  },
+  "properties": {
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 128,
+      "description": "Client-provided deduplication key for the entire plan."
+    },
+    "board_topic_id": {
+      "type": "string",
+      "pattern": "^top_[A-Za-z0-9]+$",
+      "description": "Optional coordination board topic ID for automatic terminal handoff writeback."
+    },
+    "actor_profile": {
+      "type": "string",
+      "maxLength": 40,
+      "pattern": "^[a-z0-9][a-z0-9._@-]{0,39}$",
+      "description": "Optional caller profile attribution persisted on created runs."
+    },
+    "parent_run_id": {
+      "type": "string",
+      "pattern": "^run_[A-Za-z0-9]+$",
+      "description": "Parent run ID injected from AHUB_RUN_ID for lineage and recursion checks."
+    },
+    "nodes": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 20,
+      "items": {
+        "$ref": "#/$defs/PlanNodeSpec"
+      },
+      "description": "Acyclic list of plan nodes (total edges across all nodes <= 60)."
+    }
+  }
+}

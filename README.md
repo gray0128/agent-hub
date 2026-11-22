@@ -4,10 +4,11 @@
 
 ## 核心设计原则
 
-1. **Web 任务中心独立完备**：不依赖任何外部聊天机器人，浏览器端即可独立完成多机节点监控、任务派发、多轮会话续接、流式输出查看、权限审批跳转、拖拽编排队列与整树任务取消。
-2. **统一 CLI 赋能任意 Agent**：外部助手（如 Grok Bot）与各机器上的本地 Agent 均通过同一个 `ahub` CLI 及配套 `SKILL.md` 调用任务中心，不再手拼 HTTP 请求或解析临时文本标记。
-3. **纯出站零隧道节点**：各工作机无需公网 IP，也无需部署 `cloudflared`。本地守护进程 `ahub node serve` 仅维持单条出站 `wss://` 长连接并与云端 D1 租约状态机配合，确保机器休眠或断网期间的任务持久入队、上线自动补领。
-4. **严格前端工程约束**：Web 控制台锁定 `shadcn/ui`（`radix-nova` 预设）、`lucide-react`、`motion/react`、`react-resizable-panels`、`@dnd-kit` 与 `zustand` 的「每类职责唯一库」白名单，组件源代码完全可控，杜绝重复依赖与模板化样式膨胀。
+1. **Web 任务中心独立完备**：不依赖任何外部聊天机器人，浏览器端即可独立完成「协同板」（四栏看板、主题时间线与统一待办收件箱）、多机节点监控、任务派发、多轮会话续接、流式输出查看、权限审批跳转、拖拽编排队列与整树任务取消。
+2. **跨机协同板与阻塞问答**：除受控任务流外，支持跨机共享结构化协同主题（5 态 `todo` / `in_progress` / `blocked` / `done` / `archived`、`external_ref`、`handoff` / `question` / `answer` / `artifact` 消息）与阻塞提问/人工应答（`ahub board ask --wait` / `ahub board wait`），并由系统自动在任务中心「收件箱」聚合待处理提问。
+3. **统一 CLI 赋能任意 Agent**：外部助手（如 Grok Bot）与各机器上的本地 Agent 均通过同一个 `ahub` CLI 及配套 `SKILL.md` 调用任务中心与协同板，不再手拼 HTTP 请求或解析临时文本标记。
+4. **纯出站零隧道节点**：各工作机无需公网 IP，也无需部署 `cloudflared`。本地守护进程 `ahub node serve` 仅维持单条出站 `wss://` 长连接并与云端 D1 租约状态机配合，确保机器休眠或断网期间的任务持久入队、上线自动补领。
+5. **严格前端工程约束**：Web 控制台锁定 `shadcn/ui`（`radix-nova` 预设）、`lucide-react`、`motion/react`、`react-resizable-panels`、`@dnd-kit` 与 `zustand` 的「每类职责唯一库」白名单，组件源代码完全可控，杜绝重复依赖与模板化样式膨胀。
 
 ## 节点安装与日常更新（一句话 Agent 自举）
 
@@ -96,7 +97,7 @@ agent-hub/
 │   └── ahub/                         # Go CLI 与守护进程统一入口
 ├── internal/
 │   ├── api/                          # REST 与 WebSocket 客户端
-│   ├── cli/                          # 调用端命令实现（run / wait / result / cancel / nodes）
+│   ├── cli/                          # 调用端命令实现（run / plan / retry / wait / result / cancel / resolve / nodes / board / activity / native-emit / auth）
 │   ├── config/                       # 本地配置与 0600 凭据读写
 │   ├── daemon/                       # node serve 守护循环、心跳续租与本地 workdir 互斥锁
 │   ├── runner/                       # 进程组隔离、最小环境变量白名单与 Agent 适配器
@@ -106,9 +107,9 @@ agent-hub/
 │   └── ahub/
 │       └── SKILL.md                  # 嵌入 ahub 二进制的 Agent 调用指南
 ├── evals/
-│   ├── substrate/                    # Plane 1：ahub-fakeagent 与 I-1~I-7 混沌不变量套件
+│   ├── substrate/                    # Plane 1：ahub-fakeagent 与 I-1~I-15 混沌不变量套件
 │   ├── formal/                       # Plane 1：D1/DO/Cron 状态机 TLA+ 模型检验
-│   ├── agent-cli/                    # Plane 2：盲测沙箱、E-01~E-08 黄金场景与轨迹评分器
+│   ├── agent-cli/                    # Plane 2：盲测沙箱、E-01~E-13 黄金场景与轨迹评分器
 │   └── web/                          # Plane 3：前端反模式扫描与 CDP 运行时压测脚本
 └── docs/
     ├── 01-architecture.md
@@ -119,6 +120,9 @@ agent-hub/
     ├── 06-roadmap-and-verification.md
     ├── 07-eval-framework.md
     └── schemas/
+        ├── board.schema.json
+        ├── native-event.schema.json
+        ├── plan-create.schema.json
         ├── run-create.schema.json
         ├── run-record.schema.json
         └── ws-frames.schema.json
@@ -135,6 +139,9 @@ agent-hub/
 | [05-web-frontend-spec.md](docs/05-web-frontend-spec.md) | 前端依赖白名单、`radix-nova` 视觉规范、三栏可调布局、`@dnd-kit` 拖拽与 `zustand` 状态切片 | 前端工程师与 UI 生成 Agent |
 | [06-roadmap-and-verification.md](docs/06-roadmap-and-verification.md) | `wrangler.jsonc` 蓝图、Cloudflare 配额核算、四阶段可验证切片与端到端验收矩阵 | 实施与测试负责人 |
 | [07-eval-framework.md](docs/07-eval-framework.md) | 基于第一性原理的三平面评测框架（底座不变量、盲测 Agent-CLI 轨迹、前端 CDP 与变异门禁） | 全栈开发与质量验收 |
+| [board.schema.json](docs/schemas/board.schema.json) | 跨机协同板 REST API、主题/消息/事件与 `ErrorEnvelope` Schema | 接口校验与契约测试 |
+| [native-event.schema.json](docs/schemas/native-event.schema.json) | 原生会话事件与通知投递状态 Schema | 接口校验与契约测试 |
+| [plan-create.schema.json](docs/schemas/plan-create.schema.json) | `POST /api/v1/plans` 跨机 DAG 计划请求体 JSON Schema（Draft 2020-12） | 接口校验与契约测试 |
 | [run-create.schema.json](docs/schemas/run-create.schema.json) | `POST /api/v1/runs` 请求体 JSON Schema（Draft 2020-12） | 接口校验与契约测试 |
 | [run-record.schema.json](docs/schemas/run-record.schema.json) | `Run` 标准数据结构与 `ahub --json` 输出信封 Schema | 接口校验与契约测试 |
 | [ws-frames.schema.json](docs/schemas/ws-frames.schema.json) | `/ws/node` 与 `/ws/stream` 双向 WebSocket JSON 帧联合 Schema | 协议编解码与契约测试 |

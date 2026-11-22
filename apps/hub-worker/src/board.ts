@@ -125,7 +125,7 @@ function buildSafeReadChannelNext(channel: string, externalRef?: string): string
 function buildSafeReadTopicNext(channel: string, topicId: string): string[] {
   if (!BOARD_CHANNEL_RE.test(channel)) return [];
   if (BOARD_TOPIC_ID_RE.test(topicId)) {
-    return sanitizeNextHints([`ahub board read ${topicId} --json`, `ahub board read ${channel} --json`]);
+    return sanitizeNextHints([`ahub board read --topic ${topicId} --json`, `ahub board read ${channel} --json`]);
   }
   return sanitizeNextHints([`ahub board read ${channel} --json`]);
 }

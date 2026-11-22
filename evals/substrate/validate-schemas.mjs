@@ -10,6 +10,7 @@ const ajv = new Ajv2020({ strict: true, strictRequired: false, allErrors: true }
 addFormats(ajv);
 
 const files = [
+  "plan-create.schema.json",
   "run-create.schema.json",
   "run-record.schema.json",
   "native-event.schema.json",
@@ -1390,6 +1391,426 @@ const cases = [
         sent_at: null,
         created_at: "2026-11-22T03:05:00.000Z",
         updated_at: "2026-11-22T03:05:00.000Z"
+      }
+    }
+  },
+  {
+    name: "plan-create valid multi-node DAG with in_sec, depends_on, board_topic_id, actor_profile",
+    schema: "plan-create.schema.json",
+    valid: true,
+    payload: {
+      idempotency_key: "plan-idem-0001",
+      board_topic_id: "top_01JABCDEF123456789",
+      actor_profile: "codex-orchestrator@mbp",
+      nodes: [
+        {
+          key: "review",
+          node_id: "mbp",
+          workdir: "agent-hub",
+          agent: "codex",
+          model: "gpt-5.6-sol",
+          effort: "high",
+          prompt: "Review PR diff on mbp"
+        },
+        {
+          key: "verify",
+          node_id: "linux-dev",
+          workdir: "/workspace/agent-hub",
+          agent: "pi",
+          depends_on: ["review", "run_01JABCDEF123456789"],
+          in_sec: 300,
+          priority_order: 100,
+          prompt: "Run integration checks after review",
+          notify: { target: "grok", events: ["done", "failed"] }
+        }
+      ]
+    }
+  },
+  {
+    name: "plan-create valid minimal single-node plan",
+    schema: "plan-create.schema.json",
+    valid: true,
+    payload: {
+      nodes: [
+        {
+          key: "step-1",
+          node_id: "macmini",
+          workdir: "demo",
+          agent: "agy",
+          scheduled_at: "2026-11-23T12:00:00.000Z",
+          prompt: "Check CI status"
+        }
+      ]
+    }
+  },
+  {
+    name: "plan-create invalid empty nodes",
+    schema: "plan-create.schema.json",
+    valid: false,
+    payload: {
+      nodes: []
+    }
+  },
+  {
+    name: "plan-create invalid >20 nodes",
+    schema: "plan-create.schema.json",
+    valid: false,
+    payload: {
+      nodes: Array.from({ length: 21 }, (_, i) => ({
+        key: `step-${i + 1}`,
+        node_id: "macmini",
+        workdir: "demo",
+        agent: "pi",
+        prompt: `Step ${i + 1}`
+      }))
+    }
+  },
+  {
+    name: "plan-create invalid scheduled_at and in_sec together",
+    schema: "plan-create.schema.json",
+    valid: false,
+    payload: {
+      nodes: [
+        {
+          key: "step-1",
+          node_id: "macmini",
+          workdir: "demo",
+          agent: "pi",
+          scheduled_at: "2026-11-23T12:00:00.000Z",
+          in_sec: 120,
+          prompt: "Conflicting schedule fields"
+        }
+      ]
+    }
+  },
+  {
+    name: "plan-create invalid in_sec below 60",
+    schema: "plan-create.schema.json",
+    valid: false,
+    payload: {
+      nodes: [
+        {
+          key: "step-1",
+          node_id: "macmini",
+          workdir: "demo",
+          agent: "pi",
+          in_sec: 30,
+          prompt: "Too soon"
+        }
+      ]
+    }
+  },
+  {
+    name: "plan-create invalid in_sec above 604800",
+    schema: "plan-create.schema.json",
+    valid: false,
+    payload: {
+      nodes: [
+        {
+          key: "step-1",
+          node_id: "macmini",
+          workdir: "demo",
+          agent: "pi",
+          in_sec: 604801,
+          prompt: "Too far"
+        }
+      ]
+    }
+  },
+  {
+    name: "plan-create invalid uppercase key",
+    schema: "plan-create.schema.json",
+    valid: false,
+    payload: {
+      nodes: [
+        {
+          key: "StepOne",
+          node_id: "macmini",
+          workdir: "demo",
+          agent: "pi",
+          prompt: "Bad key"
+        }
+      ]
+    }
+  },
+  {
+    name: "plan-create invalid duplicate depends_on",
+    schema: "plan-create.schema.json",
+    valid: false,
+    payload: {
+      nodes: [
+        {
+          key: "step-1",
+          node_id: "macmini",
+          workdir: "demo",
+          agent: "pi",
+          depends_on: ["a", "a"],
+          prompt: "Dup deps"
+        }
+      ]
+    }
+  },
+  {
+    name: "plan-create invalid >10 depends_on",
+    schema: "plan-create.schema.json",
+    valid: false,
+    payload: {
+      nodes: [
+        {
+          key: "step-1",
+          node_id: "macmini",
+          workdir: "demo",
+          agent: "pi",
+          depends_on: Array.from({ length: 11 }, (_, i) => `dep-${i + 1}`),
+          prompt: "Too many deps"
+        }
+      ]
+    }
+  },
+  {
+    name: "plan-create invalid extra root property",
+    schema: "plan-create.schema.json",
+    valid: false,
+    payload: {
+      unknown_prop: true,
+      nodes: [
+        {
+          key: "step-1",
+          node_id: "macmini",
+          workdir: "demo",
+          agent: "pi",
+          prompt: "Extra prop"
+        }
+      ]
+    }
+  },
+  {
+    name: "run-create valid with Slice 2 depends_on, scheduled_at, board_topic_id, actor_profile",
+    schema: "run-create.schema.json",
+    valid: true,
+    payload: {
+      node_id: "macmini",
+      workdir: "demo",
+      agent: "pi",
+      prompt: "Verify release",
+      depends_on: ["run_01JABCDEF123456789"],
+      scheduled_at: "2026-11-23T12:00:00.000Z",
+      board_topic_id: "top_01JABCDEF123456789",
+      actor_profile: "pi-runner@macmini"
+    }
+  },
+  {
+    name: "run-create invalid bad depends_on run id",
+    schema: "run-create.schema.json",
+    valid: false,
+    payload: {
+      node_id: "macmini",
+      workdir: "demo",
+      agent: "pi",
+      prompt: "Verify release",
+      depends_on: ["not_a_run_id"]
+    }
+  },
+  {
+    name: "run-create invalid >10 depends_on",
+    schema: "run-create.schema.json",
+    valid: false,
+    payload: {
+      node_id: "macmini",
+      workdir: "demo",
+      agent: "pi",
+      prompt: "Verify release",
+      depends_on: Array.from({ length: 11 }, (_, i) => `run_01JABCDEF1234567${i}`)
+    }
+  },
+  {
+    name: "run-create invalid board_topic_id pattern",
+    schema: "run-create.schema.json",
+    valid: false,
+    payload: {
+      node_id: "macmini",
+      workdir: "demo",
+      agent: "pi",
+      prompt: "Verify release",
+      board_topic_id: "bad_topic"
+    }
+  },
+  {
+    name: "run-create invalid actor_profile",
+    schema: "run-create.schema.json",
+    valid: false,
+    payload: {
+      node_id: "macmini",
+      workdir: "demo",
+      agent: "pi",
+      prompt: "Verify release",
+      actor_profile: "INVALID PROFILE!"
+    }
+  },
+  {
+    name: "run-record valid waiting run with plan, deps, and DEPENDENCY_PENDING",
+    schema: "run-record.schema.json",
+    valid: true,
+    payload: {
+      id: "run_01JABCDEF123456790",
+      thread_id: "thr_01JABCDEF123456790",
+      root_run_id: "run_01JABCDEF123456790",
+      parent_run_id: null,
+      depth: 0,
+      max_depth: 1,
+      node_id: "linux-dev",
+      workdir: "/workspace/demo",
+      agent: "pi",
+      status: "waiting",
+      plan_id: "pln_01JABCDEF123456789",
+      plan_key: "verify",
+      scheduled_at: "2026-11-23T12:00:00.000Z",
+      retry_of_run_id: null,
+      actor_profile: "codex-orchestrator@mbp",
+      board_topic_id: "top_01JABCDEF123456789",
+      depends_on_run_ids: ["run_01JABCDEF123456789"],
+      blocked_reason: "DEPENDENCY_PENDING",
+      created_at: "2026-11-22T12:00:00.000Z",
+      updated_at: "2026-11-22T12:00:00.000Z"
+    }
+  },
+  {
+    name: "run-record valid waiting retry_of_run_id with UPSTREAM_FAILED",
+    schema: "run-record.schema.json",
+    valid: true,
+    payload: {
+      id: "run_01JABCDEF123456791",
+      thread_id: "thr_01JABCDEF123456791",
+      root_run_id: "run_01JABCDEF123456791",
+      parent_run_id: null,
+      depth: 0,
+      max_depth: 1,
+      node_id: "mbp",
+      workdir: "/workspace/demo",
+      agent: "codex",
+      status: "waiting",
+      retry_of_run_id: "run_01JABCDEF123456788",
+      depends_on_run_ids: ["run_01JABCDEF123456787"],
+      blocked_reason: "UPSTREAM_FAILED",
+      created_at: "2026-11-22T12:00:00.000Z",
+      updated_at: "2026-11-22T12:00:00.000Z"
+    }
+  },
+  {
+    name: "run-record invalid blocked_reason BAD_REASON",
+    schema: "run-record.schema.json",
+    valid: false,
+    payload: {
+      id: "run_01JABCDEF123456790",
+      thread_id: "thr_01JABCDEF123456790",
+      root_run_id: "run_01JABCDEF123456790",
+      depth: 0,
+      max_depth: 1,
+      node_id: "linux-dev",
+      workdir: "/workspace/demo",
+      agent: "pi",
+      status: "waiting",
+      blocked_reason: "BAD_REASON",
+      created_at: "2026-11-22T12:00:00.000Z",
+      updated_at: "2026-11-22T12:00:00.000Z"
+    }
+  },
+  {
+    name: "run-record invalid plan_id pattern",
+    schema: "run-record.schema.json",
+    valid: false,
+    payload: {
+      id: "run_01JABCDEF123456790",
+      thread_id: "thr_01JABCDEF123456790",
+      root_run_id: "run_01JABCDEF123456790",
+      depth: 0,
+      max_depth: 1,
+      node_id: "linux-dev",
+      workdir: "/workspace/demo",
+      agent: "pi",
+      status: "waiting",
+      plan_id: "plan_bad",
+      created_at: "2026-11-22T12:00:00.000Z",
+      updated_at: "2026-11-22T12:00:00.000Z"
+    }
+  },
+  {
+    name: "board valid ErrorEnvelope DEPENDENCY_CYCLE_DETECTED (root oneOf)",
+    schema: "board.schema.json",
+    valid: true,
+    payload: {
+      ok: false,
+      error: {
+        code: "DEPENDENCY_CYCLE_DETECTED",
+        message: "Dependency cycle detected among nodes: a -> b -> a."
+      }
+    }
+  },
+  {
+    name: "ws-frames valid run.updated waiting SCHEDULED",
+    schema: "ws-frames.schema.json",
+    valid: true,
+    payload: {
+      type: "run.updated",
+      run: {
+        id: "run_01JABCDEF123456790",
+        thread_id: "thr_01JABCDEF123456790",
+        root_run_id: "run_01JABCDEF123456790",
+        parent_run_id: null,
+        depth: 0,
+        max_depth: 1,
+        node_id: "macmini",
+        workdir: "/workspace/demo",
+        agent: "pi",
+        status: "waiting",
+        scheduled_at: "2026-11-23T12:00:00.000Z",
+        blocked_reason: "SCHEDULED",
+        depends_on_run_ids: [],
+        created_at: "2026-11-22T12:00:00.000Z",
+        updated_at: "2026-11-22T12:00:00.000Z"
+      }
+    }
+  },
+  {
+    name: "ws-frames invalid run.updated unknown status paused",
+    schema: "ws-frames.schema.json",
+    valid: false,
+    payload: {
+      type: "run.updated",
+      run: {
+        id: "run_01JABCDEF123456790",
+        thread_id: "thr_01JABCDEF123456790",
+        root_run_id: "run_01JABCDEF123456790",
+        depth: 0,
+        max_depth: 1,
+        node_id: "macmini",
+        workdir: "/workspace/demo",
+        agent: "pi",
+        status: "paused",
+        created_at: "2026-11-22T12:00:00.000Z",
+        updated_at: "2026-11-22T12:00:00.000Z"
+      }
+    }
+  },
+  {
+    name: "ws-frames invalid run.updated unknown blocked_reason",
+    schema: "ws-frames.schema.json",
+    valid: false,
+    payload: {
+      type: "run.updated",
+      run: {
+        id: "run_01JABCDEF123456790",
+        thread_id: "thr_01JABCDEF123456790",
+        root_run_id: "run_01JABCDEF123456790",
+        depth: 0,
+        max_depth: 1,
+        node_id: "macmini",
+        workdir: "/workspace/demo",
+        agent: "pi",
+        status: "waiting",
+        blocked_reason: "UNKNOWN_BLOCK",
+        created_at: "2026-11-22T12:00:00.000Z",
+        updated_at: "2026-11-22T12:00:00.000Z"
       }
     }
   }

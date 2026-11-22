@@ -12,10 +12,10 @@ flowchart TB
 
     subgraph CF["Cloudflare Edge (ahub.bobocai.win)"]
         Worker["Hub Worker\nREST API + 静态资源托管 + 自举模板"]
-        D1[("Cloudflare D1\n事实源: nodes / threads / runs / run_events / native_events / board_topics / board_messages / board_events / web_push_subscriptions / notification_deliveries / api_keys")]
+        D1[("Cloudflare D1\n事实源: nodes / threads / runs / run_dependencies / run_events / native_events / board_topics / board_messages / board_events / web_push_subscriptions / notification_deliveries / api_keys")]
         DO["Durable Object: NodeHub\nWebSocket Hibernation 实时信道"]
         Queue[["Cloudflare Queue\nahub-outbound-notify"]]
-        Cron["Cron Trigger\n租约超时巡检 + 原生/协同事件清理 + 提问过期"]
+        Cron["Cron Trigger\n租约超时巡检 + 到期等待任务唤醒 + 原生/协同事件清理 + 提问过期"]
     end
 
     subgraph Nodes["工作节点机群 (纯出站 wss:// 与 HTTPS)"]
@@ -30,7 +30,7 @@ flowchart TB
     SW["Web Service Worker (sw.js)\n零回源解密弹窗 + 点击深链"]
 
     WebUI -- "HTTPS + wss://.../ws/stream" --> Worker
-    Bot -- "HTTPS + ahub run / ahub board" --> Worker
+    Bot -- "HTTPS + ahub run / plan / retry / board" --> Worker
     LocalCaller -- "HTTPS + wss://.../ws/stream (run_id / topic_id)" --> Worker
 
     Worker --> D1
@@ -55,14 +55,14 @@ flowchart TB
 
 ### 2.1 为什么用 D1 作为唯一事实源
 
-- **跨设备持久状态**：`nodes`（含节点默认外部通知通道外键 `default_notify_key_id`）、`threads`、`runs`、`run_events`、`native_events`（本地原生会话幂等事件与人工确认账本）、`board_topics` / `board_messages` / `board_events`（跨机共享协同主题、结构化交接与双向阻塞问答）、`web_push_subscriptions`（AES-256-GCM 密文保存浏览器推送订阅、节点与事件过滤规则）、`notification_deliveries`（受控 `Run`、原生 `NativeEvent` 与协同板提问 `board_message` 共用的多通道投递明细账本）与 `api_keys`（含协同板频道前缀白名单 `allowed_board_prefixes_json`）全部持久化在 D1 SQLite 中，用户在手机、笔记本或任意桌面浏览器打开 Web 任务中心都能读取完整历史。
-- **三域正交隔离与协同解耦**：受控执行域（`threads` / `runs` / `run_events`）、原生旁路域（`native_events`）与跨机协同域（`board_topics` / `board_messages` / `board_events`）在 D1 中物理隔离、互不混流：`native_events` 按 `(node_id, agent, native_session_id || workdir)` 逻辑聚合；协同板**不绑定单一 `node_id`、`workdir` 或 `agent`**，也不申请调度锁或进程租约。本次 Slice 1a 对现行受控 `Run` 7 态状态机保持零侵入（`waiting` DAG 8 态与任务终态自动回写协同主题属 Slice 2）。
+- **跨设备持久状态**：`nodes`（含节点默认外部通知通道外键 `default_notify_key_id`）、`threads`、`runs`（8 态含 `waiting`，含 `plan_id`、`plan_key`、`scheduled_at`、`retry_of_run_id`、`actor_profile` 与 `board_topic_id`）、`run_dependencies`（粗粒度跨机有向无环依赖边）、`run_events`、`native_events`（本地原生会话幂等事件与人工确认账本）、`board_topics` / `board_messages` / `board_events`（跨机共享协同主题、结构化交接与双向阻塞问答）、`web_push_subscriptions`（AES-256-GCM 密文保存浏览器推送订阅、节点与事件过滤规则）、`notification_deliveries`（受控 `Run`、原生 `NativeEvent` 与协同板提问 `board_message` 共用的多通道投递明细账本）与 `api_keys`（含协同板频道前缀白名单 `allowed_board_prefixes_json`）全部持久化在 D1 SQLite 中，用户在手机、笔记本或任意桌面浏览器打开 Web 任务中心都能读取完整历史。
+- **三域正交隔离与协同桥接**：受控执行域（`threads` / `runs` / `run_dependencies` / `run_events`）、原生旁路域（`native_events`）与跨机协同域（`board_topics` / `board_messages` / `board_events`）在 D1 中物理隔离、互不混流：`native_events` 按 `(node_id, agent, native_session_id || workdir)` 逻辑聚合；协同板**不绑定单一 `node_id`、`workdir` 或 `agent`**，也不申请调度锁或进程租约。Slice 2 将受控 `Run` 状态机扩展为 8 态（在 `queued` 前增加零资源占用的 `waiting` 状态支持前置依赖与定时触发），并通过 `runs.board_topic_id` 建立执行域向协同域的单向自动汇聚：绑定协同主题的 `Run` 到达终态（`done` / `failed` / `cancelled`）时，控制面自动向该主题追加一条脱敏 `kind = 'handoff'` 摘要消息（不触发额外推送）。
 - **确定性并发控制**：支持基于 `Compare-And-Swap (CAS)` 条件的状态迁移、幂等键去重与同机按工作区目录（`workdir`）的并发排队控制。
 - **不直接用 Cloudflare Queues 存任务**：Queues 单条消息上限为 `128 KB`、免费方案消息保留期仅 `24 小时`，且不支持按节点、工作区、状态进行条件检索或由前端直接取消已入队任务。
 
 ### 2.2 为什么用 Durable Objects（WebSocket Hibernation）承担节点与实时信令
 
-- **消除 100 秒同步超时**：Cloudflare 边缘代理对单次非流式 HTTP 请求存在 `100 秒` 超时限制（`HTTP 524`）。本体系所有任务提交接口 `POST /api/v1/runs` 采用「落库即返回」异步语义（可选最多 `45 秒` 短等待），耗时 10 至 15 分钟的 Coding Agent 执行完全脱离 HTTP 请求生命周期。
+- **消除 100 秒同步超时**：Cloudflare 边缘代理对单次非流式 HTTP 请求存在 `100 秒` 超时限制（`HTTP 524`）。本体系所有任务与计划提交接口（`POST /api/v1/runs`、`POST /api/v1/plans`、`POST /api/v1/runs/:id/retry`）均采用「落库即返回」异步语义（单个直接入队的 `/runs` 可选最多 `45 秒` 短等待；初始状态为 `waiting` 时立即返回，不阻塞等待），耗时 10 至 15 分钟的 Coding Agent 执行完全脱离 HTTP 请求生命周期。
 - **规避 Queues HTTP Pull 空转**：Cloudflare Queues 的 HTTP Pull Consumer 每次 `/messages/pull` 为即时返回，不支持服务端长轮询（Long-Polling）。若 4 台机器每 2 秒轮询一次，每日空转消耗超过 17 万次操作，迅速耗尽免费额度（10,000 次/天）；若拉长到 30 秒轮询，交互响应延迟过高。
 - **WebSocket Hibernation 零空闲计费**：每台工作机只需维护一条纯出站 `wss://ahub.bobocai.win/ws/node` 长连接接入 Durable Object `NodeHub`。空闲期间 DO 自动进入休眠状态（不计入活跃计算时长，边缘网关维持 TCP/TLS 连接不断开）；一旦用户或 Agent 提交新任务、点击取消，DO 在毫秒级唤醒并推送 `hub.wake` 或 `hub.abort` 指令。
 - **无 `cloudflared` 依赖**：工作机全部采用主动出站 TLS 连接，无需在各节点额外维护 `cloudflared` 进程、证书与隧道路由，同时天然穿透家庭宽带或公司 NAT。
@@ -71,7 +71,7 @@ flowchart TB
 
 `ahub-outbound-notify` 队列专门承接控制面对外部 Bot Webhook 与标准浏览器 Web Push 的异步投递，与 `NodeHub` DO 实时信道相互隔离：
 
-1. **受控 `Run` 多目标扇出（`ahub_run_completed` 与 Web Push）**：当受控 `Run` 到达终态（`done` / `failed` / `cancelled`）或首次进入 `needs_approval` 审批检查点时，沿用 `--notify` / `node_default` Bot 路由隔离边界（禁止 `client` 静默任务及 `depth >= 1` 子任务落入 `node_default`）；同时匹配激活的 `admin` Web Push 订阅（其中 `client` Key 创建的 `depth = 0` 任务仅在 `needs_approval` 与 `failed` 时向管理员推送 Web Push，不在 `done` / `cancelled` 弹窗；`depth >= 1` 子任务静默）。
+1. **受控 `Run` 多目标扇出（`ahub_run_completed` 与 Web Push）**：当受控 `Run` 到达终态（`done` / `failed` / `cancelled`）或首次进入 `needs_approval` 审批检查点时，沿用 `--notify` / `node_default` Bot 路由隔离边界（禁止 `client` 静默任务及 `depth >= 1` 子任务落入 `node_default`）；同时匹配激活的 `admin` Web Push 订阅（其中 `client` Key 创建的 `depth = 0` 任务仅在 `needs_approval` 与 `failed` 时向管理员推送 Web Push，不在 `done` / `cancelled` 弹窗；`depth >= 1` 子任务静默）。处于 `waiting` 状态的任务不产生排队期通知，仅在被取消转入 `cancelled` 时按上述策略结算，且终态自动回写 `board_topic_id` 的系统 `handoff` 消息永不触发额外通知推送。
 2. **本地原生会话多目标扇出（`native_events`）**：支持 `interaction_needed`、`turn_summary` 与 `progress`；Bot Webhook 仍严格按 `nodes.default_notify_key_id` Fail-Closed（节点未绑定时仅跳过 Bot 通道，**不再阻断浏览器 Web Push 通道**）；Web Push 按 `node_filter_json` 与 `event_filter_json`（`native_<event_kind>`）独立扇出，Bot 载荷继续固定携带 `action_required: "notify_user_only"` 只读转达契约。
 3. **跨机协同板阻塞提问直发（`board_message`，仅限 `kind = 'question'`）**：仅当发布 `kind = 'question'` 时写入 `notification_deliveries`（`source_kind = 'board_message'`、`trigger_event = 'question_opened'`、`node_id = source_node || 'board'`）并向 `NOTIFY_QUEUE` 入队高优 Web Push（`Urgency: high`，事件过滤键 `board_question_opened` 默认开启，当 `node_filter_json` 为空数组 `[]` 或 `source_node` 非空且命中过滤集合时投递，深链 `/?workspace=inbox&source=board&id=<msg_id>`）；`note` / `handoff` / `artifact` 在 Slice 1a 不开放 `--notify`，绝不写入 `notification_deliveries` 或触发打扰式推送。
 4. **独立投递账本与每渠道隔离入队**：入库期将每个匹配目标写入 `notification_deliveries`（`status = 'queued'`），并向 `NOTIFY_QUEUE` 投递独立的 `{ kind: "delivery", delivery_id }` 消息，使单条 Web Push `5xx` / `429` 重试绝不重复触发已成功的 Bot Webhook 或其他设备。
@@ -88,16 +88,16 @@ flowchart TB
    - 用户在任意设备上对某个 `Thread` 继续追问时，云端自动将新 `Run` 路由至该 `Thread` 绑定的原 `node_id` 与 `workdir`，并透传 `native_session_id` 实现底层会话无缝续接。
    - 若原节点当前处于 `offline`，任务安全进入 `queued` 状态，Web 面板明确提示「节点离线，任务将在节点上线后自动执行」，不静默改派到缺少上下文的另一台机器。
    - 如确需把话题迁移到另一台设备继续，通过显式「Fork 新会话」（`POST /api/v1/threads/:id/fork`）在目标节点新建独立 `Thread`，并携带前序摘要作为首轮上下文。
-2. **`Run`（单轮执行）**：对应一次具体指令从入队到终态的完整生命周期，包含快照参数、状态、租约、实时事件流与输出产物。
+2. **`Run`（单轮执行与不可变重试）**：对应一次具体指令从入队（或 `waiting` 等待前置依赖/定时）到终态的完整生命周期，包含快照参数、状态、租约、实时事件流与输出产物。任何终态（`done` / `failed` / `cancelled`）绝对不可逆；对失败或已取消任务的显式重试（`POST /api/v1/runs/:id/retry`）通过创建新 `Run`（记录 `retry_of_run_id`）并原子重绑仍处于 `waiting` 的下游依赖边完成接力。
 
 ## 4. 双保险投递与断线自愈模型
 
 WebSocket 连接在跨公网环境下可能因机器休眠、网络切换或代理波动发生闪断，因此系统严禁把 WebSocket 当作唯一投递保障，而是采用「D1 状态机兜底 + DO WebSocket 唤醒」双保险机制：
 
-1. **落库先行**：客户端调用 `POST /api/v1/runs` 后，Worker 首先将记录写入 D1（`status = 'queued'`），随即向调用方返回 `202`（或进入短等待）。
-2. **即时唤醒**：Worker 通知 DO `NodeHub`，若目标 `node_id` 当前存在活跃 WebSocket，立刻下发 `hub.wake` 信令，节点收到后主动发起认领（`POST /api/v1/nodes/:id/claim`）。
-3. **重连必扫**：无论节点因休眠唤醒还是网络闪断重新连上 `/ws/node`，在 `node.hello` 握手完成后，节点守护进程**必须立即执行一次 `claim`**，拉取离线期间积压在 D1 中的待执行任务。
-4. **租约与超时巡检及留存清理**：节点认领任务后获得有效期为 `90 秒` 的租约（`lease_expires_at`），执行期间每 `30 秒` 续期一次。Worker 每分钟通过 Cron Trigger（`scheduled`）巡检租约过期但仍处于 `claimed`、`running` 或 `needs_approval` 的任务（配合 `POST /api/v1/runs/:id/approval` 在总超时预算内的有界驻留与 `POST /api/v1/runs/:id/resolve` 人工放行收口，防止审批节点断联造成工作区互斥锁永久残留）：由于本地代码修改操作通常不具备天然幂等性，超时失联任务默认标记为 `failed`（`error_code = 'NODE_LEASE_EXPIRED'`）并通知发起方，避免节点意外重启后盲目重放造成工作区冲突；同时 Cron 依据 `NATIVE_EVENTS_RETENTION_DAYS`（默认 `30` 天）与 `BOARD_EVENTS_RETENTION_DAYS`（默认 `90` 天）分批滚动清理过期的 `native_events`、`board_events`（保留 `board_topics` 与 `board_messages` 实体）与 `notification_deliveries`，并扫描 `question_expires_at < now` 的 `open` 协同板提问执行 CAS 转 `expired`（无剩余 `open` 提问时自动恢复主题 `previous_status`），保持 `threads` / `runs` 既有留存策略不变。
+1. **落库先行**：客户端调用 `POST /api/v1/runs` 或 `POST /api/v1/plans` 后，Worker 首先将记录写入 D1（无阻塞前置于 `queued`；存在未完成 `depends_on` 或未来 `scheduled_at` 时置为 `waiting`，绝不持有租约或 `(node_id, workdir)` 互斥锁），随即向调用方返回 `202` / `201`（直接 `queued` 的单个 `/runs` 可进入短等待）。
+2. **即时唤醒与依赖推进**：Worker 仅对初始或推进为 `queued` 的目标 `node_id` 通知 DO `NodeHub`，若目标节点存在活跃 WebSocket 则立刻下发 `hub.wake` 信令驱动 `POST /api/v1/nodes/:id/claim`；当任意上游 `Run` 到达 `done` 时，控制面立即扫描 `run_dependencies` 中依赖该任务的 `waiting` 下游，若全部前置已 `done` 且 `scheduled_at` 已到期（或为空），执行 CAS `waiting -> queued` 并下发 `hub.wake`。
+3. **重连必扫**：无论节点因休眠唤醒还是网络闪断重新连上 `/ws/node`，在 `node.hello` 握手完成后，节点守护进程**必须立即执行一次 `claim`**，拉取离线期间积压在 D1 中的待执行任务（`waiting` 任务不会进入可认领集合）。
+4. **租约与超时巡检、定时唤醒及留存清理**：节点认领任务后获得有效期为 `90 秒` 的租约（`lease_expires_at`），执行期间每 `30 秒` 续期一次。Worker 每分钟通过 Cron Trigger（`scheduled`）巡检租约过期但仍处于 `claimed`、`running` 或 `needs_approval` 的任务（配合 `POST /api/v1/runs/:id/approval` 在总超时预算内的有界驻留与 `POST /api/v1/runs/:id/resolve` 人工放行收口，防止审批节点断联造成工作区互斥锁永久残留）：由于本地代码修改操作通常不具备天然幂等性，超时失联任务默认标记为 `failed`（`error_code = 'NODE_LEASE_EXPIRED'`）、自动触发关联 `board_topic_id` 终态 `handoff` 回写并通知发起方，避免节点意外重启后盲目重放造成工作区冲突；同时 Cron 扫描 `status = 'waiting' AND scheduled_at <= now` 且全部前置依赖均已 `done` 的定时任务执行 CAS `waiting -> queued` 并按 `node_id` 合并下发 `hub.wake`；并依据 `NATIVE_EVENTS_RETENTION_DAYS`（默认 `30` 天）与 `BOARD_EVENTS_RETENTION_DAYS`（默认 `90` 天）分批滚动清理过期的 `native_events`、`board_events`（保留 `board_topics` 与 `board_messages` 实体）与 `notification_deliveries`，扫描 `question_expires_at < now` 的 `open` 协同板提问执行 CAS 转 `expired`（无剩余 `open` 提问时自动恢复主题 `previous_status`），保持 `threads` / `runs` 既有留存策略不变。
 
 ## 5. 跨机 Agent 互调防递归死循环门禁
 
@@ -106,10 +106,10 @@ WebSocket 连接在跨公网环境下可能因机器休眠、网络切换或代�
 系统在调用链路上设置三道硬门禁：
 
 1. **血统透传（Lineage Propagation）**：节点守护进程拉起本地 Agent 子进程时，强制向子进程环境注入当前任务的 `AHUB_RUN_ID`、`AHUB_THREAD_ID`、`AHUB_ROOT_RUN_ID` 与 `AHUB_DEPTH`。当该 Agent 在子进程内执行 `ahub run` 时，CLI 自动读取上述环境变量并作为请求头/字段随任务提交。
-2. **深度上限硬拦截（Depth Guard）**：默认策略限制 `max_depth = 1`（即允许「人类或外部助手 `depth=0` -> 节点 Agent A `depth=1` -> 节点 Agent B」一跳协同；Agent B 若再次调用 `ahub run` 试图生成 `depth=2`，云端在校验阶段直接返回 `409 DEPTH_LIMIT_EXCEEDED`）。仅 `admin` 可在特殊场景显式放宽上限（硬上限不超过 `3`）。
+2. **深度上限硬拦截（Depth Guard）**：默认策略限制 `max_depth = 1`（即允许「人类或外部助手 `depth=0` -> 节点 Agent A `depth=1` -> 节点 Agent B」一跳协同；Agent B 若再次调用 `ahub run` 试图生成 `depth=2`，云端在校验阶段直接返回 `409 DEPTH_LIMIT_EXCEEDED`）。仅 `admin` 可在特殊场景显式放宽上限（硬上限不超过 `3`）。经 `POST /api/v1/plans` 一次性编排的跨机 DAG 整图共享调用方当前深度（后续由云端状态机按边依次唤醒，无需放宽 `max_depth = 1`），建图前执行 Kahn 拓扑检测，成环直接返回 `400 DEPENDENCY_CYCLE_DETECTED`。
 3. **目标环路检测与整树级联取消**：
    - 在同一条 `root_run_id` 祖先链上，禁止对已被祖先任务持有写锁的 `(node_id, workdir)` 发起回环调用（否则立刻返回 `409 DELEGATION_CYCLE_DETECTED`，防止自锁死锁）。
-   - Web 任务中心与 CLI 均支持按 `root_run_id` 执行级联取消（`POST /api/v1/runs/:id/cancel` 传 `cascade: true`），一次性将整棵任务树的所有 `queued` 任务置为 `cancelled` 并向全部运行中节点下发 `hub.abort`。
+   - Web 任务中心与 CLI 均支持按 `root_run_id` 及下游 `run_dependencies` 执行级联取消（`POST /api/v1/runs/:id/cancel` 传 `cascade: true`），一次性将整棵任务树及依赖它的下游 `waiting` / `queued` 任务置为 `cancelled` 并向全部运行中节点下发 `hub.abort`。
 
 ## 6. 节点端双通道消息推送与双向防环边界
 

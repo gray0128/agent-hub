@@ -1,6 +1,6 @@
 # 03 HTTP API、WebSocket 协议与通知队列契约
 
-本文档定义 `agent-hub` 控制面（默认入口 `https://ahub.bobocai.win`）对外暴露的全部 REST 接口、Durable Object `NodeHub` 的双向 WebSocket 帧格式、Cloudflare Queues 通知载荷以及标准错误码。机器可读 Schema 见 [run-create.schema.json](schemas/run-create.schema.json)、[run-record.schema.json](schemas/run-record.schema.json)、[native-event.schema.json](schemas/native-event.schema.json)、[board.schema.json](schemas/board.schema.json) 与 [ws-frames.schema.json](schemas/ws-frames.schema.json)（Slice 1a 保持 `run-create.schema.json` 与 `run-record.schema.json` 不变）。
+本文档定义 `agent-hub` 控制面（默认入口 `https://ahub.bobocai.win`）对外暴露的全部 REST 接口、Durable Object `NodeHub` 的双向 WebSocket 帧格式、Cloudflare Queues 通知载荷以及标准错误码。机器可读 Schema 见 [plan-create.schema.json](schemas/plan-create.schema.json)、[run-create.schema.json](schemas/run-create.schema.json)、[run-record.schema.json](schemas/run-record.schema.json)、[native-event.schema.json](schemas/native-event.schema.json)、[board.schema.json](schemas/board.schema.json) 与 [ws-frames.schema.json](schemas/ws-frames.schema.json)。
 
 ## 1. 通用协议约定
 
@@ -14,8 +14,8 @@
 
 ### 1.2 幂等与血统透传请求头
 
-- `Idempotency-Key`（可选，推荐所有 `POST /api/v1/runs` 调用携带）：相同 `Idempotency-Key` 在载荷一致时返回已有 `Run`（`200` / `202`）而不重复创建；若相同 Key 对应的关键参数（`node_id`、`workdir`、`agent`、`prompt`）不一致，返回 `409 IDEMPOTENCY_CONFLICT`。
-- 血统字段：`POST /api/v1/runs` 请求体支持可选字段 `parent_run_id`（`ahub` CLI 会自动从环境变量 `AHUB_RUN_ID` 读取并填入）。服务端据此查询父任务校验 `depth + 1 <= max_depth` 与 `(node_id, workdir)` 环路。
+- `Idempotency-Key`（可选，推荐所有 `POST /api/v1/runs`、`POST /api/v1/plans` 与 `POST /api/v1/runs/:id/retry` 调用携带）：相同 `Idempotency-Key` 在载荷一致时返回已有实体（`200` / `202`）而不重复创建；若相同 Key 对应的关键参数不一致，返回 `409 IDEMPOTENCY_CONFLICT`。
+- 血统字段：`POST /api/v1/runs` 与 `POST /api/v1/plans` 请求体支持可选字段 `parent_run_id`（`ahub` CLI 会自动从环境变量 `AHUB_RUN_ID` 读取并填入）。服务端据此查询父任务校验 `depth + 1 <= max_depth` 与 `(node_id, workdir)` 环路。
 
 ### 1.3 统一响应信封
 
@@ -64,20 +64,24 @@
 | `PATCH /api/v1/threads/:id` | `admin`, `client` | 更新会话标题、归档状态或置顶顺序 | 请求 `{title?, status?, pinned?, sort_order?}`（`client` Key 强制校验节点权限与线程归属） |
 | `POST /api/v1/threads/:id/fork` | `admin`, `client` | 将已有会话分叉到新节点或新工作区，建立独立 `Thread` | 请求 `{node_id, workdir, agent?, title?}`；校验源/目标节点权限与线程归属，携带原会话最新一轮摘要作为首条上下文提示 |
 
-### 2.3 任务执行与编排（Runs）
+### 2.3 任务执行与 DAG 编排（Runs & Plans）
 
 | 方法与路径 | 允许 Scope | 功能说明 | 关键请求/响应约定 |
 | --- | --- | --- | --- |
-| `POST /api/v1/runs` | `admin`, `client` | 创建并入队一个 `Run`（未传 `thread_id` 时自动新建 `Thread`）。见 [run-create.schema.json](schemas/run-create.schema.json) | 支持查询参数 `?wait_ms=0..45000`。若在 `wait_ms` 内到达终态或 `needs_approval` 直接返回 `200`；超时仍在跑返回 `202` 含 `run` 快照（绝不超过 `45000ms`，防止触发 Cloudflare 100s `524`） |
-| `GET /api/v1/runs` | `admin`, `client` | 按条件筛选任务列表，支持 `?node_id=&thread_id=&status=&root_run_id=&limit=50` | 返回 `runs[]` 摘要列表（不含大体积 `output_md`；`prompt` 统一经凭据脱敏并截断至 `<= 1200` 字符；可附带 `deliveries_summary: { total, sent, queued, failed }`） |
-| `GET /api/v1/runs/:id` | `admin`, `client` | 查询单条任务详情与输出，支持 `?view=summary|full&tail_bytes=16384` | `view=summary`（默认）按 `tail_bytes` 截断返回 `output_preview` 与 `truncated: true`，同时将 `prompt` 脱敏并截断至 `<= 1200` 字符；`view=full` 返回完整 `output_md` 与完整脱敏后的 `prompt`（保留 `$VAR` / `<PLACEHOLDER>` 占位符，绝不回传未脱敏真实凭据）；可附带 `deliveries_summary` |
+| `POST /api/v1/plans` | `admin`, `client` | 幂等批量提交粗粒度跨机 DAG 执行计划（见 [plan-create.schema.json](schemas/plan-create.schema.json)） | 请求 `{ idempotency_key?, board_topic_id?, actor_profile?, parent_run_id?, nodes: PlanNodeSpec[] }`（`1..20` 节点、总边数 `<= 60`、单节点 `depends_on <= 10`，每节点允许引用计划内 `key` 或既有 `run_...`，可选 `scheduled_at` 或 `in_sec` 二选一）；支持 `Idempotency-Key`（命中返回 `200 { ok: true, plan_id, deduplicated: true, runs }`，载荷冲突返回 `409 IDEMPOTENCY_CONFLICT`）；建图前执行 Kahn 拓扑环检测（成环返回 `400 DEPENDENCY_CYCLE_DETECTED`），并逐项校验节点存在/`draining`、工作区、`client` 权限、`max_depth = 1`、委派环路、`scheduled_at`（`[now+60s, now+7d]`）及 `board_topic_id` 频道前缀权限；原子入库后返回 `201 { ok: true, plan_id, runs }`，仅对初始状态为 `queued` 的节点下发 `hub.wake` |
+| `POST /api/v1/runs` | `admin`, `client` | 创建单个 `Run`（未传 `thread_id` 时自动新建 `Thread`；存在未完成 `depends_on` 或未来 `scheduled_at` 时初始状态为 `waiting`）。见 [run-create.schema.json](schemas/run-create.schema.json) | 新增可选字段 `depends_on?: string[]`（`<= 10` 条既有 `run_...`）、`scheduled_at?: string`（`[now+60s, now+7d]`）、`board_topic_id?: string`（校验存在与频道前缀权限）与 `actor_profile?: string`；支持查询参数 `?wait_ms=0..45000`；若初始状态为 `waiting` 则立即返回 `202` 含 `run` 快照且**不等待 `wait_ms`、不下发 `hub.wake`**；直接入队且在 `wait_ms` 内到达终态或 `needs_approval` 直接返回 `200`，超时仍在跑返回 `202`（绝不超过 `45000ms`） |
+| `GET /api/v1/runs` | `admin`, `client` | 按条件筛选任务列表，支持 `?node_id=&thread_id=&status=&root_run_id=&plan_id=&board_topic_id=&limit=50` | `status` 支持 8 态（含 `waiting`）；返回 `runs[]` 摘要列表（不含大体积 `output_md`；`prompt` 统一经凭据脱敏并截断至 `<= 1200` 字符；携带 Slice 2 字段与派生 `blocked_reason`，可附带 `deliveries_summary`） |
+| `GET /api/v1/runs/:id` | `admin`, `client` | 查询单条任务详情与输出，支持 `?view=summary|full&tail_bytes=16384` | `view=summary`（默认）按 `tail_bytes` 截断返回 `output_preview` 与 `truncated: true`，同时将 `prompt` 脱敏并截断至 `<= 1200` 字符；`view=full` 返回完整 `output_md` 与完整脱敏后的 `prompt`（保留 `$VAR` / `<PLACEHOLDER>` 占位符，绝不回传未脱敏真实凭据）；返回完整 `depends_on_run_ids`、`blocked_reason` 等 Slice 2 字段及可选 `deliveries_summary` |
 | `GET /api/v1/runs/:id/events` | `admin`, `client` | 增量拉取过程事件，支持 `?after_seq=0&limit=200` | 返回 `events[]` 与 `next_seq` |
-| `PATCH /api/v1/runs/:id` | `admin`, `client` | 仅限任务仍处于 `queued` 时调整目标 `node_id`、`workdir`、`model`、`effort` 或 `priority_order` | 若任务已被认领离开 `queued` 返回 `409 INVALID_STATE_TRANSITION`；改派 `node_id`/`workdir` 仅限尚未建连的单轮新会话（已建连或多轮会话须走 `/fork`，否则返回 `409 INVALID_STATE_TRANSITION`），并同步校验委派环路（`409 DELEGATION_CYCLE_DETECTED`）与同步更新 `threads(node_id, workdir, project_key)` |
+| `PATCH /api/v1/runs/:id` | `admin`, `client` | 仅限任务仍处于 `queued` 或 `waiting` 时调整目标 `node_id`、`workdir`、`model`、`effort` 或 `priority_order` | 若任务处于活跃或终态返回 `409 INVALID_STATE_TRANSITION`；改派 `node_id`/`workdir` 仅限尚未建连的单轮新会话（已建连或多轮会话须走 `/fork`，否则返回 `409 INVALID_STATE_TRANSITION`），并同步校验委派环路（`409 DELEGATION_CYCLE_DETECTED`）与同步更新 `threads(node_id, workdir, project_key)`；仅当任务为 `queued` 时触发 DO `hub.wake` |
 | `POST /api/v1/runs/reorder` | `admin`, `client` | 批量重排同节点待执行队列的 `priority_order`（供前端 `@dnd-kit` 拖拽排序） | 请求 `{node_id, ordered_run_ids: string[]}`（`client` Key 校检节点权限与队列条目归属） |
-| `POST /api/v1/runs/:id/resolve` | `admin`, `client` | 人工在远控完成审批后手动放行结算处于 `needs_approval` 的任务 | 可选请求 `{summary?}`；CAS 置 `status='done'`、释放租约、向 `NodeHub` 发 `hub.abort(approval_resolved)` 解锁本地 `workdir` 并广播 `run.updated` |
-| `POST /api/v1/runs/:id/cancel` | `admin`, `client` | 取消单个任务或整棵衍生任务树 | 请求 `{cascade?: boolean, reason?: string}`；`queued` 直接变 `cancelled`，运行中任务立即经 DO 下发 `hub.abort` |
+| `POST /api/v1/runs/:id/resolve` | `admin`, `client` | 人工在远控完成审批后手动放行结算处于 `needs_approval` 的任务 | 可选请求 `{summary?}`；CAS 置 `status='done'`、释放租约、向 `NodeHub` 发 `hub.abort(approval_resolved)` 解锁本地 `workdir`、唤醒就绪下游 `waiting` 任务、若绑定 `board_topic_id` 则自动回写 `handoff` 并广播 `run.updated` |
+| `POST /api/v1/runs/:id/cancel` | `admin`, `client` | 取消单个任务或整棵衍生/下游依赖任务树 | 请求 `{cascade?: boolean, reason?: string}`；`waiting` 与 `queued` 直接变 `cancelled`，运行中任务立即经 DO 下发 `hub.abort`；`cascade: true` 时同时沿 `root_run_id` 子树及 `run_dependencies` 下游 `waiting` 依赖边级联取消；到达终态若绑定 `board_topic_id` 则自动回写 `handoff` |
+| `POST /api/v1/runs/:id/retry` | `admin`, `client` | 对终态 `failed` 或 `cancelled` 任务创建替代 `Run` 并重绑下游 `waiting` 依赖边 | 仅允许目标任务处于 `failed` / `cancelled`（否则返回 `409 INVALID_STATE_TRANSITION`）；可选请求 `{ idempotency_key?, model?, effort?, timeout_sec?, actor_profile? }`（支持 `Idempotency-Key`）；原子新建替代 `Run`（写入 `retry_of_run_id = :id`、复制原任务参数与前置 `run_dependencies`）、将所有处于 `waiting` 状态且依赖 `:id` 的下游边重绑指向新 `run_id`、原终态记录绝对不可变；返回 `201`（幂等命中 `200`）`{ ok: true, run, rebound_run_ids, deduplicated? }`，若新任务初始为 `queued` 则下发 `hub.wake` |
 
-> **`RunRecord.prompt` 控制面脱敏与截断边界**：除节点认领接口 `POST /api/v1/nodes/:id/claim`（`node` Scope）返回原始未脱敏 `prompt`、以及 `GET /api/v1/runs/:id?view=full` 返回完整脱敏 `prompt` 外，其余全部控制面 REST 接口（含 `POST /api/v1/runs` 及其 `wait_ms` 长轮询返回、`GET /api/v1/runs`、`GET /api/v1/runs/:id?view=summary`、`PATCH /api/v1/runs/:id`、`POST /api/v1/runs/reorder`、`POST /api/v1/runs/:id/resolve`、`POST /api/v1/runs/:id/cancel`、`POST /api/v1/threads/:id/fork`、`POST /api/v1/runs/:id/approval`、`POST /api/v1/runs/:id/complete`）与 `/ws/stream` 推送的 `RunRecord.prompt` 均统一经凭据脱敏并截断至最多 `1200` 字符（超出附加 `\n...[truncated]`），且不额外新增 `prompt_preview` 重复字段，以维持 [run-record.schema.json](schemas/run-record.schema.json) 紧凑契约。
+> **Slice 2 `RunRecord` 扩展字段与 `prompt` 脱敏边界**：
+> - `RunRecord`（见 [run-record.schema.json](schemas/run-record.schema.json)）新增 8 个可选字段：`plan_id: string | null`、`plan_key: string | null`、`scheduled_at: string | null`、`retry_of_run_id: string | null`、`actor_profile: string`、`board_topic_id: string | null`、`depends_on_run_ids: string[]`、`blocked_reason: "DEPENDENCY_PENDING" | "SCHEDULED" | "UPSTREAM_FAILED" | "UPSTREAM_CANCELLED" | null`。
+> - 除节点认领接口 `POST /api/v1/nodes/:id/claim`（`node` Scope）返回原始未脱敏 `prompt`、以及 `GET /api/v1/runs/:id?view=full` 返回完整脱敏 `prompt` 外，其余全部控制面 REST 接口（含 `POST /api/v1/plans`、`POST /api/v1/runs` 及其 `wait_ms` 长轮询返回、`GET /api/v1/runs`、`GET /api/v1/runs/:id?view=summary`、`PATCH /api/v1/runs/:id`、`POST /api/v1/runs/reorder`、`POST /api/v1/runs/:id/resolve`、`POST /api/v1/runs/:id/cancel`、`POST /api/v1/runs/:id/retry`、`POST /api/v1/threads/:id/fork`、`POST /api/v1/runs/:id/approval`、`POST /api/v1/runs/:id/complete`）与 `/ws/stream` 推送的 `RunRecord.prompt` 均统一经凭据脱敏并截断至最多 `1200` 字符（超出附加 `\n...[truncated]`），且不额外新增 `prompt_preview` 重复字段。
 
 ### 2.4 凭证管理与自举分发
 
@@ -140,6 +144,8 @@
 | `POST /api/v1/board/messages/:id/answer` | **`admin`** | 对处于 `open` 的 `question` 独占 CAS 作答 | 请求 `{ selected_option?, answer_text?, actor_profile? }`（`AnswerBoardQuestionRequest`，`answer_text` 与 `selected_option` 至少提供一项）；非 `admin` 返回 `403 FORBIDDEN_SCOPE`；单语句 CAS 校验 `kind = 'question' AND question_state = 'open'`，冲突返回 `409 INVALID_STATE_TRANSITION`；写入 `kind = 'answer'` 消息、无剩余 `open` 问题时恢复 `previous_status`，返回 `200 { ok: true, topic, question, answer, cursor }`（`AnswerBoardQuestionResponse`）并广播 `board.question_answered` |
 | `GET /api/v1/board/events` | `admin`, `client` | 按 `?channel=&topic_id=&after_cursor=0&limit=100` 增量拉取协同事件游标流 | 响应 `200 { ok: true, events: BoardEvent[], next_cursor: number }`（`BoardEventsResponse`） |
 
+> **受控任务终态自动回写（`postSystemRunHandoffToBoard`）**：当绑定非空 `board_topic_id` 的受控 `Run` 通过 `/complete`、`/resolve`、`/cancel` 或 Cron `reapExpiredLeases` 进入终态（`done` / `failed` / `cancelled`）时，控制面在 Worker 内部调用 `postSystemRunHandoffToBoard`（以 `idempotency_key: "run-handoff:" + run.id` 去重），向目标主题追加一条脱敏 `kind = 'handoff'` 消息（`data` 含 `run_id`、`thread_id`、`plan_id`、`plan_key`、`status`、`node_id`、`workdir`、`agent`、`duration_ms`、`error_code`）并经 `NodeHub` 广播 `board.message_created`；系统自动回写**绝不**触发 `NOTIFY_QUEUE` 推送（即使原主题已被删除也不阻塞 `Run` 终态持久化）。
+
 ## 3. Durable Objects WebSocket 双向协议
 
 控制面在 Durable Object `NodeHub` 中利用 **WebSocket Hibernation API** 托管两类长连接，全部帧均采用 UTF-8 JSON 文本帧。完整字段约束见 [ws-frames.schema.json](schemas/ws-frames.schema.json)。
@@ -157,7 +163,7 @@
 
 **Hub -> Node 帧**：
 
-1. `hub.welcome`：确认连接接受与心跳周期（`heartbeat_interval_ms: 25000`），附带当前是否存在积压队列标志 `has_pending_runs`。
+1. `hub.welcome`：确认连接接受与心跳周期（`heartbeat_interval_ms: 25000`），附带当前是否存在可直接认领的 `status = 'queued'` 积压标志 `has_pending_runs`（**不包含 `waiting` 任务**）。
 2. `hub.wake`：通知节点有新任务或重试指令待拉取（含 `reason: "run_queued" | "reconcile"` 与提示 `run_id`）。节点收到后立即并发安全地调用 `POST /api/v1/nodes/:id/claim`。
 3. `hub.abort`：要求节点立即终止指定 `run_id`（含 `reason`）。节点对目标子进程组先发 `SIGTERM`，若 `5 秒` 内未退出则补发 `SIGKILL`。
 
@@ -171,7 +177,7 @@
 **Hub -> Client 帧**：
 - `snapshot`：建连瞬间下发当前最新快照。全局或 `run_id` 流包含 `nodes`、可选 `threads` 与 `runs`（`client` Scope 省略 `default_notify_*`，`runs[].prompt` 脱敏截断 `<= 1200` 字符）；**仅当 `att.scope === "admin" && !att.runId && !att.topicId` 时**额外包含 `native_events`（最近最多 `100` 条）、`open_interaction_count`（`integer >= 0`）与 `open_board_question_count`（`integer >= 0`）；`?topic_id=` 流携带 `nodes: []` 与目标 `topic` 详情。
 - `node.status`：节点状态变更增量（推送给 `client` Scope 连接时同样省略 `default_notify_*` 字段）。
-- `run.updated`：任意 `Run` 状态、耗时、摘要、`notify_status` 或 `deliveries_summary` 变更（`run.prompt` 统一脱敏并截断至 `<= 1200` 字符）。
+- `run.updated`：任意 `Run` 状态（含 `waiting -> queued` 唤醒、`waiting -> cancelled` 取消、以及上游失败/取消或重试重绑导致下游 `waiting` 任务的 `blocked_reason` / `depends_on_run_ids` 更新）、耗时、摘要、`notify_status` 或 `deliveries_summary` 变更（`run.prompt` 统一脱敏并截断至 `<= 1200` 字符）。
 - `run.event` / `run.events`：实时执行流事件增量（单条或批量）。
 - `native_event.upserted`（**仅全局 `admin` 流**）：`{ type: "native_event.upserted", event: NativeEventView, open_interaction_count: number }`。
 - `delivery.updated`（**仅全局 `admin` 流**）：`{ type: "delivery.updated", delivery: NotificationDeliveryRecord }`。
@@ -201,6 +207,7 @@
 目标入队规则如下：
 
 - **受控 `Run` 任务通知**：
+  - 处于 `waiting` 状态的任务不产生排队期通知；仅当进入 `done`、`failed`、`cancelled`（含 `waiting -> cancelled`）或首次进入 `needs_approval` 时按以下策略结算。
   - Bot Webhook：若 `runs.notify_policy_json` 显式指定有效目标（`target` 为 `"grok"` 或 `"webhook"` 且命中 `events` 过滤），任务进入 `done`、`failed`、`cancelled` 或首次进入 `needs_approval` 时生成对应 `bot_webhook` / `legacy_webhook` 投递行；若 `target == "none"`，**仅当**满足 `depth == 0` **且**发起方为人工控制面（`runs.created_by_key_id IS NULL`）或 `admin` API Key 时转入 `nodes.default_notify_key_id`（`route_mode = "node_default"`；失效则将 `runs.notify_status` 置为 `'failed'`）。凡走 `node_default` 路由均额外校验 `nodes.default_notify_events` 包含 `run_<status>`。`client` 静默任务与 `depth >= 1` 子任务绝不触发 `node_default`。
   - Web Push：仅当 `depth == 0` 时匹配 `enabled = 1 AND revoked_at IS NULL` 且 `node_filter_json` 覆盖目标节点的管理员订阅；其中人工/`admin` 任务按 `run_<status>` 过滤，**`client` Key 创建的 `depth == 0` 任务仅匹配 `needs_approval` 与 `failed`（绝不在 `done` / `cancelled` 弹窗）**，`depth >= 1` 子任务对 Web Push 完全静默。
 - **节点原生 Agent 事件通知（`native_events`）**：
@@ -321,7 +328,8 @@ Bot Webhook 重试策略：HTTP 非 `2xx` 时抛出异常由 Cloudflare Queues �
 
 | 错误码 | HTTP 状态 | 语义说明 | 调用方恢复建议 |
 | --- | --- | --- | --- |
-| `BAD_REQUEST` | `400` | 请求 JSON 格式非法、字段校验未通过（含协同板 `channel`/`actor_profile` 格式非法、`data` 超出 `32 KB`、`question_options` 超过 `8` 项）、VAPID 未配置或 Push 端点未命中 SSRF 白名单 | 按响应 `error.message` 与 `error.next`（若有）修正请求参数或服务端配置后重发 |
+| `BAD_REQUEST` | `400` | 请求 JSON 格式非法、字段校验未通过（含未知 `depends_on`、`scheduled_at` 越界、`plans` 节点/边超配额、协同板 `channel`/`actor_profile` 格式非法、`data` 超出 `32 KB`、`question_options` 超过 `8` 项）、VAPID 未配置或 Push 端点未命中 SSRF 白名单 | 按响应 `error.message` 与 `error.next`（若有）修正请求参数或服务端配置后重发 |
+| `DEPENDENCY_CYCLE_DETECTED` | `400` | `POST /api/v1/plans` 的节点依赖关系包含环路或自环（Kahn 拓扑排序未通过） | 检查并消除 `nodes[].depends_on` 中的循环依赖后重新提交 |
 | `UNAUTHORIZED` | `401` | 缺少或无效的认证凭证 | 检查 `AHUB_TOKEN` 或重新登录 Cloudflare Access |
 | `FORBIDDEN_SCOPE` | `403` | 当前 Key 无权操作目标节点、禁止关闭 `--sandbox`、跨节点上报、越权访问 `admin` 原生活动/Push 接口、`client` 缺少对应 `allowed_board_prefixes` 或尝试代答提问，或 `node` Key 访问 `/api/v1/board/*` 与 `/ws/stream` | 联系管理员在 Web 控制台调整 Key 权限、改用 `admin` 凭证，或按 `error.next` 切换至已授权频道 |
 | `NOT_FOUND` | `404` | 请求的目标资源（`run_id`、`thread_id`、`native_event_id`、`topic_id`、`message_id`、`delivery_id` 或 `subscription_id`）不存在 | 刷新列表确认目标 ID 是否已过期或被清理 |
@@ -332,7 +340,7 @@ Bot Webhook 重试策略：HTTP 非 `2xx` 时抛出异常由 Cloudflare Queues �
 | `DEPTH_LIMIT_EXCEEDED` | `409` | 跨机衍生调用深度超过 `max_depth` | 停止继续委派，在当前上下文汇总结果返回上级 |
 | `DELEGATION_CYCLE_DETECTED` | `409` | 同一 `root_run_id` 祖先链试图回环调用已持锁的 `(node_id, workdir)` | 禁止循环派单，直接由当前节点处理或返回 |
 | `IDEMPOTENCY_CONFLICT` | `409` | 重复的 `Idempotency-Key` 携带了不一致的参数（含协同板发消息携带不同载荷） | 更换新的幂等键或复用原请求参数 |
-| `INVALID_STATE_TRANSITION` | `409` | 操作与当前状态冲突（如试图修改已认领任务、改派多轮已建连会话、覆盖终态、修改/测试已吊销 Push 订阅，或对已答复/已过期/非 `question` 消息调用 `/answer`） | 重新查询详情对齐状态；多轮会话改派请改用 `/fork` |
+| `INVALID_STATE_TRANSITION` | `409` | 操作与当前状态冲突（如试图修改非 `queued`/`waiting` 任务、改派多轮已建连会话、对非 `failed`/`cancelled` 任务调用 `/retry`、覆盖终态、修改/测试已吊销 Push 订阅，或对已答复/已过期/非 `question` 消息调用 `/answer`） | 重新查询详情对齐状态；多轮会话改派请改用 `/fork` |
 | `LEASE_CONFLICT` | `409` | 节点心跳、审批检查点或完成上报携带的 `lease_owner` 与云端当前租约不匹配 | 立即停止本地目录占用等待下次认领 |
 | `APPROVAL_TIMEOUT` | `—`（任务 `error_code`） | 处于 `needs_approval` 状态的任务超过单轮 `timeout_sec` 上限仍未获批放行 | 检查远控或工作区变更后视需要重派新任务 |
 | `NODE_LEASE_EXPIRED` | `410` | 节点心跳租约超时未续期，任务已被回收标为失败 | 检查节点在线状态与本地工作区后决定是否重发 |

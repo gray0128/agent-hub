@@ -750,7 +750,8 @@ export function resolveWorkspace(
       400,
       "WORKDIR_AMBIGUOUS",
       `Multiple workspaces matched project key '${normalized}'.`,
-      { candidates: keyMatches.map((m) => m.path) }
+      { candidates: keyMatches.map((m) => m.path) },
+      ["ahub nodes --online --json"]
     );
   }
 
@@ -769,14 +770,17 @@ export function resolveWorkspace(
       400,
       "WORKDIR_AMBIGUOUS",
       `Multiple workspaces matched '${normalized}'.`,
-      { candidates: suffixMatches.map((m) => m.path) }
+      { candidates: suffixMatches.map((m) => m.path) },
+      ["ahub nodes --online --json"]
     );
   }
 
   throw new HubError(
     400,
     "WORKDIR_NOT_FOUND",
-    `No workspace matched '${normalized}' on target node.`
+    `No workspace matched '${normalized}' on target node.`,
+    undefined,
+    ["ahub nodes --json"]
   );
 }
 
@@ -892,7 +896,9 @@ export async function patchNode(
 ): Promise<NodeRecord> {
   const existing = await db.prepare(`SELECT * FROM nodes WHERE id = ?1`).bind(nodeId).first<NodeRow>();
   if (!existing) {
-    throw new HubError(404, "NODE_NOT_FOUND", `Node '${nodeId}' not found.`);
+    throw new HubError(404, "NODE_NOT_FOUND", `Node '${nodeId}' not found.`, undefined, [
+      "ahub nodes --json"
+    ]);
   }
 
   let nextDefaultNotifyKeyId = existing.default_notify_key_id ?? null;
@@ -1087,7 +1093,9 @@ export async function createRun(
     }
     const nodeRow = await db.prepare(`SELECT * FROM nodes WHERE id = ?1`).bind(targetNodeId).first<NodeRow>();
     if (!nodeRow) {
-      throw new HubError(404, "NODE_NOT_FOUND", `Node '${targetNodeId}' not found.`);
+      throw new HubError(404, "NODE_NOT_FOUND", `Node '${targetNodeId}' not found.`, undefined, [
+        "ahub nodes --json"
+      ]);
     }
     if (nodeRow.status === "draining") {
       throw new HubError(409, "NODE_DRAINING", `Node '${targetNodeId}' is draining.`);
@@ -1105,7 +1113,9 @@ export async function createRun(
   if (input.threadId) {
     const nodeRow = await db.prepare(`SELECT status FROM nodes WHERE id = ?1`).bind(targetNodeId).first<{ status: NodeStatus }>();
     if (!nodeRow) {
-      throw new HubError(404, "NODE_NOT_FOUND", `Node '${targetNodeId}' not found.`);
+      throw new HubError(404, "NODE_NOT_FOUND", `Node '${targetNodeId}' not found.`, undefined, [
+        "ahub nodes --json"
+      ]);
     }
     if (nodeRow.status === "draining") {
       throw new HubError(409, "NODE_DRAINING", `Node '${targetNodeId}' is draining.`);
@@ -1259,7 +1269,9 @@ export async function claimRunsForNode(
     .bind(nodeId)
     .first<{ status: NodeStatus; max_concurrency: number }>();
   if (!node) {
-    throw new HubError(404, "NODE_NOT_FOUND", `Node '${nodeId}' not found.`);
+    throw new HubError(404, "NODE_NOT_FOUND", `Node '${nodeId}' not found.`, undefined, [
+      "ahub nodes --json"
+    ]);
   }
   const now = nowIso();
   if (node.status === "draining") {
@@ -2153,7 +2165,9 @@ export async function createNativeEvent(
 
   const node = await getNodeById(db, nodeId);
   if (!node) {
-    throw new HubError(404, "NODE_NOT_FOUND", `Node '${nodeId}' not found.`);
+    throw new HubError(404, "NODE_NOT_FOUND", `Node '${nodeId}' not found.`, undefined, [
+      "ahub nodes --json"
+    ]);
   }
 
   const sanitizedTitle = redactSecrets(input.title).slice(0, 200);
@@ -2825,7 +2839,9 @@ export async function patchQueuedRun(
     }
     const node = await db.prepare(`SELECT * FROM nodes WHERE id = ?1`).bind(nextNodeId).first<NodeRow>();
     if (!node) {
-      throw new HubError(404, "NODE_NOT_FOUND", `Node '${nextNodeId}' not found.`);
+      throw new HubError(404, "NODE_NOT_FOUND", `Node '${nextNodeId}' not found.`, undefined, [
+        "ahub nodes --json"
+      ]);
     }
     if (node.status === "draining") {
       throw new HubError(409, "NODE_DRAINING", `Node '${nextNodeId}' is draining.`);
