@@ -18,6 +18,7 @@ import (
 
 	"github.com/gray0128/agent-hub/internal/api"
 	"github.com/gray0128/agent-hub/internal/config"
+	"github.com/gray0128/agent-hub/internal/redact"
 	"github.com/gray0128/agent-hub/internal/runner"
 )
 
@@ -547,7 +548,7 @@ func (d *Daemon) executeClaimedRun(runCtx, parentCtx context.Context, run api.Ru
 
 	res := runner.ExecuteRun(runCtx, run, d.cfg, agentCfg, runner.Callbacks{
 		OnEvent: func(kind string, payload map[string]interface{}) {
-			d.batcher.Add(run.ID, kind, payload)
+			d.batcher.Add(run.ID, kind, redact.Map(payload))
 		},
 		OnState: func(status, remoteControlURL, resolvedModel, resolvedEffort string) {
 			d.sendRunState(run.ID, leaseOwner, status, remoteControlURL, resolvedModel, resolvedEffort)
@@ -591,12 +592,12 @@ func (d *Daemon) checkpointNeedsApproval(runCtx context.Context, runID, leaseOwn
 		reqCtx, cancel := context.WithTimeout(runCtx, 8*time.Second)
 		_, err := d.client.CheckpointApproval(reqCtx, runID, api.ApprovalCheckpointRequest{
 			LeaseOwner:       leaseOwner,
-			RemoteControlURL: res.RemoteControlURL,
+			RemoteControlURL: redact.Text(res.RemoteControlURL),
 			NativeSessionID:  res.NativeSessionID,
 			ResolvedModel:    res.ResolvedModel,
 			ResolvedEffort:   res.ResolvedEffort,
-			Summary:          res.Summary,
-			OutputMD:         res.OutputMD,
+			Summary:          redact.Text(res.Summary),
+			OutputMD:         redact.Text(res.OutputMD),
 			OutputBytes:      res.OutputBytes,
 			DurationMs:       res.DurationMs,
 		})
@@ -655,19 +656,25 @@ func (d *Daemon) finishRun(parentCtx context.Context, runID, leaseOwner string, 
 		defer cancel()
 	}
 
-	_, err := d.client.CompleteRun(finishCtx, runID, api.CompleteRunRequest{
+	req := api.CompleteRunRequest{
 		LeaseOwner:      leaseOwner,
 		Status:          res.Status,
 		NativeSessionID: res.NativeSessionID,
 		ResolvedModel:   res.ResolvedModel,
 		ResolvedEffort:  res.ResolvedEffort,
-		Summary:         res.Summary,
-		OutputMD:        res.OutputMD,
+		Summary:         redact.Text(res.Summary),
+		OutputMD:        redact.Text(res.OutputMD),
 		OutputBytes:     res.OutputBytes,
 		DurationMs:      res.DurationMs,
 		ErrorCode:       res.ErrorCode,
-		ErrorMessage:    res.ErrorMessage,
-	})
+		ErrorMessage:    redact.Text(res.ErrorMessage),
+	}
+	if res.Status == "done" {
+		req.Result = res.StructuredResult
+		req.ResultError = redact.Text(res.ResultError)
+	}
+
+	_, err := d.client.CompleteRun(finishCtx, runID, req)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[ahub node] complete %s error: %v\n", runID, err)
 	}
@@ -713,7 +720,7 @@ func (d *Daemon) sendRunState(runID, leaseOwner, status, remoteURL, resolvedMode
 		"ts":          time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	if remoteURL != "" {
-		frame["remote_control_url"] = remoteURL
+		frame["remote_control_url"] = redact.Text(remoteURL)
 	}
 	if resolvedModel != "" {
 		frame["resolved_model"] = resolvedModel

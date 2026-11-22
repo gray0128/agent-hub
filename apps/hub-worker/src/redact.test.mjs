@@ -133,4 +133,9 @@ test("redactBoardData handles deep nesting iteratively, key-aware redaction, pla
   const redactedCyclic = redactJsonValue(cyclic);
   assert.equal(redactedCyclic.token, "[REDACTED]");
   assert.equal(redactedCyclic.self, "[Circular]");
+
+  assert.equal(
+    redactSecrets('{"AHUB_TOKEN":"__MISSING__","AWS_SECRET_ACCESS_KEY":"__MISSING__"}'),
+    '{"AHUB_TOKEN":"__MISSING__","AWS_SECRET_ACCESS_KEY":"__MISSING__"}'
+  );
 });

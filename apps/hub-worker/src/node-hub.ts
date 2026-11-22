@@ -34,6 +34,7 @@ import {
   type NotificationDeliveryRecord,
   type RunRecord
 } from "./types";
+import { redactJsonValue } from "./redact";
 import { nowIso } from "./ulid";
 import { parseNodeWsFrame } from "./validation";
 
@@ -600,8 +601,9 @@ export class NodeHub extends DurableObject<Env> {
       }
 
       case "run.event": {
+        const sanitizedPayload = redactJsonValue(frame.payload) as Record<string, unknown>;
         const ok = await appendRunEvents(this.env.DB, att.nodeId, frame.run_id, [
-          { seq: frame.seq, kind: frame.kind, payload: frame.payload, ts: frame.ts }
+          { seq: frame.seq, kind: frame.kind, payload: sanitizedPayload, ts: frame.ts }
         ]);
         if (ok) {
           this.broadcastToStream(
@@ -610,7 +612,7 @@ export class NodeHub extends DurableObject<Env> {
               run_id: frame.run_id,
               seq: frame.seq,
               kind: frame.kind,
-              payload: frame.payload,
+              payload: sanitizedPayload,
               ts: frame.ts
             },
             { runId: frame.run_id, nodeId: att.nodeId }
@@ -620,13 +622,17 @@ export class NodeHub extends DurableObject<Env> {
       }
 
       case "run.events": {
-        const ok = await appendRunEvents(this.env.DB, att.nodeId, frame.run_id, frame.events);
+        const sanitizedEvents = frame.events.map((ev) => ({
+          ...ev,
+          payload: redactJsonValue(ev.payload) as Record<string, unknown>
+        }));
+        const ok = await appendRunEvents(this.env.DB, att.nodeId, frame.run_id, sanitizedEvents);
         if (ok) {
           this.broadcastToStream(
             {
               type: "run.events",
               run_id: frame.run_id,
-              events: frame.events
+              events: sanitizedEvents
             },
             { runId: frame.run_id, nodeId: att.nodeId }
           );

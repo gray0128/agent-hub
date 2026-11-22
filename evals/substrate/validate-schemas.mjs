@@ -2235,6 +2235,367 @@ const cases = [
         next: ["ahub " + "x".repeat(508)]
       }
     }
+  },
+  // Slice 3 Phase C1 labels & structured result schema cases
+  {
+    name: "run-create valid 16 labels boundary and result_schema",
+    schema: "run-create.schema.json",
+    valid: true,
+    payload: {
+      node_id: "macmini",
+      workdir: "demo",
+      agent: "pi",
+      prompt: "Verify Slice 3 labels and schema",
+      labels: {
+        env: "prod",
+        "team/owner": "core",
+        "svc.tier": "gold",
+        ...Object.fromEntries(Array.from({ length: 13 }, (_, i) => [`k_${i + 3}`, `v-${i + 3}`]))
+      },
+      result_schema: {
+        type: "object",
+        required: ["ok"],
+        properties: { ok: { type: "boolean" } },
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    name: "run-create invalid ahub.* reserved label key",
+    schema: "run-create.schema.json",
+    valid: false,
+    payload: {
+      node_id: "macmini",
+      workdir: "demo",
+      agent: "pi",
+      prompt: "Reserved label prefix",
+      labels: { "ahub.plan_id": "pln_01JABCDEF123456789" }
+    }
+  },
+  {
+    name: "run-create invalid 17 labels exceeding maxProperties",
+    schema: "run-create.schema.json",
+    valid: false,
+    payload: {
+      node_id: "macmini",
+      workdir: "demo",
+      agent: "pi",
+      prompt: "Too many labels",
+      labels: Object.fromEntries(Array.from({ length: 17 }, (_, i) => [`k-${i}`, "v"]))
+    }
+  },
+  {
+    name: "run-create invalid uppercase label key",
+    schema: "run-create.schema.json",
+    valid: false,
+    payload: {
+      node_id: "macmini",
+      workdir: "demo",
+      agent: "pi",
+      prompt: "Invalid key",
+      labels: { BadKey: "val" }
+    }
+  },
+  {
+    name: "run-create invalid label value with control char",
+    schema: "run-create.schema.json",
+    valid: false,
+    payload: {
+      node_id: "macmini",
+      workdir: "demo",
+      agent: "pi",
+      prompt: "Control char value",
+      labels: { env: "line1\nline2" }
+    }
+  },
+  {
+    name: "run-create invalid label value exceeding 128 chars",
+    schema: "run-create.schema.json",
+    valid: false,
+    payload: {
+      node_id: "macmini",
+      workdir: "demo",
+      agent: "pi",
+      prompt: "Oversize label value",
+      labels: { env: "x".repeat(129) }
+    }
+  },
+  {
+    name: "run-create invalid non-object result_schema",
+    schema: "run-create.schema.json",
+    valid: false,
+    payload: {
+      node_id: "macmini",
+      workdir: "demo",
+      agent: "pi",
+      prompt: "Bad result_schema type",
+      result_schema: ["not", "an", "object"]
+    }
+  },
+  {
+    name: "plan-create valid node labels and result_schema",
+    schema: "plan-create.schema.json",
+    valid: true,
+    payload: {
+      nodes: [
+        {
+          key: "verify",
+          node_id: "macmini",
+          workdir: "demo",
+          agent: "pi",
+          prompt: "Run checks",
+          labels: { stage: "verify", "team/area": "e2e" },
+          result_schema: {
+            type: "object",
+            required: ["passed"],
+            properties: { passed: { type: "boolean" } }
+          }
+        }
+      ]
+    }
+  },
+  {
+    name: "PlanNodeSpec invalid ahub.* reserved label key",
+    schema: "plan-create.schema.json",
+    def: "PlanNodeSpec",
+    valid: false,
+    payload: {
+      key: "step-1",
+      node_id: "macmini",
+      workdir: "demo",
+      agent: "pi",
+      prompt: "Reserved node label",
+      labels: { "ahub.source": "caller" }
+    }
+  },
+  {
+    name: "PlanNodeSpec invalid 17 labels exceeding maxProperties",
+    schema: "plan-create.schema.json",
+    def: "PlanNodeSpec",
+    valid: false,
+    payload: {
+      key: "step-1",
+      node_id: "macmini",
+      workdir: "demo",
+      agent: "pi",
+      prompt: "Too many node labels",
+      labels: Object.fromEntries(Array.from({ length: 17 }, (_, i) => [`n-${i}`, "v"]))
+    }
+  },
+  {
+    name: "PlanNodeSpec invalid non-object result_schema",
+    schema: "plan-create.schema.json",
+    def: "PlanNodeSpec",
+    valid: false,
+    payload: {
+      key: "step-1",
+      node_id: "macmini",
+      workdir: "demo",
+      agent: "pi",
+      prompt: "Non-object result_schema",
+      result_schema: "not-object"
+    }
+  },
+  {
+    name: "run-record valid control-plane ahub.* label, result_schema, and structured result",
+    schema: "run-record.schema.json",
+    valid: true,
+    payload: {
+      id: "run_01JABCDEF123456794",
+      thread_id: "thr_01JABCDEF123456794",
+      root_run_id: "run_01JABCDEF123456794",
+      depth: 0,
+      max_depth: 1,
+      node_id: "macmini",
+      workdir: "/workspace/demo",
+      agent: "pi",
+      status: "done",
+      labels: {
+        env: "prod",
+        "ahub.plan_id": "pln_01JABCDEF123456789"
+      },
+      result_schema: { type: "object", properties: { ok: { type: "boolean" } } },
+      result: { ok: true, items: [1] },
+      created_at: "2026-11-22T12:00:00.000Z",
+      updated_at: "2026-11-22T12:00:05.000Z"
+    }
+  },
+  {
+    name: "run-record valid RESULT_SCHEMA_MISMATCH with null result and preserved output_md",
+    schema: "run-record.schema.json",
+    valid: true,
+    payload: {
+      id: "run_01JABCDEF123456795",
+      thread_id: "thr_01JABCDEF123456795",
+      root_run_id: "run_01JABCDEF123456795",
+      depth: 0,
+      max_depth: 1,
+      node_id: "macmini",
+      workdir: "/workspace/demo",
+      agent: "pi",
+      status: "failed",
+      error_code: "RESULT_SCHEMA_MISMATCH",
+      error_message: "Structured result did not match schema.",
+      result_schema: { type: "object", required: ["ok"] },
+      result: null,
+      output_md: "preserved",
+      output_bytes: 9,
+      created_at: "2026-11-22T12:00:00.000Z",
+      updated_at: "2026-11-22T12:00:05.000Z"
+    }
+  },
+  {
+    name: "run-record invalid 17 labels exceeding maxProperties",
+    schema: "run-record.schema.json",
+    valid: false,
+    payload: {
+      id: "run_01JABCDEF123456796",
+      thread_id: "thr_01JABCDEF123456796",
+      root_run_id: "run_01JABCDEF123456796",
+      depth: 0,
+      max_depth: 1,
+      node_id: "macmini",
+      workdir: "/workspace/demo",
+      agent: "pi",
+      status: "done",
+      labels: Object.fromEntries(Array.from({ length: 17 }, (_, i) => [`r-${i}`, "v"])),
+      created_at: "2026-11-22T12:00:00.000Z",
+      updated_at: "2026-11-22T12:00:05.000Z"
+    }
+  },
+  {
+    name: "run-record invalid label value with control char and 129 chars",
+    schema: "run-record.schema.json",
+    valid: false,
+    payload: {
+      id: "run_01JABCDEF123456797",
+      thread_id: "thr_01JABCDEF123456797",
+      root_run_id: "run_01JABCDEF123456797",
+      depth: 0,
+      max_depth: 1,
+      node_id: "macmini",
+      workdir: "/workspace/demo",
+      agent: "pi",
+      status: "done",
+      labels: { bad_ctrl: "a\u0007b", too_long: "y".repeat(129) },
+      created_at: "2026-11-22T12:00:00.000Z",
+      updated_at: "2026-11-22T12:00:05.000Z"
+    }
+  },
+  {
+    name: "run-record invalid array result_schema",
+    schema: "run-record.schema.json",
+    valid: false,
+    payload: {
+      id: "run_01JABCDEF123456798",
+      thread_id: "thr_01JABCDEF123456798",
+      root_run_id: "run_01JABCDEF123456798",
+      depth: 0,
+      max_depth: 1,
+      node_id: "macmini",
+      workdir: "/workspace/demo",
+      agent: "pi",
+      status: "done",
+      result_schema: [],
+      created_at: "2026-11-22T12:00:00.000Z",
+      updated_at: "2026-11-22T12:00:05.000Z"
+    }
+  },
+  {
+    name: "ws-frames valid run.updated with ahub.* label, result_schema, and result",
+    schema: "ws-frames.schema.json",
+    valid: true,
+    payload: {
+      type: "run.updated",
+      run: {
+        id: "run_01JABCDEF123456799",
+        thread_id: "thr_01JABCDEF123456799",
+        root_run_id: "run_01JABCDEF123456799",
+        depth: 0,
+        max_depth: 1,
+        node_id: "macmini",
+        workdir: "/workspace/demo",
+        agent: "pi",
+        status: "done",
+        labels: { env: "eval", "ahub.plan_id": "pln_01JABCDEF123456789" },
+        result_schema: { type: "object" },
+        result: { ok: true },
+        created_at: "2026-11-22T12:00:00.000Z",
+        updated_at: "2026-11-22T12:00:05.000Z"
+      }
+    }
+  },
+  {
+    name: "ws-frames valid snapshot with Slice 3 RunRecord fields",
+    schema: "ws-frames.schema.json",
+    valid: true,
+    payload: {
+      type: "snapshot",
+      nodes: [],
+      runs: [
+        {
+          id: "run_01JABCDEF123456800",
+          thread_id: "thr_01JABCDEF123456800",
+          root_run_id: "run_01JABCDEF123456800",
+          depth: 0,
+          max_depth: 1,
+          node_id: "macmini",
+          workdir: "/workspace/demo",
+          agent: "pi",
+          status: "done",
+          labels: { "svc.tier": "gold" },
+          result_schema: null,
+          result: "scalar-result",
+          created_at: "2026-11-22T12:00:00.000Z",
+          updated_at: "2026-11-22T12:00:05.000Z"
+        }
+      ],
+      ts: "2026-11-22T12:00:05.000Z"
+    }
+  },
+  {
+    name: "ws-frames invalid run.updated with 17 labels",
+    schema: "ws-frames.schema.json",
+    valid: false,
+    payload: {
+      type: "run.updated",
+      run: {
+        id: "run_01JABCDEF123456801",
+        thread_id: "thr_01JABCDEF123456801",
+        root_run_id: "run_01JABCDEF123456801",
+        depth: 0,
+        max_depth: 1,
+        node_id: "macmini",
+        workdir: "/workspace/demo",
+        agent: "pi",
+        status: "done",
+        labels: Object.fromEntries(Array.from({ length: 17 }, (_, i) => [`w-${i}`, "v"])),
+        created_at: "2026-11-22T12:00:00.000Z",
+        updated_at: "2026-11-22T12:00:05.000Z"
+      }
+    }
+  },
+  {
+    name: "ws-frames invalid run.updated with string result_schema",
+    schema: "ws-frames.schema.json",
+    valid: false,
+    payload: {
+      type: "run.updated",
+      run: {
+        id: "run_01JABCDEF123456802",
+        thread_id: "thr_01JABCDEF123456802",
+        root_run_id: "run_01JABCDEF123456802",
+        depth: 0,
+        max_depth: 1,
+        node_id: "macmini",
+        workdir: "/workspace/demo",
+        agent: "pi",
+        status: "done",
+        result_schema: "bad",
+        created_at: "2026-11-22T12:00:00.000Z",
+        updated_at: "2026-11-22T12:00:05.000Z"
+      }
+    }
   }
 ];
 

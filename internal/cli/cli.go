@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -364,8 +366,8 @@ func runRun(g globalOpts, args []string) int {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	var nodeID, dir, agent, modelFlag, effortFlag, threadID, notifyTarget, idemKey, title string
-	var inFlag, topicFlag, asFlag string
-	var afterFlags strictStringSliceFlag
+	var inFlag, topicFlag, asFlag, resultSchemaFlag string
+	var afterFlags, labelFlags strictStringSliceFlag
 	var noSandbox bool
 	var timeoutDur, waitDur time.Duration
 
@@ -386,6 +388,8 @@ func runRun(g globalOpts, args []string) int {
 	fs.StringVar(&inFlag, "in", "", "delay before queuing (1m..7d)")
 	fs.StringVar(&topicFlag, "topic", "", "board topic id for terminal handoff writeback")
 	fs.StringVar(&asFlag, "as", "", "actor profile attribution")
+	fs.Var(&labelFlags, "label", "run label key=value (repeatable, max 16)")
+	fs.StringVar(&resultSchemaFlag, "result-schema", "", "inline JSON schema, @file, or '-' for stdin")
 	fs.BoolVar(&noSandbox, "no-sandbox", false, "disable sandbox")
 	fs.DurationVar(&timeoutDur, "timeout", 15*time.Minute, "run timeout")
 	fs.DurationVar(&waitDur, "wait", 45*time.Second, "wait timeout")
@@ -396,16 +400,20 @@ func runRun(g globalOpts, args []string) int {
 		"--effort": true, "--thread": true, "--title": true,
 		"--notify": true, "--idempotency-key": true,
 		"--after": true, "--in": true, "--topic": true, "--as": true,
+		"--label": true, "--result-schema": true,
 		"--timeout": true, "--wait": true,
 	}
 	if err := parseFlagsFlexible(fs, args, valFlags); err != nil {
 		return api.ExitBadUsageOrInput
 	}
 
-	var waitExplicit bool
+	var waitExplicit, resultSchemaSet bool
 	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "wait" {
+		switch f.Name {
+		case "wait":
 			waitExplicit = true
+		case "result-schema":
+			resultSchemaSet = true
 		}
 	})
 
@@ -413,8 +421,17 @@ func runRun(g globalOpts, args []string) int {
 	if len(pos) == 0 {
 		return failUsage(g.JSON, "prompt argument or '-' (stdin) is required")
 	}
+	promptUsedStdin := pos[0] == "-"
+	if resultSchemaSet {
+		if strings.TrimSpace(resultSchemaFlag) == "" {
+			return failUsage(g.JSON, "--result-schema cannot be empty")
+		}
+		if promptUsedStdin && strings.TrimSpace(resultSchemaFlag) == "-" {
+			return failUsage(g.JSON, "cannot read both prompt and --result-schema from stdin")
+		}
+	}
 	var prompt string
-	if pos[0] == "-" {
+	if promptUsedStdin {
 		raw, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return failErr(g.JSON, err)
@@ -434,6 +451,19 @@ func runRun(g globalOpts, args []string) int {
 	dependsOn, err := parseAfterRunIDs(afterFlags)
 	if err != nil {
 		return failUsage(g.JSON, err.Error())
+	}
+
+	labels, err := parseRunLabelsFlag(labelFlags)
+	if err != nil {
+		return failUsage(g.JSON, err.Error())
+	}
+
+	var resultSchema json.RawMessage
+	if resultSchemaSet {
+		resultSchema, err = parseResultSchemaFlag(resultSchemaFlag, promptUsedStdin)
+		if err != nil {
+			return failUsage(g.JSON, err.Error())
+		}
 	}
 
 	scheduledAt := ""
@@ -487,6 +517,8 @@ func runRun(g globalOpts, args []string) int {
 		ScheduledAt:    scheduledAt,
 		BoardTopicID:   topicID,
 		ActorProfile:   actorProfile,
+		Labels:         labels,
+		ResultSchema:   resultSchema,
 	}
 	if notifyTarget != "" {
 		req.Notify = &api.NotifyConfig{Target: notifyTarget}
@@ -757,15 +789,16 @@ done:
 func runResult(g globalOpts, args []string) int {
 	fs := flag.NewFlagSet("result", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	var full bool
+	var dataOnly, full bool
 	var tail int
+	fs.BoolVar(&dataOnly, "data", false, "output structured result data")
 	fs.BoolVar(&full, "full", false, "return full output_md")
 	fs.IntVar(&tail, "tail", 16384, "tail bytes for summary preview")
 	if err := parseFlagsFlexible(fs, args, map[string]bool{"--tail": true}); err != nil {
 		return api.ExitBadUsageOrInput
 	}
 	if fs.NArg() < 1 {
-		return failUsage(g.JSON, "usage: ahub result <run_id> [--full] [--tail 16384] [--json]")
+		return failUsage(g.JSON, "usage: ahub result <run_id> [--data] [--full] [--tail 16384] [--json]")
 	}
 	runID := fs.Arg(0)
 
@@ -779,7 +812,11 @@ func runResult(g globalOpts, args []string) int {
 	if err != nil {
 		return failErr(g.JSON, err)
 	}
-	outputRunResult(g.JSON, run, full)
+	if dataOnly {
+		outputRunResultData(g.JSON, run, full)
+	} else {
+		outputRunResult(g.JSON, run, full)
+	}
 	if isWaitStopState(run.Status) {
 		return api.ExitCodeForRunStatus(run.Status)
 	}
@@ -790,14 +827,16 @@ func runRuns(g globalOpts, args []string) int {
 	fs := flag.NewFlagSet("runs", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	var nodeID, status, planID, topicID string
+	var labelFlags strictStringSliceFlag
 	var limit int
 	fs.StringVar(&nodeID, "node", "", "filter by node id")
 	fs.StringVar(&status, "status", "", "filter by status")
 	fs.StringVar(&planID, "plan", "", "filter by plan id (pln_...)")
 	fs.StringVar(&topicID, "topic", "", "filter by board topic id (top_...)")
+	fs.Var(&labelFlags, "label", "filter by label key=value (repeatable, max 8)")
 	fs.IntVar(&limit, "limit", 20, "limit")
 	valFlags := map[string]bool{
-		"--node": true, "--status": true, "--plan": true, "--topic": true, "--limit": true,
+		"--node": true, "--status": true, "--plan": true, "--topic": true, "--label": true, "--limit": true,
 	}
 	if err := parseFlagsFlexible(fs, args, valFlags); err != nil {
 		return api.ExitBadUsageOrInput
@@ -814,6 +853,10 @@ func runRuns(g globalOpts, args []string) int {
 	if err := validateBoardTopicID(topicID); err != nil {
 		return failUsage(g.JSON, err.Error())
 	}
+	labelsFilter, err := parseRunLabelFilters(labelFlags)
+	if err != nil {
+		return failUsage(g.JSON, err.Error())
+	}
 
 	client, err := newClient(g)
 	if err != nil {
@@ -826,6 +869,7 @@ func runRuns(g globalOpts, args []string) int {
 		Status:       status,
 		PlanID:       planID,
 		BoardTopicID: topicID,
+		Labels:       labelsFilter,
 		Limit:        limit,
 	})
 	if err != nil {
@@ -839,7 +883,8 @@ func runRuns(g globalOpts, args []string) int {
 		writeJSON(map[string]interface{}{"ok": true, "runs": outRuns})
 	} else {
 		for _, r := range runs {
-			fmt.Printf("%s  %-14s %-10s %-6s %s\n", r.ID, r.Status, r.NodeID, r.Agent, r.Summary)
+			s := sanitizeRunRecord(r, false)
+			fmt.Printf("%s  %-14s %-10s %-6s %s\n", s.ID, s.Status, s.NodeID, s.Agent, s.Summary)
 		}
 	}
 	return api.ExitOK
@@ -866,10 +911,14 @@ func runThreads(g globalOpts, args []string) int {
 	if err != nil {
 		return failErr(g.JSON, err)
 	}
+	outThreads := make([]api.ThreadRecord, 0, len(threads))
+	for _, t := range threads {
+		outThreads = append(outThreads, sanitizeThreadRecord(t))
+	}
 	if g.JSON {
-		writeJSON(map[string]interface{}{"ok": true, "threads": threads})
+		writeJSON(map[string]interface{}{"ok": true, "threads": outThreads})
 	} else {
-		for _, t := range threads {
+		for _, t := range outThreads {
 			fmt.Printf("%s  %-10s %-6s %-16s %s\n", t.ID, t.NodeID, t.Agent, t.ProjectKey, t.Title)
 		}
 	}
@@ -1435,11 +1484,59 @@ func clearEmptyPtr(p *string) *string {
 	return p
 }
 
+func redactRawJSON(raw json.RawMessage) json.RawMessage {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	dec.UseNumber()
+	var decoded interface{}
+	if err := dec.Decode(&decoded); err != nil {
+		return nil
+	}
+	var trailing interface{}
+	if err := dec.Decode(&trailing); err != io.EOF {
+		return nil
+	}
+	redacted := redact.Value(decoded)
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(redacted); err != nil {
+		return nil
+	}
+	return json.RawMessage(bytes.TrimSpace(buf.Bytes()))
+}
+
+func sanitizeThreadRecord(t api.ThreadRecord) api.ThreadRecord {
+	t.Title = redact.Text(t.Title)
+	return t
+}
+
 func sanitizeRunRecord(r api.RunRecord, full bool) api.RunRecord {
 	r.LeaseOwner = ""
 	r.Prompt = redact.Text(r.Prompt)
 	if !full && r.Prompt != "" {
 		r.Prompt, _ = redact.TruncateUTF8(r.Prompt, 1536)
+	}
+	r.RemoteControlURL = redact.Text(r.RemoteControlURL)
+	r.Summary = redact.Text(r.Summary)
+	r.OutputPreview = redact.Text(r.OutputPreview)
+	r.OutputMD = redact.Text(r.OutputMD)
+	r.ErrorMessage = redact.Text(r.ErrorMessage)
+	if len(r.Labels) > 0 {
+		cleaned := make(map[string]string, len(r.Labels))
+		for k, v := range r.Labels {
+			cleaned[k] = redact.Text(v)
+		}
+		r.Labels = cleaned
+	}
+	if len(r.ResultSchema) > 0 {
+		r.ResultSchema = redactRawJSON(r.ResultSchema)
+	}
+	if len(r.Result) > 0 {
+		r.Result = redactRawJSON(r.Result)
 	}
 	r.ParentRunID = clearEmptyPtr(r.ParentRunID)
 	r.PlanID = clearEmptyPtr(r.PlanID)
@@ -1449,6 +1546,48 @@ func sanitizeRunRecord(r api.RunRecord, full bool) api.RunRecord {
 	r.BoardTopicID = clearEmptyPtr(r.BoardTopicID)
 	r.BlockedReason = clearEmptyPtr(r.BlockedReason)
 	return r
+}
+
+func outputRunResultData(asJSON bool, run *api.RunRecord, full bool) {
+	if run == nil {
+		return
+	}
+	sanitized := sanitizeRunRecord(*run, full)
+	resRaw := json.RawMessage(bytes.TrimSpace(sanitized.Result))
+	if len(resRaw) == 0 {
+		resRaw = json.RawMessage("null")
+	}
+	if asJSON {
+		writeJSON(struct {
+			OK           bool            `json:"ok"`
+			RunID        string          `json:"run_id"`
+			Status       string          `json:"status"`
+			Result       json.RawMessage `json:"result"`
+			ErrorCode    string          `json:"error_code,omitempty"`
+			ErrorMessage string          `json:"error_message,omitempty"`
+		}{
+			OK:           true,
+			RunID:        sanitized.ID,
+			Status:       sanitized.Status,
+			Result:       resRaw,
+			ErrorCode:    sanitized.ErrorCode,
+			ErrorMessage: sanitized.ErrorMessage,
+		})
+		return
+	}
+	if bytes.Equal(resRaw, []byte("null")) {
+		fmt.Println("null")
+	} else {
+		var pretty bytes.Buffer
+		if err := json.Indent(&pretty, resRaw, "", "  "); err == nil {
+			fmt.Println(pretty.String())
+		} else {
+			fmt.Println(string(resRaw))
+		}
+	}
+	if sanitized.ErrorCode != "" {
+		fmt.Fprintf(os.Stderr, "Error [%s]: %s\n", sanitized.ErrorCode, sanitized.ErrorMessage)
+	}
 }
 
 func outputRunResult(asJSON bool, run *api.RunRecord, full bool) {
@@ -1461,7 +1600,19 @@ func outputRunResult(asJSON bool, run *api.RunRecord, full bool) {
 		writeJSON(sanitized)
 		return
 	}
-	fmt.Printf("Run %s [%s] node=%s agent=%s duration=%dms\n", run.ID, run.Status, run.NodeID, run.Agent, run.DurationMs)
+	fmt.Printf("Run %s [%s] node=%s agent=%s duration=%dms\n", sanitized.ID, sanitized.Status, sanitized.NodeID, sanitized.Agent, sanitized.DurationMs)
+	if len(sanitized.Labels) > 0 {
+		keys := make([]string, 0, len(sanitized.Labels))
+		for k := range sanitized.Labels {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		pairs := make([]string, 0, len(keys))
+		for _, k := range keys {
+			pairs = append(pairs, k+"="+sanitized.Labels[k])
+		}
+		fmt.Printf("Labels: %s\n", strings.Join(pairs, ", "))
+	}
 	if sanitized.Status == "waiting" {
 		if sanitized.BlockedReason != nil && *sanitized.BlockedReason != "" {
 			fmt.Printf("Blocked Reason: %s\n", *sanitized.BlockedReason)
@@ -1473,19 +1624,27 @@ func outputRunResult(asJSON bool, run *api.RunRecord, full bool) {
 	if sanitized.Prompt != "" {
 		fmt.Printf("Prompt:\n%s\n", sanitized.Prompt)
 	}
-	if run.RemoteControlURL != "" {
-		fmt.Printf("Approval URL: %s\n", run.RemoteControlURL)
+	if sanitized.RemoteControlURL != "" {
+		fmt.Printf("Approval URL: %s\n", sanitized.RemoteControlURL)
 	}
-	if run.Summary != "" {
-		fmt.Printf("Summary: %s\n", run.Summary)
+	if sanitized.Summary != "" {
+		fmt.Printf("Summary: %s\n", sanitized.Summary)
 	}
-	if run.OutputMD != "" {
-		fmt.Println(run.OutputMD)
-	} else if run.OutputPreview != "" {
-		fmt.Println(run.OutputPreview)
+	if trimmedRes := bytes.TrimSpace(sanitized.Result); len(trimmedRes) > 0 && !bytes.Equal(trimmedRes, []byte("null")) {
+		var pretty bytes.Buffer
+		if err := json.Indent(&pretty, trimmedRes, "", "  "); err == nil {
+			fmt.Printf("Result:\n%s\n", pretty.String())
+		} else {
+			fmt.Printf("Result:\n%s\n", string(trimmedRes))
+		}
 	}
-	if run.ErrorCode != "" {
-		fmt.Fprintf(os.Stderr, "Error [%s]: %s\n", run.ErrorCode, run.ErrorMessage)
+	if sanitized.OutputMD != "" {
+		fmt.Println(sanitized.OutputMD)
+	} else if sanitized.OutputPreview != "" {
+		fmt.Println(sanitized.OutputPreview)
+	}
+	if sanitized.ErrorCode != "" {
+		fmt.Fprintf(os.Stderr, "Error [%s]: %s\n", sanitized.ErrorCode, sanitized.ErrorMessage)
 	}
 }
 
@@ -1558,12 +1717,12 @@ Commands:
   auth login      Validate and save client credentials (0600, supports --token-stdin)
   auth status     Inspect redacted client credentials and optional --verify connectivity
   nodes           List registered nodes and workspaces
-  run             Create and dispatch a run (supports --after, --in, --topic, --as, '-' stdin)
+  run             Create and dispatch a run (supports --after, --in, --topic, --as, --label, --result-schema, '-' stdin)
   plan            Submit a cross-machine DAG plan from JSON file or '-' stdin
   retry           Retry a failed or cancelled run and rebind waiting dependents
   wait            Wait for a run over WebSocket until terminal or needs_approval
-  result          Fetch run summary or --full output
-  runs            List recent runs (supports --status, --plan, --topic)
+  result          Fetch run summary, --data structured result, or --full output
+  runs            List recent runs (supports --status, --plan, --topic, --label)
   threads         List threads
   activity        Inspect read-only native agent activity across nodes (admin only)
   board           Post, read, ask, or wait on cross-machine coordination board

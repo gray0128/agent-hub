@@ -621,7 +621,7 @@ func TestInvariant_Slice2_PlansValidationScopeAndCancel(t *testing.T) {
 
 	macRoot := filepath.Join(h.tmpDir, "workspaces", "s2p-mac-root")
 	macAlpha := h.makeWorkspaceDir(filepath.Join("s2p-mac-root", "proj-alpha"))
-	_ = h.makeWorkspaceDir(filepath.Join("s2p-mac-root", "cnb", "demo"))
+	macCnbDemo := h.makeWorkspaceDir(filepath.Join("s2p-mac-root", "cnb", "demo"))
 	_ = h.makeWorkspaceDir(filepath.Join("s2p-mac-root", "github", "demo"))
 
 	mbpRoot := filepath.Join(h.tmpDir, "workspaces", "s2p-mbp-root")
@@ -825,7 +825,7 @@ func TestInvariant_Slice2_PlansValidationScopeAndCancel(t *testing.T) {
 		t.Fatalf("invalid/cyclic plans leaked %d run_dependencies rows into D1", afterDeps-beforeDeps)
 	}
 
-	// 3. max_depth = 1 multi-step plan compatibility vs depth=2 rejection + client scope (P-08)
+	// 3. max_depth = 1 multi-step plan compatibility vs depth=2 rejection + T5-01 cross-tenant parent_run_id isolation + client scope (P-08)
 	parentRun := s2CreateRun(t, h, h.adminToken, map[string]interface{}{
 		"node_id": "mbp",
 		"workdir": mbpDir,
@@ -834,9 +834,17 @@ func TestInvariant_Slice2_PlansValidationScopeAndCancel(t *testing.T) {
 	})
 	_ = s2WaitRunStatus(t, h, h.adminToken, parentRun.ID, "done", 10*time.Second)
 
-	// Depth 0 parent submitting a 2-step plan on macmini succeeds at depth=1
+	clientParentRun := s2CreateRun(t, h, clientTok, map[string]interface{}{
+		"node_id": "macmini",
+		"workdir": macCnbDemo,
+		"agent":   "agy",
+		"prompt":  `{"directives":[{"op":"sleep","ms":30}]}`,
+	})
+	_ = s2WaitRunStatus(t, h, clientTok, clientParentRun.ID, "done", 10*time.Second)
+
+	// Depth 0 parent submitting a 2-step plan on macmini succeeds at depth=1 (same tenant)
 	stSubPlan, rawSubPlan := h.doJSON(http.MethodPost, "/api/v1/plans", clientTok, map[string]interface{}{
-		"parent_run_id":  parentRun.ID,
+		"parent_run_id":  clientParentRun.ID,
 		"board_topic_id": topDemo.ID,
 		"nodes": []map[string]interface{}{
 			{"key": "c1", "node_id": "macmini", "workdir": macAlpha, "agent": "agy", "in_sec": 300, "prompt": "d1"},
@@ -862,6 +870,43 @@ func TestInvariant_Slice2_PlansValidationScopeAndCancel(t *testing.T) {
 		},
 	})
 	s2AssertError(t, stDeep, rawDeep, http.StatusConflict, "DEPTH_LIMIT_EXCEEDED")
+
+	// T5-01: Cross-tenant parent_run_id on /runs and /plans must fail 403 FORBIDDEN_SCOPE without lineage pollution
+	_, client2Tok := h.mustCreateKeyWithPrefixes("s2p-client-2", "client", []string{"macmini"}, []string{"proj/demo"}, true)
+	for _, tc := range []struct {
+		name     string
+		tok      string
+		parentID string
+	}{
+		{"client_attaches_to_admin_other_node", clientTok, parentRun.ID},
+		{"client2_attaches_to_client1_same_node", client2Tok, clientParentRun.ID},
+	} {
+		stCR, rawCR := h.doJSON(http.MethodPost, "/api/v1/runs?wait_ms=0", tc.tok, map[string]interface{}{
+			"node_id":       "macmini",
+			"workdir":       macAlpha,
+			"agent":         "agy",
+			"parent_run_id": tc.parentID,
+			"prompt":        "t501 cross tenant run " + tc.name,
+		})
+		s2AssertError(t, stCR, rawCR, http.StatusForbidden, "FORBIDDEN_SCOPE")
+
+		stCP, rawCP := h.doJSON(http.MethodPost, "/api/v1/plans", tc.tok, map[string]interface{}{
+			"parent_run_id": tc.parentID,
+			"nodes": []map[string]interface{}{
+				{"key": "t501", "node_id": "macmini", "workdir": macAlpha, "agent": "agy", "prompt": "t501 cross tenant plan"},
+			},
+		})
+		s2AssertError(t, stCP, rawCP, http.StatusForbidden, "FORBIDDEN_SCOPE")
+	}
+	stTreeAdm, rawTreeAdm := h.doJSON(http.MethodGet, "/api/v1/runs?root_run_id="+parentRun.ID, h.adminToken, nil)
+	if stTreeAdm != http.StatusOK {
+		t.Fatalf("GET root_run_id lineage failed (%d): %s", stTreeAdm, string(rawTreeAdm))
+	}
+	var treeAdmResp evalSlice2RunsListResp
+	_ = json.Unmarshal(rawTreeAdm, &treeAdmResp)
+	if len(treeAdmResp.Runs) != 1 {
+		t.Fatalf("T5-01 lineage pollution under admin parentRun %s: got %d runs", parentRun.ID, len(treeAdmResp.Runs))
+	}
 
 	// Delegation cycle in plan -> 409 DELEGATION_CYCLE_DETECTED
 	stDelCyc, rawDelCyc := h.doJSON(http.MethodPost, "/api/v1/plans", h.adminToken, map[string]interface{}{
@@ -1075,6 +1120,135 @@ func TestInvariant_Slice2_PlansValidationScopeAndCancel(t *testing.T) {
 		t.Fatalf("F7 Tier 1 #5 unexpected RunRecord: %+v (raw=%s)", waitNotifyRec, waitNotifyOut)
 	}
 	_, _ = h.doJSON(http.MethodPost, "/api/v1/runs/"+waitNotifyRec.ID+"/cancel", h.adminToken, map[string]interface{}{"cascade": false})
+
+	// 7. Thread title secret redaction across runs, plans (+ idempotency), PATCH /threads/:id, fork, REST, and ahub threads CLI
+	const (
+		thrPromptSecret   = "sk-proj-SubstrateRunLine1Secret9876543210"
+		thrPatchSecret    = "xoxb-" + "123456789012-1234567890123-SubstratePatchSec"
+		thrPlanPromptSec  = "ahub_adm_SubstratePlanPromptSec1234"
+		thrPlanExplicitSec = "sk-proj-SubstratePlanExplicitSec1234567890"
+	)
+	runLeakTest := s2CreateRun(t, h, h.adminToken, map[string]interface{}{
+		"node_id": "macmini",
+		"workdir": macAlpha,
+		"agent":   "agy",
+		"prompt":  "Check token=" + thrPromptSecret + " please\n{\"directives\":[{\"op\":\"sleep\",\"ms\":10}]}",
+	}, http.StatusAccepted)
+
+	assertThreadsNoSecret := func(label string, forbidden ...string) []api.ThreadRecord {
+		t.Helper()
+		stThr, rawThr := h.doJSON(http.MethodGet, "/api/v1/threads?limit=50", h.adminToken, nil)
+		if stThr != http.StatusOK {
+			t.Fatalf("%s GET /api/v1/threads failed (%d): %s", label, stThr, string(rawThr))
+		}
+		for _, sec := range forbidden {
+			if strings.Contains(string(rawThr), sec) {
+				t.Fatalf("%s GET /api/v1/threads leaked secret %q: %s", label, sec, string(rawThr))
+			}
+		}
+		var resp struct {
+			OK      bool               `json:"ok"`
+			Threads []api.ThreadRecord `json:"threads"`
+		}
+		if err := json.Unmarshal(rawThr, &resp); err != nil || !resp.OK {
+			t.Fatalf("%s decode /api/v1/threads failed: err=%v body=%s", label, err, string(rawThr))
+		}
+		return resp.Threads
+	}
+
+	threadsAfterRun := assertThreadsNoSecret("prompt-derived /runs", thrPromptSecret)
+	var foundRunThr bool
+	for _, th := range threadsAfterRun {
+		if th.ID == runLeakTest.ThreadID {
+			foundRunThr = true
+			if !strings.Contains(th.Title, "[REDACTED]") {
+				t.Fatalf("expected [REDACTED] in prompt-derived thread title, got %q", th.Title)
+			}
+		}
+	}
+	if !foundRunThr {
+		t.Fatalf("thread %s missing from GET /api/v1/threads", runLeakTest.ThreadID)
+	}
+
+	// Verify ahub threads --json masks secrets and matches
+	cliThrCode, cliThrOut, cliThrErr := h.runCLI("", "--json", "threads")
+	if cliThrCode != api.ExitOK {
+		t.Fatalf("ahub threads --json failed (%d): stdout=%s stderr=%s", cliThrCode, cliThrOut, cliThrErr)
+	}
+	if strings.Contains(cliThrOut, thrPromptSecret) || !strings.Contains(cliThrOut, "[REDACTED]") {
+		t.Fatalf("ahub threads --json secret redaction check failed: %s", cliThrOut)
+	}
+
+	// Verify POST /api/v1/threads/:id/fork propagates redacted title
+	stFork, rawFork := h.doJSON(http.MethodPost, "/api/v1/threads/"+runLeakTest.ThreadID+"/fork", h.adminToken, map[string]interface{}{
+		"node_id": "macmini",
+		"workdir": macAlpha,
+	})
+	if stFork != http.StatusAccepted {
+		t.Fatalf("fork thread failed (%d): %s", stFork, string(rawFork))
+	}
+	if strings.Contains(string(rawFork), thrPromptSecret) || !strings.Contains(string(rawFork), "[REDACTED]") {
+		t.Fatalf("forked thread leaked or dropped redaction: %s", string(rawFork))
+	}
+
+	// Verify PATCH /api/v1/threads/:id redacts title
+	stPatch, rawPatch := h.doJSON(http.MethodPatch, "/api/v1/threads/"+runLeakTest.ThreadID, h.adminToken, map[string]interface{}{
+		"title": "Patched " + thrPatchSecret,
+	})
+	if stPatch != http.StatusOK {
+		t.Fatalf("PATCH /api/v1/threads/%s failed (%d): %s", runLeakTest.ThreadID, stPatch, string(rawPatch))
+	}
+	if strings.Contains(string(rawPatch), thrPatchSecret) || !strings.Contains(string(rawPatch), "[REDACTED]") {
+		t.Fatalf("PATCH /api/v1/threads response leaked or missed redaction: %s", string(rawPatch))
+	}
+	assertThreadsNoSecret("patched thread", thrPromptSecret, thrPatchSecret)
+
+	// Verify POST /api/v1/plans redacts prompt-derived & explicit titles AND idempotent replay returns 200 deduplicated: true
+	planSecretPayload := map[string]interface{}{
+		"idempotency_key": "sub_plan_thr_secret_01",
+		"nodes": []map[string]interface{}{
+			{
+				"key": "p_prompt", "node_id": "macmini", "workdir": macAlpha, "agent": "agy",
+				"prompt": "Plan " + thrPlanPromptSec + "\n{\"directives\":[{\"op\":\"sleep\",\"ms\":10}]}",
+			},
+			{
+				"key": "p_explicit", "node_id": "macmini", "workdir": macAlpha, "agent": "agy",
+				"title":      "Explicit " + thrPlanExplicitSec,
+				"depends_on": []string{"p_prompt"},
+				"prompt":     `{"directives":[{"op":"sleep","ms":10}]}`,
+			},
+		},
+	}
+	stPlanSec, rawPlanSec := h.doJSON(http.MethodPost, "/api/v1/plans", h.adminToken, planSecretPayload)
+	if stPlanSec != http.StatusCreated {
+		t.Fatalf("POST /api/v1/plans with secrets failed (%d): %s", stPlanSec, string(rawPlanSec))
+	}
+	assertThreadsNoSecret("plan threads", thrPlanPromptSec, thrPlanExplicitSec)
+
+	stPlanReplay, rawPlanReplay := h.doJSON(http.MethodPost, "/api/v1/plans", h.adminToken, planSecretPayload)
+	if stPlanReplay != http.StatusOK {
+		t.Fatalf("idempotent replay of secret-containing plan expected 200, got %d: %s", stPlanReplay, string(rawPlanReplay))
+	}
+	var replayPlanResp evalSlice2PlanResp
+	if err := json.Unmarshal(rawPlanReplay, &replayPlanResp); err != nil || !replayPlanResp.Deduplicated {
+		t.Fatalf("expected deduplicated=true on plan replay, err=%v body=%s", err, string(rawPlanReplay))
+	}
+
+	// Mutated title on same idempotency_key must still 409 IDEMPOTENCY_CONFLICT
+	mutatedNodes := []map[string]interface{}{
+		planSecretPayload["nodes"].([]map[string]interface{})[0],
+		{
+			"key": "p_explicit", "node_id": "macmini", "workdir": macAlpha, "agent": "agy",
+			"title":      "Explicit Changed",
+			"depends_on": []string{"p_prompt"},
+			"prompt":     `{"directives":[{"op":"sleep","ms":10}]}`,
+		},
+	}
+	stPlanMut, rawPlanMut := h.doJSON(http.MethodPost, "/api/v1/plans", h.adminToken, map[string]interface{}{
+		"idempotency_key": "sub_plan_thr_secret_01",
+		"nodes":           mutatedNodes,
+	})
+	s2AssertError(t, stPlanMut, rawPlanMut, http.StatusConflict, "IDEMPOTENCY_CONFLICT")
 }
 
 // I-14 (F4 + F5 + P-02 + P-04): POST /api/v1/runs/:id/retry terminal immutability,

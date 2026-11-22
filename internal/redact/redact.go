@@ -26,7 +26,7 @@ var (
 	isoDateRe          = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}`)
 	lettersOnlyRe      = regexp.MustCompile(`^[A-Za-z]+$`)
 	hasAlnumRe         = regexp.MustCompile(`[A-Za-z0-9]`)
-	placeholderWords   = map[string]bool{"true": true, "false": true, "null": true, "none": true, "env": true, "file": true, "flag": true}
+	placeholderWords   = map[string]bool{"true": true, "false": true, "null": true, "none": true, "env": true, "file": true, "flag": true, "__missing__": true}
 )
 
 func unwrapQuote(raw string) (quote, inner string, quoted bool) {

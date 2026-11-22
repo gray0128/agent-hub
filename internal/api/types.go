@@ -1,5 +1,7 @@
 package api
 
+import "encoding/json"
+
 type WorkspaceEntry struct {
 	Key           string `json:"key"`
 	Path          string `json:"path"`
@@ -172,6 +174,9 @@ type RunRecord struct {
 	BoardTopicID      *string            `json:"board_topic_id,omitempty"`
 	DependsOnRunIDs   []string           `json:"depends_on_run_ids,omitempty"`
 	BlockedReason     *string            `json:"blocked_reason,omitempty"`
+	Labels            map[string]string  `json:"labels,omitempty"`
+	ResultSchema      json.RawMessage    `json:"result_schema,omitempty"`
+	Result            json.RawMessage    `json:"result,omitempty"`
 	PriorityOrder     float64            `json:"priority_order,omitempty"`
 	LeaseOwner        string             `json:"lease_owner,omitempty"`
 	ResolvedModel     string             `json:"resolved_model,omitempty"`
@@ -202,23 +207,25 @@ type NotifyConfig struct {
 }
 
 type CreateRunRequest struct {
-	ThreadID       string        `json:"thread_id,omitempty"`
-	NodeID         string        `json:"node_id,omitempty"`
-	Workdir        string        `json:"workdir,omitempty"`
-	Agent          string        `json:"agent,omitempty"`
-	Model          string        `json:"model,omitempty"`
-	Effort         string        `json:"effort,omitempty"`
-	Sandbox        *bool         `json:"sandbox,omitempty"`
-	TimeoutSec     int           `json:"timeout_sec,omitempty"`
-	Prompt         string        `json:"prompt"`
-	Title          string        `json:"title,omitempty"`
-	ParentRunID    string        `json:"parent_run_id,omitempty"`
-	IdempotencyKey string        `json:"idempotency_key,omitempty"`
-	DependsOn      []string      `json:"depends_on,omitempty"`
-	ScheduledAt    string        `json:"scheduled_at,omitempty"`
-	BoardTopicID   string        `json:"board_topic_id,omitempty"`
-	ActorProfile   string        `json:"actor_profile,omitempty"`
-	Notify         *NotifyConfig `json:"notify,omitempty"`
+	ThreadID       string            `json:"thread_id,omitempty"`
+	NodeID         string            `json:"node_id,omitempty"`
+	Workdir        string            `json:"workdir,omitempty"`
+	Agent          string            `json:"agent,omitempty"`
+	Model          string            `json:"model,omitempty"`
+	Effort         string            `json:"effort,omitempty"`
+	Sandbox        *bool             `json:"sandbox,omitempty"`
+	TimeoutSec     int               `json:"timeout_sec,omitempty"`
+	Prompt         string            `json:"prompt"`
+	Title          string            `json:"title,omitempty"`
+	ParentRunID    string            `json:"parent_run_id,omitempty"`
+	IdempotencyKey string            `json:"idempotency_key,omitempty"`
+	DependsOn      []string          `json:"depends_on,omitempty"`
+	ScheduledAt    string            `json:"scheduled_at,omitempty"`
+	BoardTopicID   string            `json:"board_topic_id,omitempty"`
+	ActorProfile   string            `json:"actor_profile,omitempty"`
+	Labels         map[string]string `json:"labels,omitempty"`
+	ResultSchema   json.RawMessage   `json:"result_schema,omitempty"`
+	Notify         *NotifyConfig     `json:"notify,omitempty"`
 }
 
 type CancelRunRequest struct {
@@ -233,25 +240,28 @@ type ListRunsOptions struct {
 	RootRunID    string
 	PlanID       string
 	BoardTopicID string
+	Labels       []string
 	Limit        int
 }
 
 type PlanNodeSpec struct {
-	Key           string        `json:"key"`
-	NodeID        string        `json:"node_id"`
-	Workdir       string        `json:"workdir"`
-	Agent         string        `json:"agent"`
-	Model         string        `json:"model,omitempty"`
-	Effort        string        `json:"effort,omitempty"`
-	Sandbox       *bool         `json:"sandbox,omitempty"`
-	TimeoutSec    int           `json:"timeout_sec,omitempty"`
-	Prompt        string        `json:"prompt"`
-	Title         string        `json:"title,omitempty"`
-	DependsOn     []string      `json:"depends_on,omitempty"`
-	ScheduledAt   string        `json:"scheduled_at,omitempty"`
-	InSec         *int          `json:"in_sec,omitempty"`
-	PriorityOrder *float64      `json:"priority_order,omitempty"`
-	Notify        *NotifyConfig `json:"notify,omitempty"`
+	Key           string            `json:"key"`
+	NodeID        string            `json:"node_id"`
+	Workdir       string            `json:"workdir"`
+	Agent         string            `json:"agent"`
+	Model         string            `json:"model,omitempty"`
+	Effort        string            `json:"effort,omitempty"`
+	Sandbox       *bool             `json:"sandbox,omitempty"`
+	TimeoutSec    int               `json:"timeout_sec,omitempty"`
+	Prompt        string            `json:"prompt"`
+	Title         string            `json:"title,omitempty"`
+	DependsOn     []string          `json:"depends_on,omitempty"`
+	ScheduledAt   string            `json:"scheduled_at,omitempty"`
+	InSec         *int              `json:"in_sec,omitempty"`
+	PriorityOrder *float64          `json:"priority_order,omitempty"`
+	Labels        map[string]string `json:"labels,omitempty"`
+	ResultSchema  json.RawMessage   `json:"result_schema,omitempty"`
+	Notify        *NotifyConfig     `json:"notify,omitempty"`
 }
 
 type CreatePlanRequest struct {
@@ -297,17 +307,19 @@ type HeartbeatResponse struct {
 }
 
 type CompleteRunRequest struct {
-	LeaseOwner      string `json:"lease_owner"`
-	Status          string `json:"status"`
-	NativeSessionID string `json:"native_session_id,omitempty"`
-	ResolvedModel   string `json:"resolved_model,omitempty"`
-	ResolvedEffort  string `json:"resolved_effort,omitempty"`
-	Summary         string `json:"summary"`
-	OutputMD        string `json:"output_md"`
-	OutputBytes     int    `json:"output_bytes"`
-	DurationMs      int64  `json:"duration_ms"`
-	ErrorCode       string `json:"error_code,omitempty"`
-	ErrorMessage    string `json:"error_message,omitempty"`
+	LeaseOwner      string          `json:"lease_owner"`
+	Status          string          `json:"status"`
+	NativeSessionID string          `json:"native_session_id,omitempty"`
+	ResolvedModel   string          `json:"resolved_model,omitempty"`
+	ResolvedEffort  string          `json:"resolved_effort,omitempty"`
+	Summary         string          `json:"summary"`
+	OutputMD        string          `json:"output_md"`
+	OutputBytes     int             `json:"output_bytes"`
+	DurationMs      int64           `json:"duration_ms"`
+	ErrorCode       string          `json:"error_code,omitempty"`
+	ErrorMessage    string          `json:"error_message,omitempty"`
+	Result          json.RawMessage `json:"result,omitempty"`
+	ResultError     string          `json:"result_error,omitempty"`
 }
 
 type ApprovalCheckpointRequest struct {

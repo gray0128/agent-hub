@@ -691,13 +691,14 @@ func TestWaitWaitingTimeoutAndRunsFiltersAndSkillBudget(t *testing.T) {
 		t.Fatalf("sanitizeRunRecord did not clear empty pointers: %+v", san)
 	}
 
-	// 5. Embedded SKILL.md byte budget & Slice 2 coverage guard
+	// 5. Embedded SKILL.md byte budget & Slice 2/3 coverage guard
 	if len(skills.AhubSkillMD) > 4500 {
 		t.Fatalf("skills/ahub/SKILL.md exceeds 4500 bytes: got %d", len(skills.AhubSkillMD))
 	}
 	for _, required := range []string{
 		"ahub plan", "ahub retry", "--after", "--in", "--topic", "--as",
 		"DEPENDENCY_CYCLE_DETECTED", "INVALID_STATE_TRANSITION", "ahub board ask", "ahub native-emit",
+		"--label", "--result-schema", "--data", "AHUB_RESULT_FILE", "RESULT_SCHEMA_MISMATCH",
 	} {
 		if !strings.Contains(skills.AhubSkillMD, required) {
 			t.Fatalf("skills/ahub/SKILL.md missing required token %q", required)

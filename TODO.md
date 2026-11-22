@@ -4,7 +4,11 @@
 
 ## Doing
 
+- [ ] `RFC-0001 Slice 3`（[Issue #4](https://github.com/gray0128/agent-hub/issues/4)）：交付受控任务 `labels` 筛选与可选结构化产物校验（[0010_labels_and_structured_result.sql](./apps/hub-worker/migrations/0010_labels_and_structured_result.sql)、无 `eval` 受限 Draft 2020-12 校验器 `json-schema-subset.ts`、`AHUB_RESULT_FILE` 隔离注入与清理、`RESULT_SCHEMA_MISMATCH` 保留 `output_md`、`ahub run --label --result-schema` / `ahub runs --label` / `ahub result --data`、Web 标签筛选与结构化结果视图及 `I-16`–`I-17` / `E-15` / Phase 4d / `MG-6`–`MG-7`）
+
 ## Done
+
+- [x] `RFC-0001 Slice 2`（`c202358`，PR `#3`，[Issue #2](https://github.com/gray0128/agent-hub/issues/2)）：交付受控 `Run` `waiting` 8 态 DAG 生命周期（[0009_waiting_dag_and_schedule.sql](./apps/hub-worker/migrations/0009_waiting_dag_and_schedule.sql)、`run_dependencies`、`POST /api/v1/plans`、定时唤醒 `scheduled_at`、`POST /api/v1/runs/:id/retry` 终态不可变与下游重绑、`board_topic_id` 终态自动 `handoff` 回写、Go CLI `ahub plan` / `ahub retry` / `ahub run --after/--in/--topic/--as`、Web 控制台 DAG `lineage` / Retry / Board-Run 桥接与 `I-12`–`I-15` / `E-12`–`E-14` / `RunLifecycle.tla`）
 
 - [x] `RFC-0001 Slice 1b`（`912ed81`）：交付 Web 协同板四栏 `@dnd-kit` 看板（`todo`/`in_progress`/`blocked`/`done` 跨栏拖拽、列内排序与乐观回滚）、「近期主题」快速跳转与键盘快捷键面板
 

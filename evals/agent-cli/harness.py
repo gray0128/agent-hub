@@ -411,7 +411,7 @@ def strip_variable_payload(obj: object, is_board: bool) -> object:
         return obj
     out = {}
     for k, v in obj.items():
-        if not is_board and k in ("output_preview", "output_md"):
+        if not is_board and k in ("output_preview", "output_md", "result", "result_schema"):
             continue
         if is_board and k in ("text_md", "data"):
             continue
@@ -975,6 +975,101 @@ def execute_contract_scenario(substrate: LocalSubstrate, scenario: dict) -> tupl
             )
             eval_retry_contract(substrate, out1, a_before, [b_id])
             eval_no_waiting_poll(sandbox, expected_max_calls=2, forbidden_subcommands=("run", "plan", "runs", "result"))
+
+        elif sid == "E-15":
+            compact_schema = {
+                "type": "object",
+                "required": ["ok", "count"],
+                "properties": {
+                    "ok": {"type": "boolean"},
+                    "count": {"type": "integer"},
+                },
+                "additionalProperties": False,
+            }
+            schema_json = json.dumps(compact_schema, separators=(",", ":"))
+            expected_result = {"ok": True, "count": 2}
+
+            # Step 1: Dispatch with --label and inline --result-schema -> done with matching labels & result
+            prompt1 = json.dumps({
+                "summary": "e15 structured result ok",
+                "response": "E15_OK",
+                "directives": [{"op": "write_result_file", "result": expected_result}],
+            })
+            rc1, out1, _ = sandbox.call_ahub(
+                [
+                    "--json", "run", "-n", "macmini", "-d", "alpha", "-a", "agy",
+                    "--label", "env=eval",
+                    "--label", f"trial={trial_nonce}",
+                    "--result-schema", schema_json,
+                    "--wait", "10s", "-",
+                ],
+                prompt1,
+            )
+            assert rc1 == 0 and out1.get("status") == "done", f"E-15 step 1 failed: rc={rc1} {out1}"
+            r1_id = out1.get("id", "")
+            assert r1_id.startswith("run_"), f"E-15 missing run_id on step 1: {out1}"
+            assert out1.get("labels") == {"env": "eval", "trial": trial_nonce}, f"E-15 labels mismatch: {out1}"
+            assert out1.get("result") == expected_result, f"E-15 result mismatch: {out1}"
+
+            # Step 2: Query via ahub runs --label (multiple labels ANDed)
+            rc2, out2, _ = sandbox.call_ahub(
+                ["--json", "runs", "--label", "env=eval", "--label", f"trial={trial_nonce}", "--limit", "10"]
+            )
+            assert rc2 == 0 and out2.get("ok") is True, f"E-15 step 2 runs --label failed: rc={rc2} {out2}"
+            runs2 = out2.get("runs", [])
+            assert isinstance(runs2, list) and any(r.get("id") == r1_id for r in runs2), (
+                f"E-15 step 2 missing {r1_id} in runs: {out2}"
+            )
+            for r in runs2:
+                r_labels = r.get("labels", {})
+                assert r_labels.get("env") == "eval" and r_labels.get("trial") == trial_nonce, (
+                    f"E-15 step 2 returned run without matching labels: {r}"
+                )
+
+            # Step 3: Extract structured data via ahub result <id> --data
+            rc3, out3, _ = sandbox.call_ahub(["--json", "result", r1_id, "--data"])
+            assert rc3 == 0, f"E-15 step 3 result --data failed: rc={rc3} {out3}"
+            assert out3.get("ok") is True, f"E-15 step 3 expected ok=true: {out3}"
+            assert out3.get("run_id") == r1_id, f"E-15 step 3 run_id mismatch: {out3}"
+            assert out3.get("status") == "done", f"E-15 step 3 status mismatch: {out3}"
+            assert out3.get("result") == expected_result, f"E-15 step 3 result mismatch: {out3}"
+            assert "output_md" not in out3, f"E-15 step 3 --data must omit output_md: {out3}"
+
+            # Step 4: Dispatch with @schema.json and mismatched result -> exit 10 + RESULT_SCHEMA_MISMATCH
+            schema_path = sandbox.root / "schema.json"
+            schema_path.write_text(schema_json, encoding="utf-8")
+            prompt4 = json.dumps({
+                "summary": "e15 structured result mismatch",
+                "response": "E15_PRESERVED_OUTPUT_MD",
+                "directives": [{"op": "write_result_file", "result": {"ok": "bad-type", "count": 2}}],
+            })
+            rc4, out4, _ = sandbox.call_ahub(
+                [
+                    "--json", "run", "-n", "macmini", "-d", "alpha", "-a", "agy",
+                    "--label", f"trial={trial_nonce}",
+                    "--result-schema", f"@{schema_path}",
+                    "--wait", "10s", "-",
+                ],
+                prompt4,
+            )
+            assert rc4 == 10, f"E-15 step 4 expected exit 10, got rc={rc4} {out4}"
+            assert out4.get("status") == "failed", f"E-15 step 4 expected failed: {out4}"
+            assert out4.get("error_code") == "RESULT_SCHEMA_MISMATCH", f"E-15 step 4 error_code mismatch: {out4}"
+            r2_id = out4.get("id", "")
+            assert r2_id.startswith("run_"), f"E-15 missing run_id on step 4: {out4}"
+
+            # Step 5: Read full output on failed run -> exit 10, result is None, output_md preserved
+            rc5, out5, _ = sandbox.call_ahub(["--json", "result", r2_id, "--full"])
+            assert rc5 == 10, f"E-15 step 5 expected exit 10, got rc={rc5} {out5}"
+            assert out5.get("error_code") == "RESULT_SCHEMA_MISMATCH", f"E-15 step 5 error_code mismatch: {out5}"
+            assert out5.get("result") is None, f"E-15 step 5 expected result=None on mismatch: {out5}"
+            assert "output_md" in out5 and "E15_PRESERVED_OUTPUT_MD" in out5["output_md"], (
+                f"E-15 step 5 must preserve output_md: {out5}"
+            )
+
+            eval_no_waiting_poll(sandbox, expected_max_calls=5, forbidden_subcommands=())
+            skill_bytes_len = len(sandbox.skill_text.encode("utf-8"))
+            assert skill_bytes_len <= 4500, f"SKILL.md exceeds 4500 B budget: {skill_bytes_len}"
 
         else:
             raise ValueError(f"Unknown scenario {sid}")

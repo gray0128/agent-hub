@@ -97,7 +97,7 @@ agent-hub/
 │   └── ahub/                         # Go CLI 与守护进程统一入口
 ├── internal/
 │   ├── api/                          # REST 与 WebSocket 客户端
-│   ├── cli/                          # 调用端命令实现（run / plan / retry / wait / result / cancel / resolve / nodes / board / activity / native-emit / auth）
+│   ├── cli/                          # 调用端命令实现（run [--label/--result-schema] / plan / retry / wait / result [--data] / cancel / resolve / nodes / board / activity / native-emit / auth）
 │   ├── config/                       # 本地配置与 0600 凭据读写
 │   ├── daemon/                       # node serve 守护循环、心跳续租与本地 workdir 互斥锁
 │   ├── runner/                       # 进程组隔离、最小环境变量白名单与 Agent 适配器
@@ -107,9 +107,9 @@ agent-hub/
 │   └── ahub/
 │       └── SKILL.md                  # 嵌入 ahub 二进制的 Agent 调用指南
 ├── evals/
-│   ├── substrate/                    # Plane 1：ahub-fakeagent 与 I-1~I-15 混沌不变量套件
+│   ├── substrate/                    # Plane 1：ahub-fakeagent 与 I-1~I-17 混沌不变量套件
 │   ├── formal/                       # Plane 1：D1/DO/Cron 状态机 TLA+ 模型检验
-│   ├── agent-cli/                    # Plane 2：盲测沙箱、E-01~E-13 黄金场景与轨迹评分器
+│   ├── agent-cli/                    # Plane 2：盲测沙箱、E-01~E-15 黄金场景与轨迹评分器
 │   └── web/                          # Plane 3：前端反模式扫描与 CDP 运行时压测脚本
 └── docs/
     ├── 01-architecture.md

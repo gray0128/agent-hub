@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,24 +12,30 @@ import (
 )
 
 type directive struct {
-	Op       string   `json:"op"`
-	Ms       int      `json:"ms,omitempty"`
-	HoldMs   int      `json:"hold_ms,omitempty"`
-	Count    int      `json:"count,omitempty"`
-	Interval int      `json:"interval_ms,omitempty"`
-	Kind     string   `json:"kind,omitempty"`
-	Cmd      []string `json:"cmd,omitempty"`
-	PIDFile  string   `json:"pid_file,omitempty"`
-	Keys     []string `json:"keys,omitempty"`
-	URL      string   `json:"url,omitempty"`
-	Then     string   `json:"then,omitempty"`
-	Bytes    int      `json:"bytes,omitempty"`
-	Code     int      `json:"code,omitempty"`
-	Message  string   `json:"message,omitempty"`
-	AhubBin  string   `json:"ahub_bin,omitempty"`
-	Node     string   `json:"target_node,omitempty"`
-	Workdir  string   `json:"workdir,omitempty"`
-	Line     string   `json:"line,omitempty"`
+	Op              string          `json:"op"`
+	Ms              int             `json:"ms,omitempty"`
+	HoldMs          int             `json:"hold_ms,omitempty"`
+	Count           int             `json:"count,omitempty"`
+	Interval        int             `json:"interval_ms,omitempty"`
+	Kind            string          `json:"kind,omitempty"`
+	Cmd             []string        `json:"cmd,omitempty"`
+	PIDFile         string          `json:"pid_file,omitempty"`
+	Keys            []string        `json:"keys,omitempty"`
+	URL             string          `json:"url,omitempty"`
+	Then            string          `json:"then,omitempty"`
+	Bytes           int             `json:"bytes,omitempty"`
+	Code            int             `json:"code,omitempty"`
+	Message         string          `json:"message,omitempty"`
+	AhubBin         string          `json:"ahub_bin,omitempty"`
+	Node            string          `json:"target_node,omitempty"`
+	Workdir         string          `json:"workdir,omitempty"`
+	Line            string          `json:"line,omitempty"`
+	Result          json.RawMessage `json:"result,omitempty"`
+	RawContent      string          `json:"raw_content,omitempty"`
+	OversizeBytes   int             `json:"oversize_bytes,omitempty"`
+	MissingEnvError bool            `json:"missing_env_error,omitempty"`
+	MarkerFile      string          `json:"marker_file,omitempty"`
+	AltResult       json.RawMessage `json:"alt_result,omitempty"`
 }
 
 type scriptPayload struct {
@@ -147,7 +154,7 @@ func main() {
 	if len(script.Directives) == 0 {
 		msg := "fakeagent completed"
 		if prompt != "" {
-			msg = fmt.Sprintf("fakeagent completed (passed_session=%s): %s", passedSession, prompt)
+			msg = fmt.Sprintf("fakeagent completed (passed_session=%s prompt_sha256=%x): %s", passedSession, sha256.Sum256([]byte(prompt)), prompt)
 		}
 		writeJSONLine(map[string]interface{}{
 			"type":       "agent_end",
@@ -283,6 +290,47 @@ func main() {
 				n = 131072
 			}
 			responseParts = append(responseParts, strings.Repeat("B", n))
+		case "write_result_file":
+			resPath := os.Getenv("AHUB_RESULT_FILE")
+			if resPath == "" {
+				if d.MissingEnvError {
+					fmt.Fprintln(os.Stderr, "AHUB_RESULT_FILE is not set")
+					os.Exit(1)
+				}
+				responseParts = append(responseParts, "AHUB_RESULT_FILE=__MISSING__")
+				continue
+			}
+			var payload []byte
+			if d.MarkerFile != "" {
+				if _, statErr := os.Stat(d.MarkerFile); os.IsNotExist(statErr) {
+					if err := os.WriteFile(d.MarkerFile, []byte("1\n"), 0o644); err != nil {
+						fmt.Fprintf(os.Stderr, "write marker_file error: %v\n", err)
+						os.Exit(1)
+					}
+				} else if len(d.AltResult) > 0 {
+					payload = []byte(d.AltResult)
+				}
+			}
+			if payload == nil {
+				switch {
+				case d.OversizeBytes > 0:
+					if d.OversizeBytes >= 10 {
+						payload = []byte(`{"pad":"` + strings.Repeat("X", d.OversizeBytes-10) + `"}`)
+					} else {
+						payload = []byte(strings.Repeat("X", d.OversizeBytes))
+					}
+				case d.RawContent != "":
+					payload = []byte(d.RawContent)
+				case len(d.Result) > 0:
+					payload = []byte(d.Result)
+				default:
+					payload = []byte(`{}`)
+				}
+			}
+			if err := os.WriteFile(resPath, payload, 0o600); err != nil {
+				fmt.Fprintf(os.Stderr, "write AHUB_RESULT_FILE error: %v\n", err)
+				os.Exit(1)
+			}
 		case "exit":
 			code := d.Code
 			if code == 0 {

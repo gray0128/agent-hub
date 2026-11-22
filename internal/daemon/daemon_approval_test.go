@@ -254,3 +254,194 @@ func TestDaemonNeedsApprovalTimeoutCompletesWithApprovalTimeout(t *testing.T) {
 		t.Fatalf("expected checkpointed metadata preserved on timeout complete, got %+v", req)
 	}
 }
+
+func TestDaemonRedactsSummaryOutputAndRemoteControlURL(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script test skipped on windows")
+	}
+
+	t.Run("complete_redacts_summary_and_output_md", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		workdir := filepath.Join(tmpDir, "repo")
+		if err := os.MkdirAll(workdir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		bin := filepath.Join(tmpDir, "fake-claude.sh")
+		const secA = "sk-proj-AGENTSECRET12345678"
+		const secB = "ahub_adm_AGENTSECRET99999"
+		script := "#!/usr/bin/env bash\n" +
+			`printf '{"type":"result","summary":"done with ` + secA + `","result":"full output ` + secB + `"}\n'` + "\n"
+		if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		var mu sync.Mutex
+		var completeReqs []api.CompleteRunRequest
+		completed := make(chan struct{}, 1)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			switch {
+			case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/heartbeat"):
+				_ = json.NewEncoder(w).Encode(api.HeartbeatResponse{OK: true, Status: "running"})
+			case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/complete"):
+				var body api.CompleteRunRequest
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				mu.Lock()
+				completeReqs = append(completeReqs, body)
+				mu.Unlock()
+				select {
+				case completed <- struct{}{}:
+				default:
+				}
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"ok":  true,
+					"run": api.RunRecord{ID: "run_red_1", Status: body.Status},
+				})
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer srv.Close()
+
+		cfg := &config.NodeConfig{
+			NodeID:               "macmini",
+			HubURL:               srv.URL,
+			MaxConcurrency:       2,
+			HeartbeatIntervalSec: 30,
+			Agents: map[string]config.AgentConfig{
+				"claude": {Enabled: true, Command: bin},
+			},
+		}
+		d := New(cfg, "node_tok", "0.2.0")
+		defer d.batcher.Close()
+
+		parentCtx, cancelParent := context.WithCancel(context.Background())
+		defer cancelParent()
+
+		d.trySpawnRun(parentCtx, api.RunRecord{
+			ID:         "run_red_1",
+			ThreadID:   "thr_red_1",
+			RootRunID:  "run_red_1",
+			NodeID:     "macmini",
+			Agent:      "claude",
+			Workdir:    workdir,
+			Prompt:     "test",
+			TimeoutSec: 30,
+			LeaseOwner: "macmini:n1",
+		})
+
+		select {
+		case <-completed:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for /complete")
+		}
+		d.runWaitGroup.Wait()
+
+		mu.Lock()
+		defer mu.Unlock()
+		if len(completeReqs) != 1 {
+			t.Fatalf("expected 1 /complete request, got %d", len(completeReqs))
+		}
+		req := completeReqs[0]
+		if strings.Contains(req.Summary, secA) || !strings.Contains(req.Summary, "[REDACTED]") {
+			t.Fatalf("expected Summary redacted, got %q", req.Summary)
+		}
+		if strings.Contains(req.OutputMD, secB) || !strings.Contains(req.OutputMD, "ahub_adm_[REDACTED]") {
+			t.Fatalf("expected OutputMD redacted, got %q", req.OutputMD)
+		}
+	})
+
+	t.Run("approval_redacts_remote_control_url_summary_and_output_md", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		workdir := filepath.Join(tmpDir, "repo")
+		if err := os.MkdirAll(workdir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		bin := filepath.Join(tmpDir, "fake-agy.sh")
+		const secOut = "sk-proj-APPRAGENTSECRET123"
+		script := "#!/usr/bin/env bash\n" +
+			`printf '{"status":"NEEDS_HUMAN_APPROVAL","remote_control_url":"https://user:pass123@example.com/rc?token=rc_secret_999","response":"Paused with ` + secOut + `"}\n'` + "\n"
+		if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		var mu sync.Mutex
+		var approvalReqs []api.ApprovalCheckpointRequest
+		checkpointed := make(chan struct{}, 1)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			switch {
+			case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/approval"):
+				var body api.ApprovalCheckpointRequest
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				mu.Lock()
+				approvalReqs = append(approvalReqs, body)
+				mu.Unlock()
+				select {
+				case checkpointed <- struct{}{}:
+				default:
+				}
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"ok":  true,
+					"run": api.RunRecord{ID: "run_red_app", Status: "needs_approval"},
+				})
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer srv.Close()
+
+		cfg := &config.NodeConfig{
+			NodeID:               "macmini",
+			HubURL:               srv.URL,
+			MaxConcurrency:       2,
+			HeartbeatIntervalSec: 30,
+			Agents: map[string]config.AgentConfig{
+				"agy": {Enabled: true, Command: bin},
+			},
+		}
+		d := New(cfg, "node_tok", "0.2.0")
+		defer d.batcher.Close()
+
+		parentCtx, cancelParent := context.WithCancel(context.Background())
+		defer cancelParent()
+
+		d.trySpawnRun(parentCtx, api.RunRecord{
+			ID:         "run_red_app",
+			NodeID:     "macmini",
+			Agent:      "agy",
+			Workdir:    workdir,
+			Prompt:     "test",
+			TimeoutSec: 30,
+			LeaseOwner: "macmini:n2",
+		})
+
+		select {
+		case <-checkpointed:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for /approval")
+		}
+		d.abortRun("run_red_app")
+		d.runWaitGroup.Wait()
+
+		mu.Lock()
+		defer mu.Unlock()
+		if len(approvalReqs) != 1 {
+			t.Fatalf("expected 1 /approval request, got %d", len(approvalReqs))
+		}
+		req := approvalReqs[0]
+		if req.RemoteControlURL != "https://[REDACTED]@example.com/rc?token=[REDACTED]" {
+			t.Fatalf("expected redacted RemoteControlURL, got %q", req.RemoteControlURL)
+		}
+		if strings.Contains(req.Summary, secOut) || !strings.Contains(req.Summary, "[REDACTED]") {
+			t.Fatalf("expected Summary redacted, got %q", req.Summary)
+		}
+		if strings.Contains(req.OutputMD, secOut) || !strings.Contains(req.OutputMD, "[REDACTED]") {
+			t.Fatalf("expected OutputMD redacted, got %q", req.OutputMD)
+		}
+	})
+}

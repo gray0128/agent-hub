@@ -100,6 +100,27 @@
       "pattern": "^[a-z0-9][a-z0-9._@-]{0,39}$",
       "description": "Optional caller profile attribution."
     },
+    "labels": {
+      "type": "object",
+      "maxProperties": 16,
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64,
+        "pattern": "^[a-z0-9][a-z0-9._/-]{0,63}$",
+        "not": { "pattern": "^ahub\\." }
+      },
+      "additionalProperties": {
+        "type": "string",
+        "maxLength": 128,
+        "pattern": "^[^\\u0000-\\u001f\\u007f]*$"
+      },
+      "description": "Optional user-defined run labels (max 16 pairs; ahub.* prefix reserved for control plane)."
+    },
+    "result_schema": {
+      "type": "object",
+      "description": "Optional inline JSON Schema (<= 16 KB serialized, bounded Draft 2020-12 subset) validating structured output written to AHUB_RESULT_FILE."
+    },
     "notify": {
       "type": "object",
       "additionalProperties": false,

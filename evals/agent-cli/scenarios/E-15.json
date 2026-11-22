@@ -1,0 +1,15 @@
+{
+  "id": "E-15",
+  "name": "任务标签筛选与结构化产物校验",
+  "task_prompt": "在 macmini 的 alpha 项目以指定标签与结构化结果 Schema 派发任务，校验通过后通过标签筛选与结果提取接口获取结构化 JSON；再派发一次不符合 Schema 的任务，确认返回失败退出码 10 但完整保留可读输出正文。",
+  "theoretical_min_calls": 5,
+  "max_wasted_calls": 0,
+  "assertions": {
+    "forbid_full_flag": false,
+    "must_match_labels": true,
+    "must_extract_structured_data": true,
+    "mismatch_exit_code": 10,
+    "mismatch_error_code": "RESULT_SCHEMA_MISMATCH",
+    "must_preserve_output_md": true
+  }
+}

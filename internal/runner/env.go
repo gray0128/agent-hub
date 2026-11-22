@@ -42,7 +42,7 @@ func BuildBaseSanitizedEnv() []string {
 	return out
 }
 
-func BuildSanitizedEnv(run api.RunRecord, hubURL, delegationToken string) []string {
+func BuildSanitizedEnv(run api.RunRecord, hubURL, delegationToken, resultFile string) []string {
 	out := BuildBaseSanitizedEnv()
 
 	if delegationToken != "" {
@@ -50,6 +50,9 @@ func BuildSanitizedEnv(run api.RunRecord, hubURL, delegationToken string) []stri
 		if hubURL != "" {
 			out = append(out, "AHUB_URL="+hubURL)
 		}
+	}
+	if strings.TrimSpace(resultFile) != "" {
+		out = append(out, "AHUB_RESULT_FILE="+resultFile)
 	}
 	out = append(out,
 		"AHUB_RUN_ID="+run.ID,

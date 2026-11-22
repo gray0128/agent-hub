@@ -225,6 +225,9 @@ export interface RunRecord {
   board_topic_id?: string | null;
   depends_on_run_ids?: string[];
   blocked_reason?: RunBlockedReason | null;
+  labels?: Record<string, string>;
+  result_schema?: Record<string, unknown> | null;
+  result?: unknown | null;
   priority_order: number;
   resolved_model: string;
   resolved_effort: string;
@@ -426,6 +429,8 @@ export interface CreateRunPayload {
   scheduled_at?: string;
   board_topic_id?: string;
   actor_profile?: string;
+  labels?: Record<string, string>;
+  result_schema?: Record<string, unknown>;
   notify?: { target: "none" | "grok" | "webhook"; events?: RunNotifyEvent[] };
 }
 
@@ -444,6 +449,8 @@ export interface PlanNodeSpec {
   scheduled_at?: string;
   in_sec?: number;
   priority_order?: number;
+  labels?: Record<string, string>;
+  result_schema?: Record<string, unknown>;
   notify?: { target?: "none" | "grok" | "webhook"; events?: RunNotifyEvent[] };
 }
 

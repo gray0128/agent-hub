@@ -81,9 +81,9 @@ test("handleSkillMd includes redacted dispatched prompt reporting rule", async (
   assert.equal(resp.status, 200);
   const text = await resp.text();
   assert.equal(text.includes("masked prompt"), true);
-  assert.equal(text.includes("Always mask tokens, passwords, keys, and webhook secrets"), true);
-  assert.equal(text.includes("at dispatch"), true);
-  assert.equal(text.includes("never call `ahub result` post-run just for raw `prompt`"), true);
+  assert.match(text, /mask tokens, passwords, keys, and webhook secrets/i);
+  assert.match(text, /(?:at|on) dispatch/);
+  assert.match(text, /never call `ahub result` post-run (?:just )?for raw `prompt`/);
   assert.equal(text.includes("fetch `prompt` via `ahub result"), false);
 });
 

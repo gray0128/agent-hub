@@ -42,6 +42,15 @@ export interface BoardTopicInspectorProps {
   onPrefillRunComposerFromTopic?: (topic: BoardTopic) => void;
 }
 
+export function computeQuickDispatchScheduledAt(
+  delaySec: number,
+  nowMs = Date.now()
+): string | undefined {
+  if (!(delaySec > 0)) return undefined;
+  const offsetMs = delaySec === 60 ? 62_000 : delaySec * 1000;
+  return new Date(nowMs + offsetMs).toISOString();
+}
+
 const TOPIC_STATUS_OPTIONS: Array<{ value: BoardTopicStatus; label: string }> = [
   { value: "todo", label: "待办 (todo)" },
   { value: "in_progress", label: "进行中 (in_progress)" },
@@ -118,8 +127,7 @@ export function BoardTopicInspector({
       return;
     }
     const delay = Number(dispatchDelaySec);
-    const scheduledAt =
-      delay > 0 ? new Date(Date.now() + delay * 1000).toISOString() : undefined;
+    const scheduledAt = computeQuickDispatchScheduledAt(delay);
     const created = await onQuickDispatchRun({
       node_id: selectedDispatchNode.id,
       workdir: dispatchWorkdir.trim(),
