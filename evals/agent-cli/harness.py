@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import argparse
 import base64
+from datetime import datetime, timedelta, timezone
 import hashlib
 import http.server
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -76,6 +78,7 @@ def wait_for_http(url: str, token: str, timeout_sec: float = 25.0) -> None:
 class LocalSubstrate:
     def __init__(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="ahub-agent-eval-"))
+        self.d1_dir = self.tmp / "d1"
         self.procs: list[subprocess.Popen] = []
         self.webhook_srv: http.server.ThreadingHTTPServer | None = None
         self.hub_url = ""
@@ -109,7 +112,7 @@ class LocalSubstrate:
         threading.Thread(target=self.webhook_srv.serve_forever, daemon=True).start()
         wh_port = self.webhook_srv.server_port
 
-        d1_dir = self.tmp / "d1"
+        d1_dir = self.d1_dir
         d1_dir.mkdir(parents=True, exist_ok=True)
         subprocess.run(
             ["pnpm", "exec", "wrangler", "d1", "migrations", "apply", "DB", "--local", "--persist-to", str(d1_dir)],
@@ -128,6 +131,7 @@ class LocalSubstrate:
                 "pnpm", "exec", "wrangler", "dev", "--local",
                 "--port", str(port), "--inspector-port", "0",
                 "--persist-to", str(d1_dir),
+                "--test-scheduled",
                 "--show-interactive-dev-session=false",
                 "--var", f"BOOTSTRAP_ADMIN_TOKEN_SHA256:{admin_sha}",
                 "--var", f"HUB_PUBLIC_URL:{self.hub_url}",
@@ -309,6 +313,53 @@ exit 99
         shutil.rmtree(self.root, ignore_errors=True)
 
 
+def exec_d1_sql(substrate: LocalSubstrate, sql_stmt: str) -> str:
+    all_sqlites = sorted(substrate.d1_dir.rglob("*.sqlite"))
+    d1_sqlites = [
+        p for p in all_sqlites
+        if "miniflare-D1DatabaseObject" in p.parts or "d1" in p.relative_to(substrate.d1_dir).parts
+    ]
+    candidates = d1_sqlites or all_sqlites
+    if not candidates:
+        raise RuntimeError(f"No .sqlite file found under {substrate.d1_dir}")
+    db_file = str(candidates[0])
+    sqlite_bin = shutil.which("sqlite3")
+    if sqlite_bin:
+        proc = subprocess.run(
+            [sqlite_bin, "-cmd", ".timeout 5000", db_file, sql_stmt],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+        )
+        return proc.stdout.strip()
+    proc = subprocess.run(
+        [
+            "pnpm", "exec", "wrangler", "d1", "execute", "DB",
+            "--local", "--persist-to", str(substrate.d1_dir),
+            "--json", "--command", sql_stmt,
+        ],
+        cwd=WORKER_DIR,
+        env={**os.environ, "CI": "1"},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=True,
+    )
+    return proc.stdout.strip()
+
+
+def trigger_scheduled(substrate: LocalSubstrate, backdate_sql: str | None = None) -> int:
+    if backdate_sql:
+        exec_d1_sql(substrate, backdate_sql)
+    req = urllib.request.Request(f"{substrate.hub_url}/cdn-cgi/handler/scheduled", method="GET")
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        _ = resp.read()
+        if resp.status != 200:
+            raise RuntimeError(f"Scheduled handler returned HTTP {resp.status}")
+        return int(resp.status)
+
+
 def seed_completed_run(
     substrate: LocalSubstrate,
     workdir: str,
@@ -353,6 +404,7 @@ def extract_subcommand(argv: list[str]) -> str:
 
 
 def strip_variable_payload(obj: object, is_board: bool) -> object:
+    """Strip variable-length user payloads recursively (including runs[] in plan/list envelopes)."""
     if isinstance(obj, list):
         return [strip_variable_payload(item, is_board) for item in obj]
     if not isinstance(obj, dict):
@@ -365,6 +417,113 @@ def strip_variable_payload(obj: object, is_board: bool) -> object:
             continue
         out[k] = strip_variable_payload(v, is_board)
     return out
+
+
+def eval_error_next_self_heal(
+    sandbox: BlindedEnv,
+    first_rc: int,
+    first_out: dict,
+    expected_exit: int,
+    expected_error_code: str,
+    expected_hint_prefix: str = "ahub ",
+    expected_hint_substr: str = "",
+    stdin_text: str | None = None,
+) -> tuple[int, dict]:
+    assert first_rc == expected_exit, f"Expected exit {expected_exit}, got rc={first_rc}: {first_out}"
+    assert first_out.get("ok") is False, f"Expected ok=false on error envelope: {first_out}"
+    err = first_out.get("error", {})
+    assert err.get("code") == expected_error_code, f"Expected {expected_error_code}, got {err}"
+    next_hints = err.get("next", [])
+    assert isinstance(next_hints, list) and 1 <= len(next_hints) <= 8, f"Invalid error.next: {first_out}"
+    for hint in next_hints:
+        assert isinstance(hint, str) and 1 <= len(hint) <= 512, f"Invalid hint item: {hint!r}"
+        assert "\r" not in hint and "\n" not in hint, f"Control char in hint: {hint!r}"
+    cmd_hint = next_hints[0]
+    if expected_hint_prefix:
+        assert cmd_hint.startswith(expected_hint_prefix), f"Unexpected error.next[0]: {next_hints}"
+    if expected_hint_substr:
+        assert expected_hint_substr in cmd_hint, f"Missing {expected_hint_substr!r} in error.next[0]: {cmd_hint!r}"
+
+    next_args = shlex.split(cmd_hint)
+    if next_args and next_args[0] == "ahub":
+        next_args = next_args[1:]
+    if "--json" not in next_args:
+        next_args = ["--json", *next_args]
+    rc2, out2, _ = sandbox.call_ahub(next_args, stdin_text=stdin_text)
+    assert rc2 == 0 and out2.get("ok") is not False, f"Self-heal command {next_args} failed: rc={rc2} {out2}"
+    return rc2, out2
+
+
+def eval_no_waiting_poll(
+    sandbox: BlindedEnv,
+    expected_max_calls: int | None = None,
+    forbidden_subcommands: tuple[str, ...] = ("runs", "result"),
+) -> None:
+    assert len(sandbox.violations()) == 0, f"Forbidden sleep/curl violations: {sandbox.violations()}"
+    traces = sandbox.traces()
+    if expected_max_calls is not None:
+        assert len(traces) <= expected_max_calls, f"Too many CLI calls ({len(traces)} > {expected_max_calls}): {[t['argv'] for t in traces]}"
+    for t in traces:
+        sub = extract_subcommand(t["argv"])
+        assert sub not in forbidden_subcommands, f"Unexpected polling/extra subcommand {sub!r}: {t['argv']}"
+
+
+def eval_plan_dag_output(
+    plan_out: dict,
+    expected_count: int,
+    topic_id: str | None = None,
+    actor_profile: str | None = None,
+    expected_edges: list[tuple[str, str]] | None = None,
+) -> dict[str, dict]:
+    assert plan_out.get("ok") is True, f"Expected ok=true on plan output: {plan_out}"
+    plan_id = plan_out.get("plan_id", "")
+    assert re.fullmatch(r"pln_[A-Za-z0-9]+", plan_id), f"Invalid plan_id: {plan_id!r}"
+    runs = plan_out.get("runs", [])
+    assert isinstance(runs, list) and len(runs) == expected_count, f"Expected {expected_count} runs, got {runs}"
+    by_key: dict[str, dict] = {}
+    for r in runs:
+        assert r.get("plan_id") == plan_id, f"Run missing plan_id {plan_id}: {r}"
+        assert r.get("lease_owner", "") == "", f"Sanitized CLI RunRecord leaked lease_owner: {r}"
+        if topic_id is not None:
+            assert r.get("board_topic_id") == topic_id, f"board_topic_id mismatch: {r}"
+        if actor_profile is not None:
+            assert r.get("actor_profile") == actor_profile, f"actor_profile mismatch: {r}"
+        pk = r.get("plan_key")
+        assert isinstance(pk, str) and pk, f"Missing plan_key on plan run: {r}"
+        by_key[pk] = r
+    for child_key, parent_key in expected_edges or []:
+        child = by_key[child_key]
+        parent = by_key[parent_key]
+        assert child.get("status") == "waiting", f"Expected downstream {child_key} waiting: {child}"
+        assert parent["id"] in child.get("depends_on_run_ids", []), f"Missing dependency edge {parent_key}->{child_key}: {child}"
+        assert child.get("blocked_reason") == "DEPENDENCY_PENDING", f"Expected DEPENDENCY_PENDING on {child_key}: {child}"
+    return by_key
+
+
+def eval_retry_contract(
+    substrate: LocalSubstrate,
+    retry_out: dict,
+    original_failed_run: dict,
+    expected_rebound_ids: list[str],
+) -> dict:
+    assert retry_out.get("ok") is True, f"Expected ok=true on retry output: {retry_out}"
+    new_run = retry_out.get("run", {})
+    orig_id = original_failed_run["id"]
+    assert isinstance(new_run, dict) and str(new_run.get("id", "")).startswith("run_"), f"Missing replacement run: {retry_out}"
+    assert new_run["id"] != orig_id, f"Retry must create new run id, got same {orig_id}"
+    assert new_run.get("retry_of_run_id") == orig_id, f"retry_of_run_id mismatch: {new_run}"
+    assert new_run.get("lease_owner", "") == "", f"Sanitized retry run leaked lease_owner: {new_run}"
+    rebound = retry_out.get("rebound_run_ids", [])
+    assert isinstance(rebound, list), f"Missing rebound_run_ids list: {retry_out}"
+    for rid in expected_rebound_ids:
+        assert rid in rebound, f"Expected {rid} in rebound_run_ids, got {rebound}"
+
+    orig_after = api_json(substrate.hub_url, substrate.client_token, f"/api/v1/runs/{orig_id}?view=full")["run"]
+    for field in ("status", "finished_at", "error_code", "output_md"):
+        assert orig_after.get(field) == original_failed_run.get(field), (
+            f"Original failed run mutated field {field}: before={original_failed_run.get(field)!r} after={orig_after.get(field)!r}"
+        )
+    return new_run
 
 
 def execute_contract_scenario(substrate: LocalSubstrate, scenario: dict) -> tuple[bool, dict]:
@@ -620,6 +779,202 @@ def execute_contract_scenario(substrate: LocalSubstrate, scenario: dict) -> tupl
                 next_args = ["--json", *next_args]
             rc2, out2, _ = sandbox.call_ahub(next_args)
             assert rc2 == 0 and out2.get("ok") is True, f"E-11 recovery command {next_args} failed: rc={rc2} {out2}"
+
+        elif sid == "E-12":
+            idem_key = f"e12-idem-{trial_nonce}"
+            seeded_top = api_json(
+                substrate.hub_url,
+                substrate.client_token,
+                "/api/v1/board/topics",
+                "POST",
+                {"channel": "proj/demo", "title": f"E-12 topic {trial_nonce}", "status": "todo"},
+            )["topic"]
+            tid = seeded_top["id"]
+            api_json(
+                substrate.hub_url,
+                substrate.client_token,
+                f"/api/v1/board/topics/{tid}/messages",
+                "POST",
+                {"kind": "note", "text_md": "initial e12 note", "idempotency_key": idem_key},
+            )
+
+            # Step 1: Board IDEMPOTENCY_CONFLICT emits buildSafeReadTopicNext (`ahub board read --topic <id> --json`)
+            rc1, out1, _ = sandbox.call_ahub(
+                ["--json", "board", "post", "proj/demo", "--topic", tid, "--idempotency-key", idem_key, "--kind", "note", "conflicting e12 note"]
+            )
+            _, out2 = eval_error_next_self_heal(
+                sandbox,
+                rc1,
+                out1,
+                expected_exit=64,
+                expected_error_code="IDEMPOTENCY_CONFLICT",
+                expected_hint_prefix="ahub board read --topic ",
+                expected_hint_substr=f"--topic {tid} --json",
+            )
+            assert out2.get("topic", {}).get("id") == tid, f"E-12 board read topic mismatch: {out2}"
+            assert len(out2.get("messages", [])) >= 1, f"E-12 expected board messages: {out2}"
+
+            # Step 2: WORKDIR_AMBIGUOUS emits `ahub nodes --online --json`
+            rc3, out3, _ = sandbox.call_ahub(
+                ["--json", "run", "-n", "macmini", "-d", "demo", "-a", "agy", "--wait", "5s", "-"],
+                "e12 check",
+            )
+            assert len(out3.get("error", {}).get("details", {}).get("candidates", [])) >= 2, (
+                f"E-12 missing candidates on WORKDIR_AMBIGUOUS: {out3}"
+            )
+            _, out4 = eval_error_next_self_heal(
+                sandbox,
+                rc3,
+                out3,
+                expected_exit=64,
+                expected_error_code="WORKDIR_AMBIGUOUS",
+                expected_hint_prefix="ahub nodes",
+                expected_hint_substr="--online --json",
+            )
+            node_ids = [n.get("id") for n in out4.get("nodes", [])]
+            assert "macmini" in node_ids, f"E-12 expected macmini in online nodes: {out4}"
+            eval_no_waiting_poll(sandbox, expected_max_calls=4, forbidden_subcommands=("runs", "result", "wait"))
+
+        elif sid == "E-13":
+            tid = api_json(
+                substrate.hub_url,
+                substrate.admin_token,
+                "/api/v1/board/topics",
+                "POST",
+                {"channel": "proj/demo", "title": f"E-13 DAG {trial_nonce}", "status": "todo"},
+            )["topic"]["id"]
+            plan_doc = json.dumps({
+                "nodes": [
+                    {"key": "step1", "node_id": "macmini", "workdir": "alpha", "agent": "agy", "prompt": "s1"},
+                    {
+                        "key": "step2",
+                        "node_id": "mbp",
+                        "workdir": "app",
+                        "agent": "pi",
+                        "depends_on": ["step1"],
+                        "prompt": json.dumps({"directives": [{"op": "sleep", "ms": 1800}]}),
+                    },
+                ]
+            })
+            rc1, out1, _ = sandbox.call_ahub(
+                ["--json", "plan", "--file", "-", "--topic", tid, "--idempotency-key", f"e13-plan-{trial_nonce}", "--as", "codex-orchestrator"],
+                plan_doc,
+            )
+            assert rc1 == 0, f"E-13 plan failed: rc={rc1} {out1}"
+            by_key = eval_plan_dag_output(
+                out1,
+                expected_count=2,
+                topic_id=tid,
+                actor_profile="codex-orchestrator",
+                expected_edges=[("step2", "step1")],
+            )
+            step1 = by_key["step1"]
+            step2 = by_key["step2"]
+            assert step1["node_id"] == "macmini" and step2["node_id"] == "mbp", f"E-13 cross-machine mismatch: {by_key}"
+            to_cancel.extend([step1["id"], step2["id"]])
+
+            # Downstream run with --after and --wait 1s (no --notify) must time out with exit 24
+            rc2, out2, _ = sandbox.call_ahub(
+                ["--json", "run", "-n", "mbp", "-d", "app", "-a", "pi", "--after", step2["id"], "--as", "codex-orchestrator", "--wait", "1s", "-"],
+                "s3",
+            )
+            assert rc2 == 24, f"E-13 expected exit 24 on --wait 1s without --notify, got rc={rc2} {out2}"
+            step3_id = out2.get("id", "")
+            assert step3_id.startswith("run_"), f"E-13 missing downstream run id: {out2}"
+            assert step2["id"] in out2.get("depends_on_run_ids", []), f"E-13 missing --after dependency: {out2}"
+            to_cancel.append(step3_id)
+
+            rc3, out3, _ = sandbox.call_ahub(["--json", "wait", step3_id, "--timeout", "15s"])
+            assert rc3 == 0 and out3.get("status") == "done", f"E-13 wait failed: rc={rc3} {out3}"
+
+            rc4, out4, _ = sandbox.call_ahub(["--json", "board", "read", "--topic", tid, "--limit", "10"])
+            assert rc4 == 0 and out4.get("ok") is True, f"E-13 board read failed: rc={rc4} {out4}"
+            handoffs = [m for m in out4.get("messages", []) if m.get("kind") == "handoff"]
+            for expected_run in (step1, step2):
+                matched = next((m for m in handoffs if m.get("data", {}).get("run_id") == expected_run["id"]), None)
+                assert matched is not None, f"E-13 missing auto-handoff for {expected_run['id']}: {out4}"
+                assert matched.get("actor_profile") == "codex-orchestrator", f"E-13 handoff actor_profile mismatch: {matched}"
+                assert matched.get("source_node") == expected_run["node_id"], f"E-13 handoff source_node mismatch: {matched}"
+                assert matched.get("data", {}).get("plan_id") == out1["plan_id"], f"E-13 handoff plan_id mismatch: {matched}"
+                assert matched.get("data", {}).get("status") == "done", f"E-13 handoff status mismatch: {matched}"
+
+            # Step 5 (F7 Tier 1 #5): --in 2m --topic <tid> --wait 1s --notify grok on waiting run -> exit 0 with webhook_armed=true
+            rc5, out5, _ = sandbox.call_ahub(
+                [
+                    "--json", "run", "-n", "macmini", "-d", "alpha", "-a", "agy",
+                    "--in", "2m", "--topic", tid, "--wait", "1s", "--notify", "grok", "-",
+                ],
+                "s4 scheduled notify",
+            )
+            assert rc5 == 0, f"E-13 scheduled --wait --notify failed: rc={rc5} {out5}"
+            assert out5.get("webhook_armed") is True, f"E-13 expected webhook_armed=true: {out5}"
+            assert out5.get("status") == "waiting", f"E-13 expected status=waiting: {out5}"
+            assert out5.get("board_topic_id") == tid, f"E-13 expected board_topic_id={tid}: {out5}"
+            assert isinstance(out5.get("scheduled_at"), str) and len(out5["scheduled_at"]) > 0, (
+                f"E-13 expected scheduled_at set: {out5}"
+            )
+            to_cancel.append(out5["id"])
+            eval_no_waiting_poll(sandbox, expected_max_calls=5, forbidden_subcommands=("runs", "result"))
+
+        elif sid == "E-14":
+            sched_iso = (datetime.now(timezone.utc) + timedelta(seconds=120)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            a_seed = api_json(
+                substrate.hub_url,
+                substrate.client_token,
+                "/api/v1/runs",
+                "POST",
+                {
+                    "node_id": "macmini",
+                    "workdir": str(substrate.ws_alpha),
+                    "agent": "agy",
+                    "prompt": "A ok",
+                    "scheduled_at": sched_iso,
+                },
+            )["run"]
+            a_id = a_seed["id"]
+            assert re.fullmatch(r"run_[A-Za-z0-9]+", a_id), f"Invalid seeded run id: {a_id!r}"
+            assert a_seed["status"] == "waiting", f"E-14 seed A expected waiting, got {a_seed}"
+
+            exec_d1_sql(
+                substrate,
+                f"UPDATE runs SET status = 'failed', scheduled_at = NULL, error_code = 'UPSTREAM_ERR', "
+                f"error_message = 'seeded upstream failure', output_md = 'orig failed log', "
+                f"finished_at = '2026-11-22T12:00:00.000Z', updated_at = '2026-11-22T12:00:00.000Z' "
+                f"WHERE id = '{a_id}';",
+            )
+            a_before = api_json(substrate.hub_url, substrate.client_token, f"/api/v1/runs/{a_id}?view=full")["run"]
+            assert a_before["status"] == "failed", f"E-14 expected seeded A failed: {a_before}"
+
+            b_seed = api_json(
+                substrate.hub_url,
+                substrate.client_token,
+                "/api/v1/runs",
+                "POST",
+                {
+                    "node_id": "mbp",
+                    "workdir": str(substrate.ws_mbp_app),
+                    "agent": "pi",
+                    "prompt": "B ok",
+                    "depends_on": [a_id],
+                },
+            )["run"]
+            b_id = b_seed["id"]
+            to_cancel.append(b_id)
+            assert b_seed["status"] == "waiting" and b_seed.get("blocked_reason") == "UPSTREAM_FAILED", (
+                f"E-14 expected B waiting/UPSTREAM_FAILED: {b_seed}"
+            )
+
+            rc1, out1, _ = sandbox.call_ahub(["--json", "retry", a_id])
+            assert rc1 == 0, f"E-14 retry failed: rc={rc1} {out1}"
+            a2 = eval_retry_contract(substrate, out1, a_before, [b_id])
+            to_cancel.append(a2["id"])
+
+            rc2, out2, _ = sandbox.call_ahub(["--json", "wait", b_id, "--timeout", "15s"])
+            assert rc2 == 0 and out2.get("id") == b_id and out2.get("status") == "done", (
+                f"E-14 downstream wait failed: rc={rc2} {out2}"
+            )
+            eval_retry_contract(substrate, out1, a_before, [b_id])
+            eval_no_waiting_poll(sandbox, expected_max_calls=2, forbidden_subcommands=("run", "plan", "runs", "result"))
 
         else:
             raise ValueError(f"Unknown scenario {sid}")

@@ -1,5 +1,6 @@
+import { AlertTriangle, Clock } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
-import type { BoardTopicStatus, NodeStatus, RunStatus } from "@/types";
+import type { BoardTopicStatus, NodeStatus, RunBlockedReason, RunStatus } from "@/types";
 
 export function NodeStatusDot({ status }: { status: NodeStatus }) {
   const colorClass =
@@ -22,6 +23,7 @@ const RUN_STATUS_META: Record<
   RunStatus,
   { label: string; variant: "outline" | "done" | "running" | "approval" | "failed" }
 > = {
+  waiting: { label: "等待中", variant: "outline" },
   queued: { label: "排队中", variant: "outline" },
   claimed: { label: "已认领", variant: "running" },
   running: { label: "执行中", variant: "running" },
@@ -31,12 +33,36 @@ const RUN_STATUS_META: Record<
   cancelled: { label: "已取消", variant: "outline" }
 };
 
-export function RunStatusBadge({ status }: { status: RunStatus }) {
+export function RunStatusBadge({
+  status,
+  blockedReason
+}: {
+  status: RunStatus;
+  blockedReason?: RunBlockedReason | null;
+}) {
   const meta = RUN_STATUS_META[status];
+  const isUpstreamBlocked =
+    status === "waiting" &&
+    (blockedReason === "UPSTREAM_FAILED" || blockedReason === "UPSTREAM_CANCELLED");
+  const variant =
+    status === "waiting"
+      ? blockedReason === "UPSTREAM_FAILED"
+        ? "failed"
+        : blockedReason === "UPSTREAM_CANCELLED"
+          ? "approval"
+          : "outline"
+      : meta.variant;
+
   return (
-    <Badge variant={meta.variant} data-run-status={status}>
+    <Badge variant={variant} data-run-status={status}>
       {status === "running" || status === "claimed" ? (
         <span className="h-1.5 w-1.5 rounded-full bg-current animate-pulse" aria-hidden="true" />
+      ) : status === "waiting" ? (
+        isUpstreamBlocked ? (
+          <AlertTriangle className="h-3 w-3 shrink-0" strokeWidth={1.75} aria-hidden="true" />
+        ) : (
+          <Clock className="h-3 w-3 shrink-0" strokeWidth={1.75} aria-hidden="true" />
+        )
       ) : null}
       {meta.label}
     </Badge>

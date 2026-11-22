@@ -1,0 +1,14 @@
+{
+  "id": "E-14",
+  "name": "上游失败后显式重试并重绑下游",
+  "task_prompt": "前置任务已失败且下游任务处于等待上游修复状态，请直接对失败任务发起显式重试并等待原下游任务完成，不要重建重复的下游任务。",
+  "theoretical_min_calls": 2,
+  "max_wasted_calls": 0,
+  "assertions": {
+    "must_preserve_terminal_run": true,
+    "must_rebind_waiting_downstream": true,
+    "must_not_recreate_downstream": true,
+    "final_exit_code": 0,
+    "expected_downstream_status": "done"
+  }
+}

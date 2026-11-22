@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "wrangler dev --local --test-scheduled",
     "typecheck": "tsc --noEmit",
-    "test": "tsc --noEmit && node --test src/auth.test.mjs src/notify-queue.test.mjs src/downloads.test.mjs src/validation.test.mjs src/redact.test.mjs src/native-events.test.mjs src/web-push.test.mjs src/admin-native-push.test.mjs test/board.test.mjs test/runs-error-next.test.mjs"
+    "test": "tsc --noEmit && node --test src/auth.test.mjs src/notify-queue.test.mjs src/downloads.test.mjs src/validation.test.mjs src/redact.test.mjs src/native-events.test.mjs src/web-push.test.mjs src/admin-native-push.test.mjs test/board.test.mjs test/runs-error-next.test.mjs test/plans.test.mjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261112.1",

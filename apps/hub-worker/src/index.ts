@@ -29,6 +29,8 @@ import {
   getPushSubscriptionByIdWithSecret,
   getRunById,
   heartbeatRun,
+  hydrateRunRecord,
+  hydrateRunRecords,
   listApiKeys,
   listDeliveriesForRun,
   listDeliveriesForSource,
@@ -39,7 +41,6 @@ import {
   listRunEvents,
   listRuns,
   listThreads,
-  mapRunRow,
   patchApiKey,
   patchNode,
   patchPushSubscription,
@@ -53,7 +54,8 @@ import {
   resolveRunApproval,
   revokeApiKey,
   revokePushSubscription,
-  upsertPushSubscription
+  upsertPushSubscription,
+  wakeDueWaitingRuns
 } from "./db";
 import {
   handleBinaryDownload,
@@ -65,6 +67,7 @@ import {
 } from "./downloads";
 import { NodeHub } from "./node-hub";
 import { processNotifyBatch } from "./notify-queue";
+import { createPlan, retryRun } from "./plans";
 import {
   type ApiScope,
   type BoardMessage,
@@ -91,6 +94,7 @@ import {
   parseCreateBoardMessageRequest,
   parseCreateBoardTopicRequest,
   parseCreateKeyRequest,
+  parseCreatePlanRequest,
   parseCreatePushSubscriptionRequest,
   parseCreateRunRequest,
   parseForkThreadRequest,
@@ -100,6 +104,7 @@ import {
   parseListBoardMessagesQuery,
   parseListBoardTopicsQuery,
   parseListNativeEventsQuery,
+  parseListRunsQuery,
   parseNativeEventCreateRequest,
   parsePatchBoardTopicRequest,
   parsePatchKeyRequest,
@@ -111,6 +116,7 @@ import {
   parseReorderBoardTopicsRequest,
   parseReorderRunsRequest,
   parseResolveRunRequest,
+  parseRetryRunRequest,
   readJsonBody
 } from "./validation";
 import { getVapidConfig, isLoopbackPushAllowed, sendWebPushNotification } from "./web-push";
@@ -200,6 +206,25 @@ async function doPost(env: Env, path: string, body: unknown): Promise<void> {
 
 async function broadcastRun(env: Env, run: RunRecord): Promise<void> {
   await doPost(env, "/internal/broadcast-run", { run }).catch(() => undefined);
+}
+
+async function wakeNodesCoalesced(
+  env: Env,
+  runs: ReadonlyArray<{ id: string; node_id: string; status: RunStatus }>
+): Promise<void> {
+  const firstRunByNode = new Map<string, string>();
+  for (const r of runs) {
+    if (r.status === "queued" && !firstRunByNode.has(r.node_id)) {
+      firstRunByNode.set(r.node_id, r.id);
+    }
+  }
+  for (const [nodeId, runId] of firstRunByNode) {
+    await doPost(env, "/internal/wake", {
+      node_id: nodeId,
+      reason: "run_queued",
+      run_id: runId
+    }).catch(() => undefined);
+  }
 }
 
 async function broadcastNode(env: Env, node: NodeRecord): Promise<void> {
@@ -487,9 +512,12 @@ export default {
             body.busyWorkdirs,
             getLeaseTtl(env)
           );
-          const claimedRuns = claimedRows.map((r) => mapRunRow(r, { view: "list", promptMode: "raw" }));
-          for (const row of claimedRows) {
-            ctx.waitUntil(broadcastRun(env, mapRunRow(row, { view: "list", promptMode: "preview" })));
+          const [claimedRuns, previewRuns] = await Promise.all([
+            hydrateRunRecords(env.DB, claimedRows, { view: "list", promptMode: "raw" }),
+            hydrateRunRecords(env.DB, claimedRows, { view: "list", promptMode: "preview" })
+          ]);
+          for (const runRecord of previewRuns) {
+            ctx.waitUntil(broadcastRun(env, runRecord));
           }
           return Response.json({ ok: true, claimed_runs: claimedRuns });
         }
@@ -533,7 +561,11 @@ export default {
             getLeaseTtl(env),
             body
           );
-          const runRecord = mapRunRow(updatedRow, { view: "summary", tailBytes: 16384 });
+          const runRecord = await hydrateRunRecord(env.DB, updatedRow, {
+            view: "summary",
+            tailBytes: 16384,
+            includeDeliveries: true
+          });
           await broadcastRun(env, runRecord);
           return Response.json({ ok: true, run: runRecord });
         }
@@ -546,9 +578,43 @@ export default {
           }
           const runId = decodePathSegment(completeMatch[1]!);
           const body = parseCompleteRequest(await readJsonBody(request));
-          const updatedRow = await completeRun(env.DB, env, runId, principal.boundNodeId, body);
-          const runRecord = mapRunRow(updatedRow, { view: "summary", tailBytes: 16384 });
+          const completeRes = await completeRun(env.DB, env, runId, principal.boundNodeId, body);
+          const [runRecord, wokenRecords, waitingDepRecords] = await Promise.all([
+            hydrateRunRecord(env.DB, completeRes.run, {
+              view: "summary",
+              tailBytes: 16384,
+              includeDeliveries: true
+            }),
+            hydrateRunRecords(env.DB, completeRes.wokenRuns, {
+              view: "summary",
+              tailBytes: 16384,
+              includeDeliveries: true
+            }),
+            hydrateRunRecords(env.DB, completeRes.waitingDependents, {
+              view: "summary",
+              tailBytes: 16384,
+              includeDeliveries: true
+            })
+          ]);
           await broadcastRun(env, runRecord);
+          if (completeRes.boardHandoff) {
+            await broadcastBoardMessage(
+              env,
+              completeRes.boardHandoff.message,
+              completeRes.boardHandoff.topic,
+              completeRes.boardHandoff.cursor,
+              completeRes.boardHandoff.openBoardQuestionCount
+            );
+          }
+          if (completeRes.wokenRuns.length > 0) {
+            await wakeNodesCoalesced(env, completeRes.wokenRuns);
+            for (const wRec of wokenRecords) {
+              await broadcastRun(env, wRec);
+            }
+          }
+          for (const depRec of waitingDepRecords) {
+            await broadcastRun(env, depRec);
+          }
           return Response.json({ ok: true, run: runRecord });
         }
 
@@ -580,7 +646,7 @@ export default {
           const body = parseForkThreadRequest(await readJsonBody(request));
           ensureNodeAllowedForClient(principal, body.nodeId);
           const { thread, seedRun } = await forkThread(env.DB, env, principal, threadId, body);
-          const runRecord = mapRunRow(seedRun, { view: "summary" });
+          const runRecord = await hydrateRunRecord(env.DB, seedRun, { view: "summary" });
           await doPost(env, "/internal/wake", {
             node_id: seedRun.node_id,
             reason: "run_queued",
@@ -590,21 +656,56 @@ export default {
           return Response.json({ ok: true, thread, run: runRecord }, { status: 202 });
         }
 
-        // 2.3 Runs
+        // 2.3 Plans & Runs
+        if (request.method === "POST" && pathname === "/api/v1/plans") {
+          requireScope(principal, ["admin", "client"]);
+          const nowMs = Date.now();
+          const body = parseCreatePlanRequest(await readJsonBody(request), nowMs);
+          const headerIdem = request.headers.get("Idempotency-Key") || undefined;
+          const res = await createPlan(env.DB, env, principal, body, headerIdem, nowMs);
+          if (!res.deduplicated) {
+            if (res.queuedRunRows.length > 0) {
+              await wakeNodesCoalesced(env, res.queuedRunRows);
+            }
+            for (const runRecord of res.runs) {
+              await broadcastRun(env, runRecord);
+            }
+            return Response.json({ ok: true, plan_id: res.planId, runs: res.runs }, { status: 201 });
+          }
+          return Response.json(
+            { ok: true, plan_id: res.planId, deduplicated: true, runs: res.runs },
+            { status: 200 }
+          );
+        }
+
         if (request.method === "POST" && pathname === "/api/v1/runs") {
           requireScope(principal, ["admin", "client"]);
-          const body = parseCreateRunRequest(await readJsonBody(request));
+          const nowMs = Date.now();
+          const body = parseCreateRunRequest(await readJsonBody(request), nowMs);
           const headerIdem = request.headers.get("Idempotency-Key") || undefined;
-          const { run } = await createRun(env.DB, env, principal, body, headerIdem);
+          const { run, deduplicated } = await createRun(env.DB, env, principal, body, headerIdem);
+          const initialRecord = await hydrateRunRecord(env.DB, run, {
+            view: "summary",
+            tailBytes: 16384,
+            includeDeliveries: true
+          });
+
+          if (run.status === "waiting") {
+            if (!deduplicated) {
+              await broadcastRun(env, initialRecord);
+            }
+            return Response.json({ ok: true, run: initialRecord }, { status: 202 });
+          }
 
           // Wake target node and notify stream subscribers
-          await doPost(env, "/internal/wake", {
-            node_id: run.node_id,
-            reason: "run_queued",
-            run_id: run.id
-          });
-          const initialRecord = mapRunRow(run, { view: "summary", tailBytes: 16384 });
-          await broadcastRun(env, initialRecord);
+          if (!deduplicated) {
+            await doPost(env, "/internal/wake", {
+              node_id: run.node_id,
+              reason: "run_queued",
+              run_id: run.id
+            });
+            await broadcastRun(env, initialRecord);
+          }
 
           const waitMs = Math.min(Math.max(Number(url.searchParams.get("wait_ms") || "0"), 0), 45000);
           if (waitMs > 0) {
@@ -645,12 +746,8 @@ export default {
 
         if (request.method === "GET" && pathname === "/api/v1/runs") {
           requireScope(principal, ["admin", "client"]);
-          const nodeId = url.searchParams.get("node_id") || undefined;
-          const threadId = url.searchParams.get("thread_id") || undefined;
-          const status = (url.searchParams.get("status") || undefined) as RunStatus | undefined;
-          const rootRunId = url.searchParams.get("root_run_id") || undefined;
-          const limit = Math.min(Math.max(Number(url.searchParams.get("limit") || "50"), 1), 200);
-          const runs = await listRuns(env.DB, principal, { nodeId, threadId, status, rootRunId, limit });
+          const filters = parseListRunsQuery(url.searchParams);
+          const runs = await listRuns(env.DB, principal, filters);
           return Response.json({ ok: true, runs });
         }
 
@@ -660,7 +757,7 @@ export default {
           const runs = await reorderQueuedRuns(env.DB, principal, body.nodeId, body.orderedRunIds);
           return Response.json({
             ok: true,
-            runs: runs.map((r) => mapRunRow(r, { view: "list" }))
+            runs: await hydrateRunRecords(env.DB, runs, { view: "list" })
           });
         }
 
@@ -679,13 +776,18 @@ export default {
           const runId = decodePathSegment(runDetailMatch[1]!);
           const body = parsePatchRunRequest(await readJsonBody(request));
           const updated = await patchQueuedRun(env.DB, principal, runId, body);
-          const runRecord = mapRunRow(updated, { view: "summary" });
-          await broadcastRun(env, runRecord);
-          await doPost(env, "/internal/wake", {
-            node_id: updated.node_id,
-            reason: "run_queued",
-            run_id: updated.id
+          const runRecord = await hydrateRunRecord(env.DB, updated, {
+            view: "summary",
+            includeDeliveries: true
           });
+          await broadcastRun(env, runRecord);
+          if (updated.status === "queued") {
+            await doPost(env, "/internal/wake", {
+              node_id: updated.node_id,
+              reason: "run_queued",
+              run_id: updated.id
+            });
+          }
           return Response.json({ ok: true, run: runRecord });
         }
 
@@ -705,15 +807,49 @@ export default {
           const runId = decodePathSegment(runResolveMatch[1]!);
           const rawBody = await readOptionalJsonBody(request, "Resolve");
           const body = parseResolveRunRequest(rawBody);
-          const { run, alreadyTerminal } = await resolveRunApproval(env.DB, env, principal, runId, body);
-          if (!alreadyTerminal) {
+          const resolveRes = await resolveRunApproval(env.DB, env, principal, runId, body);
+          if (!resolveRes.alreadyTerminal) {
             await doPost(env, "/internal/abort", {
-              targets: [{ nodeId: run.node_id, runId: run.id }],
+              targets: [{ nodeId: resolveRes.run.node_id, runId: resolveRes.run.id }],
               reason: "approval_resolved"
             }).catch(() => undefined);
           }
-          const runRecord = mapRunRow(run, { view: "summary", tailBytes: 16384 });
+          const [runRecord, wokenRecords, waitingDepRecords] = await Promise.all([
+            hydrateRunRecord(env.DB, resolveRes.run, {
+              view: "summary",
+              tailBytes: 16384,
+              includeDeliveries: true
+            }),
+            hydrateRunRecords(env.DB, resolveRes.wokenRuns, {
+              view: "summary",
+              tailBytes: 16384,
+              includeDeliveries: true
+            }),
+            hydrateRunRecords(env.DB, resolveRes.waitingDependents, {
+              view: "summary",
+              tailBytes: 16384,
+              includeDeliveries: true
+            })
+          ]);
           await broadcastRun(env, runRecord);
+          if (resolveRes.boardHandoff) {
+            await broadcastBoardMessage(
+              env,
+              resolveRes.boardHandoff.message,
+              resolveRes.boardHandoff.topic,
+              resolveRes.boardHandoff.cursor,
+              resolveRes.boardHandoff.openBoardQuestionCount
+            );
+          }
+          if (resolveRes.wokenRuns.length > 0) {
+            await wakeNodesCoalesced(env, resolveRes.wokenRuns);
+            for (const wRec of wokenRecords) {
+              await broadcastRun(env, wRec);
+            }
+          }
+          for (const depRec of waitingDepRecords) {
+            await broadcastRun(env, depRec);
+          }
           return Response.json({ ok: true, run: runRecord });
         }
 
@@ -723,15 +859,68 @@ export default {
           const runId = decodePathSegment(runCancelMatch[1]!);
           const rawBody = await readOptionalJsonBody(request, "Cancel");
           const body = parseCancelRunRequest(rawBody);
-          const { cancelledRuns, abortTargets } = await cancelRun(env.DB, env, principal, runId, body);
+          const { cancelledRuns, abortTargets, waitingDependents, boardHandoffs } = await cancelRun(
+            env.DB,
+            env,
+            principal,
+            runId,
+            body
+          );
           if (abortTargets.length > 0) {
             await doPost(env, "/internal/abort", { targets: abortTargets, reason: body.reason });
           }
-          const mapped = cancelledRuns.map((r) => mapRunRow(r, { view: "summary" }));
+          const [mapped, waitingDepRecords] = await Promise.all([
+            hydrateRunRecords(env.DB, cancelledRuns, { view: "summary", includeDeliveries: true }),
+            hydrateRunRecords(env.DB, waitingDependents, { view: "summary", includeDeliveries: true })
+          ]);
           for (const r of mapped) {
             await broadcastRun(env, r);
           }
+          for (const handoff of boardHandoffs) {
+            await broadcastBoardMessage(
+              env,
+              handoff.message,
+              handoff.topic,
+              handoff.cursor,
+              handoff.openBoardQuestionCount
+            );
+          }
+          for (const depRec of waitingDepRecords) {
+            await broadcastRun(env, depRec);
+          }
           return Response.json({ ok: true, cancelled_runs: mapped });
+        }
+
+        const runRetryMatch = /^\/api\/v1\/runs\/([^/]+)\/retry$/.exec(pathname);
+        if (request.method === "POST" && runRetryMatch) {
+          requireScope(principal, ["admin", "client"]);
+          const runId = decodePathSegment(runRetryMatch[1]!);
+          const rawBody = await readOptionalJsonBody(request, "Retry");
+          const body = parseRetryRunRequest(rawBody);
+          const headerIdem = request.headers.get("Idempotency-Key") || undefined;
+          const res = await retryRun(env.DB, env, principal, runId, body, headerIdem);
+          if (!res.deduplicated) {
+            if (res.newRunRow.status === "queued") {
+              await doPost(env, "/internal/wake", {
+                node_id: res.newRunRow.node_id,
+                reason: "run_queued",
+                run_id: res.newRunRow.id
+              });
+            }
+            await broadcastRun(env, res.run);
+            for (const depRec of res.reboundRuns) {
+              await broadcastRun(env, depRec);
+            }
+          }
+          return Response.json(
+            {
+              ok: true,
+              run: res.run,
+              rebound_run_ids: res.reboundRunIds,
+              ...(res.deduplicated ? { deduplicated: true } : {})
+            },
+            { status: res.deduplicated ? 200 : 201 }
+          );
         }
 
         // 2.4 API Keys
@@ -1211,11 +1400,31 @@ export default {
         // Deterministic admin helper to trigger lease reaping on demand
         if (request.method === "POST" && pathname === "/api/v1/admin/reap-leases") {
           requireScope(principal, ["admin"]);
-          const reaped = await reapExpiredLeases(env.DB, env);
-          for (const r of reaped) {
-            await broadcastRun(env, mapRunRow(r, { view: "summary" }));
+          const reapRes = await reapExpiredLeases(env.DB, env);
+          const [reapedRecords, waitingDepRecords] = await Promise.all([
+            hydrateRunRecords(env.DB, reapRes.reapedRuns, { view: "summary", includeDeliveries: true }),
+            hydrateRunRecords(env.DB, reapRes.waitingDependents, { view: "summary", includeDeliveries: true })
+          ]);
+          for (const r of reapedRecords) {
+            await broadcastRun(env, r);
           }
-          return Response.json({ ok: true, reaped_count: reaped.length, reaped_ids: reaped.map((r) => r.id) });
+          for (const handoff of reapRes.boardHandoffs) {
+            await broadcastBoardMessage(
+              env,
+              handoff.message,
+              handoff.topic,
+              handoff.cursor,
+              handoff.openBoardQuestionCount
+            );
+          }
+          for (const depRec of waitingDepRecords) {
+            await broadcastRun(env, depRec);
+          }
+          return Response.json({
+            ok: true,
+            reaped_count: reapRes.reapedRuns.length,
+            reaped_ids: reapRes.reapedRuns.map((r) => r.id)
+          });
         }
 
         throw new HubError(404, "NOT_FOUND", `Route ${request.method} ${pathname} not found.`);
@@ -1231,9 +1440,44 @@ export default {
   },
 
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    const reaped = await reapExpiredLeases(env.DB, env);
-    for (const r of reaped) {
-      ctx.waitUntil(broadcastRun(env, mapRunRow(r, { view: "summary" })));
+    const reapRes = await reapExpiredLeases(env.DB, env);
+    if (reapRes.reapedRuns.length > 0 || reapRes.waitingDependents.length > 0) {
+      const [reapedRecords, waitingDepRecords] = await Promise.all([
+        hydrateRunRecords(env.DB, reapRes.reapedRuns, { view: "summary", includeDeliveries: true }),
+        hydrateRunRecords(env.DB, reapRes.waitingDependents, { view: "summary", includeDeliveries: true })
+      ]);
+      for (const r of reapedRecords) {
+        ctx.waitUntil(broadcastRun(env, r));
+      }
+      for (const depRec of waitingDepRecords) {
+        ctx.waitUntil(broadcastRun(env, depRec));
+      }
+    }
+    for (const handoff of reapRes.boardHandoffs) {
+      ctx.waitUntil(
+        broadcastBoardMessage(
+          env,
+          handoff.message,
+          handoff.topic,
+          handoff.cursor,
+          handoff.openBoardQuestionCount
+        )
+      );
+    }
+    try {
+      const wokenRuns = await wakeDueWaitingRuns(env.DB);
+      if (wokenRuns.length > 0) {
+        ctx.waitUntil(wakeNodesCoalesced(env, wokenRuns));
+        const wokenRecords = await hydrateRunRecords(env.DB, wokenRuns, {
+          view: "summary",
+          includeDeliveries: true
+        });
+        for (const r of wokenRecords) {
+          ctx.waitUntil(broadcastRun(env, r));
+        }
+      }
+    } catch (err) {
+      console.error("[cron] wakeDueWaitingRuns failed:", err);
     }
     try {
       await pruneExpiredNativeActivity(env.DB, getNativeEventsRetentionDays(env), 500);

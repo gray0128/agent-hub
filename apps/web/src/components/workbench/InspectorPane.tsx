@@ -6,12 +6,16 @@ import {
   Bell,
   ChevronDown,
   ChevronRight,
+  Clock,
+  ExternalLink,
   GitFork,
   GripVertical,
+  Link2,
   ListOrdered,
   PauseCircle,
   PlayCircle,
   RefreshCw,
+  RotateCcw,
   Search,
   Send,
   Sliders,
@@ -26,6 +30,7 @@ import { DEFAULT_NODE_NOTIFY_EVENTS, PUSH_EVENT_FILTER_OPTIONS } from "@/lib/bro
 import {
   cn,
   type EventTone,
+  formatBlockedReason,
   formatLeaseRemainingSec,
   formatShortTime,
   summarizeRunEvent
@@ -140,6 +145,9 @@ export interface InspectorPaneProps {
   ) => void;
   onSelectRun: (runId: string) => void;
   onCancelRun: (runId: string, cascade: boolean) => void;
+  onRetryRun?: (runId: string) => void;
+  retryingRunIds?: Record<string, boolean>;
+  onOpenBoardTopic?: (topicId: string) => void;
   onToggleNodeDrain: (node: NodeRecord) => void;
   onUpdateNodeConcurrency: (nodeId: string, maxConcurrency: number) => void;
   onUpdateNodeDefaultNotify?: (nodeId: string, keyId: string | null) => void;
@@ -166,6 +174,9 @@ export function InspectorPane({
   onRedeliverChannel,
   onSelectRun,
   onCancelRun,
+  onRetryRun,
+  retryingRunIds = {},
+  onOpenBoardTopic,
   onToggleNodeDrain,
   onUpdateNodeConcurrency,
   onUpdateNodeDefaultNotify,
@@ -184,14 +195,22 @@ export function InspectorPane({
     activeEl?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [activeTab, inDrawer]);
 
-  const runIsActive = Boolean(
+  const runHasLease = Boolean(
     selectedRun &&
       (selectedRun.status === "queued" ||
         selectedRun.status === "claimed" ||
         selectedRun.status === "running" ||
         selectedRun.status === "needs_approval")
   );
-  const hasLease = Boolean(runIsActive && selectedRun?.lease_expires_at);
+  const runIsCancelable = Boolean(
+    selectedRun &&
+      (selectedRun.status === "waiting" ||
+        selectedRun.status === "queued" ||
+        selectedRun.status === "claimed" ||
+        selectedRun.status === "running" ||
+        selectedRun.status === "needs_approval")
+  );
+  const hasLease = Boolean(runHasLease && selectedRun?.lease_expires_at);
 
   useEffect(() => {
     if (!hasLease) return;
@@ -222,6 +241,50 @@ export function InspectorPane({
             .sort((a, b) => a.depth - b.depth || a.created_at.localeCompare(b.created_at))
         : [],
     [allRuns, rootRunId]
+  );
+
+  const runById = useMemo(() => new Map(allRuns.map((r) => [r.id, r])), [allRuns]);
+
+  const upstreamDepRuns = useMemo(() => {
+    if (!selectedRun?.depends_on_run_ids?.length) return [];
+    return selectedRun.depends_on_run_ids.map((depId) => ({
+      id: depId,
+      run: runById.get(depId) ?? null
+    }));
+  }, [runById, selectedRun?.depends_on_run_ids]);
+
+  const downstreamDepRuns = useMemo(() => {
+    if (!selectedRun) return [];
+    return allRuns
+      .filter((r) => r.depends_on_run_ids?.includes(selectedRun.id))
+      .sort((a, b) => a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id));
+  }, [allRuns, selectedRun]);
+
+  const retriedByRuns = useMemo(() => {
+    if (!selectedRun) return [];
+    return allRuns
+      .filter((r) => r.retry_of_run_id === selectedRun.id)
+      .sort((a, b) => b.created_at.localeCompare(a.created_at) || a.id.localeCompare(b.id));
+  }, [allRuns, selectedRun]);
+
+  const planRuns = useMemo(() => {
+    if (!selectedRun?.plan_id) return [];
+    return allRuns
+      .filter((r) => r.plan_id === selectedRun.plan_id)
+      .sort((a, b) => a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id));
+  }, [allRuns, selectedRun?.plan_id]);
+
+  const selectedBlockedMeta = useMemo(
+    () => (selectedRun?.status === "waiting" ? formatBlockedReason(selectedRun.blocked_reason) : null),
+    [selectedRun?.blocked_reason, selectedRun?.status]
+  );
+
+  const hasWaitingDownstream = downstreamDepRuns.some((r) => r.status === "waiting");
+  const hasDelegationChildren = Boolean(
+    selectedRun && lineageRuns.some((r) => r.parent_run_id === selectedRun.id)
+  );
+  const canCascadeCancelSelected = Boolean(
+    selectedRun && runIsCancelable && (hasWaitingDownstream || hasDelegationChildren)
   );
 
   const filteredWorkspaces = useMemo(() => {
@@ -332,7 +395,7 @@ export function InspectorPane({
                   租约 {leaseText}
                 </span>
               ) : null}
-              {selectedRun && runIsActive ? (
+              {selectedRun && runIsCancelable ? (
                 <Button
                   type="button"
                   size="sm"
@@ -431,55 +494,335 @@ export function InspectorPane({
           )}
         </TabsContent>
 
-        {/* 3. Delegation Lineage Tree */}
+        {/* 3. Delegation Lineage Tree & DAG Dependencies */}
         <TabsContent value="lineage" className="relative mt-0 min-h-0 flex-1 overflow-y-auto divide-y divide-border">
-          {lineageRuns.length === 0 ? (
+          {!selectedRun ? (
             <div className="px-3 py-6 text-center text-xs text-muted-foreground">
-              选择任务查看跨机委派拓扑树
+              选择任务查看跨机委派与 DAG 依赖拓扑
             </div>
           ) : (
-            lineageRuns.map((r) => (
-              <div
-                key={r.id}
-                style={{ paddingLeft: `${12 + r.depth * 18}px` }}
-                className={cn(
-                  "flex items-center justify-between gap-2 pr-3 py-2 hover:bg-accent/40 transition-colors duration-150",
-                  selectedRun?.id === r.id && "bg-accent/60"
-                )}
-              >
-                <button
-                  type="button"
-                  onClick={() => onSelectRun(r.id)}
-                  className="min-h-11 py-1 md:min-h-0 md:py-0 min-w-0 flex-1 text-left cursor-pointer"
-                >
-                  <div className="flex items-center gap-1.5">
-                    <span className="text-[10px] font-mono text-muted-foreground tabular-nums">
-                      D{r.depth}
+            <>
+              {/* Selected Run DAG / Schedule / Retry Summary */}
+              <div className="space-y-2.5 p-3 text-xs">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                    <RunStatusBadge status={selectedRun.status} blockedReason={selectedRun.blocked_reason} />
+                    <span className="truncate font-mono text-xs font-medium text-foreground">
+                      {selectedRun.id}
                     </span>
-                    <span className="truncate text-xs font-mono text-foreground">{r.id}</span>
+                    {selectedRun.plan_key ? (
+                      <Badge variant="outline" className="font-mono text-[10px]">
+                        key:{selectedRun.plan_key}
+                      </Badge>
+                    ) : null}
+                    {selectedRun.plan_id ? (
+                      <Badge variant="outline" className="font-mono text-[10px]">
+                        {selectedRun.plan_id}
+                      </Badge>
+                    ) : null}
+                    {selectedRun.actor_profile ? (
+                      <Badge variant="secondary" className="font-mono text-[10px]">
+                        {selectedRun.actor_profile}
+                      </Badge>
+                    ) : null}
                   </div>
-                  <div className="truncate text-[11px] font-mono text-muted-foreground">
-                    {r.node_id}:{r.workdir.split("/").pop()} ({r.agent})
+                </div>
+
+                {selectedBlockedMeta ? (
+                  <div
+                    data-testid="lineage-blocked-reason"
+                    className={cn(
+                      "border-l-2 pl-2.5 py-1 text-[11px] text-pretty",
+                      selectedBlockedMeta.tone === "failed"
+                        ? "border-[var(--status-failed)] text-[var(--status-failed)]"
+                        : selectedBlockedMeta.tone === "approval"
+                          ? "border-[var(--status-approval)] text-[var(--status-approval)]"
+                          : "border-muted-foreground/50 text-muted-foreground"
+                    )}
+                  >
+                    {selectedBlockedMeta.text}
                   </div>
-                </button>
-                <div className="flex shrink-0 items-center gap-1.5">
-                  <RunStatusBadge status={r.status} />
-                  {r.depth === 0 && lineageRuns.length > 1 ? (
+                ) : null}
+
+                {selectedRun.scheduled_at ? (
+                  <div className="flex items-center justify-between gap-2 text-[11px] tabular-nums">
+                    <span className="inline-flex items-center gap-1 text-muted-foreground">
+                      <Clock className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
+                      定时唤醒
+                    </span>
+                    <span
+                      className="font-mono text-foreground"
+                      title={selectedRun.scheduled_at}
+                    >
+                      {formatShortTime(selectedRun.scheduled_at)} ({selectedRun.scheduled_at})
+                    </span>
+                  </div>
+                ) : null}
+
+                {selectedRun.board_topic_id ? (
+                  <div className="flex items-center justify-between gap-2 text-[11px]">
+                    <span className="text-muted-foreground">协同板主题</span>
+                    {onOpenBoardTopic ? (
+                      <button
+                        type="button"
+                        data-testid={`lineage-open-board-${selectedRun.id}`}
+                        onClick={() => onOpenBoardTopic(selectedRun.board_topic_id!)}
+                        className="inline-flex min-h-11 md:min-h-0 items-center gap-1 font-mono text-[11px] text-[var(--status-running)] hover:underline cursor-pointer"
+                      >
+                        <span>{selectedRun.board_topic_id}</span>
+                        <ExternalLink className="h-3 w-3 shrink-0" strokeWidth={1.75} aria-hidden="true" />
+                      </button>
+                    ) : (
+                      <span className="font-mono text-foreground">{selectedRun.board_topic_id}</span>
+                    )}
+                  </div>
+                ) : null}
+
+                {selectedRun.retry_of_run_id ? (
+                  <div className="flex items-center justify-between gap-2 text-[11px]">
+                    <span className="text-muted-foreground">重试溯源</span>
+                    <button
+                      type="button"
+                      data-testid={`lineage-retry-of-${selectedRun.retry_of_run_id}`}
+                      onClick={() => onSelectRun(selectedRun.retry_of_run_id!)}
+                      className="inline-flex min-h-11 md:min-h-0 items-center gap-1 font-mono text-[11px] text-[var(--status-running)] hover:underline cursor-pointer"
+                    >
+                      <RotateCcw className="h-3 w-3 shrink-0" strokeWidth={1.75} aria-hidden="true" />
+                      {selectedRun.retry_of_run_id}
+                    </button>
+                  </div>
+                ) : null}
+
+                <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+                  {(selectedRun.status === "failed" || selectedRun.status === "cancelled") && onRetryRun ? (
                     <Button
                       type="button"
                       size="sm"
                       variant="outline"
-                      onClick={() => onCancelRun(r.id, true)}
-                      title="级联取消整棵树"
-                      className="min-h-11 md:min-h-0 md:h-7 px-2.5 md:px-2 text-xs md:text-[10px]"
+                      data-testid={`lineage-retry-run-${selectedRun.id}`}
+                      disabled={Boolean(retryingRunIds[selectedRun.id])}
+                      onClick={() => onRetryRun(selectedRun.id)}
+                      className="min-h-11 md:min-h-0 md:h-7 px-2.5 md:px-2 text-xs md:text-[11px]"
+                    >
+                      <RotateCcw className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
+                      {retryingRunIds[selectedRun.id] ? "重试中..." : "重试任务"}
+                    </Button>
+                  ) : null}
+                  {runIsCancelable ? (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      data-testid={`lineage-cancel-run-${selectedRun.id}`}
+                      onClick={() => onCancelRun(selectedRun.id, false)}
+                      className="min-h-11 md:min-h-0 md:h-7 px-2.5 md:px-2 text-xs md:text-[11px]"
                     >
                       <XCircle className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
-                      级联取消整棵树
+                      取消任务
+                    </Button>
+                  ) : null}
+                  {canCascadeCancelSelected ? (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="destructive"
+                      data-testid={`lineage-cascade-cancel-${selectedRun.id}`}
+                      onClick={() => onCancelRun(selectedRun.id, true)}
+                      className="min-h-11 md:min-h-0 md:h-7 px-2.5 md:px-2 text-xs md:text-[11px]"
+                    >
+                      <XCircle className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
+                      级联取消
                     </Button>
                   ) : null}
                 </div>
               </div>
-            ))
+
+              {/* Upstream Dependencies */}
+              {upstreamDepRuns.length > 0 ? (
+                <div className="space-y-1.5 p-3">
+                  <div className="flex items-center justify-between text-[11px] font-medium text-muted-foreground tabular-nums">
+                    <span className="inline-flex items-center gap-1">
+                      <Link2 className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
+                      前置依赖 ({upstreamDepRuns.length})
+                    </span>
+                  </div>
+                  <div className="divide-y divide-border rounded-[6px] border border-border bg-background/40">
+                    {upstreamDepRuns.map(({ id: depId, run: depRun }) => (
+                      <button
+                        key={depId}
+                        type="button"
+                        data-testid={`lineage-upstream-${depId}`}
+                        onClick={() => onSelectRun(depId)}
+                        className="flex w-full min-h-11 md:min-h-0 items-center justify-between gap-2 px-2.5 py-2 text-left hover:bg-accent/40 cursor-pointer"
+                      >
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate font-mono text-xs text-foreground">{depId}</div>
+                          {depRun ? (
+                            <div className="truncate font-mono text-[10px] text-muted-foreground">
+                              {depRun.node_id} · {depRun.agent}
+                              {depRun.plan_key ? ` · ${depRun.plan_key}` : ""}
+                            </div>
+                          ) : null}
+                        </div>
+                        {depRun ? (
+                          <RunStatusBadge status={depRun.status} blockedReason={depRun.blocked_reason} />
+                        ) : (
+                          <Badge variant="outline" className="font-mono text-[10px]">
+                            未知状态
+                          </Badge>
+                        )}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
+              {/* Downstream Waiting / Dependent Runs */}
+              {downstreamDepRuns.length > 0 ? (
+                <div className="space-y-1.5 p-3">
+                  <div className="text-[11px] font-medium text-muted-foreground tabular-nums">
+                    下游依赖任务 ({downstreamDepRuns.length})
+                  </div>
+                  <div className="divide-y divide-border rounded-[6px] border border-border bg-background/40">
+                    {downstreamDepRuns.map((depRun) => (
+                      <button
+                        key={depRun.id}
+                        type="button"
+                        data-testid={`lineage-downstream-${depRun.id}`}
+                        onClick={() => onSelectRun(depRun.id)}
+                        className="flex w-full min-h-11 md:min-h-0 items-center justify-between gap-2 px-2.5 py-2 text-left hover:bg-accent/40 cursor-pointer"
+                      >
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate font-mono text-xs text-foreground">{depRun.id}</div>
+                          <div className="truncate font-mono text-[10px] text-muted-foreground">
+                            {depRun.node_id} · {depRun.agent}
+                            {depRun.plan_key ? ` · ${depRun.plan_key}` : ""}
+                          </div>
+                        </div>
+                        <RunStatusBadge status={depRun.status} blockedReason={depRun.blocked_reason} />
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
+              {/* Replacement Retry Runs */}
+              {retriedByRuns.length > 0 ? (
+                <div className="space-y-1.5 p-3">
+                  <div className="text-[11px] font-medium text-muted-foreground tabular-nums">
+                    替代重试任务 ({retriedByRuns.length})
+                  </div>
+                  <div className="divide-y divide-border rounded-[6px] border border-border bg-background/40">
+                    {retriedByRuns.map((retryRun) => (
+                      <button
+                        key={retryRun.id}
+                        type="button"
+                        data-testid={`lineage-retried-by-${retryRun.id}`}
+                        onClick={() => onSelectRun(retryRun.id)}
+                        className="flex w-full min-h-11 md:min-h-0 items-center justify-between gap-2 px-2.5 py-2 text-left hover:bg-accent/40 cursor-pointer"
+                      >
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate font-mono text-xs text-foreground">{retryRun.id}</div>
+                          <div className="truncate font-mono text-[10px] text-muted-foreground tabular-nums">
+                            {retryRun.node_id} · {formatShortTime(retryRun.created_at)}
+                          </div>
+                        </div>
+                        <RunStatusBadge status={retryRun.status} blockedReason={retryRun.blocked_reason} />
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
+              {/* Plan DAG Siblings */}
+              {planRuns.length > 1 ? (
+                <div className="space-y-1.5 p-3">
+                  <div className="text-[11px] font-medium text-muted-foreground tabular-nums">
+                    同计划节点 ({planRuns.length})
+                  </div>
+                  <div className="divide-y divide-border rounded-[6px] border border-border bg-background/40">
+                    {planRuns.map((pr) => (
+                      <button
+                        key={pr.id}
+                        type="button"
+                        data-testid={`lineage-plan-node-${pr.id}`}
+                        onClick={() => onSelectRun(pr.id)}
+                        className={cn(
+                          "flex w-full min-h-11 md:min-h-0 items-center justify-between gap-2 px-2.5 py-2 text-left hover:bg-accent/40 cursor-pointer",
+                          pr.id === selectedRun.id && "bg-accent/60"
+                        )}
+                      >
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-1.5">
+                            {pr.plan_key ? (
+                              <span className="rounded border border-border px-1 py-px font-mono text-[10px] text-foreground">
+                                {pr.plan_key}
+                              </span>
+                            ) : null}
+                            <span className="truncate font-mono text-xs text-foreground">{pr.id}</span>
+                          </div>
+                          <div className="truncate font-mono text-[10px] text-muted-foreground">
+                            {pr.node_id} · {pr.agent}
+                          </div>
+                        </div>
+                        <RunStatusBadge status={pr.status} blockedReason={pr.blocked_reason} />
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
+              {/* Delegation Lineage Tree */}
+              {lineageRuns.length > 0 ? (
+                <div>
+                  <div className="px-3 pt-2.5 pb-1 text-[11px] font-medium text-muted-foreground tabular-nums">
+                    委派树 ({lineageRuns.length})
+                  </div>
+                  {lineageRuns.map((r) => (
+                    <div
+                      key={r.id}
+                      style={{ paddingLeft: `${12 + r.depth * 18}px` }}
+                      className={cn(
+                        "flex items-center justify-between gap-2 border-b border-border/60 pr-3 py-2 hover:bg-accent/40 transition-colors duration-150",
+                        selectedRun.id === r.id && "bg-accent/60"
+                      )}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => onSelectRun(r.id)}
+                        className="min-h-11 py-1 md:min-h-0 md:py-0 min-w-0 flex-1 text-left cursor-pointer"
+                      >
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-[10px] font-mono text-muted-foreground tabular-nums">
+                            D{r.depth}
+                          </span>
+                          <span className="truncate text-xs font-mono text-foreground">{r.id}</span>
+                        </div>
+                        <div className="truncate text-[11px] font-mono text-muted-foreground">
+                          {r.node_id}:{r.workdir.split("/").pop()} ({r.agent})
+                        </div>
+                      </button>
+                      <div className="flex shrink-0 items-center gap-1.5">
+                        <RunStatusBadge status={r.status} blockedReason={r.blocked_reason} />
+                        {r.depth === 0 && lineageRuns.length > 1 ? (
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            onClick={() => onCancelRun(r.id, true)}
+                            title="级联取消整棵树"
+                            className="min-h-11 md:min-h-0 md:h-7 px-2.5 md:px-2 text-xs md:text-[10px]"
+                          >
+                            <XCircle className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
+                            级联取消整棵树
+                          </Button>
+                        ) : null}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+            </>
           )}
         </TabsContent>
 

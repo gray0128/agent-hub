@@ -73,6 +73,10 @@ func Execute(args []string, version string) int {
 		return runNodes(g, subArgs)
 	case "run":
 		return runRun(g, subArgs)
+	case "plan":
+		return runPlan(g, subArgs)
+	case "retry":
+		return runRetry(g, subArgs)
 	case "wait":
 		return runWait(g, subArgs)
 	case "result":
@@ -345,10 +349,23 @@ func runNodes(g globalOpts, args []string) int {
 	return api.ExitOK
 }
 
+type strictStringSliceFlag []string
+
+func (s *strictStringSliceFlag) String() string {
+	return strings.Join(*s, ",")
+}
+
+func (s *strictStringSliceFlag) Set(v string) error {
+	*s = append(*s, v)
+	return nil
+}
+
 func runRun(g globalOpts, args []string) int {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	var nodeID, dir, agent, modelFlag, effortFlag, threadID, notifyTarget, idemKey, title string
+	var inFlag, topicFlag, asFlag string
+	var afterFlags strictStringSliceFlag
 	var noSandbox bool
 	var timeoutDur, waitDur time.Duration
 
@@ -365,6 +382,10 @@ func runRun(g globalOpts, args []string) int {
 	fs.StringVar(&title, "title", "", "thread title")
 	fs.StringVar(&notifyTarget, "notify", "", "notify target (grok|webhook)")
 	fs.StringVar(&idemKey, "idempotency-key", "", "idempotency key")
+	fs.Var(&afterFlags, "after", "upstream run_id dependencies (repeatable or comma-separated)")
+	fs.StringVar(&inFlag, "in", "", "delay before queuing (1m..7d)")
+	fs.StringVar(&topicFlag, "topic", "", "board topic id for terminal handoff writeback")
+	fs.StringVar(&asFlag, "as", "", "actor profile attribution")
 	fs.BoolVar(&noSandbox, "no-sandbox", false, "disable sandbox")
 	fs.DurationVar(&timeoutDur, "timeout", 15*time.Minute, "run timeout")
 	fs.DurationVar(&waitDur, "wait", 45*time.Second, "wait timeout")
@@ -374,11 +395,19 @@ func runRun(g globalOpts, args []string) int {
 		"-a": true, "--agent": true, "-m": true, "--model": true,
 		"--effort": true, "--thread": true, "--title": true,
 		"--notify": true, "--idempotency-key": true,
+		"--after": true, "--in": true, "--topic": true, "--as": true,
 		"--timeout": true, "--wait": true,
 	}
 	if err := parseFlagsFlexible(fs, args, valFlags); err != nil {
 		return api.ExitBadUsageOrInput
 	}
+
+	var waitExplicit bool
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "wait" {
+			waitExplicit = true
+		}
+	})
 
 	pos := fs.Args()
 	if len(pos) == 0 {
@@ -400,6 +429,35 @@ func runRun(g globalOpts, args []string) int {
 
 	if threadID == "" && (nodeID == "" || dir == "" || agent == "") {
 		return failUsage(g.JSON, "-n <node>, -d <dir>, and -a <agent> are required unless --thread is specified")
+	}
+
+	dependsOn, err := parseAfterRunIDs(afterFlags)
+	if err != nil {
+		return failUsage(g.JSON, err.Error())
+	}
+
+	scheduledAt := ""
+	if strings.TrimSpace(inFlag) != "" {
+		dur, err := parseDelayDuration(inFlag)
+		if err != nil {
+			return failUsage(g.JSON, err.Error())
+		}
+		scheduledAt = computeScheduledAt(dur)
+	}
+
+	topicID := strings.TrimSpace(topicFlag)
+	if err := validateBoardTopicID(topicID); err != nil {
+		return failUsage(g.JSON, err.Error())
+	}
+
+	actorProfile, err := resolveActorProfile(asFlag)
+	if err != nil {
+		return failUsage(g.JSON, err.Error())
+	}
+
+	validatedIdemKey, err := validateIdempotencyKey(idemKey)
+	if err != nil {
+		return failUsage(g.JSON, err.Error())
 	}
 
 	model, effort := runner.SplitModelAndEffort(modelFlag, effortFlag)
@@ -424,7 +482,11 @@ func runRun(g globalOpts, args []string) int {
 		Prompt:         prompt,
 		Title:          title,
 		ParentRunID:    strings.TrimSpace(os.Getenv("AHUB_RUN_ID")),
-		IdempotencyKey: idemKey,
+		IdempotencyKey: validatedIdemKey,
+		DependsOn:      dependsOn,
+		ScheduledAt:    scheduledAt,
+		BoardTopicID:   topicID,
+		ActorProfile:   actorProfile,
 	}
 	if notifyTarget != "" {
 		req.Notify = &api.NotifyConfig{Target: notifyTarget}
@@ -443,6 +505,9 @@ func runRun(g globalOpts, args []string) int {
 	if httpWaitMs < 0 {
 		httpWaitMs = 0
 	}
+	if !waitExplicit && (len(dependsOn) > 0 || scheduledAt != "") {
+		httpWaitMs = 0
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(httpWaitMs)*time.Millisecond+20*time.Second)
 	defer cancel()
@@ -450,6 +515,11 @@ func runRun(g globalOpts, args []string) int {
 	run, _, err := client.CreateRun(ctx, req, httpWaitMs)
 	if err != nil {
 		return failErr(g.JSON, err)
+	}
+
+	if run.Status == "waiting" && !waitExplicit {
+		outputRunResult(g.JSON, run, false)
+		return api.ExitOK
 	}
 
 	if isWaitStopState(run.Status) {
@@ -525,12 +595,37 @@ func isFatalWaitAPIError(err error) bool {
 	return apiErr.HTTPStatus == 401 || apiErr.HTTPStatus == 403 || apiErr.HTTPStatus == 404
 }
 
+var (
+	waitWSPingInterval = 25 * time.Second
+	waitWSPingTimeout  = 10 * time.Second
+)
+
 func waitViaStream(client *api.Client, runID string, timeout time.Duration) (*api.RunRecord, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	var latest *api.RunRecord
 	var lastErr error
+	lastWaitingHint := ""
+	emitWaitingHint := func(r *api.RunRecord) {
+		if r == nil || r.Status != "waiting" {
+			return
+		}
+		reason := "WAITING"
+		if r.BlockedReason != nil && *r.BlockedReason != "" {
+			reason = *r.BlockedReason
+		}
+		sched := ""
+		if r.ScheduledAt != nil && *r.ScheduledAt != "" {
+			sched = " scheduled_at=" + *r.ScheduledAt
+		}
+		key := reason + "|" + sched
+		if key != lastWaitingHint {
+			lastWaitingHint = key
+			fmt.Fprintf(os.Stderr, "[ahub wait] run %s waiting (blocked_reason=%s%s)\n", r.ID, reason, sched)
+		}
+	}
+
 	for {
 		if ctx.Err() != nil {
 			break
@@ -551,6 +646,7 @@ func waitViaStream(client *api.Client, runID string, timeout time.Duration) (*ap
 				if isWaitStopState(r.Status) {
 					return r, nil
 				}
+				emitWaitingHint(r)
 			} else {
 				lastErr = getErr
 				if isFatalWaitAPIError(getErr) {
@@ -566,48 +662,77 @@ func waitViaStream(client *api.Client, runID string, timeout time.Duration) (*ap
 		}
 
 		lastErr = nil
-		for {
-			_, data, readErr := conn.Read(ctx)
-			if readErr != nil {
-				lastErr = readErr
-				_ = conn.CloseNow()
-				break
-			}
-			var envelope struct {
-				Type string          `json:"type"`
-				Runs []api.RunRecord `json:"runs"`
-				Run  *api.RunRecord  `json:"run"`
-			}
-			if json.Unmarshal(data, &envelope) != nil {
-				continue
-			}
-			switch envelope.Type {
-			case "snapshot":
-				for i := range envelope.Runs {
-					if envelope.Runs[i].ID == runID {
-						cp := envelope.Runs[i]
-						latest = &cp
-						if isWaitStopState(cp.Status) {
+		stopRun, readErr := func() (*api.RunRecord, error) {
+			pingCtx, pingCancel := context.WithCancel(ctx)
+			defer pingCancel()
+			defer func() { _ = conn.CloseNow() }()
+
+			go func() {
+				ticker := time.NewTicker(waitWSPingInterval)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-pingCtx.Done():
+						return
+					case <-ticker.C:
+						pCtx, pCancel := context.WithTimeout(pingCtx, waitWSPingTimeout)
+						pingErr := conn.Ping(pCtx)
+						pCancel()
+						if pingErr != nil {
 							_ = conn.CloseNow()
+							return
+						}
+					}
+				}
+			}()
+
+			for {
+				_, data, err := conn.Read(ctx)
+				if err != nil {
+					return nil, err
+				}
+				var envelope struct {
+					Type string          `json:"type"`
+					Runs []api.RunRecord `json:"runs"`
+					Run  *api.RunRecord  `json:"run"`
+				}
+				if json.Unmarshal(data, &envelope) != nil {
+					continue
+				}
+				switch envelope.Type {
+				case "snapshot":
+					for i := range envelope.Runs {
+						if envelope.Runs[i].ID == runID {
+							cp := envelope.Runs[i]
+							latest = &cp
+							if isWaitStopState(cp.Status) {
+								if fullR, gErr := fetchRunSummaryBounded(client, runID); gErr == nil {
+									return fullR, nil
+								}
+								return latest, nil
+							}
+							emitWaitingHint(&cp)
+						}
+					}
+				case "run.updated":
+					if envelope.Run != nil && envelope.Run.ID == runID {
+						latest = envelope.Run
+						if isWaitStopState(latest.Status) {
 							if fullR, gErr := fetchRunSummaryBounded(client, runID); gErr == nil {
 								return fullR, nil
 							}
 							return latest, nil
 						}
-					}
-				}
-			case "run.updated":
-				if envelope.Run != nil && envelope.Run.ID == runID {
-					latest = envelope.Run
-					if isWaitStopState(latest.Status) {
-						_ = conn.CloseNow()
-						if fullR, gErr := fetchRunSummaryBounded(client, runID); gErr == nil {
-							return fullR, nil
-						}
-						return latest, nil
+						emitWaitingHint(latest)
 					}
 				}
 			}
+		}()
+		if stopRun != nil {
+			return stopRun, nil
+		}
+		if readErr != nil {
+			lastErr = readErr
 		}
 	}
 
@@ -664,21 +789,45 @@ func runResult(g globalOpts, args []string) int {
 func runRuns(g globalOpts, args []string) int {
 	fs := flag.NewFlagSet("runs", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	var nodeID, status string
+	var nodeID, status, planID, topicID string
 	var limit int
 	fs.StringVar(&nodeID, "node", "", "filter by node id")
 	fs.StringVar(&status, "status", "", "filter by status")
+	fs.StringVar(&planID, "plan", "", "filter by plan id (pln_...)")
+	fs.StringVar(&topicID, "topic", "", "filter by board topic id (top_...)")
 	fs.IntVar(&limit, "limit", 20, "limit")
-	if err := parseFlagsFlexible(fs, args, map[string]bool{"--node": true, "--status": true, "--limit": true}); err != nil {
+	valFlags := map[string]bool{
+		"--node": true, "--status": true, "--plan": true, "--topic": true, "--limit": true,
+	}
+	if err := parseFlagsFlexible(fs, args, valFlags); err != nil {
 		return api.ExitBadUsageOrInput
 	}
+	status = strings.TrimSpace(status)
+	if status != "" && !isValidRunStatus(status) {
+		return failUsage(g.JSON, fmt.Sprintf("invalid --status %q (expected waiting|queued|claimed|running|needs_approval|done|failed|cancelled)", status))
+	}
+	planID = strings.TrimSpace(planID)
+	if err := validatePlanID(planID); err != nil {
+		return failUsage(g.JSON, err.Error())
+	}
+	topicID = strings.TrimSpace(topicID)
+	if err := validateBoardTopicID(topicID); err != nil {
+		return failUsage(g.JSON, err.Error())
+	}
+
 	client, err := newClient(g)
 	if err != nil {
 		return failErr(g.JSON, err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	runs, err := client.ListRuns(ctx, nodeID, status, limit)
+	runs, err := client.ListRunsWithOptions(ctx, api.ListRunsOptions{
+		NodeID:       nodeID,
+		Status:       status,
+		PlanID:       planID,
+		BoardTopicID: topicID,
+		Limit:        limit,
+	})
 	if err != nil {
 		return failErr(g.JSON, err)
 	}
@@ -1279,12 +1428,26 @@ func isWaitStopState(status string) bool {
 	return status == "done" || status == "failed" || status == "cancelled" || status == "needs_approval"
 }
 
+func clearEmptyPtr(p *string) *string {
+	if p != nil && *p == "" {
+		return nil
+	}
+	return p
+}
+
 func sanitizeRunRecord(r api.RunRecord, full bool) api.RunRecord {
 	r.LeaseOwner = ""
 	r.Prompt = redact.Text(r.Prompt)
 	if !full && r.Prompt != "" {
 		r.Prompt, _ = redact.TruncateUTF8(r.Prompt, 1536)
 	}
+	r.ParentRunID = clearEmptyPtr(r.ParentRunID)
+	r.PlanID = clearEmptyPtr(r.PlanID)
+	r.PlanKey = clearEmptyPtr(r.PlanKey)
+	r.ScheduledAt = clearEmptyPtr(r.ScheduledAt)
+	r.RetryOfRunID = clearEmptyPtr(r.RetryOfRunID)
+	r.BoardTopicID = clearEmptyPtr(r.BoardTopicID)
+	r.BlockedReason = clearEmptyPtr(r.BlockedReason)
 	return r
 }
 
@@ -1299,6 +1462,14 @@ func outputRunResult(asJSON bool, run *api.RunRecord, full bool) {
 		return
 	}
 	fmt.Printf("Run %s [%s] node=%s agent=%s duration=%dms\n", run.ID, run.Status, run.NodeID, run.Agent, run.DurationMs)
+	if sanitized.Status == "waiting" {
+		if sanitized.BlockedReason != nil && *sanitized.BlockedReason != "" {
+			fmt.Printf("Blocked Reason: %s\n", *sanitized.BlockedReason)
+		}
+		if sanitized.ScheduledAt != nil && *sanitized.ScheduledAt != "" {
+			fmt.Printf("Scheduled At: %s\n", *sanitized.ScheduledAt)
+		}
+	}
 	if sanitized.Prompt != "" {
 		fmt.Printf("Prompt:\n%s\n", sanitized.Prompt)
 	}
@@ -1387,10 +1558,12 @@ Commands:
   auth login      Validate and save client credentials (0600, supports --token-stdin)
   auth status     Inspect redacted client credentials and optional --verify connectivity
   nodes           List registered nodes and workspaces
-  run             Create and dispatch a run (pass '-' to read prompt from stdin)
+  run             Create and dispatch a run (supports --after, --in, --topic, --as, '-' stdin)
+  plan            Submit a cross-machine DAG plan from JSON file or '-' stdin
+  retry           Retry a failed or cancelled run and rebind waiting dependents
   wait            Wait for a run over WebSocket until terminal or needs_approval
   result          Fetch run summary or --full output
-  runs            List recent runs
+  runs            List recent runs (supports --status, --plan, --topic)
   threads         List threads
   activity        Inspect read-only native agent activity across nodes (admin only)
   board           Post, read, ask, or wait on cross-machine coordination board

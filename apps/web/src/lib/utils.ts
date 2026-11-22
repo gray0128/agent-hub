@@ -1,6 +1,6 @@
 import { type ClassValue, clsx } from "clsx";
 import { twMerge } from "tailwind-merge";
-import type { RunEventItem, RunRecord } from "@/types";
+import type { RunBlockedReason, RunEventItem, RunRecord } from "@/types";
 
 export const AUTO_FULL_OUTPUT_MAX_BYTES = 128 * 1024;
 
@@ -345,4 +345,31 @@ export function formatNotifyBadgeMeta(
   if (status === "failed") return { label: "通知: 发送失败", tone: "failed" };
   if (webhookArmed) return { label: "通知: Webhook 已挂载", tone: "running" };
   return null;
+}
+
+export function formatBlockedReason(
+  reason?: RunBlockedReason | null
+): { text: string; tone: "neutral" | "approval" | "failed" } | null {
+  if (!reason) return null;
+  switch (reason) {
+    case "DEPENDENCY_PENDING":
+      return { text: "等待前置任务完成后自动入队。", tone: "neutral" };
+    case "SCHEDULED":
+      return { text: "等待定时时间到达后自动唤醒。", tone: "neutral" };
+    case "UPSTREAM_FAILED":
+      return {
+        text: "上游依赖任务已失败，当前任务保持等待。可对失败任务点击重试或取消后续任务。",
+        tone: "failed"
+      };
+    case "UPSTREAM_CANCELLED":
+      return {
+        text: "上游依赖任务已取消，当前任务保持等待。可对前置任务重试或级联取消当前任务。",
+        tone: "approval"
+      };
+    default: {
+      const _exhaustive: never = reason;
+      void _exhaustive;
+      return null;
+    }
+  }
 }

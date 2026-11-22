@@ -9,6 +9,8 @@ import type {
   BoardTopicStatus,
   CreateBoardMessagePayload,
   CreateBoardTopicPayload,
+  CreatePlanPayload,
+  CreatePlanResponse,
   CreateRunPayload,
   NativeEventAgentName,
   NativeEventKind,
@@ -22,8 +24,11 @@ import type {
   PushEventFilterKey,
   PushSubscriptionTestResponse,
   ReorderBoardTopicsPayload,
+  RetryRunPayload,
+  RetryRunResponse,
   RunEventItem,
   RunRecord,
+  RunStatus,
   ThreadRecord,
   ThreadStatus,
   WebPushSubscriptionRecord
@@ -145,9 +150,25 @@ export const apiClient = {
     );
   },
 
-  fetchRuns(token: string, params: { limit?: number; root_run_id?: string } = {}) {
+  fetchRuns(
+    token: string,
+    params: {
+      limit?: number;
+      root_run_id?: string;
+      board_topic_id?: string;
+      plan_id?: string;
+      status?: RunStatus;
+      thread_id?: string;
+      node_id?: string;
+    } = {}
+  ) {
     const sp = new URLSearchParams({ limit: String(params.limit ?? 100) });
     if (params.root_run_id) sp.set("root_run_id", params.root_run_id);
+    if (params.board_topic_id) sp.set("board_topic_id", params.board_topic_id);
+    if (params.plan_id) sp.set("plan_id", params.plan_id);
+    if (params.status) sp.set("status", params.status);
+    if (params.thread_id) sp.set("thread_id", params.thread_id);
+    if (params.node_id) sp.set("node_id", params.node_id);
     return requestJson<{ ok: true; runs: RunRecord[] }>(`/api/v1/runs?${sp.toString()}`, token);
   },
 
@@ -172,6 +193,31 @@ export const apiClient = {
     });
   },
 
+  createPlan(token: string, payload: CreatePlanPayload, idempotencyKey?: string) {
+    return requestJson<CreatePlanResponse>("/api/v1/plans", token, {
+      method: "POST",
+      ...(idempotencyKey ? { headers: { "Idempotency-Key": idempotencyKey } } : {}),
+      body: JSON.stringify(payload)
+    });
+  },
+
+  retryRun(
+    token: string,
+    runId: string,
+    payload: RetryRunPayload = {},
+    idempotencyKey?: string
+  ) {
+    return requestJson<RetryRunResponse>(
+      `/api/v1/runs/${encodeURIComponent(runId)}/retry`,
+      token,
+      {
+        method: "POST",
+        ...(idempotencyKey ? { headers: { "Idempotency-Key": idempotencyKey } } : {}),
+        body: JSON.stringify(payload)
+      }
+    );
+  },
+
   reorderQueuedRuns(token: string, nodeId: string, orderedRunIds: string[]) {
     return requestJson<{ ok: true; runs: RunRecord[] }>("/api/v1/runs/reorder", token, {
       method: "POST",
@@ -179,13 +225,13 @@ export const apiClient = {
     });
   },
 
-  cancelRun(token: string, runId: string, cascade = false) {
+  cancelRun(token: string, runId: string, cascade = false, reason?: string) {
     return requestJson<{ ok: true; cancelled_runs: RunRecord[] }>(
       `/api/v1/runs/${encodeURIComponent(runId)}/cancel`,
       token,
       {
         method: "POST",
-        body: JSON.stringify({ cascade, reason: "Cancelled from web console" })
+        body: JSON.stringify({ cascade, reason: reason ?? "Cancelled from web console" })
       }
     );
   },

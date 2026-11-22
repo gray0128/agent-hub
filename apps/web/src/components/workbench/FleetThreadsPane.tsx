@@ -49,6 +49,8 @@ function statusDotClass(status?: RunStatus): string {
       return "bg-[var(--status-failed)]";
     case "done":
       return "bg-[var(--status-done)]";
+    case "waiting":
+      return "bg-muted-foreground/60";
     case "queued":
     case "cancelled":
     default:
@@ -63,6 +65,8 @@ function statusShortLabel(status?: RunStatus): string | null {
       return "执行中";
     case "needs_approval":
       return "待审批";
+    case "waiting":
+      return "等待中";
     case "queued":
       return "排队";
     case "failed":
@@ -336,7 +340,7 @@ export function FleetThreadsPane({
       if (st === "needs_approval") {
         approval += 1;
         active += 1;
-      } else if (st === "running" || st === "claimed" || st === "queued") {
+      } else if (st === "running" || st === "claimed" || st === "queued" || st === "waiting") {
         active += 1;
       }
     }
@@ -351,7 +355,13 @@ export function FleetThreadsPane({
       }
       const st = latestRunByThread.get(t.id)?.status;
       if (statusFilter === "active") {
-        if (st !== "running" && st !== "claimed" && st !== "queued" && st !== "needs_approval") {
+        if (
+          st !== "running" &&
+          st !== "claimed" &&
+          st !== "queued" &&
+          st !== "waiting" &&
+          st !== "needs_approval"
+        ) {
           return false;
         }
       } else if (statusFilter === "needs_approval") {

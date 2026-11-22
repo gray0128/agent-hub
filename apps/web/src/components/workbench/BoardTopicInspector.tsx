@@ -1,7 +1,7 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { ExternalLink, GitBranch, Pin, PinOff, Terminal } from "lucide-react";
+import { ExternalLink, GitBranch, Pin, PinOff, Plus, Send, Terminal } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -11,18 +11,35 @@ import {
   SelectTrigger,
   SelectValue
 } from "@/components/ui/select";
-import { formatShortTime } from "@/lib/utils";
-import type { BoardMessage, BoardTopic, BoardTopicStatus } from "@/types";
+import { Textarea } from "@/components/ui/textarea";
+import { getAvailableAgents } from "@/lib/capabilities";
+import { formatBlockedReason, formatShortTime } from "@/lib/utils";
+import type {
+  AgentName,
+  BoardMessage,
+  BoardTopic,
+  BoardTopicStatus,
+  CreateRunPayload,
+  NodeRecord,
+  RunRecord
+} from "@/types";
 import { CopyButton } from "./CopyButton";
 import { MARKDOWN_COMPONENTS } from "./markdown-components";
-import { BoardTopicStatusBadge } from "./StatusBadge";
+import { BoardTopicStatusBadge, RunStatusBadge } from "./StatusBadge";
 
 export interface BoardTopicInspectorProps {
   topic: BoardTopic | null;
   messages: BoardMessage[];
   updatingTopic: boolean;
+  linkedRuns: RunRecord[];
+  linkedRunsLoading: boolean;
+  nodes: NodeRecord[];
+  dispatchingRun: boolean;
   onUpdateStatus: (topicId: string, status: BoardTopicStatus) => void;
   onTogglePin: (topic: BoardTopic) => void;
+  onOpenRunInWorkbench: (runId: string, threadId?: string | null) => void;
+  onQuickDispatchRun: (payload: CreateRunPayload) => Promise<RunRecord | null>;
+  onPrefillRunComposerFromTopic?: (topic: BoardTopic) => void;
 }
 
 const TOPIC_STATUS_OPTIONS: Array<{ value: BoardTopicStatus; label: string }> = [
@@ -48,9 +65,75 @@ export function BoardTopicInspector({
   topic,
   messages,
   updatingTopic,
+  linkedRuns,
+  linkedRunsLoading,
+  nodes,
+  dispatchingRun,
   onUpdateStatus,
-  onTogglePin
+  onTogglePin,
+  onOpenRunInWorkbench,
+  onQuickDispatchRun,
+  onPrefillRunComposerFromTopic
 }: BoardTopicInspectorProps) {
+  const [dispatchOpen, setDispatchOpen] = useState(false);
+  const [dispatchNodeId, setDispatchNodeId] = useState("");
+  const [dispatchWorkdir, setDispatchWorkdir] = useState("");
+  const [dispatchAgent, setDispatchAgent] = useState<AgentName>("agy");
+  const [dispatchDelaySec, setDispatchDelaySec] = useState<"0" | "60" | "300" | "1800">("0");
+  const [dispatchPrompt, setDispatchPrompt] = useState("");
+
+  const preferredNode = useMemo(
+    () => nodes.find((n) => n.status === "online") ?? nodes[0] ?? null,
+    [nodes]
+  );
+
+  useEffect(() => {
+    if (nodes.length === 0) return;
+    const activeNode = nodes.find((n) => n.id === dispatchNodeId) ?? preferredNode;
+    if (!activeNode) return;
+    if (dispatchNodeId !== activeNode.id) {
+      const avail = getAvailableAgents(activeNode);
+      setDispatchNodeId(activeNode.id);
+      setDispatchWorkdir(activeNode.workspaces[0]?.path ?? "");
+      setDispatchAgent(avail[0] ?? "agy");
+      return;
+    }
+    if (!dispatchWorkdir && activeNode.workspaces.length > 0) {
+      setDispatchWorkdir(activeNode.workspaces[0].path);
+    }
+  }, [dispatchNodeId, dispatchWorkdir, nodes, preferredNode]);
+
+  const selectedDispatchNode = useMemo(
+    () => nodes.find((n) => n.id === dispatchNodeId) ?? preferredNode,
+    [dispatchNodeId, nodes, preferredNode]
+  );
+  const dispatchWorkspaces = selectedDispatchNode?.workspaces ?? [];
+  const dispatchAgents = useMemo(
+    () => getAvailableAgents(selectedDispatchNode),
+    [selectedDispatchNode]
+  );
+
+  async function handleQuickDispatchSubmit() {
+    if (!topic || !selectedDispatchNode || !dispatchWorkdir.trim() || !dispatchPrompt.trim()) {
+      return;
+    }
+    const delay = Number(dispatchDelaySec);
+    const scheduledAt =
+      delay > 0 ? new Date(Date.now() + delay * 1000).toISOString() : undefined;
+    const created = await onQuickDispatchRun({
+      node_id: selectedDispatchNode.id,
+      workdir: dispatchWorkdir.trim(),
+      agent: dispatchAgent,
+      prompt: dispatchPrompt.trim(),
+      board_topic_id: topic.id,
+      ...(scheduledAt ? { scheduled_at: scheduledAt } : {})
+    });
+    if (created) {
+      setDispatchPrompt("");
+      setDispatchDelaySec("0");
+      setDispatchOpen(false);
+    }
+  }
   const participants = useMemo(() => {
     const nodes = new Set<string>();
     const profiles = new Set<string>();
@@ -344,6 +427,217 @@ export function BoardTopicInspector({
                 {readCliCmd}
               </pre>
             </div>
+          </div>
+
+          {/* Section 4: Linked Controlled Runs & Quick Dispatch */}
+          <div className="space-y-2.5 p-3" data-testid="board-linked-runs">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[11px] font-semibold text-foreground tabular-nums">
+                关联受控 Runs ({linkedRuns.length})
+              </span>
+              <div className="flex items-center gap-1">
+                {onPrefillRunComposerFromTopic ? (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => onPrefillRunComposerFromTopic(topic)}
+                    data-testid="board-open-composer-btn"
+                    className="min-h-11 md:min-h-0 md:h-7 px-2 text-xs md:text-[11px]"
+                  >
+                    执行台派发
+                  </Button>
+                ) : null}
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={dispatchOpen ? "secondary" : "outline"}
+                  onClick={() => setDispatchOpen((prev) => !prev)}
+                  data-testid="board-quick-dispatch-toggle"
+                  className="min-h-11 md:min-h-0 md:h-7 px-2.5 md:px-2 text-xs md:text-[11px]"
+                >
+                  <Plus className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
+                  派发任务
+                </Button>
+              </div>
+            </div>
+
+            {dispatchOpen ? (
+              <div
+                data-testid="board-quick-dispatch-form"
+                className="space-y-2 rounded-[6px] border border-border bg-background/60 p-2.5"
+              >
+                <div className="flex items-center justify-between gap-2 text-[10px] font-mono text-muted-foreground">
+                  <span className="truncate">board_topic_id: {topic.id}</span>
+                </div>
+
+                {nodes.length === 0 ? (
+                  <div className="py-2 text-[11px] text-muted-foreground">暂无可用执行节点</div>
+                ) : (
+                  <>
+                    <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+                      <Select
+                        value={selectedDispatchNode?.id ?? undefined}
+                        onValueChange={(v) => {
+                          const nextNode = nodes.find((n) => n.id === v) ?? null;
+                          const nextAgents = getAvailableAgents(nextNode);
+                          setDispatchNodeId(v);
+                          setDispatchWorkdir(nextNode?.workspaces[0]?.path ?? "");
+                          setDispatchAgent(
+                            nextAgents.includes(dispatchAgent)
+                              ? dispatchAgent
+                              : (nextAgents[0] ?? "agy")
+                          );
+                        }}
+                      >
+                        <SelectTrigger aria-label="快捷派发节点" data-testid="board-quick-dispatch-node">
+                          <SelectValue placeholder="选择节点" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {nodes.map((n) => (
+                            <SelectItem key={n.id} value={n.id}>
+                              {n.id} ({n.status === "online" ? "在线" : n.status === "draining" ? "已排空" : "离线"})
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+
+                      <Select
+                        value={dispatchWorkdir || undefined}
+                        onValueChange={setDispatchWorkdir}
+                      >
+                        <SelectTrigger aria-label="快捷派发目录" data-testid="board-quick-dispatch-workdir">
+                          <SelectValue placeholder="工作目录" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {dispatchWorkspaces.map((ws) => (
+                            <SelectItem key={ws.path} value={ws.path}>
+                              {ws.key}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-1.5">
+                      <Select
+                        value={dispatchAgent}
+                        onValueChange={(v) => setDispatchAgent(v as AgentName)}
+                      >
+                        <SelectTrigger aria-label="快捷派发 Agent" data-testid="board-quick-dispatch-agent">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {dispatchAgents.map((a) => (
+                            <SelectItem key={a} value={a}>
+                              {a}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+
+                      <Select
+                        value={dispatchDelaySec}
+                        onValueChange={(v) =>
+                          setDispatchDelaySec(v as "0" | "60" | "300" | "1800")
+                        }
+                      >
+                        <SelectTrigger aria-label="执行调度时间" data-testid="board-quick-dispatch-delay">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="0">立即入队</SelectItem>
+                          <SelectItem value="60">1 分钟后唤醒</SelectItem>
+                          <SelectItem value="300">5 分钟后唤醒</SelectItem>
+                          <SelectItem value="1800">30 分钟后唤醒</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+
+                    <Textarea
+                      value={dispatchPrompt}
+                      onChange={(e) => setDispatchPrompt(e.target.value)}
+                      placeholder="输入派发给节点执行的任务指令..."
+                      aria-label="快捷派发任务指令"
+                      data-testid="board-quick-dispatch-prompt"
+                      className="min-h-[68px]"
+                    />
+
+                    <div className="flex justify-end">
+                      <Button
+                        type="button"
+                        size="sm"
+                        disabled={
+                          dispatchingRun ||
+                          !selectedDispatchNode ||
+                          !dispatchWorkdir.trim() ||
+                          !dispatchPrompt.trim()
+                        }
+                        onClick={() => void handleQuickDispatchSubmit()}
+                        data-testid="board-quick-dispatch-submit"
+                        className="min-h-11 md:min-h-0 md:h-8"
+                      >
+                        <Send className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
+                        {dispatchingRun ? "派发中…" : "提交受控任务"}
+                      </Button>
+                    </div>
+                  </>
+                )}
+              </div>
+            ) : null}
+
+            {linkedRunsLoading && linkedRuns.length === 0 ? (
+              <div className="py-2 text-[11px] text-muted-foreground">关联任务加载中…</div>
+            ) : linkedRuns.length === 0 ? (
+              <div className="rounded-[6px] border border-dashed border-border bg-background/40 px-2.5 py-3 text-[11px] text-muted-foreground">
+                暂无关联到该协同主题的受控任务。可点击上方「派发任务」或使用 `ahub run --topic {topic.id}` 发起。
+              </div>
+            ) : (
+              <div className="divide-y divide-border rounded-[6px] border border-border bg-background/50">
+                {linkedRuns.map((r) => {
+                  const blocked = r.status === "waiting" ? formatBlockedReason(r.blocked_reason) : null;
+                  return (
+                    <div
+                      key={r.id}
+                      data-testid={`board-linked-run-${r.id}`}
+                      className="space-y-1 px-2.5 py-2"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex min-w-0 items-center gap-1.5">
+                          <RunStatusBadge status={r.status} blockedReason={r.blocked_reason} />
+                          <span className="truncate font-mono text-[11px] text-foreground">
+                            {r.id}
+                          </span>
+                        </div>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="ghost"
+                          data-testid={`board-linked-run-jump-${r.id}`}
+                          onClick={() => onOpenRunInWorkbench(r.id, r.thread_id)}
+                          className="min-h-11 md:min-h-0 md:h-6 shrink-0 px-2 text-xs md:text-[11px]"
+                        >
+                          <ExternalLink className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
+                          执行台
+                        </Button>
+                      </div>
+                      <div className="flex items-center justify-between gap-2 font-mono text-[10px] text-muted-foreground tabular-nums">
+                        <span className="truncate">
+                          {r.node_id} · {r.agent}
+                          {r.plan_key ? ` · ${r.plan_key}` : ""}
+                        </span>
+                        <span className="shrink-0">{formatShortTime(r.created_at)}</span>
+                      </div>
+                      {blocked ? (
+                        <div className="text-[11px] text-muted-foreground text-pretty">
+                          {blocked.text}
+                        </div>
+                      ) : null}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
         </div>
       )}

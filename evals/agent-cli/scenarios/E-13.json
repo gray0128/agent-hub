@@ -1,0 +1,16 @@
+{
+  "id": "E-13",
+  "name": "跨机 DAG 计划编排与定时回写",
+  "task_prompt": "以 codex-orchestrator 身份提交一个绑定至 proj/demo 主题的两步跨机接力计划（macmini alpha 到 mbp app），再追加一个依赖第二步且仅等待 1 秒、不启用回调的后续任务；超时后零轮询续等直至下游完成，再读取该主题确认自动回写的交接记录，最后提交一个绑定同一主题且延时 2 分钟并启用 grok 回调的任务验证立即返回。",
+  "theoretical_min_calls": 5,
+  "max_wasted_calls": 0,
+  "assertions": {
+    "plan_node_count": 2,
+    "actor_profile": "codex-orchestrator",
+    "wait_timeout_exit_code": 24,
+    "forbid_sleep_or_poll": true,
+    "final_exit_code": 0,
+    "must_auto_post_handoff": true,
+    "must_arm_scheduled_notify": true
+  }
+}

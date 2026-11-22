@@ -39,7 +39,10 @@ import type {
   BoardTopic,
   BoardTopicStatus,
   CreateBoardMessagePayload,
-  CreateBoardTopicPayload
+  CreateBoardTopicPayload,
+  CreateRunPayload,
+  NodeRecord,
+  RunRecord
 } from "@/types";
 import { BoardChannelTree } from "./BoardChannelTree";
 import { BoardKanbanView, KANBAN_COLUMNS } from "./BoardKanbanView";
@@ -69,6 +72,10 @@ export interface BoardWorkspaceProps {
   submittingMessage: boolean;
   updatingTopic: boolean;
   answeringIds: Record<string, boolean>;
+  linkedRuns: RunRecord[];
+  linkedRunsLoading: boolean;
+  nodes: NodeRecord[];
+  dispatchingRun: boolean;
   onMobileLeftOpenChange: (open: boolean) => void;
   onMobileRightOpenChange: (open: boolean) => void;
   onMobileShowDetailChange: (show: boolean) => void;
@@ -83,6 +90,9 @@ export interface BoardWorkspaceProps {
   onToggleTopicPin: (topic: BoardTopic) => void;
   onPostMessage: (topicId: string, payload: CreateBoardMessagePayload) => Promise<boolean>;
   onAnswerQuestion: (messageId: string, payload: AnswerBoardQuestionPayload) => Promise<boolean>;
+  onOpenRunInWorkbench: (runId: string, threadId?: string | null) => void;
+  onQuickDispatchRun: (payload: CreateRunPayload) => Promise<RunRecord | null>;
+  onPrefillRunComposerFromTopic?: (topic: BoardTopic) => void;
 }
 
 const BOARD_PANEL_IDS = ["board-channels", "board-timeline", "board-inspector"];
@@ -169,6 +179,10 @@ export function BoardWorkspace({
   submittingMessage,
   updatingTopic,
   answeringIds,
+  linkedRuns,
+  linkedRunsLoading,
+  nodes,
+  dispatchingRun,
   onMobileLeftOpenChange,
   onMobileRightOpenChange,
   onMobileShowDetailChange,
@@ -182,7 +196,10 @@ export function BoardWorkspace({
   onUpdateTopicStatus,
   onToggleTopicPin,
   onPostMessage,
-  onAnswerQuestion
+  onAnswerQuestion,
+  onOpenRunInWorkbench,
+  onQuickDispatchRun,
+  onPrefillRunComposerFromTopic
 }: BoardWorkspaceProps) {
   const [newTopicOpen, setNewTopicOpen] = useState(false);
   const [newChannel, setNewChannel] = useState("proj/demo");
@@ -735,6 +752,7 @@ export function BoardWorkspace({
           onOpenNewTopic={handleOpenNewTopic}
           onPostMessage={onPostMessage}
           onAnswerQuestion={onAnswerQuestion}
+          onOpenRunInWorkbench={onOpenRunInWorkbench}
         />
       )}
     </div>
@@ -745,8 +763,15 @@ export function BoardWorkspace({
       topic={selectedTopic}
       messages={selectedTopicMessages}
       updatingTopic={updatingTopic}
+      linkedRuns={linkedRuns}
+      linkedRunsLoading={linkedRunsLoading}
+      nodes={nodes}
+      dispatchingRun={dispatchingRun}
       onUpdateStatus={onUpdateTopicStatus}
       onTogglePin={onToggleTopicPin}
+      onOpenRunInWorkbench={onOpenRunInWorkbench}
+      onQuickDispatchRun={onQuickDispatchRun}
+      onPrefillRunComposerFromTopic={onPrefillRunComposerFromTopic}
     />
   );
 

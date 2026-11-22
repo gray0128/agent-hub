@@ -92,6 +92,7 @@ import type {
   BoardTopicStatus,
   CreateBoardMessagePayload,
   CreateBoardTopicPayload,
+  CreateRunPayload,
   DeliverySourceKind,
   NativeEventView,
   NodeRecord,
@@ -213,6 +214,7 @@ export function App() {
   const upsertThread = useTaskStore((s) => s.upsertThread);
   const setRuns = useTaskStore((s) => s.setRuns);
   const upsertRun = useTaskStore((s) => s.upsertRun);
+  const upsertRuns = useTaskStore((s) => s.upsertRuns);
   const appendEvents = useTaskStore((s) => s.appendEvents);
   const setFullOutput = useTaskStore((s) => s.setFullOutput);
   const selectThread = useTaskStore((s) => s.selectThread);
@@ -336,6 +338,9 @@ export function App() {
   const [submittingBoardMessage, setSubmittingBoardMessage] = useState(false);
   const [updatingBoardTopic, setUpdatingBoardTopic] = useState(false);
   const [answeringQuestionIds, setAnsweringQuestionIds] = useState<Record<string, boolean>>({});
+  const [retryingRunIds, setRetryingRunIds] = useState<Record<string, boolean>>({});
+  const [boardLinkedRunsLoading, setBoardLinkedRunsLoading] = useState(false);
+  const [boardDispatchingRun, setBoardDispatchingRun] = useState(false);
   const wsClientRef = useRef<HubStreamClient | null>(null);
   const hasConnectedOnceRef = useRef<boolean>(false);
   const boardInFlightTopicMsgRef = useRef<Set<string>>(new Set());
@@ -1131,6 +1136,46 @@ export function App() {
     workspaceMode
   ]);
 
+  // Fetch runs linked to active selected board topic
+  useEffect(() => {
+    if (
+      !hasSession ||
+      authStatus !== "authenticated" ||
+      boardPermissionDenied ||
+      workspaceMode !== "board" ||
+      !selectedBoardTopicId
+    ) {
+      setBoardLinkedRunsLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setBoardLinkedRunsLoading(true);
+    void apiClient
+      .fetchRuns(token, { board_topic_id: selectedBoardTopicId, limit: 50 })
+      .then((res) => {
+        if (!cancelled) {
+          upsertRuns(res.runs);
+        }
+      })
+      .catch(() => {
+        // non-fatal background sync
+      })
+      .finally(() => {
+        if (!cancelled) setBoardLinkedRunsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    authStatus,
+    boardPermissionDenied,
+    hasSession,
+    selectedBoardTopicId,
+    token,
+    upsertRuns,
+    workspaceMode
+  ]);
+
   // Fetch events for selected run when switched
   useEffect(() => {
     if (!hasSession || !selectedRunId) return;
@@ -1160,8 +1205,16 @@ export function App() {
     return runs
       .filter((r) => r.thread_id === selectedThreadId)
       .slice()
-      .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at));
+      .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at) || a.id.localeCompare(b.id));
   }, [runs, selectedThreadId]);
+
+  const boardLinkedRuns = useMemo(() => {
+    if (!selectedBoardTopicId) return [];
+    return runs
+      .filter((r) => r.board_topic_id === selectedBoardTopicId)
+      .slice()
+      .sort((a, b) => b.created_at.localeCompare(a.created_at) || a.id.localeCompare(b.id));
+  }, [runs, selectedBoardTopicId]);
 
   // Hydrate outputs for runs in active thread (auto full up to 128 KB, summary preview above 128 KB)
   useEffect(() => {
@@ -1347,7 +1400,21 @@ export function App() {
   const hasLineage = useMemo(() => {
     if (!selectedRun) return false;
     if (selectedRun.depth > 0) return true;
-    return runs.some((r) => r.root_run_id === selectedRun.root_run_id && r.id !== selectedRun.id);
+    if (
+      selectedRun.plan_id ||
+      selectedRun.retry_of_run_id ||
+      (selectedRun.depends_on_run_ids?.length ?? 0) > 0
+    ) {
+      return true;
+    }
+    return runs.some(
+      (r) =>
+        r.id !== selectedRun.id &&
+        (r.root_run_id === selectedRun.root_run_id ||
+          (Boolean(selectedRun.plan_id) && r.plan_id === selectedRun.plan_id) ||
+          r.depends_on_run_ids?.includes(selectedRun.id) ||
+          r.retry_of_run_id === selectedRun.id)
+    );
   }, [runs, selectedRun]);
 
   const fleetTelemetry = useMemo(() => {
@@ -1355,12 +1422,14 @@ export function App() {
     let running = 0;
     let approval = 0;
     let queued = 0;
+    let waiting = 0;
     for (const r of runs) {
       if (r.status === "running" || r.status === "claimed") running += 1;
       else if (r.status === "needs_approval") approval += 1;
       else if (r.status === "queued") queued += 1;
+      else if (r.status === "waiting") waiting += 1;
     }
-    return { online, total: nodes.length, running, approval, queued };
+    return { online, total: nodes.length, running, approval, queued, waiting };
   }, [nodes, runs]);
 
   const localPushActive = useMemo(
@@ -1492,11 +1561,29 @@ export function App() {
   }
 
   function handleSelectRunFromInspector(runId: string) {
-    const targetRun = runs.find((r) => r.id === runId);
+    const targetRun = useTaskStore.getState().runs.find((r) => r.id === runId);
     if (targetRun) {
       selectThread(targetRun.thread_id);
+      selectRun(targetRun.id);
+    } else {
+      selectRun(runId);
+      if (hasSession) {
+        void apiClient
+          .fetchRunDetail(token, runId, "summary")
+          .then((res) => {
+            upsertRun(res.run);
+            selectThread(res.run.thread_id);
+            selectRun(res.run.id);
+            if (!useTaskStore.getState().threads.some((t) => t.id === res.run.thread_id)) {
+              void apiClient
+                .fetchThreads(token)
+                .then((tRes) => setThreads(tRes.threads))
+                .catch(() => {});
+            }
+          })
+          .catch(() => {});
+      }
     }
-    selectRun(runId);
     setCenterMode("controlled");
     if (!isDesktop) {
       setMobileRightOpen(false);
@@ -1676,9 +1763,75 @@ export function App() {
     if (!hasSession) return;
     try {
       const res = await apiClient.cancelRun(token, runId, cascade);
-      res.cancelled_runs.forEach(upsertRun);
+      upsertRuns(res.cancelled_runs);
+      if (authScope === "client") {
+        const cancelledIds = new Set(res.cancelled_runs.map((r) => r.id));
+        const affectedWaiting = useTaskStore
+          .getState()
+          .runs.filter(
+            (r) =>
+              r.status === "waiting" &&
+              !cancelledIds.has(r.id) &&
+              r.depends_on_run_ids?.some((depId) => cancelledIds.has(depId) || depId === runId)
+          );
+        if (affectedWaiting.length > 0) {
+          const refreshed = await Promise.allSettled(
+            affectedWaiting.map((r) => apiClient.fetchRunDetail(token, r.id, "summary"))
+          );
+          const nextRuns = refreshed
+            .filter(
+              (item): item is PromiseFulfilledResult<{ ok: true; run: RunRecord }> =>
+                item.status === "fulfilled"
+            )
+            .map((item) => item.value.run);
+          if (nextRuns.length > 0) {
+            upsertRuns(nextRuns);
+          }
+        }
+      }
     } catch (err) {
       setErrorBanner(err instanceof ApiClientError ? err.message : "终止运行失败");
+    }
+  }
+
+  async function handleRetryRun(runId: string) {
+    if (!hasSession) return;
+    setRetryingRunIds((prev) => ({ ...prev, [runId]: true }));
+    setErrorBanner(null);
+    try {
+      const res = await apiClient.retryRun(token, runId);
+      upsertRun(res.run);
+      selectThread(res.run.thread_id);
+      selectRun(res.run.id);
+      setCenterMode("controlled");
+      if (!useTaskStore.getState().threads.some((t) => t.id === res.run.thread_id)) {
+        void apiClient
+          .fetchThreads(token)
+          .then((tRes) => setThreads(tRes.threads))
+          .catch(() => {});
+      }
+      if (res.rebound_run_ids.length > 0) {
+        const refreshed = await Promise.allSettled(
+          res.rebound_run_ids.map((id) => apiClient.fetchRunDetail(token, id, "summary"))
+        );
+        const nextRuns = refreshed
+          .filter(
+            (item): item is PromiseFulfilledResult<{ ok: true; run: RunRecord }> =>
+              item.status === "fulfilled"
+          )
+          .map((item) => item.value.run);
+        if (nextRuns.length > 0) {
+          upsertRuns(nextRuns);
+        }
+      }
+    } catch (err) {
+      setErrorBanner(err instanceof ApiClientError ? err.message : "重试任务失败");
+    } finally {
+      setRetryingRunIds((prev) => {
+        const next = { ...prev };
+        delete next[runId];
+        return next;
+      });
     }
   }
 
@@ -1879,6 +2032,135 @@ export function App() {
     setWorkspaceMode("runs");
   }
 
+  function handleJumpToRunFromBoard(runId: string, threadId?: string | null) {
+    const existing = useTaskStore.getState().runs.find((r) => r.id === runId);
+    setWorkspaceMode("runs");
+    setLeftTab("threads");
+    setCenterMode("controlled");
+    setBoardMobileLeftOpen(false);
+    setBoardMobileRightOpen(false);
+    setMobileLeftOpen(false);
+    setMobileRightOpen(false);
+
+    if (existing) {
+      selectThread(existing.thread_id);
+      selectRun(existing.id);
+      return;
+    }
+
+    if (threadId) {
+      selectThread(threadId);
+    }
+    selectRun(runId);
+
+    if (hasSession) {
+      void apiClient
+        .fetchRunDetail(token, runId, "summary")
+        .then((res) => {
+          upsertRun(res.run);
+          selectThread(res.run.thread_id);
+          selectRun(res.run.id);
+          if (!useTaskStore.getState().threads.some((t) => t.id === res.run.thread_id)) {
+            void apiClient
+              .fetchThreads(token)
+              .then((tRes) => setThreads(tRes.threads))
+              .catch(() => {});
+          }
+        })
+        .catch(() => {});
+    }
+  }
+
+  function handleJumpToBoardTopic(topicId: string) {
+    const target = useBoardStore.getState().topics.find((t) => t.id === topicId);
+    if (target) {
+      if (selectedBoardChannel && selectedBoardChannel !== target.channel) {
+        selectBoardChannel(target.channel);
+      }
+      if (boardTopicFilter === "open_questions" && (target.open_question_count ?? 0) <= 0) {
+        setBoardTopicFilter("active");
+      }
+    } else {
+      if (selectedBoardChannel) {
+        selectBoardChannel(null);
+      }
+      if (boardTopicFilter === "open_questions") {
+        setBoardTopicFilter("active");
+      }
+      if (hasSession && !boardPermissionDenied) {
+        void apiClient
+          .fetchBoardTopicMessages(token, topicId, { limit: 100 })
+          .then((res) => {
+            upsertBoardTopic(res.topic);
+            setBoardTopicMessages(res.topic.id, res.messages, res.cursor);
+          })
+          .catch(() => {});
+      }
+    }
+    if (boardSearchQuery.trim()) {
+      setBoardSearchQuery("");
+    }
+    selectBoardTopic(topicId);
+    setWorkspaceMode("board");
+    if (!isDesktop) {
+      setBoardMobileShowDetail(true);
+    }
+    setMobileLeftOpen(false);
+    setMobileRightOpen(false);
+  }
+
+  async function handleQuickDispatchFromBoardTopic(
+    payload: CreateRunPayload
+  ): Promise<RunRecord | null> {
+    if (!hasSession) {
+      setOnboardingOpen(true);
+      return null;
+    }
+    setBoardDispatchingRun(true);
+    setErrorBanner(null);
+    try {
+      const res = await apiClient.createRun(token, payload);
+      if (res.run) {
+        upsertRun(res.run);
+        if (!useTaskStore.getState().threads.some((t) => t.id === res.run.thread_id)) {
+          const threadsRes = await apiClient.fetchThreads(token);
+          setThreads(threadsRes.threads);
+        }
+        return res.run;
+      }
+      return null;
+    } catch (err) {
+      setErrorBanner(err instanceof ApiClientError ? err.message : "派发受控任务失败");
+      return null;
+    } finally {
+      setBoardDispatchingRun(false);
+    }
+  }
+
+  function handlePrefillRunComposerFromTopic(topic: BoardTopic) {
+    const targetNode =
+      nodes.find((n) => n.id === (composer.nodeId || selectedNodeId)) ??
+      nodes.find((n) => n.status === "online") ??
+      nodes[0];
+    selectThread(null);
+    setWorkspaceMode("runs");
+    setLeftTab("threads");
+    setCenterMode("controlled");
+    setBoardMobileLeftOpen(false);
+    setBoardMobileRightOpen(false);
+    setMobileLeftOpen(false);
+    setMobileRightOpen(false);
+    patchComposer({
+      mode: "new",
+      nodeId: targetNode?.id ?? composer.nodeId,
+      workdir: composer.workdir || targetNode?.workspaces?.[0]?.path || "",
+      boardTopicId: topic.id
+    });
+    window.requestAnimationFrame(() => {
+      document.getElementById("prompt-input")?.focus();
+    });
+  }
+
   async function handleSubmitPrompt() {
     if (!hasSession) {
       setOnboardingOpen(true);
@@ -1899,6 +2181,7 @@ export function App() {
         model: composer.model.trim() || undefined,
         effort: composer.effort || undefined,
         sandbox: composer.sandbox,
+        board_topic_id: composer.boardTopicId || undefined,
         notify: { target: composer.notifyTarget },
         prompt: promptText
       });
@@ -1910,7 +2193,7 @@ export function App() {
         const threadsRes = await apiClient.fetchThreads(token);
         setThreads(threadsRes.threads);
       }
-      patchComposer({ mode: "reply", prompt: "" });
+      patchComposer({ mode: "reply", prompt: "", boardTopicId: null });
     } catch (err) {
       setErrorBanner(err instanceof ApiClientError ? err.message : "创建运行失败");
     } finally {
@@ -2229,6 +2512,9 @@ export function App() {
     onRedeliverChannel: authScope === "admin" ? handleRedeliverChannel : undefined,
     onSelectRun: handleSelectRunFromInspector,
     onCancelRun: handleCancelRun,
+    onRetryRun: handleRetryRun,
+    retryingRunIds,
+    onOpenBoardTopic: handleJumpToBoardTopic,
     onToggleNodeDrain: handleToggleNodeDrain,
     onUpdateNodeConcurrency: handleUpdateNodeConcurrency,
     onUpdateNodeDefaultNotify: authScope === "admin" ? handleUpdateNodeDefaultNotify : undefined,
@@ -2254,6 +2540,7 @@ export function App() {
     ) : (
       <ConversationPane
         nodes={nodes}
+        allRuns={runs}
         selectedThread={selectedThread}
         threadRuns={threadRuns}
         selectedRunId={selectedRun?.id ?? null}
@@ -2263,11 +2550,15 @@ export function App() {
         composer={composer}
         composerNotice={composerNotice}
         submitting={submitting}
+        retryingRunIds={retryingRunIds}
         onPatchComposer={patchComposer}
         onDismissComposerNotice={() => setComposerNotice(null)}
         onSelectRun={selectRun}
+        onJumpToRun={handleSelectRunFromInspector}
+        onOpenBoardTopic={handleJumpToBoardTopic}
         onLoadFullOutput={handleLoadFullOutput}
         onCancelRun={handleCancelRun}
+        onRetryRun={handleRetryRun}
         onResolveRun={handleResolveRun}
         onForkThread={handleForkThread}
         onOpenLineage={() => {
@@ -2456,6 +2747,7 @@ export function App() {
                 >
                   <span>运行 {fleetTelemetry.running}</span>
                   <span>排队 {fleetTelemetry.queued}</span>
+                  {fleetTelemetry.waiting > 0 ? <span>等待 {fleetTelemetry.waiting}</span> : null}
                   <span
                     className={cn(
                       fleetTelemetry.approval > 0 && "text-[var(--status-approval)] font-medium"
@@ -2680,6 +2972,10 @@ export function App() {
               submittingMessage={submittingBoardMessage}
               updatingTopic={updatingBoardTopic}
               answeringIds={answeringQuestionIds}
+              linkedRuns={boardLinkedRuns}
+              linkedRunsLoading={boardLinkedRunsLoading}
+              nodes={nodes}
+              dispatchingRun={boardDispatchingRun}
               onMobileLeftOpenChange={setBoardMobileLeftOpen}
               onMobileRightOpenChange={setBoardMobileRightOpen}
               onMobileShowDetailChange={setBoardMobileShowDetail}
@@ -2703,6 +2999,9 @@ export function App() {
               onToggleTopicPin={handleToggleBoardTopicPin}
               onPostMessage={handlePostBoardMessage}
               onAnswerQuestion={handleAnswerBoardQuestion}
+              onOpenRunInWorkbench={handleJumpToRunFromBoard}
+              onQuickDispatchRun={handleQuickDispatchFromBoardTopic}
+              onPrefillRunComposerFromTopic={handlePrefillRunComposerFromTopic}
             />
           ) : workspaceMode === "inbox" ? (
             <PendingInbox

@@ -7,17 +7,21 @@ import {
   Bell,
   ChevronDown,
   ChevronUp,
+  Clock,
   ExternalLink,
   FileText,
   CheckCircle2,
   GitBranch,
   GitFork,
+  Link2,
   Lock,
+  RotateCcw,
   Send,
   Shield,
   SlidersHorizontal,
   Square,
-  Terminal
+  Terminal,
+  X
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -37,6 +41,7 @@ import {
 import {
   buildRunCliPreview,
   cn,
+  formatBlockedReason,
   formatBytes,
   formatDurationMs,
   formatNotifyBadgeMeta,
@@ -60,6 +65,7 @@ const NOTIFY_LABELS: Record<ComposerDraft["notifyTarget"], string> = {
 
 export interface ConversationPaneProps {
   nodes: NodeRecord[];
+  allRuns?: RunRecord[];
   selectedThread: ThreadRecord | null;
   threadRuns: RunRecord[];
   selectedRunId: string | null;
@@ -69,11 +75,15 @@ export interface ConversationPaneProps {
   composer: ComposerDraft;
   composerNotice?: string | null;
   submitting: boolean;
+  retryingRunIds?: Record<string, boolean>;
   onPatchComposer: (patch: Partial<ComposerDraft>) => void;
   onDismissComposerNotice?: () => void;
   onSelectRun: (runId: string) => void;
+  onJumpToRun?: (runId: string) => void;
+  onOpenBoardTopic?: (topicId: string) => void;
   onLoadFullOutput: (runId: string) => void;
   onCancelRun: (runId: string, cascade: boolean) => void;
+  onRetryRun?: (runId: string) => void;
   onResolveRun?: (runId: string) => void;
   onForkThread: (thread: ThreadRecord) => void;
   onOpenLineage?: () => void;
@@ -84,6 +94,7 @@ export interface ConversationPaneProps {
 
 export function ConversationPane({
   nodes,
+  allRuns = [],
   selectedThread,
   threadRuns,
   selectedRunId,
@@ -93,11 +104,15 @@ export function ConversationPane({
   composer,
   composerNotice,
   submitting,
+  retryingRunIds = {},
   onPatchComposer,
   onDismissComposerNotice,
   onSelectRun,
+  onJumpToRun,
+  onOpenBoardTopic,
   onLoadFullOutput,
   onCancelRun,
+  onRetryRun,
   onResolveRun,
   onForkThread,
   onOpenLineage,
@@ -351,10 +366,29 @@ export function ConversationPane({
             const copyableText = (hasFullOutput ? fullText : undefined) ?? previewText ?? run.summary;
             const evCount = eventsByRunId[run.id]?.length ?? 0;
             const isActive =
+              run.status === "waiting" ||
               run.status === "queued" ||
               run.status === "claimed" ||
               run.status === "running" ||
               run.status === "needs_approval";
+            const blockedMeta =
+              run.status === "waiting" ? formatBlockedReason(run.blocked_reason) : null;
+            const hasWaitingDependents = allRuns.some(
+              (r) => r.status === "waiting" && r.depends_on_run_ids?.includes(run.id)
+            );
+            const hasDelegationChildren = allRuns.some(
+              (r) =>
+                r.parent_run_id === run.id &&
+                (r.status === "waiting" ||
+                  r.status === "queued" ||
+                  r.status === "claimed" ||
+                  r.status === "running" ||
+                  r.status === "needs_approval")
+            );
+            const canCascadeCancel = isActive && (hasWaitingDependents || hasDelegationChildren);
+            const canRetry =
+              (run.status === "failed" || run.status === "cancelled") && Boolean(onRetryRun);
+            const jumpToRun = onJumpToRun ?? onSelectRun;
             const notifyMeta = formatNotifyBadgeMeta(run.notify_status, run.webhook_armed);
             const cmdExpanded = Boolean(expandedCmdRuns[run.id]);
             const cliPreview = buildRunCliPreview(run, selectedThread?.native_session_id);
@@ -381,8 +415,56 @@ export function ConversationPane({
               >
                 <div className="flex min-h-7 flex-wrap items-center justify-between gap-x-2 gap-y-1 sm:h-7 sm:flex-nowrap">
                   <div className="flex min-w-0 flex-wrap items-center gap-1.5 overflow-hidden sm:flex-nowrap">
-                    <RunStatusBadge status={run.status} />
+                    <RunStatusBadge status={run.status} blockedReason={run.blocked_reason} />
                     <span className="min-w-0 truncate text-xs font-mono text-foreground">{run.id}</span>
+                    {run.plan_key || run.plan_id ? (
+                      <Badge
+                        variant="outline"
+                        className="shrink-0 font-mono text-[10px]"
+                        title={run.plan_id ? `Plan ${run.plan_id}` : undefined}
+                      >
+                        {run.plan_key ? `plan:${run.plan_key}` : run.plan_id}
+                      </Badge>
+                    ) : null}
+                    {run.actor_profile ? (
+                      <Badge variant="secondary" className="shrink-0 font-mono text-[10px]">
+                        {run.actor_profile}
+                      </Badge>
+                    ) : null}
+                    {run.board_topic_id ? (
+                      onOpenBoardTopic ? (
+                        <button
+                          type="button"
+                          data-testid={`run-open-board-${run.id}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onOpenBoardTopic(run.board_topic_id!);
+                          }}
+                          className="inline-flex min-h-11 px-2 md:min-h-6 md:px-1.5 items-center gap-1 rounded-[5px] border border-border bg-card font-mono text-[11px] md:text-[10px] text-[var(--status-running)] hover:bg-accent cursor-pointer shrink-0"
+                        >
+                          <span>{run.board_topic_id}</span>
+                          <ExternalLink className="h-2.5 w-2.5 shrink-0" strokeWidth={1.75} aria-hidden="true" />
+                        </button>
+                      ) : (
+                        <Badge variant="outline" className="shrink-0 font-mono text-[10px]">
+                          {run.board_topic_id}
+                        </Badge>
+                      )
+                    ) : null}
+                    {run.retry_of_run_id ? (
+                      <button
+                        type="button"
+                        data-testid={`run-retry-of-${run.id}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          jumpToRun(run.retry_of_run_id!);
+                        }}
+                        className="inline-flex min-h-11 px-2 md:min-h-6 md:px-1.5 items-center gap-1 rounded-[5px] border border-border bg-card font-mono text-[11px] md:text-[10px] text-muted-foreground hover:text-foreground hover:bg-accent cursor-pointer shrink-0"
+                      >
+                        <RotateCcw className="h-2.5 w-2.5 shrink-0" strokeWidth={1.75} aria-hidden="true" />
+                        <span>重试自 {run.retry_of_run_id}</span>
+                      </button>
+                    ) : null}
                     {run.depth > 0 ? (
                       <Badge variant="outline" className="shrink-0 font-mono text-[10px]">
                         depth={run.depth}
@@ -442,17 +524,48 @@ export function ConversationPane({
                     ) : null}
 
                     {isActive ? (
+                      <>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          onClick={() => onCancelRun(run.id, false)}
+                          className="min-h-11 md:min-h-0 md:h-6 px-2.5 md:px-2 text-xs md:text-[11px]"
+                        >
+                          <Square className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
+                          取消任务
+                        </Button>
+                        {canCascadeCancel ? (
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            data-testid={`cascade-cancel-run-${run.id}`}
+                            onClick={() => onCancelRun(run.id, true)}
+                            className="min-h-11 md:min-h-0 md:h-6 px-2.5 md:px-2 text-xs md:text-[11px]"
+                          >
+                            级联取消
+                          </Button>
+                        ) : null}
+                      </>
+                    ) : null}
+
+                    {canRetry && onRetryRun ? (
                       <Button
                         type="button"
                         size="sm"
                         variant="outline"
-                        onClick={() => onCancelRun(run.id, false)}
+                        data-testid={`retry-run-${run.id}`}
+                        disabled={Boolean(retryingRunIds[run.id])}
+                        onClick={() => onRetryRun(run.id)}
                         className="min-h-11 md:min-h-0 md:h-6 px-2.5 md:px-2 text-xs md:text-[11px]"
                       >
-                        <Square className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
-                        取消任务
+                        <RotateCcw className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
+                        {retryingRunIds[run.id] ? "重试中..." : "重试任务"}
                       </Button>
-                    ) : hasUnloadedOutput ? (
+                    ) : null}
+
+                    {!isActive && hasUnloadedOutput ? (
                       <Button
                         type="button"
                         size="sm"
@@ -513,6 +626,64 @@ export function ConversationPane({
                     <pre className="mt-1.5 overflow-x-auto font-mono text-[11px] leading-relaxed text-foreground whitespace-pre-wrap break-all">
                       {cliPreview.fullCommand}
                     </pre>
+                  </div>
+                ) : null}
+
+                {run.status === "waiting" ? (
+                  <div
+                    data-testid={`run-waiting-info-${run.id}`}
+                    onClick={(e) => e.stopPropagation()}
+                    className={cn(
+                      "mt-2 space-y-1.5 border-l-2 pl-3 py-0.5 text-xs cursor-auto",
+                      blockedMeta?.tone === "failed"
+                        ? "border-[var(--status-failed)]"
+                        : blockedMeta?.tone === "approval"
+                          ? "border-[var(--status-approval)]"
+                          : "border-muted-foreground/50"
+                    )}
+                  >
+                    {blockedMeta ? (
+                      <p
+                        className={cn(
+                          "text-pretty",
+                          blockedMeta.tone === "failed"
+                            ? "text-[var(--status-failed)]"
+                            : blockedMeta.tone === "approval"
+                              ? "text-[var(--status-approval)]"
+                              : "text-muted-foreground"
+                        )}
+                      >
+                        {blockedMeta.text}
+                      </p>
+                    ) : null}
+                    {run.scheduled_at ? (
+                      <div className="flex flex-wrap items-center gap-1.5 font-mono text-[11px] text-muted-foreground tabular-nums">
+                        <Clock className="h-3 w-3 shrink-0" strokeWidth={1.75} aria-hidden="true" />
+                        <span>定时唤醒：</span>
+                        <span className="text-foreground" title={run.scheduled_at}>
+                          {formatShortTime(run.scheduled_at)}
+                        </span>
+                      </div>
+                    ) : null}
+                    {run.depends_on_run_ids && run.depends_on_run_ids.length > 0 ? (
+                      <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+                        <span className="inline-flex items-center gap-1 text-muted-foreground">
+                          <Link2 className="h-3 w-3 shrink-0" strokeWidth={1.75} aria-hidden="true" />
+                          前置依赖：
+                        </span>
+                        {run.depends_on_run_ids.map((depId) => (
+                          <button
+                            key={depId}
+                            type="button"
+                            data-testid={`run-dep-link-${run.id}-${depId}`}
+                            onClick={() => jumpToRun(depId)}
+                            className="inline-flex min-h-11 px-2 md:min-h-6 md:px-1.5 items-center rounded-[4px] border border-border bg-background/70 font-mono text-[11px] md:text-[10px] text-[var(--status-running)] hover:bg-accent cursor-pointer"
+                          >
+                            {depId}
+                          </button>
+                        ))}
+                      </div>
+                    ) : null}
                   </div>
                 ) : null}
 
@@ -730,6 +901,26 @@ export function ConversationPane({
           {targetNode?.status === "offline" ? (
             <div className="mb-2 rounded-[5px] border border-[var(--status-approval)]/40 bg-[var(--status-approval)]/10 px-2.5 py-1 text-[11px] text-[var(--status-approval)] text-pretty">
               目标节点当前离线。现在提交的任务将安全进入排队队列，并在节点上线后自动开始执行。
+            </div>
+          ) : null}
+
+          {composer.boardTopicId ? (
+            <div
+              data-testid="composer-board-topic-badge"
+              className="mb-2 flex items-center justify-between gap-2 rounded-[5px] border border-border bg-background/70 px-2.5 py-1 text-[11px]"
+            >
+              <span className="truncate font-mono text-muted-foreground">
+                关联协同板主题：<span className="text-foreground">{composer.boardTopicId}</span>
+              </span>
+              <button
+                type="button"
+                aria-label="取消关联协同板主题"
+                onClick={() => onPatchComposer({ boardTopicId: null })}
+                className="inline-flex min-h-11 px-2 md:min-h-0 md:px-1 items-center gap-0.5 text-xs md:text-[10px] text-muted-foreground hover:text-foreground cursor-pointer"
+              >
+                <X className="h-3 w-3" strokeWidth={1.75} aria-hidden="true" />
+                解绑
+              </button>
             </div>
           ) : null}
 

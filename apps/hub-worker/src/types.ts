@@ -5,6 +5,7 @@ export type NativeEventAgentName = AgentName | "grok";
 export type EffortLevel = "" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | "auto";
 export type ThreadStatus = "active" | "archived";
 export type RunStatus =
+  | "waiting"
   | "queued"
   | "claimed"
   | "running"
@@ -12,6 +13,11 @@ export type RunStatus =
   | "done"
   | "failed"
   | "cancelled";
+export type BlockedReason =
+  | "DEPENDENCY_PENDING"
+  | "SCHEDULED"
+  | "UPSTREAM_FAILED"
+  | "UPSTREAM_CANCELLED";
 export type RunEventKind =
   | "status"
   | "tool_use"
@@ -72,6 +78,7 @@ export type ErrorCode =
   | "WORKDIR_AMBIGUOUS"
   | "DEPTH_LIMIT_EXCEEDED"
   | "DELEGATION_CYCLE_DETECTED"
+  | "DEPENDENCY_CYCLE_DETECTED"
   | "IDEMPOTENCY_CONFLICT"
   | "INVALID_STATE_TRANSITION"
   | "LEASE_CONFLICT"
@@ -240,6 +247,14 @@ export interface RunRecord {
   timeout_sec: number;
   prompt?: string;
   status: RunStatus;
+  plan_id?: string | null;
+  plan_key?: string | null;
+  scheduled_at?: string | null;
+  retry_of_run_id?: string | null;
+  actor_profile?: string;
+  board_topic_id?: string | null;
+  depends_on_run_ids?: string[];
+  blocked_reason?: BlockedReason | null;
   priority_order: number;
   resolved_model: string;
   resolved_effort: string;

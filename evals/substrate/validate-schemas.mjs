@@ -1813,6 +1813,428 @@ const cases = [
         updated_at: "2026-11-22T12:00:00.000Z"
       }
     }
+  },
+  // Slice 2 Phase B boundary & negative schema cases
+  {
+    name: "plan-create valid boundary 20 nodes max",
+    schema: "plan-create.schema.json",
+    valid: true,
+    payload: {
+      nodes: Array.from({ length: 20 }, (_, i) => ({
+        key: `step-${i + 1}`,
+        node_id: "macmini",
+        workdir: "demo",
+        agent: "pi",
+        prompt: `Step ${i + 1}`
+      }))
+    }
+  },
+  {
+    name: "plan-create valid boundary 10 depends_on max and in_sec=60",
+    schema: "plan-create.schema.json",
+    valid: true,
+    payload: {
+      actor_profile: "a" + "b".repeat(39),
+      nodes: [
+        ...Array.from({ length: 10 }, (_, i) => ({
+          key: `prep-${i + 1}`,
+          node_id: "macmini",
+          workdir: "demo",
+          agent: "pi",
+          in_sec: 60,
+          prompt: `Prep ${i + 1}`
+        })),
+        {
+          key: "fan-in",
+          node_id: "mbp",
+          workdir: "demo",
+          agent: "codex",
+          depends_on: Array.from({ length: 10 }, (_, i) => `prep-${i + 1}`),
+          in_sec: 604800,
+          prompt: "Fan in"
+        }
+      ]
+    }
+  },
+  {
+    name: "PlanNodeSpec invalid extra unknown property",
+    schema: "plan-create.schema.json",
+    def: "PlanNodeSpec",
+    valid: false,
+    payload: {
+      key: "step-1",
+      node_id: "macmini",
+      workdir: "demo",
+      agent: "pi",
+      prompt: "Run check",
+      extra_node_prop: true
+    }
+  },
+  {
+    name: "PlanNodeSpec invalid 65-char key",
+    schema: "plan-create.schema.json",
+    def: "PlanNodeSpec",
+    valid: false,
+    payload: {
+      key: "k".repeat(65),
+      node_id: "macmini",
+      workdir: "demo",
+      agent: "pi",
+      prompt: "Run check"
+    }
+  },
+  {
+    name: "PlanNodeSpec invalid timeout_sec below 10",
+    schema: "plan-create.schema.json",
+    def: "PlanNodeSpec",
+    valid: false,
+    payload: {
+      key: "step-1",
+      node_id: "macmini",
+      workdir: "demo",
+      agent: "pi",
+      timeout_sec: 9,
+      prompt: "Run check"
+    }
+  },
+  {
+    name: "PlanNodeSpec invalid timeout_sec above 7200",
+    schema: "plan-create.schema.json",
+    def: "PlanNodeSpec",
+    valid: false,
+    payload: {
+      key: "step-1",
+      node_id: "macmini",
+      workdir: "demo",
+      agent: "pi",
+      timeout_sec: 7201,
+      prompt: "Run check"
+    }
+  },
+  {
+    name: "plan-create invalid board_topic_id",
+    schema: "plan-create.schema.json",
+    valid: false,
+    payload: {
+      board_topic_id: "bad_top",
+      nodes: [
+        {
+          key: "step-1",
+          node_id: "macmini",
+          workdir: "demo",
+          agent: "pi",
+          prompt: "Run check"
+        }
+      ]
+    }
+  },
+  {
+    name: "plan-create invalid actor_profile",
+    schema: "plan-create.schema.json",
+    valid: false,
+    payload: {
+      actor_profile: "Bad Profile",
+      nodes: [
+        {
+          key: "step-1",
+          node_id: "macmini",
+          workdir: "demo",
+          agent: "pi",
+          prompt: "Run check"
+        }
+      ]
+    }
+  },
+  {
+    name: "plan-create invalid idempotency_key shorter than 8 chars",
+    schema: "plan-create.schema.json",
+    valid: false,
+    payload: {
+      idempotency_key: "short7",
+      nodes: [
+        {
+          key: "step-1",
+          node_id: "macmini",
+          workdir: "demo",
+          agent: "pi",
+          prompt: "Run check"
+        }
+      ]
+    }
+  },
+  {
+    name: "run-create valid boundary 10 depends_on",
+    schema: "run-create.schema.json",
+    valid: true,
+    payload: {
+      node_id: "macmini",
+      workdir: "demo",
+      agent: "pi",
+      prompt: "Wait for 10 upstream runs",
+      depends_on: Array.from({ length: 10 }, (_, i) => `run_01JABCDEF12345678${i}`)
+    }
+  },
+  {
+    name: "run-create invalid in_sec rejected on REST endpoint",
+    schema: "run-create.schema.json",
+    valid: false,
+    payload: {
+      node_id: "macmini",
+      workdir: "demo",
+      agent: "pi",
+      prompt: "Should use scheduled_at instead of in_sec",
+      in_sec: 120
+    }
+  },
+  {
+    name: "run-create invalid duplicate depends_on",
+    schema: "run-create.schema.json",
+    valid: false,
+    payload: {
+      node_id: "macmini",
+      workdir: "demo",
+      agent: "pi",
+      prompt: "Dup deps",
+      depends_on: ["run_01JABCDEF123456789", "run_01JABCDEF123456789"]
+    }
+  },
+  {
+    name: "run-create invalid scheduled_at date-time format",
+    schema: "run-create.schema.json",
+    valid: false,
+    payload: {
+      node_id: "macmini",
+      workdir: "demo",
+      agent: "pi",
+      prompt: "Bad schedule",
+      scheduled_at: "not-a-date"
+    }
+  },
+  {
+    name: "run-record valid waiting UPSTREAM_CANCELLED empty actor_profile and depends_on_run_ids",
+    schema: "run-record.schema.json",
+    valid: true,
+    payload: {
+      id: "run_01JABCDEF123456792",
+      thread_id: "thr_01JABCDEF123456792",
+      root_run_id: "run_01JABCDEF123456792",
+      depth: 0,
+      max_depth: 1,
+      node_id: "macmini",
+      workdir: "/workspace/demo",
+      agent: "pi",
+      status: "waiting",
+      actor_profile: "",
+      depends_on_run_ids: [],
+      blocked_reason: "UPSTREAM_CANCELLED",
+      created_at: "2026-11-22T12:00:00.000Z",
+      updated_at: "2026-11-22T12:00:00.000Z"
+    }
+  },
+  {
+    name: "run-record invalid retry_of_run_id pattern",
+    schema: "run-record.schema.json",
+    valid: false,
+    payload: {
+      id: "run_01JABCDEF123456792",
+      thread_id: "thr_01JABCDEF123456792",
+      root_run_id: "run_01JABCDEF123456792",
+      depth: 0,
+      max_depth: 1,
+      node_id: "macmini",
+      workdir: "/workspace/demo",
+      agent: "pi",
+      status: "queued",
+      retry_of_run_id: "bad_run",
+      created_at: "2026-11-22T12:00:00.000Z",
+      updated_at: "2026-11-22T12:00:00.000Z"
+    }
+  },
+  {
+    name: "run-record invalid plan_key pattern",
+    schema: "run-record.schema.json",
+    valid: false,
+    payload: {
+      id: "run_01JABCDEF123456792",
+      thread_id: "thr_01JABCDEF123456792",
+      root_run_id: "run_01JABCDEF123456792",
+      depth: 0,
+      max_depth: 1,
+      node_id: "macmini",
+      workdir: "/workspace/demo",
+      agent: "pi",
+      status: "waiting",
+      plan_key: "BadKey",
+      created_at: "2026-11-22T12:00:00.000Z",
+      updated_at: "2026-11-22T12:00:00.000Z"
+    }
+  },
+  {
+    name: "run-record invalid >10 depends_on_run_ids",
+    schema: "run-record.schema.json",
+    valid: false,
+    payload: {
+      id: "run_01JABCDEF123456792",
+      thread_id: "thr_01JABCDEF123456792",
+      root_run_id: "run_01JABCDEF123456792",
+      depth: 0,
+      max_depth: 1,
+      node_id: "macmini",
+      workdir: "/workspace/demo",
+      agent: "pi",
+      status: "waiting",
+      depends_on_run_ids: Array.from({ length: 11 }, (_, i) => `run_01JABCDEF1234567${i}`),
+      created_at: "2026-11-22T12:00:00.000Z",
+      updated_at: "2026-11-22T12:00:00.000Z"
+    }
+  },
+  {
+    name: "ws-frames valid hub.welcome with has_pending_runs true",
+    schema: "ws-frames.schema.json",
+    valid: true,
+    payload: {
+      type: "hub.welcome",
+      node_id: "macmini",
+      heartbeat_interval_ms: 25000,
+      has_pending_runs: true
+    }
+  },
+  {
+    name: "ws-frames valid run.updated waiting retry_of_run_id UPSTREAM_CANCELLED",
+    schema: "ws-frames.schema.json",
+    valid: true,
+    payload: {
+      type: "run.updated",
+      run: {
+        id: "run_01JABCDEF123456793",
+        thread_id: "thr_01JABCDEF123456793",
+        root_run_id: "run_01JABCDEF123456793",
+        depth: 0,
+        max_depth: 1,
+        node_id: "mbp",
+        workdir: "/workspace/demo",
+        agent: "codex",
+        status: "waiting",
+        retry_of_run_id: "run_01JABCDEF123456790",
+        blocked_reason: "UPSTREAM_CANCELLED",
+        depends_on_run_ids: ["run_01JABCDEF123456789"],
+        created_at: "2026-11-22T12:00:00.000Z",
+        updated_at: "2026-11-22T12:00:00.000Z"
+      }
+    }
+  },
+  {
+    name: "ws-frames valid system board.message_created handoff frame",
+    schema: "ws-frames.schema.json",
+    valid: true,
+    payload: {
+      type: "board.message_created",
+      cursor: 12,
+      message: {
+        id: "msg_01JABCDEF123456790",
+        topic_id: "top_01JABCDEF123456789",
+        channel: "proj/demo",
+        seq: 3,
+        kind: "handoff",
+        reply_to_id: null,
+        actor_scope: "admin",
+        actor_key_id: null,
+        actor_profile: "codex-orchestrator",
+        source_node: "macmini",
+        text_md: "Run `run_01JABCDEF123456790` finished with status `done`.",
+        data: {
+          run_id: "run_01JABCDEF123456790",
+          thread_id: "thr_01JABCDEF123456790",
+          plan_id: "pln_01JABCDEF123456789",
+          plan_key: "review",
+          status: "done",
+          node_id: "macmini",
+          workdir: "/workspace/demo",
+          agent: "codex",
+          duration_ms: 1250,
+          error_code: ""
+        },
+        question_state: "",
+        question_options: [],
+        question_expires_at: null,
+        answered_message_id: null,
+        answered_at: null,
+        created_at: "2026-11-22T12:01:00.000Z"
+      }
+    }
+  },
+  {
+    name: "board ErrorEnvelope valid NODE_NOT_FOUND with next array",
+    schema: "board.schema.json",
+    def: "ErrorEnvelope",
+    valid: true,
+    payload: {
+      ok: false,
+      error: {
+        code: "NODE_NOT_FOUND",
+        message: "Target node 'missing-node' was not found.",
+        next: ["ahub nodes --json"]
+      }
+    }
+  },
+  {
+    name: "board ErrorEnvelope valid WORKDIR_AMBIGUOUS with next array",
+    schema: "board.schema.json",
+    def: "ErrorEnvelope",
+    valid: true,
+    payload: {
+      ok: false,
+      error: {
+        code: "WORKDIR_AMBIGUOUS",
+        message: "Multiple workspaces matched project key 'demo'.",
+        details: {
+          candidates: ["cnb/demo", "github/demo"]
+        },
+        next: ["ahub nodes --online --json"]
+      }
+    }
+  },
+  {
+    name: "board ErrorEnvelope invalid non-string next item",
+    schema: "board.schema.json",
+    def: "ErrorEnvelope",
+    valid: false,
+    payload: {
+      ok: false,
+      error: {
+        code: "NODE_NOT_FOUND",
+        message: "Target node was not found.",
+        next: [123]
+      }
+    }
+  },
+  {
+    name: "board ErrorEnvelope invalid next exceeding 8 items",
+    schema: "board.schema.json",
+    def: "ErrorEnvelope",
+    valid: false,
+    payload: {
+      ok: false,
+      error: {
+        code: "BAD_REQUEST",
+        message: "Too many next hints.",
+        next: Array.from({ length: 9 }, () => "ahub nodes --json")
+      }
+    }
+  },
+  {
+    name: "board ErrorEnvelope invalid next hint exceeding 512 chars",
+    schema: "board.schema.json",
+    def: "ErrorEnvelope",
+    valid: false,
+    payload: {
+      ok: false,
+      error: {
+        code: "BAD_REQUEST",
+        message: "Hint too long.",
+        next: ["ahub " + "x".repeat(508)]
+      }
+    }
   }
 ];
 

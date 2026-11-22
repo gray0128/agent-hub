@@ -1,0 +1,15 @@
+{
+  "id": "E-12",
+  "name": "错误引导命令自愈闭环",
+  "task_prompt": "在 proj/demo 频道对既有协同主题使用指定幂等键写入一条笔记，再到 macmini 的 demo 项目派发一条简短检查；若遇到冲突或路径歧义提示，严格按返回结果中的下一步建议命令一次读取主题详情或在线节点完成自愈，禁止盲目重试。",
+  "theoretical_min_calls": 4,
+  "max_wasted_calls": 0,
+  "assertions": {
+    "first_exit_code": 64,
+    "first_error_code": "IDEMPOTENCY_CONFLICT",
+    "requires_error_next": true,
+    "must_execute_board_read_topic": true,
+    "workdir_error_code": "WORKDIR_AMBIGUOUS",
+    "final_exit_code": 0
+  }
+}

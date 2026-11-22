@@ -419,6 +419,7 @@ for (const pane of [
 const slice1aTabularTargets = new Set([
   "BoardWorkspace.tsx",
   "BoardTopicTimeline.tsx",
+  "BoardTopicInspector.tsx",
   "BoardKanbanView.tsx",
   "PendingInbox.tsx"
 ]);

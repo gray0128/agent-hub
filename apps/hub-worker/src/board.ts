@@ -33,11 +33,13 @@ import {
 } from "./types";
 import { newId, nowIso } from "./ulid";
 import {
+  ACTOR_PROFILE_RE,
   BOARD_CHANNEL_RE,
   BOARD_MESSAGE_ID_RE,
   BOARD_TOPIC_ID_RE,
   codePointLength,
   DEFAULT_NODE_NOTIFY_EVENTS,
+  NODE_ID_RE,
   type ParsedAnswerBoardQuestion,
   type ParsedCreateBoardMessage,
   type ParsedCreateBoardTopic,
@@ -1643,4 +1645,186 @@ export function buildForbiddenBoardScopeError(principal: AuthPrincipal, channel:
     undefined,
     hints.length > 0 ? hints : undefined
   );
+}
+
+export interface BoardSystemHandoffRun {
+  id: string;
+  thread_id: string;
+  plan_id?: string | null;
+  plan_key?: string | null;
+  status: string;
+  node_id: string;
+  workdir: string;
+  agent: string;
+  summary: string;
+  output_md: string;
+  duration_ms: number;
+  error_code: string;
+  error_message: string;
+  actor_profile?: string;
+  board_topic_id?: string | null;
+}
+
+export interface SystemRunHandoffResult {
+  topic: BoardTopic;
+  message: BoardMessage;
+  cursor: number;
+  openBoardQuestionCount: number;
+}
+
+function truncateCodePoints(text: string, maxCodePoints: number): string {
+  const chars = Array.from(text);
+  if (chars.length <= maxCodePoints) {
+    return text;
+  }
+  return chars.slice(0, maxCodePoints).join("");
+}
+
+export async function postSystemRunHandoffToBoard(
+  db: D1Database,
+  run: BoardSystemHandoffRun
+): Promise<SystemRunHandoffResult | null> {
+  const topicId = run.board_topic_id ?? null;
+  if (!topicId || !BOARD_TOPIC_ID_RE.test(topicId)) {
+    return null;
+  }
+  if (run.status !== "done" && run.status !== "failed" && run.status !== "cancelled") {
+    return null;
+  }
+
+  try {
+    const idemKey = `run-handoff:${run.id}`;
+    const existingMsg = await db
+      .prepare(`SELECT id FROM board_messages WHERE idempotency_key = ?1 LIMIT 1`)
+      .bind(idemKey)
+      .first<{ id: string }>();
+    if (existingMsg) {
+      return null;
+    }
+
+    const topicRow = await db
+      .prepare(`SELECT * FROM board_topics WHERE id = ?1 LIMIT 1`)
+      .bind(topicId)
+      .first<BoardTopicRow>();
+    if (!topicRow) {
+      return null;
+    }
+
+    const planTag = run.plan_id
+      ? ` (plan \`${run.plan_id}\`${run.plan_key ? ` / \`${run.plan_key}\`` : ""})`
+      : "";
+    const excerpt =
+      run.summary.trim() ||
+      run.error_message.trim() ||
+      run.output_md.trim().slice(0, 1200) ||
+      "(no summary)";
+    const rawTextMd = run.error_code
+      ? `Run \`${run.id}\`${planTag} on \`${run.node_id}\` (\`${run.agent}\`) finished with \`${run.status}\` (\`${run.error_code}\`).\n\n${excerpt}`
+      : `Run \`${run.id}\`${planTag} on \`${run.node_id}\` (\`${run.agent}\`) finished with \`${run.status}\`.\n\n${excerpt}`;
+    const redactedTextMd = truncateCodePoints(redactSecrets(rawTextMd), 8192);
+    const finalTextMd = redactedTextMd.length > 0 ? redactedTextMd : `Run ${run.id}: ${run.status}`;
+
+    const redactedData = redactBoardData({
+      run_id: run.id,
+      thread_id: run.thread_id,
+      plan_id: run.plan_id ?? null,
+      plan_key: run.plan_key ?? null,
+      status: run.status,
+      node_id: run.node_id,
+      workdir: run.workdir,
+      agent: run.agent,
+      duration_ms: Number(run.duration_ms ?? 0),
+      error_code: run.error_code ?? ""
+    });
+    const redactedDataJson = JSON.stringify(redactedData);
+    const safeDataJson =
+      utf8ByteLength(redactedDataJson) <= 32768
+        ? redactedDataJson
+        : JSON.stringify({
+            run_id: run.id,
+            thread_id: run.thread_id,
+            plan_id: run.plan_id ?? null,
+            plan_key: run.plan_key ?? null,
+            status: run.status,
+            node_id: run.node_id,
+            agent: run.agent,
+            duration_ms: Number(run.duration_ms ?? 0),
+            error_code: redactSecrets(run.error_code ?? "")
+          });
+
+    const actorProfile =
+      run.actor_profile && ACTOR_PROFILE_RE.test(run.actor_profile) ? run.actor_profile : "";
+    const sourceNode = run.node_id && NODE_ID_RE.test(run.node_id) ? run.node_id : "";
+    const now = nowIso();
+    const messageId = newId("msg");
+
+    await db.batch([
+      db
+        .prepare(
+          `INSERT INTO board_messages (
+             id, topic_id, channel, seq, kind, reply_to_id,
+             actor_scope, actor_key_id, actor_profile, source_node,
+             text_md, data_json, idempotency_key,
+             question_state, question_options_json, question_expires_at,
+             answered_message_id, answered_at, created_at
+           ) VALUES (
+             ?1, ?2, ?3, COALESCE((SELECT MAX(seq) FROM board_messages WHERE topic_id = ?2), 0) + 1, 'handoff', NULL,
+             'admin', NULL, ?4, ?5,
+             ?6, ?7, ?8,
+             '', '[]', NULL,
+             NULL, NULL, ?9
+           )`
+        )
+        .bind(
+          messageId,
+          topicId,
+          topicRow.channel,
+          actorProfile,
+          sourceNode,
+          finalTextMd,
+          safeDataJson,
+          idemKey,
+          now
+        ),
+      db
+        .prepare(
+          `INSERT INTO board_events (channel, topic_id, message_id, event_type, actor_profile, created_at)
+           VALUES (?1, ?2, ?3, 'message.posted', ?4, ?5)`
+        )
+        .bind(topicRow.channel, topicId, messageId, actorProfile, now),
+      db
+        .prepare(
+          `UPDATE board_topics
+           SET last_message_id = ?1,
+               last_handoff_message_id = ?1,
+               last_event_cursor = last_insert_rowid(),
+               updated_at = ?2
+           WHERE id = ?3`
+        )
+        .bind(messageId, now, topicId)
+    ]);
+
+    const [freshTopicRow, freshMsgRow, openBoardQuestionCount] = await Promise.all([
+      db.prepare(`SELECT * FROM board_topics WHERE id = ?1 LIMIT 1`).bind(topicId).first<BoardTopicRow>(),
+      db.prepare(`SELECT * FROM board_messages WHERE id = ?1 LIMIT 1`).bind(messageId).first<BoardMessageRow>(),
+      countOpenBoardQuestions(db)
+    ]);
+    if (!freshTopicRow || !freshMsgRow) {
+      return null;
+    }
+
+    return {
+      topic: await hydrateBoardTopic(db, freshTopicRow),
+      message: mapBoardMessageRow(freshMsgRow),
+      cursor: Number(freshTopicRow.last_event_cursor ?? 0),
+      openBoardQuestionCount
+    };
+  } catch (err) {
+    console.warn(
+      `[board] postSystemRunHandoffToBoard ignored error for run=${run.id}: ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    );
+    return null;
+  }
 }

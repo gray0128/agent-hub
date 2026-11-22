@@ -11,11 +11,11 @@ import {
   enqueueRunNotificationIfNeeded,
   getDeliveriesSummaryMap,
   getNodeById,
+  hydrateRunRecord,
   listNativeEvents,
   listNodes,
   listRuns,
   listThreads,
-  mapRunRow,
   renewNodePingLeases,
   type RunRow,
   sanitizeNodeForScope,
@@ -660,7 +660,7 @@ export class NodeHub extends DurableObject<Env> {
               await getDeliveriesSummaryMap(this.env.DB, "run", [runRowForBroadcast.id])
             ).get(runRowForBroadcast.id);
           }
-          const runRecord = mapRunRow(runRowForBroadcast, {
+          const runRecord = await hydrateRunRecord(this.env.DB, runRowForBroadcast, {
             view: "summary",
             tailBytes: 16384,
             promptMode: "preview",

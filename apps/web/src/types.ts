@@ -120,6 +120,7 @@ export type EffortLevel =
 export type NodeStatus = "online" | "offline" | "draining";
 export type ThreadStatus = "active" | "archived";
 export type RunStatus =
+  | "waiting"
   | "queued"
   | "claimed"
   | "running"
@@ -127,6 +128,14 @@ export type RunStatus =
   | "done"
   | "failed"
   | "cancelled";
+
+export type RunBlockedReason =
+  | "DEPENDENCY_PENDING"
+  | "SCHEDULED"
+  | "UPSTREAM_FAILED"
+  | "UPSTREAM_CANCELLED";
+
+export type RunNotifyEvent = "done" | "failed" | "cancelled" | "needs_approval";
 
 export interface WorkspaceEntry {
   key: string;
@@ -208,6 +217,14 @@ export interface RunRecord {
   timeout_sec: number;
   prompt?: string;
   status: RunStatus;
+  plan_id?: string | null;
+  plan_key?: string | null;
+  scheduled_at?: string | null;
+  retry_of_run_id?: string | null;
+  actor_profile?: string;
+  board_topic_id?: string | null;
+  depends_on_run_ids?: string[];
+  blocked_reason?: RunBlockedReason | null;
   priority_order: number;
   resolved_model: string;
   resolved_effort: string;
@@ -400,9 +417,64 @@ export interface CreateRunPayload {
   model?: string;
   effort?: EffortLevel;
   sandbox?: boolean;
+  timeout_sec?: number;
   prompt: string;
   title?: string;
-  notify?: { target: "none" | "grok" | "webhook" };
+  parent_run_id?: string;
+  idempotency_key?: string;
+  depends_on?: string[];
+  scheduled_at?: string;
+  board_topic_id?: string;
+  actor_profile?: string;
+  notify?: { target: "none" | "grok" | "webhook"; events?: RunNotifyEvent[] };
+}
+
+export interface PlanNodeSpec {
+  key: string;
+  node_id: string;
+  workdir: string;
+  agent: AgentName;
+  model?: string;
+  effort?: EffortLevel;
+  sandbox?: boolean;
+  timeout_sec?: number;
+  prompt: string;
+  title?: string;
+  depends_on?: string[];
+  scheduled_at?: string;
+  in_sec?: number;
+  priority_order?: number;
+  notify?: { target?: "none" | "grok" | "webhook"; events?: RunNotifyEvent[] };
+}
+
+export interface CreatePlanPayload {
+  idempotency_key?: string;
+  board_topic_id?: string;
+  actor_profile?: string;
+  parent_run_id?: string;
+  nodes: PlanNodeSpec[];
+}
+
+export interface CreatePlanResponse {
+  ok: true;
+  plan_id: string;
+  deduplicated?: boolean;
+  runs: RunRecord[];
+}
+
+export interface RetryRunPayload {
+  idempotency_key?: string;
+  model?: string;
+  effort?: EffortLevel;
+  timeout_sec?: number;
+  actor_profile?: string;
+}
+
+export interface RetryRunResponse {
+  ok: true;
+  run: RunRecord;
+  rebound_run_ids: string[];
+  deduplicated?: boolean;
 }
 
 export type StreamFrame =

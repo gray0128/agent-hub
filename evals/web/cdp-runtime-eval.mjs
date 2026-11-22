@@ -328,6 +328,111 @@ async function apiJson(hubUrl, token, reqPath, init = {}) {
   return data;
 }
 
+function findD1SqliteFile(dir) {
+  if (!fs.existsSync(dir)) return null;
+  let fallback = null;
+  const stack = [dir];
+  while (stack.length > 0) {
+    const cur = stack.pop();
+    for (const entry of fs.readdirSync(cur, { withFileTypes: true })) {
+      const full = path.join(cur, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(full);
+      } else if (entry.name.endsWith(".sqlite")) {
+        if (full.split(path.sep).includes("d1")) {
+          return full;
+        }
+        if (!fallback) {
+          fallback = full;
+        }
+      }
+    }
+  }
+  return fallback;
+}
+
+function execD1(d1Dir, sql) {
+  const dbFile = findD1SqliteFile(d1Dir);
+  if (dbFile) {
+    try {
+      return execFileSync("sqlite3", ["-cmd", ".timeout 5000", dbFile, sql], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"]
+      }).trim();
+    } catch {
+      // Fallback to wrangler d1 execute below
+    }
+  }
+  return execFileSync(
+    "pnpm",
+    [
+      "exec",
+      "wrangler",
+      "d1",
+      "execute",
+      "DB",
+      "--local",
+      "--persist-to",
+      d1Dir,
+      "--json",
+      "--command",
+      sql
+    ],
+    {
+      cwd: workerDir,
+      env: { ...process.env, CI: "1" },
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"]
+    }
+  ).trim();
+}
+
+async function triggerScheduled(hubUrl) {
+  const res = await fetch(`${hubUrl}/cdn-cgi/handler/scheduled`);
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`triggerScheduled failed: HTTP ${res.status} ${text}`);
+  }
+  return res.text();
+}
+
+async function clickDomMatch(cdp, finderFnSource, label) {
+  const box = await cdp.evalJS(`
+    (() => {
+      const el = (${finderFnSource})();
+      if (!(el instanceof HTMLElement)) return null;
+      el.scrollIntoView({ block: "center", inline: "nearest" });
+      const r = el.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) return null;
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+    })()
+  `);
+  if (!box) {
+    throw new Error(`Element not clickable or invisible (${label})`);
+  }
+  await cdp.send("Input.dispatchMouseEvent", {
+    type: "mouseMoved",
+    x: box.x,
+    y: box.y,
+    button: "none",
+    clickCount: 0
+  });
+  await cdp.send("Input.dispatchMouseEvent", {
+    type: "mousePressed",
+    x: box.x,
+    y: box.y,
+    button: "left",
+    clickCount: 1
+  });
+  await cdp.send("Input.dispatchMouseEvent", {
+    type: "mouseReleased",
+    x: box.x,
+    y: box.y,
+    button: "left",
+    clickCount: 1
+  });
+}
+
 function toBase64Url(buf) {
   return Buffer.from(buf)
     .toString("base64")
@@ -529,6 +634,36 @@ function buildEvalInitScript(mockPushEndpoint, p256dh, auth) {
     window.__AHUB_CLS__ = 0;
     window.__AHUB_CLS_SOURCES__ = [];
     window.__AHUB_CAPTURED_NOTIFS__ = [];
+    window.__AHUB_STREAM_SOCKETS__ = [];
+    window.__AHUB_EVAL_INJECT_WS__ = (frame) => {
+      const openSockets = (window.__AHUB_STREAM_SOCKETS__ || []).filter((s) => s && s.readyState === 1);
+      const target = openSockets[openSockets.length - 1];
+      if (!target) {
+        throw new Error("No open /ws/stream WebSocket available for injection");
+      }
+      const payload = typeof frame === "string" ? frame : JSON.stringify(frame);
+      target.dispatchEvent(new MessageEvent("message", { data: payload }));
+      return true;
+    };
+    (() => {
+      const OrigWebSocket = window.WebSocket;
+      if (typeof OrigWebSocket === "function") {
+        const WrappedWebSocket = function(url, protocols) {
+          const ws = protocols !== undefined ? new OrigWebSocket(url, protocols) : new OrigWebSocket(url);
+          if (String(url || "").includes("/ws/stream")) {
+            window.__AHUB_STREAM_SOCKETS__.push(ws);
+          }
+          return ws;
+        };
+        WrappedWebSocket.prototype = OrigWebSocket.prototype;
+        Object.setPrototypeOf(WrappedWebSocket, OrigWebSocket);
+        WrappedWebSocket.CONNECTING = OrigWebSocket.CONNECTING;
+        WrappedWebSocket.OPEN = OrigWebSocket.OPEN;
+        WrappedWebSocket.CLOSING = OrigWebSocket.CLOSING;
+        WrappedWebSocket.CLOSED = OrigWebSocket.CLOSED;
+        window.WebSocket = WrappedWebSocket;
+      }
+    })();
     new PerformanceObserver((list) => {
       for (const entry of list.getEntries()) {
         if (!entry.hadRecentInput) {
@@ -760,6 +895,7 @@ try {
       "0",
       "--persist-to",
       d1Dir,
+      "--test-scheduled",
       "--show-interactive-dev-session=false",
       "--var",
       `BOOTSTRAP_ADMIN_TOKEN_SHA256:${adminSha}`,
@@ -3928,6 +4064,894 @@ try {
     throw new Error("Slice 1b Inbox Esc did not dismiss detail view on desktop");
   }
 
+  // Phase 4c: RFC-0001 Slice 2 — waiting badge, runStatusRank, DAG lineage, Retry, cascade cancel, Cron wake, [run] jump & BoardTopicInspector
+  await cdpClient.setViewport(1440, 900, false);
+  await cdpClient.evalJS(`window.__AHUB_CLS__ = 0; window.__AHUB_CLS_SOURCES__ = [];`);
+
+  const s2TopicRes = await apiJson(hubUrl, adminToken, "/api/v1/board/topics", {
+    method: "POST",
+    body: JSON.stringify({
+      channel: "proj/demo",
+      title: "Slice 2 DAG 协同回写验收",
+      status: "in_progress"
+    })
+  });
+  const s2Topic = s2TopicRes.topic;
+
+  const s2PlanRes = await apiJson(hubUrl, adminToken, "/api/v1/plans", {
+    method: "POST",
+    body: JSON.stringify({
+      idempotency_key: "cdp-slice2-dag-plan-001",
+      board_topic_id: s2Topic.id,
+      actor_profile: "codex-orchestrator",
+      nodes: [
+        {
+          key: "s2a",
+          node_id: "macmini",
+          workdir: wsAlpha,
+          agent: "agy",
+          title: "Slice 2 上游失败任务 s2a",
+          prompt: JSON.stringify({
+            summary: "s2a 模拟失败以验证阻塞与重试",
+            response: "s2a failed intentionally",
+            directives: [{ op: "exit", code: 1, message: "s2a intentional failure" }]
+          })
+        },
+        {
+          key: "s2b",
+          node_id: "mbp",
+          workdir: wsMbp,
+          agent: "pi",
+          depends_on: ["s2a"],
+          title: "Slice 2 下游等待任务 s2b",
+          prompt: JSON.stringify({
+            summary: "s2b 下游依赖任务",
+            response: "s2b downstream ok",
+            directives: [{ op: "sleep", ms: 5 }]
+          })
+        }
+      ]
+    })
+  });
+  const s2aSeed = s2PlanRes.runs.find((r) => r.plan_key === "s2a");
+  const s2bSeed = s2PlanRes.runs.find((r) => r.plan_key === "s2b");
+  if (!s2aSeed || !s2bSeed) {
+    throw new Error(`Slice 2 plan missing s2a/s2b: ${JSON.stringify(s2PlanRes)}`);
+  }
+
+  let s2a = null;
+  for (let i = 0; i < 40; i++) {
+    const r = await apiJson(hubUrl, adminToken, `/api/v1/runs/${s2aSeed.id}`);
+    if (r.run.status === "failed") {
+      s2a = r.run;
+      break;
+    }
+    if (r.run.status === "done" || r.run.status === "cancelled") {
+      throw new Error(`Expected s2a to fail, got ${JSON.stringify(r.run)}`);
+    }
+    await sleep(200);
+  }
+  if (!s2a) {
+    throw new Error(`s2a (${s2aSeed.id}) did not reach failed in time`);
+  }
+
+  const s2bD1 = (await apiJson(hubUrl, adminToken, `/api/v1/runs/${s2bSeed.id}`)).run;
+  if (
+    s2bD1.status !== "waiting" ||
+    s2bD1.blocked_reason !== "UPSTREAM_FAILED" ||
+    !Array.isArray(s2bD1.depends_on_run_ids) ||
+    !s2bD1.depends_on_run_ids.includes(s2a.id)
+  ) {
+    throw new Error(`Expected s2b waiting with UPSTREAM_FAILED depending on ${s2a.id}, got ${JSON.stringify(s2bD1)}`);
+  }
+
+  const s2SchedPlanRes = await apiJson(hubUrl, adminToken, "/api/v1/plans", {
+    method: "POST",
+    body: JSON.stringify({
+      idempotency_key: "cdp-slice2-sched-plan-001",
+      board_topic_id: s2Topic.id,
+      actor_profile: "codex-orchestrator",
+      nodes: [
+        {
+          key: "s2sched",
+          node_id: "mbp",
+          workdir: wsMbp,
+          agent: "pi",
+          in_sec: 120,
+          title: "Slice 2 定时唤醒任务 s2Sched",
+          prompt: JSON.stringify({
+            summary: "s2Sched 定时唤醒完成",
+            response: "s2Sched cron wake ok",
+            directives: [{ op: "sleep", ms: 5 }]
+          })
+        }
+      ]
+    })
+  });
+  const s2Sched = s2SchedPlanRes.runs[0];
+  if (!s2Sched || s2Sched.status !== "waiting" || s2Sched.blocked_reason !== "SCHEDULED" || !s2Sched.scheduled_at) {
+    throw new Error(`Expected s2Sched waiting with SCHEDULED, got ${JSON.stringify(s2SchedPlanRes)}`);
+  }
+
+  const s2cPlanRes = await apiJson(hubUrl, adminToken, "/api/v1/plans", {
+    method: "POST",
+    body: JSON.stringify({
+      idempotency_key: "cdp-slice2-cancel-chain-001",
+      nodes: [
+        {
+          key: "s2c1",
+          node_id: "mbp",
+          workdir: wsMbp,
+          agent: "pi",
+          in_sec: 300,
+          title: "Slice 2 取消链上游 s2c1",
+          prompt: JSON.stringify({ summary: "s2c1 ok", directives: [{ op: "sleep", ms: 5 }] })
+        },
+        {
+          key: "s2c2",
+          node_id: "mbp",
+          workdir: wsMbp,
+          agent: "pi",
+          depends_on: ["s2c1"],
+          title: "Slice 2 取消链下游 s2c2",
+          prompt: JSON.stringify({ summary: "s2c2 ok", directives: [{ op: "sleep", ms: 5 }] })
+        }
+      ]
+    })
+  });
+  const s2c1 = s2cPlanRes.runs.find((r) => r.plan_key === "s2c1");
+  const s2c2 = s2cPlanRes.runs.find((r) => r.plan_key === "s2c2");
+  if (!s2c1 || !s2c2 || s2c1.status !== "waiting" || s2c2.status !== "waiting") {
+    throw new Error(`Expected s2c1 & s2c2 waiting, got ${JSON.stringify(s2cPlanRes)}`);
+  }
+
+  const s2dPlanRes = await apiJson(hubUrl, adminToken, "/api/v1/plans", {
+    method: "POST",
+    body: JSON.stringify({
+      idempotency_key: "cdp-slice2-cascade-pair-001",
+      nodes: [
+        {
+          key: "s2d1",
+          node_id: "mbp",
+          workdir: wsMbp,
+          agent: "pi",
+          in_sec: 300,
+          title: "Slice 2 级联取消上游 s2d1",
+          prompt: JSON.stringify({ summary: "s2d1 ok", directives: [{ op: "sleep", ms: 5 }] })
+        },
+        {
+          key: "s2d2",
+          node_id: "mbp",
+          workdir: wsMbp,
+          agent: "pi",
+          depends_on: ["s2d1"],
+          title: "Slice 2 级联取消下游 s2d2",
+          prompt: JSON.stringify({ summary: "s2d2 ok", directives: [{ op: "sleep", ms: 5 }] })
+        }
+      ]
+    })
+  });
+  const s2d1 = s2dPlanRes.runs.find((r) => r.plan_key === "s2d1");
+  const s2d2 = s2dPlanRes.runs.find((r) => r.plan_key === "s2d2");
+  if (!s2d1 || !s2d2 || s2d1.status !== "waiting" || s2d2.status !== "waiting") {
+    throw new Error(`Expected s2d1 & s2d2 waiting, got ${JSON.stringify(s2dPlanRes)}`);
+  }
+
+  // Open Board -> s2Topic -> verify terminal s2a auto-handoff + BoardTopicInspector linked runs + [run] jump
+  await cdpClient.clickSelector('[data-testid="workspace-tab-board"]');
+  await sleep(250);
+  const hasTimelineTab = await cdpClient.evalJS(`Boolean(document.querySelector('[data-testid="board-view-tab-timeline"]'))`);
+  if (hasTimelineTab) {
+    await cdpClient.clickSelector('[data-testid="board-view-tab-timeline"]');
+    await sleep(150);
+  }
+  await cdpClient.clickSelector('[data-testid="board-channel-item-proj/demo"]');
+  for (let i = 0; i < 30; i++) {
+    if (await cdpClient.evalJS(`Boolean(document.querySelector('[data-testid="board-topic-item-${s2Topic.id}"]'))`)) {
+      break;
+    }
+    if (i === 29) throw new Error(`s2Topic ${s2Topic.id} did not appear in board topic list`);
+    await sleep(150);
+  }
+  await cdpClient.clickSelector(`[data-testid="board-topic-item-${s2Topic.id}"]`);
+
+  let s2BoardHydrated = null;
+  for (let i = 0; i < 40; i++) {
+    s2BoardHydrated = await cdpClient.evalJS(`
+      (() => {
+        const msgList = document.querySelector('[data-testid="board-messages-list"]');
+        const insp = document.querySelector('[data-testid="board-topic-inspector"]');
+        const rows = msgList ? Array.from(msgList.querySelectorAll('[data-message-kind="handoff"]')) : [];
+        const s2aRow = rows.find((el) => (el.textContent || "").includes(${JSON.stringify(s2a.id)}));
+        const runLink =
+          document.querySelector('[data-testid="board-handoff-run-link-${s2a.id}"]') ||
+          document.querySelector('[data-testid="board-run-link-${s2a.id}"]') ||
+          (s2aRow
+            ? Array.from(s2aRow.querySelectorAll("button, a")).find((el) => {
+                const t = (el.textContent || "").trim();
+                const rid = el.getAttribute("data-run-id") || "";
+                return rid === ${JSON.stringify(s2a.id)} || t.includes("[run]") || t.includes(${JSON.stringify(s2a.id)}) || t.includes("查看任务");
+              })
+            : null);
+        const inspText = insp?.textContent ?? "";
+        return {
+          hasHandoffRow: Boolean(s2aRow),
+          hasRunLink: Boolean(runLink),
+          inspHasS2a: inspText.includes(${JSON.stringify(s2a.id)}),
+          inspHasS2b: inspText.includes(${JSON.stringify(s2bSeed.id)})
+        };
+      })()
+    `);
+    if (
+      s2BoardHydrated.hasHandoffRow &&
+      s2BoardHydrated.hasRunLink &&
+      s2BoardHydrated.inspHasS2a &&
+      s2BoardHydrated.inspHasS2b
+    ) {
+      break;
+    }
+    if (i === 39) {
+      throw new Error(`Slice 2 Board timeline handoff / BoardTopicInspector linked runs check failed: ${JSON.stringify(s2BoardHydrated)}`);
+    }
+    await sleep(150);
+  }
+
+  // Click [run] link in BoardTopicTimeline -> must switch to runs workspace and select s2a
+  await clickDomMatch(
+    cdpClient,
+    `() => {
+      const direct =
+        document.querySelector('[data-testid="board-handoff-run-link-${s2a.id}"]') ||
+        document.querySelector('[data-testid="board-run-link-${s2a.id}"]');
+      if (direct) return direct;
+      const rows = Array.from(document.querySelectorAll('[data-testid="board-messages-list"] [data-message-kind="handoff"]'));
+      const s2aRow = rows.find((el) => (el.textContent || "").includes(${JSON.stringify(s2a.id)}));
+      if (!s2aRow) return null;
+      return Array.from(s2aRow.querySelectorAll("button, a")).find((el) => {
+        const t = (el.textContent || "").trim();
+        const rid = el.getAttribute("data-run-id") || "";
+        return rid === ${JSON.stringify(s2a.id)} || t.includes("[run]") || t.includes(${JSON.stringify(s2a.id)}) || t.includes("查看任务");
+      }) || null;
+    }`,
+    `BoardTopicTimeline [run] link for ${s2a.id}`
+  );
+
+  let jumpedToS2a = null;
+  for (let i = 0; i < 30; i++) {
+    jumpedToS2a = await cdpClient.evalJS(`({
+      workspaceMode: window.__AHUB_EVAL__?.getState()?.workspaceMode,
+      selectedRunId: window.__AHUB_EVAL__?.getState()?.selectedRunId,
+      selectedThreadId: window.__AHUB_EVAL__?.getState()?.selectedThreadId,
+      rowStatus: document.querySelector('[data-testid="run-row-${s2a.id}"] [data-run-status]')?.getAttribute("data-run-status") ?? null
+    })`);
+    if (
+      jumpedToS2a.workspaceMode === "runs" &&
+      jumpedToS2a.selectedRunId === s2a.id &&
+      jumpedToS2a.selectedThreadId === s2a.thread_id &&
+      jumpedToS2a.rowStatus === "failed"
+    ) {
+      break;
+    }
+    if (i === 29) {
+      throw new Error(`Clicking [run] link for ${s2a.id} did not navigate to runs & select s2a: ${JSON.stringify(jumpedToS2a)}`);
+    }
+    await sleep(150);
+  }
+
+  // Switch to s2b thread -> verify waiting StatusBadge, exact docs/05 UPSTREAM_FAILED copy & Inspector 5-Tab DOM order + Tab 3 lineage
+  await cdpClient.clickSelector('[data-testid="fleet-tab-threads"]');
+  await sleep(150);
+  await cdpClient.clickSelector(`[data-testid="thread-item-${s2bSeed.thread_id}"] button:nth-of-type(2)`);
+  let s2bRowCheck = null;
+  for (let i = 0; i < 25; i++) {
+    s2bRowCheck = await cdpClient.evalJS(`({
+      waitingBadge: Boolean(document.querySelector('[data-testid="run-row-${s2bSeed.id}"] [data-run-status="waiting"]')),
+      rowText: document.querySelector('[data-testid="run-row-${s2bSeed.id}"]')?.textContent ?? ""
+    })`);
+    if (
+      s2bRowCheck.waitingBadge &&
+      s2bRowCheck.rowText.includes("上游依赖任务已失败，当前任务保持等待。可对失败任务点击重试或取消后续任务。")
+    ) {
+      break;
+    }
+    if (i === 24) {
+      throw new Error(`Expected s2b waiting badge and exact UPSTREAM_FAILED copy, got ${JSON.stringify(s2bRowCheck)}`);
+    }
+    await sleep(150);
+  }
+
+  const inspectorTabOrder = await cdpClient.evalJS(`
+    Array.from(document.querySelectorAll('[data-testid="inspector-pane"] [role="tab"]')).map((el) => ({
+      text: (el.textContent || "").trim(),
+      testid: el.getAttribute("data-testid") || null
+    }))
+  `);
+  if (
+    inspectorTabOrder.length !== 5 ||
+    !inspectorTabOrder[0].text.includes("过程事件") ||
+    !inspectorTabOrder[1].text.includes("待跑队列") ||
+    !inspectorTabOrder[2].text.includes("委派拓扑") ||
+    !inspectorTabOrder[3].text.includes("节点控制") ||
+    !inspectorTabOrder[4].text.includes("投递明细") ||
+    inspectorTabOrder[4].testid !== "inspector-tab-deliveries"
+  ) {
+    throw new Error(`InspectorPane 5-Tab DOM order :nth-of-type(1..5) violated: ${JSON.stringify(inspectorTabOrder)}`);
+  }
+
+  await cdpClient.clickSelector('[data-testid="inspector-pane"] [role="tab"]:nth-of-type(3)');
+  await sleep(200);
+  const lineageCheck = await cdpClient.evalJS(`({
+    activeTab: window.__AHUB_EVAL__?.getState()?.activeTab,
+    text: document.querySelector('[data-testid="inspector-pane"]')?.textContent ?? ""
+  })`);
+  if (
+    lineageCheck.activeTab !== "lineage" ||
+    !lineageCheck.text.includes(s2a.id) ||
+    !lineageCheck.text.includes(s2bSeed.id) ||
+    (!lineageCheck.text.includes("UPSTREAM_FAILED") && !lineageCheck.text.includes("上游依赖任务已失败"))
+  ) {
+    throw new Error(`InspectorPane Tab 3 (lineage) DAG/blocked_reason check failed: ${JSON.stringify(lineageCheck)}`);
+  }
+
+  // Verify s2Sched waiting badge, SCHEDULED copy, and scheduled_at tabular-nums in both row and InspectorPane Tab 3 (lineage)
+  await cdpClient.clickSelector(`[data-testid="thread-item-${s2Sched.thread_id}"] button:nth-of-type(2)`);
+  await sleep(150);
+  await cdpClient.clickSelector(`[data-testid="run-row-${s2Sched.id}"]`);
+  await sleep(150);
+  await cdpClient.clickSelector('[data-testid="inspector-pane"] [role="tab"]:nth-of-type(3)');
+  await sleep(150);
+  let s2SchedUiCheck = null;
+  for (let i = 0; i < 25; i++) {
+    s2SchedUiCheck = await cdpClient.evalJS(`
+      (() => {
+        const row = document.querySelector('[data-testid="run-row-${s2Sched.id}"]');
+        const insp = document.querySelector('[data-testid="inspector-pane"]');
+        if (!row || !insp) return null;
+        const waitingBadge = Boolean(row.querySelector('[data-run-status="waiting"]'));
+        const rowText = row.textContent ?? "";
+        const tabularEls = Array.from(row.querySelectorAll("*")).filter((el) => {
+          const cs = getComputedStyle(el);
+          return el.classList.contains("tabular-nums") || (cs.fontVariantNumeric || "").includes("tabular-nums");
+        });
+        const activeTab = window.__AHUB_EVAL__?.getState()?.activeTab ?? null;
+        const inspSchedEl = Array.from(insp.querySelectorAll("*")).find(
+          (el) => (el.textContent || "").includes(${JSON.stringify(s2Sched.scheduled_at)}) &&
+            (el.classList.contains("tabular-nums") || (getComputedStyle(el).fontVariantNumeric || "").includes("tabular-nums"))
+        );
+        const inspText = insp.textContent ?? "";
+        return {
+          waitingBadge,
+          hasScheduledCopy: rowText.includes("等待定时时间到达后自动唤醒。"),
+          tabularCount: tabularEls.length,
+          activeTab,
+          inspHasScheduledLabel: inspText.includes("定时唤醒"),
+          inspHasScheduledAtTabular: Boolean(inspSchedEl)
+        };
+      })()
+    `);
+    if (
+      s2SchedUiCheck?.waitingBadge &&
+      s2SchedUiCheck.hasScheduledCopy &&
+      s2SchedUiCheck.tabularCount > 0 &&
+      s2SchedUiCheck.activeTab === "lineage" &&
+      s2SchedUiCheck.inspHasScheduledLabel &&
+      s2SchedUiCheck.inspHasScheduledAtTabular
+    ) {
+      break;
+    }
+    if (i === 24) {
+      throw new Error(`Expected s2Sched waiting badge, SCHEDULED copy, and tabular-nums scheduled_at in row + lineage, got ${JSON.stringify(s2SchedUiCheck)}`);
+    }
+    await sleep(150);
+  }
+
+  // Trigger Retry on s2a in UI -> verify POST /api/v1/runs/:id/retry creates s2a2, s2a stays failed, s2b rebinds to s2a2
+  await cdpClient.clickSelector(`[data-testid="thread-item-${s2a.thread_id}"] button:nth-of-type(2)`);
+  await sleep(150);
+  await cdpClient.clickSelector(`[data-testid="run-row-${s2a.id}"]`);
+  await sleep(150);
+  await clickDomMatch(
+    cdpClient,
+    `() => {
+      const byTestId =
+        document.querySelector('[data-testid="retry-run-btn-${s2a.id}"]') ||
+        document.querySelector('[data-testid="run-row-${s2a.id}"] [data-testid="retry-run-btn"]') ||
+        document.querySelector('[data-testid="inspector-pane"] [data-testid="retry-run-btn"]') ||
+        document.querySelector('[data-testid="retry-run-btn"]');
+      if (byTestId) return byTestId;
+      const row = document.querySelector('[data-testid="run-row-${s2a.id}"]');
+      const inRow = row
+        ? Array.from(row.querySelectorAll("button")).find((b) => /重试|Retry/i.test((b.textContent || "").trim()))
+        : null;
+      if (inRow) return inRow;
+      const insp = document.querySelector('[data-testid="inspector-pane"]');
+      return insp
+        ? Array.from(insp.querySelectorAll("button")).find((b) => /重试|Retry/i.test((b.textContent || "").trim())) || null
+        : null;
+    }`,
+    `Retry button for ${s2a.id}`
+  );
+
+  let s2a2 = null;
+  for (let i = 0; i < 40; i++) {
+    const threadRuns = (await apiJson(hubUrl, adminToken, `/api/v1/runs?thread_id=${s2a.thread_id}`)).runs;
+    const foundD1 = threadRuns.find((r) => r.retry_of_run_id === s2a.id);
+    const foundUi = await cdpClient.evalJS(`
+      window.__AHUB_EVAL__.getState().runs.find((r) => r.retry_of_run_id === ${JSON.stringify(s2a.id)}) ?? null
+    `);
+    if (foundD1 && foundUi) {
+      s2a2 = foundD1;
+      break;
+    }
+    if (i === 39) {
+      throw new Error(`Retry on ${s2a.id} did not create s2a2 in D1 & UI in time`);
+    }
+    await sleep(200);
+  }
+
+  const s2aImmutableD1 = (await apiJson(hubUrl, adminToken, `/api/v1/runs/${s2a.id}`)).run;
+  const s2aDomStatus = await cdpClient.evalJS(
+    `document.querySelector('[data-testid="run-row-${s2a.id}"] [data-run-status]')?.getAttribute("data-run-status") ?? null`
+  );
+  const s2bAfterRetryD1 = (await apiJson(hubUrl, adminToken, `/api/v1/runs/${s2bSeed.id}`)).run;
+  const s2bAfterRetryUi = await cdpClient.evalJS(
+    `window.__AHUB_EVAL__.getState().runs.find((r) => r.id === ${JSON.stringify(s2bSeed.id)}) ?? null`
+  );
+  if (
+    s2aImmutableD1.status !== "failed" ||
+    s2aDomStatus !== "failed" ||
+    !Array.isArray(s2bAfterRetryD1.depends_on_run_ids) ||
+    !s2bAfterRetryD1.depends_on_run_ids.includes(s2a2.id) ||
+    s2bAfterRetryD1.depends_on_run_ids.includes(s2a.id) ||
+    !Array.isArray(s2bAfterRetryUi?.depends_on_run_ids) ||
+    !s2bAfterRetryUi.depends_on_run_ids.includes(s2a2.id)
+  ) {
+    throw new Error(
+      `Retry immutability / rebind parity failed: s2aD1=${s2aImmutableD1.status}, s2aDom=${s2aDomStatus}, s2bD1=${JSON.stringify(s2bAfterRetryD1.depends_on_run_ids)}, s2bUi=${JSON.stringify(s2bAfterRetryUi?.depends_on_run_ids)}`
+    );
+  }
+  for (let i = 0; i < 40; i++) {
+    const r = await apiJson(hubUrl, adminToken, `/api/v1/runs/${s2a2.id}`);
+    if (r.run.status === "failed" || r.run.status === "done" || r.run.status === "cancelled") break;
+    await sleep(200);
+  }
+
+  // Verify single waiting cancel (s2c1 -> s2c2 UPSTREAM_CANCELLED copy) AND UI cascade cancel (s2d1 -> s2d2)
+  await cdpClient.clickSelector(`[data-testid="thread-item-${s2c1.thread_id}"] button:nth-of-type(2)`);
+  await sleep(150);
+  await cdpClient.clickSelector(`[data-testid="run-row-${s2c1.id}"]`);
+  await sleep(150);
+  await clickDomMatch(
+    cdpClient,
+    `() => {
+      return (
+        document.querySelector('[data-testid="cancel-run-${s2c1.id}"]') ||
+        document.querySelector('[data-testid="lineage-cancel-run-${s2c1.id}"]') ||
+        Array.from(
+          document.querySelectorAll('[data-testid="run-row-${s2c1.id}"] button, [data-testid="inspector-pane"] button')
+        ).find((b) => /^(取消任务|取消等待|取消)$/.test((b.textContent || "").trim())) ||
+        null
+      );
+    }`,
+    `Single cancel button for waiting run ${s2c1.id}`
+  );
+  await sleep(200);
+  const hasSingleCancelConfirmModal = await cdpClient.evalJS(`
+    Boolean(Array.from(document.querySelectorAll('[role="alertdialog"] button, [role="dialog"] button')).find((b) => /确认|继续|确定/.test((b.textContent || "").trim())))
+  `);
+  if (hasSingleCancelConfirmModal) {
+    await clickDomMatch(
+      cdpClient,
+      `() => Array.from(document.querySelectorAll('[role="alertdialog"] button, [role="dialog"] button')).find((b) => /确认|继续|确定/.test((b.textContent || "").trim())) || null`,
+      "Confirm single cancel dialog button"
+    );
+  }
+  for (let i = 0; i < 30; i++) {
+    const c1D1 = (await apiJson(hubUrl, adminToken, `/api/v1/runs/${s2c1.id}`)).run;
+    const c1Ui = await cdpClient.evalJS(
+      `window.__AHUB_EVAL__.getState().runs.find((r) => r.id === ${JSON.stringify(s2c1.id)})?.status ?? null`
+    );
+    if (c1D1.status === "cancelled" && c1Ui === "cancelled") break;
+    if (i === 29) throw new Error(`Waiting run ${s2c1.id} did not cancel in time: d1=${c1D1.status} ui=${c1Ui}`);
+    await sleep(150);
+  }
+
+  // Verify s2c2 remains waiting with UPSTREAM_CANCELLED in D1 and exact docs/05 §6 copy in UI
+  await cdpClient.clickSelector(`[data-testid="thread-item-${s2c2.thread_id}"] button:nth-of-type(2)`);
+  let s2c2Check = null;
+  for (let i = 0; i < 30; i++) {
+    s2c2Check = await cdpClient.evalJS(`({
+      waitingBadge: Boolean(document.querySelector('[data-testid="run-row-${s2c2.id}"] [data-run-status="waiting"]')),
+      rowText: document.querySelector('[data-testid="run-row-${s2c2.id}"]')?.textContent ?? ""
+    })`);
+    if (
+      s2c2Check.waitingBadge &&
+      s2c2Check.rowText.includes("上游依赖任务已取消，当前任务保持等待。可对前置任务重试或级联取消当前任务。")
+    ) {
+      break;
+    }
+    if (i === 29) {
+      throw new Error(`Expected exact UPSTREAM_CANCELLED copy & waiting badge on ${s2c2.id}, got ${JSON.stringify(s2c2Check)}`);
+    }
+    await sleep(150);
+  }
+  const s2c2D1 = (await apiJson(hubUrl, adminToken, `/api/v1/runs/${s2c2.id}`)).run;
+  if (s2c2D1.status !== "waiting" || s2c2D1.blocked_reason !== "UPSTREAM_CANCELLED") {
+    throw new Error(`Expected ${s2c2.id} to stay waiting with UPSTREAM_CANCELLED in D1, got ${JSON.stringify(s2c2D1)}`);
+  }
+
+  // Now verify UI cascade cancel on s2d1 -> s2d2
+  await cdpClient.clickSelector(`[data-testid="thread-item-${s2d1.thread_id}"] button:nth-of-type(2)`);
+  await sleep(150);
+  await cdpClient.clickSelector(`[data-testid="run-row-${s2d1.id}"]`);
+  await sleep(150);
+  await clickDomMatch(
+    cdpClient,
+    `() => {
+      return (
+        document.querySelector('[data-testid="cascade-cancel-run-${s2d1.id}"]') ||
+        document.querySelector('[data-testid="lineage-cascade-cancel-${s2d1.id}"]') ||
+        document.querySelector('[data-testid="cascade-cancel-btn"]') ||
+        document.querySelector('[data-testid="cascade-cancel-${s2d1.id}"]') ||
+        Array.from(
+          document.querySelectorAll('[data-testid="run-row-${s2d1.id}"] button, [data-testid="inspector-pane"] button')
+        ).find((b) => /^级联取消$/.test((b.textContent || "").trim())) ||
+        null
+      );
+    }`,
+    `Cascade cancel button for waiting run ${s2d1.id}`
+  );
+  await sleep(200);
+  const hasCascadeConfirmModal = await cdpClient.evalJS(`
+    Boolean(Array.from(document.querySelectorAll('[role="alertdialog"] button, [role="dialog"] button')).find((b) => /确认|继续|确定/.test((b.textContent || "").trim())))
+  `);
+  if (hasCascadeConfirmModal) {
+    await clickDomMatch(
+      cdpClient,
+      `() => Array.from(document.querySelectorAll('[role="alertdialog"] button, [role="dialog"] button')).find((b) => /确认|继续|确定/.test((b.textContent || "").trim())) || null`,
+      "Confirm cascade cancel dialog button"
+    );
+  }
+  for (let i = 0; i < 30; i++) {
+    const d1D1 = (await apiJson(hubUrl, adminToken, `/api/v1/runs/${s2d1.id}`)).run;
+    const d2D1 = (await apiJson(hubUrl, adminToken, `/api/v1/runs/${s2d2.id}`)).run;
+    const d1Ui = await cdpClient.evalJS(
+      `window.__AHUB_EVAL__.getState().runs.find((r) => r.id === ${JSON.stringify(s2d1.id)})?.status ?? null`
+    );
+    const d2Ui = await cdpClient.evalJS(
+      `window.__AHUB_EVAL__.getState().runs.find((r) => r.id === ${JSON.stringify(s2d2.id)})?.status ?? null`
+    );
+    if (
+      d1D1.status === "cancelled" &&
+      d2D1.status === "cancelled" &&
+      d1Ui === "cancelled" &&
+      d2Ui === "cancelled"
+    ) {
+      break;
+    }
+    if (i === 29) {
+      throw new Error(
+        `Cascade cancel convergence failed for ${s2d1.id}->${s2d2.id}: d1=(${d1D1.status},${d2D1.status}) ui=(${d1Ui},${d2Ui})`
+      );
+    }
+    await sleep(150);
+  }
+
+  // Backdate s2Sched via execD1 + triggerScheduled(hubUrl) -> verify UI + D1 waiting -> queued -> done & runStatusRank monotonicity
+  if (!/^run_[A-Za-z0-9]+$/.test(s2Sched.id)) {
+    throw new Error(`Unexpected s2Sched id format: ${s2Sched.id}`);
+  }
+  await cdpClient.clickSelector(`[data-testid="thread-item-${s2Sched.thread_id}"] button:nth-of-type(2)`);
+  await sleep(150);
+
+  // Pre-triggerScheduled runs-workspace Slice 2 CLS gate (<= 0.001) covering [run] jump, waiting badge, lineage tab, Retry, single & cascade cancel
+  const runsSlice2Cls = await cdpClient.evalJS(`window.__AHUB_CLS__ ?? 0`);
+  const runsSlice2ClsSources = await cdpClient.evalJS(`window.__AHUB_CLS_SOURCES__ ?? []`);
+  if (runsSlice2Cls > 0.001) {
+    throw new Error(
+      `Expected zero CLS in Slice 2 runs workspace before triggerScheduled, got ${runsSlice2Cls}; sources=${JSON.stringify(runsSlice2ClsSources)}`
+    );
+  }
+
+  execD1(d1Dir, `UPDATE runs SET scheduled_at = '2020-01-01T00:00:00.000Z' WHERE id = '${s2Sched.id}';`);
+  await triggerScheduled(hubUrl);
+
+  const slice2RankMap = {
+    waiting: 0,
+    queued: 1,
+    claimed: 2,
+    running: 3,
+    needs_approval: 3,
+    done: 4,
+    failed: 4,
+    cancelled: 4
+  };
+  const observedSchedStatuses = [];
+  let maxObservedSchedRank = -1;
+  let schedDone = false;
+  for (let i = 0; i < 80; i++) {
+    const uiStatus = await cdpClient.evalJS(
+      `window.__AHUB_EVAL__.getState().runs.find((r) => r.id === ${JSON.stringify(s2Sched.id)})?.status ?? null`
+    );
+    if (uiStatus) {
+      if (observedSchedStatuses[observedSchedStatuses.length - 1] !== uiStatus) {
+        observedSchedStatuses.push(uiStatus);
+      }
+      const rank = slice2RankMap[uiStatus];
+      if (typeof rank !== "number") {
+        throw new Error(`Unknown run status observed for s2Sched: ${uiStatus}`);
+      }
+      if (rank < maxObservedSchedRank) {
+        throw new Error(`runStatusRank regression on s2Sched: ${JSON.stringify(observedSchedStatuses)}`);
+      }
+      maxObservedSchedRank = rank;
+      if (uiStatus === "done") {
+        const domDone = await cdpClient.evalJS(
+          `Boolean(document.querySelector('[data-testid="run-row-${s2Sched.id}"] [data-run-status="done"]'))`
+        );
+        const d1Sched = (await apiJson(hubUrl, adminToken, `/api/v1/runs/${s2Sched.id}`)).run;
+        if (domDone && d1Sched.status === "done") {
+          schedDone = true;
+          break;
+        }
+      }
+    }
+    await sleep(125);
+  }
+  if (!schedDone) {
+    throw new Error(`s2Sched did not converge waiting -> queued -> done after Cron wake; observed=${JSON.stringify(observedSchedStatuses)}`);
+  }
+
+  // P-10 / F8 Tier 2 #1 / MG-7 (runStatusRank): inject out-of-order waiting/queued WS frames while a Slice 2 run is actively "running" (NOT terminal "done"), then verify WS reconnect parity against D1
+  const s2RankSeedRes = await apiJson(hubUrl, adminToken, "/api/v1/runs?wait_ms=0", {
+    method: "POST",
+    body: JSON.stringify({
+      node_id: "macmini",
+      workdir: wsAlpha,
+      agent: "agy",
+      board_topic_id: s2Topic.id,
+      actor_profile: "codex-orchestrator",
+      title: "Slice 2 runStatusRank 保序校验任务",
+      prompt: JSON.stringify({
+        summary: "runStatusRank out-of-order guard ok",
+        response: "rank guard done",
+        directives: [{ op: "sleep", ms: 4000 }]
+      })
+    })
+  });
+  const s2RankSeed = s2RankSeedRes.run;
+  for (let i = 0; i < 40; i++) {
+    const hasThreadItem = await cdpClient.evalJS(
+      `Boolean(document.querySelector('[data-testid="thread-item-${s2RankSeed.thread_id}"] button:nth-of-type(2)'))`
+    );
+    if (hasThreadItem) break;
+    if (i === 39) throw new Error(`s2RankSeed thread ${s2RankSeed.thread_id} did not appear in UI`);
+    await sleep(100);
+  }
+  await cdpClient.clickSelector(`[data-testid="thread-item-${s2RankSeed.thread_id}"] button:nth-of-type(2)`);
+  let liveRunningRun = null;
+  for (let i = 0; i < 120; i++) {
+    const probe = await cdpClient.evalJS(`({
+      run: window.__AHUB_EVAL__?.getState()?.runs?.find((r) => r.id === ${JSON.stringify(s2RankSeed.id)}) ?? null,
+      domStatus: document.querySelector('[data-testid="run-row-${s2RankSeed.id}"] [data-run-status]')?.getAttribute("data-run-status") ?? null
+    })`);
+    if (probe.run?.status === "running" && probe.domStatus === "running") {
+      liveRunningRun = probe.run;
+      break;
+    }
+    if (probe.run?.status === "done" || probe.run?.status === "failed" || probe.run?.status === "cancelled") {
+      throw new Error(`s2RankSeed reached terminal state ${probe.run.status} before active running check`);
+    }
+    await sleep(50);
+  }
+  if (!liveRunningRun) {
+    throw new Error(`s2RankSeed (${s2RankSeed.id}) did not reach active running state in UI`);
+  }
+
+  for (const staleStatus of ["waiting", "queued"]) {
+    const injectedRes = await cdpClient.evalJS(`
+      (() => {
+        const current = window.__AHUB_EVAL__.getState().runs.find((r) => r.id === ${JSON.stringify(s2RankSeed.id)});
+        if (!current || current.status !== "running") {
+          return { error: "expected active running state before injection, got " + (current && current.status) };
+        }
+        window.__AHUB_EVAL_INJECT_WS__({
+          type: "run.updated",
+          run: {
+            ...current,
+            status: ${JSON.stringify(staleStatus)},
+            blocked_reason: ${staleStatus === "waiting" ? '"SCHEDULED"' : "null"}
+          }
+        });
+        const afterStore = window.__AHUB_EVAL__.getState().runs.find((r) => r.id === ${JSON.stringify(s2RankSeed.id)})?.status ?? null;
+        const afterDom = document.querySelector('[data-testid="run-row-${s2RankSeed.id}"] [data-run-status]')?.getAttribute("data-run-status") ?? null;
+        return { afterStore, afterDom };
+      })()
+    `);
+    if (injectedRes?.error || injectedRes?.afterStore !== "running" || injectedRes?.afterDom !== "running") {
+      throw new Error(
+        `MG-7 runStatusRank regression on out-of-order ${staleStatus} WS frame (same updated_at): ${JSON.stringify(injectedRes)}`
+      );
+    }
+  }
+
+  await waitForSeedRunDone(s2RankSeed.id, "P-10 runStatusRank run");
+
+  // Force /ws/stream reconnect and verify UI parity against D1
+  const socketCountBeforeReconnect = await cdpClient.evalJS(`
+    (() => {
+      const open = (window.__AHUB_STREAM_SOCKETS__ || []).filter((s) => s && s.readyState === 1);
+      if (open.length === 0) throw new Error("No open /ws/stream socket to reconnect");
+      const beforeCount = window.__AHUB_STREAM_SOCKETS__.length;
+      const target = open[open.length - 1];
+      target.close(4000, "eval-reconnect");
+      return beforeCount;
+    })()
+  `);
+  await sleep(250);
+  await cdpClient.evalJS(`
+    (() => {
+      const target = (window.__AHUB_STREAM_SOCKETS__ || [])[${socketCountBeforeReconnect} - 1];
+      if (target && target.readyState === 2) {
+        target.dispatchEvent(new CloseEvent("close", { code: 4000, reason: "eval-reconnect", wasClean: false }));
+      }
+    })()
+  `);
+  let reconnected = false;
+  let lastConnState = null;
+  for (let i = 0; i < 60; i++) {
+    lastConnState = await cdpClient.evalJS(`({
+      streamStatus: window.__AHUB_EVAL__?.getState()?.streamStatus ?? null,
+      socketCount: (window.__AHUB_STREAM_SOCKETS__ || []).length,
+      readyStates: (window.__AHUB_STREAM_SOCKETS__ || []).map((s) => s.readyState)
+    })`);
+    if (lastConnState.streamStatus === "connected" && lastConnState.socketCount > socketCountBeforeReconnect) {
+      reconnected = true;
+      break;
+    }
+    await sleep(150);
+  }
+  if (!reconnected) {
+    throw new Error(`HubStreamClient did not reconnect /ws/stream in time during P-10 check: ${JSON.stringify({ socketCountBeforeReconnect, lastConnState })}`);
+  }
+  await sleep(300);
+
+  for (const rid of [s2RankSeed.id, s2a.id, s2bSeed.id, s2c1.id, s2d1.id, s2d2.id]) {
+    const d1Run = (await apiJson(hubUrl, adminToken, `/api/v1/runs/${rid}`)).run;
+    const uiStatus = await cdpClient.evalJS(
+      `window.__AHUB_EVAL__.getState().runs.find((r) => r.id === ${JSON.stringify(rid)})?.status ?? null`
+    );
+    if (uiStatus !== d1Run.status) {
+      throw new Error(`P-10 WS reconnect parity mismatch for ${rid}: ui=${uiStatus} d1=${d1Run.status}`);
+    }
+  }
+
+  // BoardTopicInspector quick dispatch -> verify linked run created in UI & D1, plus 1440x900 & 390x844 containment + CLS==0
+  await cdpClient.evalJS(`window.__AHUB_CLS__ = 0; window.__AHUB_CLS_SOURCES__ = [];`);
+  await cdpClient.clickSelector('[data-testid="workspace-tab-board"]');
+  await sleep(200);
+  await cdpClient.clickSelector(`[data-testid="board-topic-item-${s2Topic.id}"]`);
+  await sleep(250);
+
+  const beforeQuickDispatchIds = (
+    await apiJson(hubUrl, adminToken, `/api/v1/runs?board_topic_id=${s2Topic.id}`)
+  ).runs.map((r) => r.id);
+
+  await clickDomMatch(
+    cdpClient,
+    `() => {
+      const insp = document.querySelector('[data-testid="board-topic-inspector"]');
+      if (!insp) return null;
+      return (
+        insp.querySelector('[data-testid="board-quick-dispatch-toggle"]') ||
+        insp.querySelector('[data-testid="board-quick-dispatch-btn"]') ||
+        insp.querySelector('[data-testid="board-topic-quick-dispatch-btn"]') ||
+        insp.querySelector('[data-testid="board-topic-dispatch-btn"]') ||
+        Array.from(insp.querySelectorAll("button")).find((b) => /^(快捷派发|派发任务|新建任务)$/.test((b.textContent || "").trim())) ||
+        null
+      );
+    }`,
+    "BoardTopicInspector quick dispatch trigger"
+  );
+  await sleep(250);
+
+  const quickDispatchCtx = await cdpClient.evalJS(`({
+    workspaceMode: window.__AHUB_EVAL__?.getState()?.workspaceMode,
+    hasQuickForm: Boolean(document.querySelector('[data-testid="board-quick-dispatch-form"]')),
+    hasInlineInput: Boolean(
+      document.querySelector('[data-testid="board-quick-dispatch-prompt"]') ||
+      document.querySelector('[data-testid="board-topic-inspector"] textarea') ||
+      document.querySelector('[data-testid="board-topic-inspector"] input[type="text"]') ||
+      document.querySelector('[role="dialog"] textarea') ||
+      document.querySelector('[role="dialog"] input[type="text"]')
+    )
+  })`);
+
+  const quickPromptText = JSON.stringify({
+    summary: "BoardTopicInspector 快捷派发完成",
+    response: "quick dispatch ok",
+    directives: [{ op: "sleep", ms: 5 }]
+  });
+
+  if (!quickDispatchCtx.hasInlineInput || quickDispatchCtx.workspaceMode !== "board") {
+    throw new Error(
+      `BoardTopicInspector quick dispatch did not open inline form in board workspace: ${JSON.stringify(quickDispatchCtx)}`
+    );
+  }
+  const inputSel = await cdpClient.evalJS(`
+    document.querySelector('[data-testid="board-quick-dispatch-prompt"]')
+      ? '[data-testid="board-quick-dispatch-prompt"]'
+      : document.querySelector('[data-testid="board-topic-inspector"] textarea')
+        ? '[data-testid="board-topic-inspector"] textarea'
+        : document.querySelector('[data-testid="board-topic-inspector"] input[type="text"]')
+          ? '[data-testid="board-topic-inspector"] input[type="text"]'
+          : document.querySelector('[role="dialog"] textarea')
+            ? '[role="dialog"] textarea'
+            : '[role="dialog"] input[type="text"]'
+  `);
+  await cdpClient.fillInput(inputSel, quickPromptText);
+  await sleep(100);
+  await clickDomMatch(
+    cdpClient,
+    `() => {
+      const direct =
+        document.querySelector('[data-testid="board-quick-dispatch-submit"]') ||
+        document.querySelector('[data-testid="board-topic-dispatch-submit"]');
+      if (direct && !direct.disabled) return direct;
+      const container =
+        document.querySelector('[role="dialog"]') ||
+        document.querySelector('[data-testid="board-topic-inspector"]');
+      return container
+        ? Array.from(container.querySelectorAll("button")).find((b) => /^(提交|发送|确认派发|创建并派发|提交受控任务)$/.test((b.textContent || "").trim()) && !b.disabled) || null
+        : null;
+    }`,
+    "BoardTopicInspector quick dispatch submit"
+  );
+
+  let quickRun = null;
+  for (let i = 0; i < 40; i++) {
+    const linked = (await apiJson(hubUrl, adminToken, `/api/v1/runs?board_topic_id=${s2Topic.id}`)).runs;
+    const candidate = linked.find((r) => !beforeQuickDispatchIds.includes(r.id));
+    const inUi = candidate
+      ? await cdpClient.evalJS(`Boolean(window.__AHUB_EVAL__.getState().runs.find((r) => r.id === ${JSON.stringify(candidate.id)}))`)
+      : false;
+    if (candidate && inUi && candidate.status === "done") {
+      quickRun = candidate;
+      break;
+    }
+    if (i === 39) {
+      throw new Error(`BoardTopicInspector quick dispatch run did not appear/finish in UI & D1: candidate=${JSON.stringify(candidate)} inUi=${inUi}`);
+    }
+    await sleep(200);
+  }
+  if (quickRun.board_topic_id !== s2Topic.id) {
+    throw new Error(`Expected quickRun.board_topic_id=${s2Topic.id}, got ${JSON.stringify(quickRun)}`);
+  }
+
+  const s2ModeAfterDispatch = await cdpClient.evalJS(`window.__AHUB_EVAL__.getState().workspaceMode`);
+  if (s2ModeAfterDispatch !== "board") {
+    await cdpClient.clickSelector('[data-testid="workspace-tab-board"]');
+    await sleep(200);
+    await cdpClient.clickSelector(`[data-testid="board-topic-item-${s2Topic.id}"]`);
+    await sleep(200);
+  }
+  await assertViewportContainment(cdpClient, "desktop-1440x900-slice2");
+  const slice2Cls = await cdpClient.evalJS(`window.__AHUB_CLS__ ?? 0`);
+  const slice2ClsSources = await cdpClient.evalJS(`window.__AHUB_CLS_SOURCES__ ?? []`);
+  if (slice2Cls > 0.001) {
+    throw new Error(`Expected zero CLS in Slice 2 Phase 4c, got ${slice2Cls}; sources=${JSON.stringify(slice2ClsSources)}`);
+  }
+
+  // Mobile 390x844 Slice 2 containment check (board & runs)
+  await cdpClient.setViewport(390, 844, true);
+  await sleep(250);
+  await assertViewportContainment(cdpClient, "mobile-390x844-slice2-board");
+  await cdpClient.clickSelector('[data-testid="workspace-tab-runs"]');
+  await sleep(250);
+  await assertViewportContainment(cdpClient, "mobile-390x844-slice2-runs");
+  await cdpClient.setViewport(1440, 900, false);
+  await sleep(200);
+
   // Phase 5: Verify client-scope Board + Runs isolation (prefix-scoped AND empty-prefix) with zero 403/console errors
   const forbiddenResponses = [];
   await cdpClient.send("Network.enable");
@@ -3939,6 +4963,25 @@ try {
     }
   });
   cdpClient.consoleErrors.length = 0;
+
+  // Seed a clientBoardKey-owned linked run on s2Topic so Phase 5 can verify linked runs & [run] jump under client scope with 0 403s
+  const clientS2RunRes = await apiJson(hubUrl, clientBoardKey.token, "/api/v1/runs?wait_ms=0", {
+    method: "POST",
+    body: JSON.stringify({
+      node_id: "macmini",
+      workdir: wsAlpha,
+      agent: "agy",
+      board_topic_id: s2Topic.id,
+      actor_profile: "client-bot",
+      title: "Phase 5 client 协同回写任务",
+      prompt: JSON.stringify({
+        summary: "client scope 协同回写完成",
+        response: "client board handoff ok",
+        directives: [{ op: "sleep", ms: 5 }]
+      })
+    })
+  });
+  const clientS2Run = await waitForSeedRunDone(clientS2RunRes.run.id, "Phase 5 clientBoardKey Slice 2 run");
 
   // Test A: clientBoardKey with allowed_board_prefixes: ["proj/demo"]
   await cdpClient.setViewport(1440, 900, false);
@@ -4004,6 +5047,63 @@ try {
     clientBoardReadOnly.hasAnswerSubmit
   ) {
     throw new Error(`Expected client scope Board question to render read-only notice without answer submit, got ${JSON.stringify(clientBoardReadOnly)}`);
+  }
+
+  // Verify viewing s2Topic with linked runs & clicking [run] jump in client scope produces 0 403s & 0 consoleErrors
+  await cdpClient.clickSelector(`[data-testid="board-topic-item-${s2Topic.id}"]`);
+  for (let i = 0; i < 30; i++) {
+    const clientS2Ready = await cdpClient.evalJS(`
+      (() => {
+        const inspText = document.querySelector('[data-testid="board-topic-inspector"]')?.textContent ?? "";
+        const direct =
+          document.querySelector('[data-testid="board-handoff-run-link-${clientS2Run.id}"]') ||
+          document.querySelector('[data-testid="board-run-link-${clientS2Run.id}"]');
+        const rows = Array.from(document.querySelectorAll('[data-testid="board-messages-list"] [data-message-kind="handoff"]'));
+        const row = rows.find((el) => (el.textContent || "").includes(${JSON.stringify(clientS2Run.id)}));
+        const link = direct || (row
+          ? Array.from(row.querySelectorAll("button, a")).find((el) => {
+              const t = (el.textContent || "").trim();
+              const rid = el.getAttribute("data-run-id") || "";
+              return rid === ${JSON.stringify(clientS2Run.id)} || t.includes("[run]") || t.includes(${JSON.stringify(clientS2Run.id)}) || t.includes("查看任务");
+            })
+          : null);
+        return Boolean(link && inspText.includes(${JSON.stringify(clientS2Run.id)}));
+      })()
+    `);
+    if (clientS2Ready) break;
+    if (i === 29) {
+      throw new Error(`clientBoardKey s2Topic linked run / [run] link (${clientS2Run.id}) did not render in time`);
+    }
+    await sleep(150);
+  }
+  await clickDomMatch(
+    cdpClient,
+    `() => {
+      const direct =
+        document.querySelector('[data-testid="board-handoff-run-link-${clientS2Run.id}"]') ||
+        document.querySelector('[data-testid="board-run-link-${clientS2Run.id}"]');
+      if (direct) return direct;
+      const rows = Array.from(document.querySelectorAll('[data-testid="board-messages-list"] [data-message-kind="handoff"]'));
+      const row = rows.find((el) => (el.textContent || "").includes(${JSON.stringify(clientS2Run.id)}));
+      if (!row) return null;
+      return Array.from(row.querySelectorAll("button, a")).find((el) => {
+        const t = (el.textContent || "").trim();
+        const rid = el.getAttribute("data-run-id") || "";
+        return rid === ${JSON.stringify(clientS2Run.id)} || t.includes("[run]") || t.includes(${JSON.stringify(clientS2Run.id)}) || t.includes("查看任务");
+      }) || null;
+    }`,
+    `client scope [run] link for ${clientS2Run.id}`
+  );
+  for (let i = 0; i < 25; i++) {
+    const clientJumped = await cdpClient.evalJS(`({
+      workspaceMode: window.__AHUB_EVAL__?.getState()?.workspaceMode,
+      selectedRunId: window.__AHUB_EVAL__?.getState()?.selectedRunId
+    })`);
+    if (clientJumped.workspaceMode === "runs" && clientJumped.selectedRunId === clientS2Run.id) break;
+    if (i === 24) {
+      throw new Error(`client scope [run] jump failed for ${clientS2Run.id}: ${JSON.stringify(clientJumped)}`);
+    }
+    await sleep(150);
   }
 
   await cdpClient.clickSelector('[data-testid="workspace-tab-inbox"]');
