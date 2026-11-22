@@ -3,7 +3,7 @@ import {
   getNativeEventById,
   getNativeNotifyCooldownSec,
   hasRecentNonUrgentSessionDelivery,
-  mapRunRow,
+  hydrateRunRecord,
   parseNotifyPolicy,
   parseStringArray,
   recomputeSourceNotifyStatus,
@@ -370,7 +370,7 @@ async function broadcastDeliveryAndParent(
       .first<RunRow>();
     if (freshRun) {
       await doBroadcast(env, "/internal/broadcast-run", {
-        run: mapRunRow(freshRun, {
+        run: await hydrateRunRecord(env.DB, freshRun, {
           view: "summary",
           tailBytes: 16384,
           promptMode: "preview",

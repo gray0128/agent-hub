@@ -74,6 +74,32 @@
       "maxLength": 128,
       "description": "Client-provided deduplication key."
     },
+    "depends_on": {
+      "type": "array",
+      "maxItems": 10,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^run_[A-Za-z0-9]+$"
+      },
+      "description": "Optional upstream run IDs that must reach 'done' before this run becomes 'queued'."
+    },
+    "scheduled_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Optional UTC RFC 3339 timestamp (+60s to +7d) before which the run remains 'waiting'."
+    },
+    "board_topic_id": {
+      "type": "string",
+      "pattern": "^top_[A-Za-z0-9]+$",
+      "description": "Optional coordination board topic ID for automatic terminal handoff writeback."
+    },
+    "actor_profile": {
+      "type": "string",
+      "maxLength": 40,
+      "pattern": "^[a-z0-9][a-z0-9._@-]{0,39}$",
+      "description": "Optional caller profile attribution."
+    },
     "notify": {
       "type": "object",
       "additionalProperties": false,

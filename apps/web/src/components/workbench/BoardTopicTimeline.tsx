@@ -5,6 +5,7 @@ import {
   ArrowLeft,
   ChevronDown,
   ChevronUp,
+  ExternalLink,
   HelpCircle,
   PanelRight,
   Pin,
@@ -70,6 +71,7 @@ export interface BoardTopicTimelineProps {
   onOpenNewTopic: () => void;
   onPostMessage: (topicId: string, payload: CreateBoardMessagePayload) => Promise<boolean>;
   onAnswerQuestion: (messageId: string, payload: AnswerBoardQuestionPayload) => Promise<boolean>;
+  onOpenRunInWorkbench?: (runId: string, threadId?: string | null) => void;
 }
 
 const MESSAGE_KIND_META: Record<
@@ -148,7 +150,8 @@ export function BoardTopicTimeline({
   onToggleInspector,
   onOpenNewTopic,
   onPostMessage,
-  onAnswerQuestion
+  onAnswerQuestion,
+  onOpenRunInWorkbench
 }: BoardTopicTimelineProps) {
   const [composerKind, setComposerKind] = useState<"note" | "handoff" | "question" | "artifact">("note");
   const [composerText, setComposerText] = useState("");
@@ -722,6 +725,12 @@ export function BoardTopicTimeline({
                 const kindMeta = MESSAGE_KIND_META[msg.kind];
                 const isOpenQuestion = msg.kind === "question" && msg.question_state === "open";
                 const actorLabel = `${msg.actor_profile || msg.actor_scope}${msg.source_node ? `@${msg.source_node}` : ""}`;
+                const msgRunId =
+                  typeof msg.data?.run_id === "string" ? msg.data.run_id.trim() : "";
+                const msgThreadId =
+                  typeof msg.data?.thread_id === "string" && msg.data.thread_id.trim()
+                    ? msg.data.thread_id.trim()
+                    : null;
                 return (
                   <article
                     key={msg.id}
@@ -735,6 +744,11 @@ export function BoardTopicTimeline({
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <div className="flex min-w-0 flex-wrap items-center gap-1.5">
                         <Badge variant={kindMeta.variant}>{kindMeta.label}</Badge>
+                        {msgRunId ? (
+                          <Badge variant="outline" className="font-mono text-[10px]">
+                            [run]
+                          </Badge>
+                        ) : null}
                         <Badge variant="outline" className="font-mono text-[10px]">
                           {msg.actor_scope}
                         </Badge>
@@ -782,6 +796,23 @@ export function BoardTopicTimeline({
                     ) : null}
 
                     {renderStructuredDataPreview(msg)}
+
+                    {msgRunId && onOpenRunInWorkbench ? (
+                      <div className="pt-1">
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          data-testid={`board-msg-open-run-${msg.id}`}
+                          data-run-id={msgRunId}
+                          onClick={() => onOpenRunInWorkbench(msgRunId, msgThreadId)}
+                          className="min-h-11 md:min-h-0 md:h-6 px-2.5 md:px-2 font-mono text-xs md:text-[11px]"
+                        >
+                          <ExternalLink className="h-3 w-3 shrink-0" strokeWidth={1.75} aria-hidden="true" />
+                          <span>查看执行 {msgRunId}</span>
+                        </Button>
+                      </div>
+                    ) : null}
                   </article>
                 );
               })

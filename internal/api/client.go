@@ -204,25 +204,11 @@ func (c *Client) ListNativeEvents(ctx context.Context, opts ListNativeEventsOpti
 }
 
 func (c *Client) ListRuns(ctx context.Context, nodeID, status string, limit int) ([]RunRecord, error) {
-	q := url.Values{}
-	if nodeID != "" {
-		q.Set("node_id", nodeID)
-	}
-	if status != "" {
-		q.Set("status", status)
-	}
-	if limit > 0 {
-		q.Set("limit", strconv.Itoa(limit))
-	}
-	var res struct {
-		OK   bool        `json:"ok"`
-		Runs []RunRecord `json:"runs"`
-	}
-	_, err := c.doJSON(ctx, http.MethodGet, "/api/v1/runs?"+q.Encode(), nil, &res, nil)
-	if err != nil {
-		return nil, err
-	}
-	return res.Runs, nil
+	return c.ListRunsWithOptions(ctx, ListRunsOptions{
+		NodeID: nodeID,
+		Status: status,
+		Limit:  limit,
+	})
 }
 
 func (c *Client) ListThreads(ctx context.Context, nodeID, keyword string, limit int) ([]ThreadRecord, error) {
@@ -252,13 +238,16 @@ func (c *Client) CancelRun(ctx context.Context, runID string, cascade bool, reas
 		OK            bool        `json:"ok"`
 		CancelledRuns []RunRecord `json:"cancelled_runs"`
 	}
-	body := map[string]interface{}{
-		"cascade": cascade,
-		"reason":  reason,
+	body := CancelRunRequest{
+		Cascade: cascade,
+		Reason:  reason,
 	}
 	_, err := c.doJSON(ctx, http.MethodPost, "/api/v1/runs/"+url.PathEscape(runID)+"/cancel", body, &res, nil)
 	if err != nil {
 		return nil, err
+	}
+	if res.CancelledRuns == nil {
+		res.CancelledRuns = []RunRecord{}
 	}
 	return res.CancelledRuns, nil
 }

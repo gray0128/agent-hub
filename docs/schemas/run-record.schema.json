@@ -90,6 +90,7 @@
     "status": {
       "type": "string",
       "enum": [
+        "waiting",
         "queued",
         "claimed",
         "running",
@@ -98,6 +99,44 @@
         "failed",
         "cancelled"
       ]
+    },
+    "plan_id": {
+      "type": ["string", "null"],
+      "pattern": "^pln_[A-Za-z0-9]+$"
+    },
+    "plan_key": {
+      "type": ["string", "null"],
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+    },
+    "scheduled_at": {
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "retry_of_run_id": {
+      "type": ["string", "null"],
+      "pattern": "^run_[A-Za-z0-9]+$"
+    },
+    "actor_profile": {
+      "type": "string",
+      "maxLength": 40,
+      "pattern": "^(|[a-z0-9][a-z0-9._@-]{0,39})$"
+    },
+    "board_topic_id": {
+      "type": ["string", "null"],
+      "pattern": "^top_[A-Za-z0-9]+$"
+    },
+    "depends_on_run_ids": {
+      "type": "array",
+      "maxItems": 10,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^run_[A-Za-z0-9]+$"
+      }
+    },
+    "blocked_reason": {
+      "type": ["string", "null"],
+      "enum": ["DEPENDENCY_PENDING", "SCHEDULED", "UPSTREAM_FAILED", "UPSTREAM_CANCELLED", null]
     },
     "priority_order": {
       "type": "number"

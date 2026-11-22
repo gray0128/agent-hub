@@ -19,6 +19,7 @@ export interface ComposerDraft {
   effort: EffortLevel;
   sandbox: boolean;
   notifyTarget: "none" | "webhook" | "grok";
+  boardTopicId: string | null;
   prompt: string;
 }
 
@@ -138,6 +139,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set) => ({
     effort: "",
     sandbox: true,
     notifyTarget: "none",
+    boardTopicId: null,
     prompt: ""
   },
 

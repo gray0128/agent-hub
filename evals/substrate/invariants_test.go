@@ -388,21 +388,36 @@ func (h *testHarness) mustCreateKeyWithPrefixes(name, scope string, allowedNodes
 
 func (h *testHarness) d1SQLiteFile() string {
 	h.t.Helper()
-	var found string
+	var preferred, fallback string
 	_ = filepath.WalkDir(h.d1Dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil || d == nil || d.IsDir() {
 			return nil
 		}
 		if strings.HasSuffix(d.Name(), ".sqlite") {
-			found = p
-			return filepath.SkipAll
+			if fallback == "" {
+				fallback = p
+			}
+			rel, relErr := filepath.Rel(h.d1Dir, p)
+			if relErr != nil {
+				rel = p
+			}
+			for _, seg := range strings.Split(filepath.ToSlash(rel), "/") {
+				if seg == "miniflare-D1DatabaseObject" || seg == "d1" {
+					preferred = p
+					return filepath.SkipAll
+				}
+			}
 		}
 		return nil
 	})
-	if found == "" {
-		h.t.Fatalf("no .sqlite file found under d1Dir %s", h.d1Dir)
+	if preferred != "" {
+		return preferred
 	}
-	return found
+	if fallback != "" {
+		return fallback
+	}
+	h.t.Fatalf("no .sqlite file found under d1Dir %s", h.d1Dir)
+	return ""
 }
 
 func (h *testHarness) execD1SQL(sqlStmt string) string {

@@ -356,6 +356,7 @@
                 "WORKDIR_AMBIGUOUS",
                 "DEPTH_LIMIT_EXCEEDED",
                 "DELEGATION_CYCLE_DETECTED",
+                "DEPENDENCY_CYCLE_DETECTED",
                 "IDEMPOTENCY_CONFLICT",
                 "INVALID_STATE_TRANSITION",
                 "LEASE_CONFLICT",

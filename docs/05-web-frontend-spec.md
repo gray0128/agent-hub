@@ -44,7 +44,7 @@
 | 状态 `running` / `claimed` | `oklch(0.68 0.16 245)` | `oklch(0.54 0.18 245)` | 执行中脉冲指示与活动进度 |
 | 状态 `needs_approval` | `oklch(0.78 0.16 75)` | `oklch(0.62 0.17 65)` | 人工审批横幅、待放行提示、待处理原生互动（`attention_state === "open"`）、协同板 `blocked` 状态与 `open` 提问标识，以及部分送达态（`partial`）；`acked` / `superseded` / `stale` 降级为中性/次级文本 |
 | 状态 `failed` | `oklch(0.64 0.21 25)` | `oklch(0.55 0.21 25)` | 失败徽标与危险操作按钮 |
-| 状态 `queued` / `offline` / `cancelled` | `oklch(0.62 0.01 260)` | `oklch(0.52 0.01 260)` | 排队中、离线与已取消态 |
+| 状态 `waiting` / `queued` / `offline` / `cancelled` | `oklch(0.62 0.01 260)` | `oklch(0.52 0.01 260)` | 等待前置/定时（配时钟/阻塞标签）、排队中、离线与已取消态；若 `blocked_reason` 为 `UPSTREAM_FAILED` / `UPSTREAM_CANCELLED` 时以失败/警告语义提示 |
 
 ### 2.3 排版与微交互规范
 
@@ -91,11 +91,11 @@
 
 - **左栏（频道与视图导航）**：提供「全部活跃」（`active`）、「待我确认」（`open_questions`）与跨频道「近期动态」（`recent`，聚合全部未归档跨频道活跃主题并按最近活跃时间 `updated_at DESC, id DESC` 倒序呈现）三个快速筛选视图、路径式 `Channels` 树（展示各频道活跃主题数与未答复提问数，`tabular-nums`）与「`+ 新建主题`」弹窗触发器。
 - **中栏（三视角画布 `BoardWorkspace.tsx` / `BoardTopicTimeline.tsx` / `BoardKanbanView.tsx`）**：顶部提供「`话题流`（`timeline`，默认以兼容 Slice 1a）| `列表`（`list`）| `看板`（`kanban`）」三视角切换器（移动端保持 `>= 44×44px` 触控高度）：
-  - **话题流（`timeline`）**：展示当前频道/筛选条件下的主题列表与选中主题时间线。主题内存在 `open` 提问时在顶部置顶待答复横幅（`admin` 可直接点选建议选项或输入答复提交；`client` 仅展示只读状态提示）。时间线混合呈现 `note`、`handoff`、`question`、`answer` 与 `artifact`，显式标示每条消息的 `actor_scope`、`actor_profile` 与 `source_node`；底部提供统一 Composer 提交新备注/交接/提问/产物（`note`/`handoff`/`artifact` 明确提示不触发外发推送）。
+  - **话题流（`timeline`）**：展示当前频道/筛选条件下的主题列表与选中主题时间线。主题内存在 `open` 提问时在顶部置顶待答复横幅（`admin` 可直接点选建议选项或输入答复提交；`client` 仅展示只读状态提示）。时间线混合呈现 `note`、`handoff`、`question`、`answer` 与 `artifact`（含关联受控任务终态自动回写的 `[run]` 摘要消息，`data.run_id` 可直接点击跳转至「`执行台`」并定位对应 `Thread` 与 `Run`），显式标示每条消息的 `actor_scope`、`actor_profile` 与 `source_node`；底部提供统一 Composer 提交新备注/交接/提问/产物（`note`/`handoff`/`artifact` 明确提示不触发外发推送）。
   - **列表（`list`）**：全宽展示匹配频道/筛选/搜索的主题清单（含频道、状态、置顶、外部锚点 `external_ref`、最近交接署名、未答复提问角标与 `tabular-nums` 更新时间），点击或回车进入主题时间线详情。
   - **看板（`kanban`）**：以 4 个活跃状态列（`待开始`/`todo`、`进行中`/`in_progress`、`待确认`/`blocked`、`已完成`/`done`，排除 `archived`）呈现主题卡片，列内按 `pinned DESC, sort_order ASC, updated_at DESC, id ASC` 排序（与后端 `sort=order` 严格对齐，同列与跨列拖拽均保持置顶分区与未置顶分区顺序一致）。卡片保留整卡指针/触摸拖拽，同时将 `@dnd-kit` `KeyboardSensor`（`Enter`/`Space` 键盘拖拽）隔离绑定到卡片内独立拖拽手柄按钮（`GripVertical`），确保焦点位于看板卡片本体时按 `Enter` 稳定进入话题详情而不被键盘拖拽劫持。**单频道拖拽约束**：仅当 `selectedChannel !== null` 且处于桌面端时启用 `@dnd-kit` 同列重排与跨列状态流转，乐观更新后调用 `POST /api/v1/board/topics/reorder` 持久化目标列 `ordered_topic_ids`（失败时自动回滚并提示错误）；当 `selectedChannel === null` 时禁用拖拽并在看板顶部展示单频道引导与一键切换频道入口。
   - **协同板键盘快捷流（`J`/`K`/`1`–`4`/`Enter`/`Esc`）**：焦点不在输入框、文本域、下拉选择框、IME 组合态或弹窗/抽屉内时生效（且当焦点位于非列表/卡片交互控件如按钮、链接或标签页时，`Enter`/`Space` 保留原生控件激活，不被全局快捷键劫持）：`J`/`K` 上下移动主题列表/卡片焦点；`Enter` 选中聚焦主题并进入详情（在已聚焦选项时确认提交答复）；`Esc` 清除预选选项或从详情退回列表（若从 `list`/`kanban` 进入则同步恢复原视角，切换频道或筛选视图时清理残留返回视角）；`1`–`4` 在主题详情存在 `open` 提问时，若为 `admin` 且选项序号存在则预选第 `1`–`4` 个建议选项（再按 `Enter` 提交），否则保持无操作且绝不回退修改主题状态；仅在无 `open` 提问时快捷切换当前聚焦/选中主题状态（`1=todo`、`2=in_progress`、`3=blocked`、`4=done`）。
-- **右栏（主题上下文检视器）**：支持 5 态切换（`todo` / `in_progress` / `blocked` / `done` / `archived`）、置顶开关、`external_ref` 锚点展示、参与节点/角色摘要，以及**最新 `handoff` 交接快照**（提取 `data` 中的 `repo` / `branch` / `commit_sha` / `pr_url` / `next_action` 与一键复制 `ahub board read` 命令）。
+- **右栏（主题上下文检视器）**：支持 5 态切换（`todo` / `in_progress` / `blocked` / `done` / `archived`）、置顶开关、`external_ref` 锚点展示、参与节点/角色摘要、**最新 `handoff` 交接快照**（提取 `data` 中的 `repo` / `branch` / `commit_sha` / `pr_url` / `next_action` 与一键复制 `ahub board read` 命令），以及 **3. 关联受控 Runs**（按 `GET /api/v1/runs?board_topic_id=<id>` 展示绑定该主题的受控任务列表、状态/阻塞原因与直跳「`执行台`」按钮，并支持预填 `board_topic_id` 的快捷派发入口，严禁引入额外 npm 依赖）。
 
 #### 待决收件箱（`inbox`）桌面端 Master-Detail 双栏布局（`PendingInbox.tsx`）
 
@@ -133,7 +133,7 @@
      - 「`节点`」（`data-testid="fleet-tab-nodes"`，保留既有选择器）：全高展示机群节点列表（在线状态、`active_runs_count / max_concurrency`、可用 Agent 徽标与工作目录数），顶部提供集群目录汇总及一键全部收起/展开开关；每个节点均支持独立收起/展开其下的工作目录列表（点击目录切换为新建会话目标目录，或直接拖拽工作目录至中栏派发台）。
 2. **中栏：`ConversationPane`（受控对话台）与 `NativeActivityPane`（原生活动详情流）**
    - **受控会话态（`ConversationPane`）**：顶部栏展示当前 `Thread` 绑定的 `node_id`、`project_key`、`agent`、`native_session_id` 短 ID；若当前选中的 `Run` 存在父任务或子任务，显示可点击切换的血统面包屑及「级联取消整棵树」按钮。
-   - 中间消息流按时间正序排列该 `Thread` 下的所有 `Run`：展示经控制面脱敏与截断的 Prompt 预览（`<= 1200` 字符；绝不展示未脱敏凭据）、实际命中模型与思考强度、独立计时耗时与正文输出。其中常规体量输出（`output_bytes <= 128 KB`）自动水合完整 `output_md` 从头渲染，并在前端对超长正文（`> 4000` 字符或 `> 60` 行）默认折叠高度，支持一键「展开全文 / 收起长输出」与完整复制；超大输出（`> 128 KB`）先自动水合 `16 KB` 尾部预览，并在正文上方展示显式截断提示条与「加载完整输出」按钮按需拉取全文；在正文尚未水合就绪时显式标注加载态与「末行摘要：」，禁止将单行 `summary` 冒充完整输出。当 `status === 'needs_approval'` 时在顶部渲染高对比度琥珀色操作条，提供一键打开 `remote_control_url` 审批按钮与「标记已放行」按钮（调用 `POST /api/v1/runs/:id/resolve` 解除工作目录租约并流转为 `done`）。
+   - 中间消息流按时间正序排列该 `Thread` 下的所有 `Run`：展示经控制面脱敏与截断的 Prompt 预览（`<= 1200` 字符；绝不展示未脱敏凭据）、实际命中模型与思考强度、独立计时耗时与正文输出。当 `status === 'waiting'` 时，展示 `blocked_reason` 语义提示、定时执行时间 `scheduled_at`（`tabular-nums`）、前置依赖 `depends_on_run_ids`（点击可跳转聚焦对应上游 `Run`）、`plan_id`/`plan_key` 与取消按钮；当存在 `actor_profile` 或绑定 `board_topic_id` 时展示归属徽标与跳转「`协同板`」入口；对 `failed` 或 `cancelled` 任务提供「重试任务」按钮（调用 `POST /api/v1/runs/:id/retry` 并定位到新建替代 `Run`，保持原终态记录只读）。其中常规体量输出（`output_bytes <= 128 KB`）自动水合完整 `output_md` 从头渲染，并在前端对超长正文（`> 4000` 字符或 `> 60` 行）默认折叠高度，支持一键「展开全文 / 收起长输出」与完整复制；超大输出（`> 128 KB`）先自动水合 `16 KB` 尾部预览，并在正文上方展示显式截断提示条与「加载完整输出」按钮按需拉取全文；在正文尚未水合就绪时显式标注加载态与「末行摘要：」，禁止将单行 `summary` 冒充完整输出。当 `status === 'needs_approval'` 时在顶部渲染高对比度琥珀色操作条，提供一键打开 `remote_control_url` 审批按钮与「标记已放行」按钮（调用 `POST /api/v1/runs/:id/resolve` 解除工作目录租约并流转为 `done`）。
    - 底部「多机任务派发台（Composer）」：选择已有 `Thread` 时锁定物理绑定的 `node_id`、`workdir` 与 `agent`（同时提供「切换至新建会话」开关）；新建会话与续聊参数均基于所选节点实时上报的 `node.capabilities.agents` 驱动「`node` -> `agent` -> `model` -> `effort`」四级联动：仅展示目标节点已启用且可用的 Agent；模型列表来自所选 Agent 的实时目录 `models[]`，同时支持「跟随节点默认」及在离线或目录未知时手动输入模型 ID（当所选 Agent 为 `agy` 且节点尚未返回显式默认模型或处于离线/兜底态时，派发台默认对齐 `gemini-4-hydrogen` 与 `high`）；推理强度依据当前模型声明的 `efforts[]` 过滤展示（含 `ultra`、`auto` 等节点档位），对于 `efforts` 为空的独立模型（如 `gemini-pro-orchestrator`）自动禁用强度选择并将 `effort` 置空；支持 `⌘Enter` / `Ctrl+Enter` 提交与草稿本地自动保存。
    - **原生活动态（`NativeActivityPane.tsx`）**：当左栏处于「`原生活动`」并选中原生会话或事件时，中栏切换为只读 `NativeActivityPane`（**严禁渲染伪终端输入/发送框**，底部展示诚实物理边界提示：「原生会话运行在节点本机终端中，不支持从云端向交互式 TTY 注入指令或强杀进程。」）。
      - 头部操作栏：按 `agent` 生成精确本机终端续接命令一键复制（`claude --resume <sid>`、`agy --conversation <sid>`、`codex resume <sid>`、`pi --session <sid>`、`omp --resume=<sid>`、`grok` 提示；无 `native_session_id` 时回退 `cd <workdir> && <agent>`）；「携带摘要新建受控任务」按钮切回受控派发台预填 `nodeId`、`workdir` 与脱敏摘要（若原 `agent === "grok"`，自动回退该节点首个可用受控 Agent 并明确提示原因）。
@@ -142,7 +142,7 @@
    - 右栏五个标签页必须严格保持以下 DOM 顺序（以兼容 CDP `:nth-of-type(1|2|4)` 既有选择器）：
    - **Tab 1（`events` / `:nth-of-type(1)`）过程事件**：订阅当前选中 `Run` 的 `run_events`，以等宽时间线展示 `status`、`tool_use`、`turn_end`、`stderr_warn`，并实时计算 `lease_expires_at` 剩余秒数。
    - **Tab 2（`queue` / `:nth-of-type(2)`）待跑队列**：按节点与 `workdir` 分组展示待执行的 `queued` 任务与当前持锁占用目录，支持直接拖拽排序或跨节点改派。
-   - **Tab 3（`lineage` / `:nth-of-type(3)`）委派拓扑**：展示当前 `Run` 所属 `root_run_id` 的父子委派树与深度。
+   - **Tab 3（`lineage` / `:nth-of-type(3)`）委派拓扑**：展示当前 `Run` 所属 `root_run_id` 的父子委派树与深度，并呈现 Slice 2 粗粒度 DAG 依赖关系（`plan_id` / `plan_key`、`depends_on_run_ids` 前置节点、下游等待节点、`retry_of_run_id` 重试溯源、`blocked_reason` 与 `scheduled_at`）；支持针对 `waiting` 任务取消及针对 `failed` / `cancelled` 任务一键重试。
    - **Tab 4（`control` / `:nth-of-type(4)`）节点控制**：展示节点在线态、并发上限调整、排空开关、**默认 Bot 通知通道绑定与事件过滤**（**仅当 `authScope === "admin"` 时**展示 `<Select>` 绑定/解绑任意有效且允许该节点的 `client` Key，并实时提示「通道失效/已吊销」徽标；已绑定默认通道时同步展示 8 类触发事件勾选按钮以持久化 `default_notify_events`（其中 `0007` 的 7 项受控/原生事件默认开启，第 8 项 `board_question_opened` 默认关闭、按需开启，启用后附带该 `source_node` 的协同板提问同步路由至该节点默认 Bot 通道）；`client` Scope 登录后隐藏该绑定控件且不请求 `GET /api/v1/keys`，服务端同步省略 `default_notify_*` 字段），以及已上报工作区筛选、路径复制与一键派发。
    - **Tab 5（`deliveries` / `:nth-of-type(5)`，必须为第 5 个标签页）投递明细**：依据当前聚焦对象（受控 `Run` 调 `GET /api/v1/runs/:id/deliveries`，或原生事件调 `GET /api/v1/native-events/:id`；**仅限 `authScope === "admin"` 请求**）展示 `deliveries_summary`（`tabular-nums`）与逐渠道 `NotificationDeliveryRecord` 明细行（`channel_label`、`channel_kind`、脱敏 `target_host`、`route_mode`、`status`、`http_status`、`attempts`、`error_code`、`error_message`、`sent_at`），对 `status === "skipped"` 明细以中性灰字展示跳过原因（如 `SUPERSEDED_BY_NEWER_TURN`、`SESSION_COOLDOWN_ACTIVE`），并对 `status === "failed"`（「重推此通道」）与 `status === "skipped"`（「立即推送此通道」）的行提供单通道推送按钮（分别调用 `POST /api/v1/native-events/:id/redeliver` 或 `POST /api/v1/runs/:id/redeliver`，仅传入 `{ delivery_id }`）。
    - **顶栏「通知渠道」弹窗（`BrowserNotifyDialog.tsx`）**：由顶栏按钮（`data-testid="open-browser-notify-btn"`，紧邻 `互动 N` 胶囊；`authScope !== "admin"` 时隐藏）触发，展示当前浏览器三态健康度（`Web Push 已激活（离线可达）` / `仅页内提醒（未配置 VAPID 或 iOS 未添加主屏幕）` / `浏览器权限已拒绝（附恢复指引）`）；支持仅在用户点击手势内发起 `Notification.requestPermission()` -> `navigator.serviceWorker.register('/sw.js')` -> `pushManager.subscribe()` -> `POST /api/v1/push-subscriptions`（经 `apiClient`），新订阅默认勾选 `["run_needs_approval", "run_failed", "native_interaction_needed", "board_question_opened"]`（其中 `board_question_opened` 显示为「协同板阻塞提问」），并提供按设备勾选 `native_turn_summary`、`native_progress`、`run_done`、`run_cancelled` 与 `node_filter`，以及全部已注册设备列表（`enabled` 开关、重命名、「发送测试通知」回显 HTTP 状态码、解绑吊销）。
@@ -161,7 +161,7 @@
   - 在 `< 640px` 窄屏下，将「接入节点」「API Keys」「主题切换」三个低频管理/外观入口收拢进顶栏右侧「更多」菜单（`DropdownMenu`，触发按钮与菜单项均满足 `>= 44px` 高度），避免窄屏顶栏拥挤；`>= 640px` 维持既有独立按钮展示。
 - **左右响应式抽屉（`shadcn/ui` `Sheet`）**：
   - 左抽屉（`FleetThreadsPane`）与右抽屉（`InspectorPane`）适配安全区内边距；左抽屉在移动端禁用工作区芯片拖拽（保留点击直选工作区，防止与竖向滚动手势冲突），在分叉会话成功后自动收起抽屉并切至新分支受控对话流。
-  - 右抽屉中点击Queued/Lineage 任一 `Run` 时同步切换对应 `Thread` 与 `Run` 并在移动端自动收起抽屉。
+  - 右抽屉中点击 Queue / Lineage / 依赖列表任一 `Run` 时同步切换对应 `Thread` 与 `Run` 并在移动端自动收起抽屉。
   - 右抽屉的 5 个标签页（`events`、`queue`、`lineage`、`control`、`deliveries`）在 `< 768px` 下采用单行可滑动横向滚动条（`overflow-x-auto`，严禁折行或挤压成窄格，单项高度 `>= 44px`），切换激活标签页时自动调用 `scrollIntoView({ block: "nearest", inline: "nearest" })` 确保当前页签可见。
 - **中栏阅读与派单体验**：
   - `ConversationPane` 任务卡片在移动端与桌面端均提供直达右抽屉「过程事件」的快捷按钮（管理员同时支持点击通知状态胶囊直达「投递明细」）；当会话已有历史任务（`threadRuns.length > 0`）时，底部 Composer 在 `< 768px` 下支持一键收折为单行紧凑条（「续聊 `<node>:<project>` · 展开输入指令」），释放手机竖屏阅读高度，展开后自动聚焦指令输入框。
@@ -216,6 +216,9 @@ export interface FleetState {
 }
 
 // 2. 受控会话、任务与事件流切片 (apps/web/src/stores/task-store.ts)
+// RunStatus 涵盖 8 态：'waiting' | 'queued' | 'claimed' | 'running' | 'needs_approval' | 'done' | 'failed' | 'cancelled'
+// 单调合并优先级 runStatusRank：waiting (0) < queued (1) < claimed (2) < running | needs_approval (3) < done | failed | cancelled (4)
+// RunRecord 同步包含可选 Slice 2 字段：plan_id、plan_key、scheduled_at、retry_of_run_id、actor_profile、board_topic_id、depends_on_run_ids、blocked_reason
 export interface TaskState {
   threads: ThreadRecord[];
   runs: RunRecord[];
@@ -392,3 +395,7 @@ export interface BoardState {
 | 移动端吸底问答确认提示 | 「提交答复后将立即唤醒等待中的本地或远端会话。」 |
 | 危险操作：吊销凭证 | 「确认吊销此凭证？吊销立即生效；若该凭证属于在线节点，对应节点连接将被立即断开。」 |
 | 看板未选单频道拖拽引导 | 「当前处于跨频道聚合视图，看板拖拽仅在单个频道内启用。请先从左侧频道树或下方按钮切换至单个频道。」 |
+| 等待前置依赖（`DEPENDENCY_PENDING`） | 「等待前置任务完成后自动入队。」 |
+| 等待定时唤醒（`SCHEDULED`） | 「等待定时时间到达后自动唤醒。」 |
+| 上游执行失败阻断（`UPSTREAM_FAILED`） | 「上游依赖任务已失败，当前任务保持等待。可对失败任务点击重试或取消后续任务。」 |
+| 上游已取消阻断（`UPSTREAM_CANCELLED`） | 「上游依赖任务已取消，当前任务保持等待。可对前置任务重试或级联取消当前任务。」 |

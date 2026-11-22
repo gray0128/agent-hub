@@ -75,7 +75,23 @@ export const DEFAULT_NODE_NOTIFY_EVENTS: readonly PushEventFilterKey[] = [
 export const VALID_PUSH_EVENT_FILTER_KEYS: ReadonlySet<PushEventFilterKey> = PUSH_EVENT_FILTER_KEYS;
 export const NODE_ID_RE = /^[a-z0-9][a-z0-9_-]*$/;
 const THREAD_ID_RE = /^thr_[A-Za-z0-9]+$/;
-const RUN_ID_RE = /^run_[A-Za-z0-9]+$/;
+export const RUN_ID_RE = /^run_[A-Za-z0-9]+$/;
+export const PLAN_ID_RE = /^pln_[A-Za-z0-9]+$/;
+export const PLAN_KEY_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+export const MIN_SCHEDULE_SEC = 60;
+export const MAX_SCHEDULE_SEC = 604800;
+const RUN_STATUSES = new Set<RunStatus>([
+  "waiting",
+  "queued",
+  "claimed",
+  "running",
+  "needs_approval",
+  "done",
+  "failed",
+  "cancelled"
+]);
+const RFC3339_DATE_TIME_RE =
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/i;
 const KEY_ID_RE = /^key_[A-Za-z0-9]{8,64}$/;
 const NATIVE_EVENT_ID_RE = /^[A-Za-z0-9_.:-]{8,128}$/;
 const NATIVE_EVENT_ROW_ID_RE = /^evt_[A-Za-z0-9]+$/;
@@ -193,6 +209,82 @@ export async function readJsonBody(request: Request): Promise<unknown> {
   }
 }
 
+function parseNotifyPolicyField(raw: unknown): NotifyPolicy {
+  if (raw === undefined) {
+    return { target: "none" };
+  }
+  const nObj = asRecord(raw, "notify");
+  rejectUnknownKeys(nObj, ["target", "events"], "notify");
+  const targetRaw = asOptionalString(nObj, "target") ?? "none";
+  if (!NOTIFY_TARGETS.has(targetRaw as NotifyTarget)) {
+    throw new HubError(400, "BAD_REQUEST", `Invalid notify target '${targetRaw}'.`);
+  }
+  let events: NotifyEvent[] | undefined;
+  if (nObj["events"] !== undefined) {
+    if (!Array.isArray(nObj["events"])) {
+      throw new HubError(400, "BAD_REQUEST", "notify.events must be an array.");
+    }
+    const seen = new Set<NotifyEvent>();
+    events = [];
+    for (const item of nObj["events"]) {
+      if (typeof item !== "string" || !NOTIFY_EVENTS.has(item as NotifyEvent)) {
+        throw new HubError(400, "BAD_REQUEST", "Invalid event in notify.events.");
+      }
+      const ev = item as NotifyEvent;
+      if (!seen.has(ev)) {
+        seen.add(ev);
+        events.push(ev);
+      }
+    }
+  }
+  return { target: targetRaw as NotifyTarget, events };
+}
+
+export function parseScheduledAtIso(raw: string, nowMs = Date.now()): string {
+  const m = RFC3339_DATE_TIME_RE.exec(raw);
+  if (!m) {
+    throw new HubError(
+      400,
+      "BAD_REQUEST",
+      "scheduled_at must be a valid RFC 3339 UTC/offset timestamp."
+    );
+  }
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+  const hour = Number(m[4]);
+  const minute = Number(m[5]);
+  const second = Number(m[6]);
+  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  if (
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > daysInMonth ||
+    hour > 23 ||
+    minute > 59 ||
+    second > 59
+  ) {
+    throw new HubError(400, "BAD_REQUEST", "scheduled_at contains an invalid calendar date or time.");
+  }
+  const ms = Date.parse(raw);
+  if (!Number.isFinite(ms)) {
+    throw new HubError(400, "BAD_REQUEST", "scheduled_at must be a valid RFC 3339 timestamp.");
+  }
+  // Allow 500ms clock skew on lower bound so client `now + 60s` isn't rejected due to transport latency,
+  // while strictly rejecting <= 59s offsets.
+  const minMs = nowMs + (MIN_SCHEDULE_SEC * 1000 - 500);
+  const maxMs = nowMs + MAX_SCHEDULE_SEC * 1000;
+  if (ms < minMs || ms > maxMs) {
+    throw new HubError(
+      400,
+      "BAD_REQUEST",
+      `scheduled_at must be between +${MIN_SCHEDULE_SEC}s and +${MAX_SCHEDULE_SEC}s from now.`
+    );
+  }
+  return new Date(ms).toISOString();
+}
+
 export interface ParsedCreateRun {
   threadId?: string;
   nodeId?: string;
@@ -206,10 +298,14 @@ export interface ParsedCreateRun {
   title?: string;
   parentRunId?: string;
   idempotencyKey?: string;
+  dependsOn?: string[];
+  scheduledAt?: string;
+  boardTopicId?: string;
+  actorProfile?: string;
   notify: NotifyPolicy;
 }
 
-export function parseCreateRunRequest(raw: unknown): ParsedCreateRun {
+export function parseCreateRunRequest(raw: unknown, nowMs = Date.now()): ParsedCreateRun {
   const obj = asRecord(raw, "CreateRunRequest");
   rejectUnknownKeys(
     obj,
@@ -226,6 +322,10 @@ export function parseCreateRunRequest(raw: unknown): ParsedCreateRun {
       "title",
       "parent_run_id",
       "idempotency_key",
+      "depends_on",
+      "scheduled_at",
+      "board_topic_id",
+      "actor_profile",
       "notify"
     ],
     "CreateRunRequest"
@@ -284,34 +384,48 @@ export function parseCreateRunRequest(raw: unknown): ParsedCreateRun {
     throw new HubError(400, "BAD_REQUEST", "idempotency_key must have length >= 8.");
   }
 
-  let notify: NotifyPolicy = { target: "none" };
-  if (obj["notify"] !== undefined) {
-    const nObj = asRecord(obj["notify"], "notify");
-    rejectUnknownKeys(nObj, ["target", "events"], "notify");
-    const targetRaw = asOptionalString(nObj, "target") ?? "none";
-    if (!NOTIFY_TARGETS.has(targetRaw as NotifyTarget)) {
-      throw new HubError(400, "BAD_REQUEST", `Invalid notify target '${targetRaw}'.`);
+  let dependsOn: string[] | undefined;
+  if (obj["depends_on"] !== undefined) {
+    if (!Array.isArray(obj["depends_on"])) {
+      throw new HubError(400, "BAD_REQUEST", "depends_on must be an array.");
     }
-    let events: NotifyEvent[] | undefined;
-    if (nObj["events"] !== undefined) {
-      if (!Array.isArray(nObj["events"])) {
-        throw new HubError(400, "BAD_REQUEST", "notify.events must be an array.");
-      }
-      const seen = new Set<NotifyEvent>();
-      events = [];
-      for (const item of nObj["events"]) {
-        if (typeof item !== "string" || !NOTIFY_EVENTS.has(item as NotifyEvent)) {
-          throw new HubError(400, "BAD_REQUEST", "Invalid event in notify.events.");
-        }
-        const ev = item as NotifyEvent;
-        if (!seen.has(ev)) {
-          seen.add(ev);
-          events.push(ev);
-        }
-      }
+    if (obj["depends_on"].length > 10) {
+      throw new HubError(400, "BAD_REQUEST", "depends_on exceeds maxItems 10.");
     }
-    notify = { target: targetRaw as NotifyTarget, events };
+    const seen = new Set<string>();
+    dependsOn = [];
+    for (const item of obj["depends_on"]) {
+      if (typeof item !== "string" || !RUN_ID_RE.test(item)) {
+        throw new HubError(400, "BAD_REQUEST", "depends_on items must be valid run_... IDs.");
+      }
+      if (seen.has(item)) {
+        throw new HubError(400, "BAD_REQUEST", `Duplicate run ID '${item}' in depends_on.`);
+      }
+      seen.add(item);
+      dependsOn.push(item);
+    }
   }
+
+  const scheduledAtRaw = asOptionalString(obj, "scheduled_at", 64);
+  const scheduledAt =
+    scheduledAtRaw !== undefined ? parseScheduledAtIso(scheduledAtRaw, nowMs) : undefined;
+
+  const boardTopicId = asOptionalString(obj, "board_topic_id", 64);
+  if (boardTopicId !== undefined && !BOARD_TOPIC_ID_RE.test(boardTopicId)) {
+    throw new HubError(400, "BAD_REQUEST", "Invalid board_topic_id format.");
+  }
+
+  const actorProfile = asOptionalString(obj, "actor_profile", 40);
+  if (
+    actorProfile !== undefined &&
+    (codePointLength(actorProfile) < 1 ||
+      codePointLength(actorProfile) > 40 ||
+      !ACTOR_PROFILE_RE.test(actorProfile))
+  ) {
+    throw new HubError(400, "BAD_REQUEST", "Invalid actor_profile format.");
+  }
+
+  const notify = parseNotifyPolicyField(obj["notify"]);
 
   return {
     threadId,
@@ -326,8 +440,315 @@ export function parseCreateRunRequest(raw: unknown): ParsedCreateRun {
     title,
     parentRunId,
     idempotencyKey,
+    dependsOn,
+    scheduledAt,
+    boardTopicId,
+    actorProfile,
     notify
   };
+}
+
+export interface ParsedPlanNodeSpec {
+  key: string;
+  nodeId: string;
+  workdir: string;
+  agent: AgentName;
+  model: string;
+  effort: EffortLevel;
+  sandbox: boolean;
+  timeoutSec: number;
+  prompt: string;
+  title?: string;
+  dependsOn: string[];
+  scheduledAt?: string;
+  inSec?: number;
+  priorityOrder?: number;
+  notify: NotifyPolicy;
+}
+
+export interface ParsedCreatePlan {
+  idempotencyKey?: string;
+  boardTopicId?: string;
+  actorProfile: string;
+  parentRunId?: string;
+  nodes: ParsedPlanNodeSpec[];
+}
+
+export function parseCreatePlanRequest(raw: unknown, nowMs = Date.now()): ParsedCreatePlan {
+  const obj = asRecord(raw, "CreatePlanRequest");
+  rejectUnknownKeys(
+    obj,
+    ["idempotency_key", "board_topic_id", "actor_profile", "parent_run_id", "nodes"],
+    "CreatePlanRequest"
+  );
+
+  const idempotencyKey = asOptionalString(obj, "idempotency_key", 128);
+  if (idempotencyKey !== undefined && idempotencyKey.length < 8) {
+    throw new HubError(400, "BAD_REQUEST", "idempotency_key must have length >= 8.");
+  }
+
+  const boardTopicId = asOptionalString(obj, "board_topic_id", 64);
+  if (boardTopicId !== undefined && !BOARD_TOPIC_ID_RE.test(boardTopicId)) {
+    throw new HubError(400, "BAD_REQUEST", "Invalid board_topic_id format.");
+  }
+
+  const actorProfileRaw = asOptionalString(obj, "actor_profile", 40);
+  if (
+    actorProfileRaw !== undefined &&
+    (codePointLength(actorProfileRaw) < 1 ||
+      codePointLength(actorProfileRaw) > 40 ||
+      !ACTOR_PROFILE_RE.test(actorProfileRaw))
+  ) {
+    throw new HubError(400, "BAD_REQUEST", "Invalid actor_profile format.");
+  }
+  const actorProfile = actorProfileRaw ?? "";
+
+  const parentRunId = asOptionalString(obj, "parent_run_id");
+  if (parentRunId !== undefined && !RUN_ID_RE.test(parentRunId)) {
+    throw new HubError(400, "BAD_REQUEST", "Invalid parent_run_id format.");
+  }
+
+  const rawNodes = obj["nodes"];
+  if (!Array.isArray(rawNodes) || rawNodes.length < 1 || rawNodes.length > 20) {
+    throw new HubError(400, "BAD_REQUEST", "nodes must be an array of 1..20 plan node specs.");
+  }
+
+  const seenKeys = new Set<string>();
+  const nodes: ParsedPlanNodeSpec[] = [];
+  let totalEdges = 0;
+
+  for (let i = 0; i < rawNodes.length; i++) {
+    const ctxLabel = `nodes[${i}]`;
+    const nObj = asRecord(rawNodes[i], ctxLabel);
+    rejectUnknownKeys(
+      nObj,
+      [
+        "key",
+        "node_id",
+        "workdir",
+        "agent",
+        "model",
+        "effort",
+        "sandbox",
+        "timeout_sec",
+        "prompt",
+        "title",
+        "depends_on",
+        "scheduled_at",
+        "in_sec",
+        "priority_order",
+        "notify"
+      ],
+      ctxLabel
+    );
+
+    const key = asRequiredString(nObj, "key", 1, 64);
+    if (!PLAN_KEY_RE.test(key)) {
+      throw new HubError(400, "BAD_REQUEST", `Invalid plan node key '${key}' in ${ctxLabel}.`);
+    }
+    if (seenKeys.has(key)) {
+      throw new HubError(400, "BAD_REQUEST", `Duplicate plan node key '${key}'.`);
+    }
+    seenKeys.add(key);
+
+    const nodeId = asRequiredString(nObj, "node_id", 1, 64);
+    if (!NODE_ID_RE.test(nodeId)) {
+      throw new HubError(400, "BAD_REQUEST", `Invalid node_id '${nodeId}' in ${ctxLabel}.`);
+    }
+
+    const workdir = asRequiredString(nObj, "workdir", 1, 512);
+    const agentRaw = asRequiredString(nObj, "agent", 1);
+    if (!AGENTS.has(agentRaw as AgentName)) {
+      throw new HubError(400, "BAD_REQUEST", `Unsupported agent '${agentRaw}' in ${ctxLabel}.`);
+    }
+    const agent = agentRaw as AgentName;
+
+    const model = asOptionalString(nObj, "model", 128) ?? "";
+    const effortRaw = asOptionalString(nObj, "effort") ?? "";
+    if (effortRaw !== "" && !EFFORTS.has(effortRaw as EffortLevel)) {
+      throw new HubError(400, "BAD_REQUEST", `Unsupported effort '${effortRaw}' in ${ctxLabel}.`);
+    }
+    const effort = effortRaw as EffortLevel;
+    const sandbox = asOptionalBoolean(nObj, "sandbox") ?? true;
+    const timeoutSec = asOptionalInt(nObj, "timeout_sec", 10, 7200) ?? 900;
+    const prompt = asRequiredString(nObj, "prompt", 1, 200000);
+    const title = asOptionalString(nObj, "title", 160);
+
+    const dependsOn: string[] = [];
+    if (nObj["depends_on"] !== undefined) {
+      if (!Array.isArray(nObj["depends_on"])) {
+        throw new HubError(400, "BAD_REQUEST", `${ctxLabel}.depends_on must be an array.`);
+      }
+      if (nObj["depends_on"].length > 10) {
+        throw new HubError(400, "BAD_REQUEST", `${ctxLabel}.depends_on exceeds maxItems 10.`);
+      }
+      const seenDeps = new Set<string>();
+      for (const dep of nObj["depends_on"]) {
+        if (typeof dep !== "string" || (!PLAN_KEY_RE.test(dep) && !RUN_ID_RE.test(dep))) {
+          throw new HubError(
+            400,
+            "BAD_REQUEST",
+            `Invalid dependency '${String(dep)}' in ${ctxLabel}.depends_on.`
+          );
+        }
+        if (seenDeps.has(dep)) {
+          throw new HubError(
+            400,
+            "BAD_REQUEST",
+            `Duplicate dependency '${dep}' in ${ctxLabel}.depends_on.`
+          );
+        }
+        seenDeps.add(dep);
+        dependsOn.push(dep);
+      }
+      totalEdges += dependsOn.length;
+      if (totalEdges > 60) {
+        throw new HubError(400, "BAD_REQUEST", "Total dependency edges across plan nodes exceeds 60.");
+      }
+    }
+
+    if (nObj["scheduled_at"] !== undefined && nObj["in_sec"] !== undefined) {
+      throw new HubError(
+        400,
+        "BAD_REQUEST",
+        `${ctxLabel} cannot specify both scheduled_at and in_sec.`
+      );
+    }
+
+    const scheduledAtRaw = asOptionalString(nObj, "scheduled_at", 64);
+    const inSec = asOptionalInt(nObj, "in_sec", MIN_SCHEDULE_SEC, MAX_SCHEDULE_SEC);
+    let scheduledAt: string | undefined;
+    if (scheduledAtRaw !== undefined) {
+      scheduledAt = parseScheduledAtIso(scheduledAtRaw, nowMs);
+    } else if (inSec !== undefined) {
+      scheduledAt = new Date(nowMs + inSec * 1000).toISOString();
+    }
+
+    const priorityOrder = asOptionalNumber(nObj, "priority_order");
+    const notify = parseNotifyPolicyField(nObj["notify"]);
+
+    nodes.push({
+      key,
+      nodeId,
+      workdir,
+      agent,
+      model,
+      effort,
+      sandbox,
+      timeoutSec,
+      prompt,
+      title,
+      dependsOn,
+      scheduledAt,
+      inSec,
+      priorityOrder,
+      notify
+    });
+  }
+
+  return {
+    idempotencyKey,
+    boardTopicId,
+    actorProfile,
+    parentRunId,
+    nodes
+  };
+}
+
+export interface ParsedRetryRun {
+  idempotencyKey?: string;
+  model?: string;
+  effort?: EffortLevel;
+  timeoutSec?: number;
+  actorProfile?: string;
+}
+
+export function parseRetryRunRequest(raw: unknown): ParsedRetryRun {
+  if (raw === undefined || raw === null) {
+    return {};
+  }
+  const obj = asRecord(raw, "RetryRunRequest");
+  rejectUnknownKeys(
+    obj,
+    ["idempotency_key", "model", "effort", "timeout_sec", "actor_profile"],
+    "RetryRunRequest"
+  );
+
+  const idempotencyKey = asOptionalString(obj, "idempotency_key", 128);
+  if (idempotencyKey !== undefined && idempotencyKey.length < 8) {
+    throw new HubError(400, "BAD_REQUEST", "idempotency_key must have length >= 8.");
+  }
+
+  const model = asOptionalString(obj, "model", 128);
+  const effortRaw = asOptionalString(obj, "effort");
+  let effort: EffortLevel | undefined;
+  if (effortRaw !== undefined) {
+    if (!EFFORTS.has(effortRaw as EffortLevel)) {
+      throw new HubError(400, "BAD_REQUEST", `Unsupported effort '${effortRaw}'.`);
+    }
+    effort = effortRaw as EffortLevel;
+  }
+  const timeoutSec = asOptionalInt(obj, "timeout_sec", 10, 7200);
+  const actorProfile = asOptionalString(obj, "actor_profile", 40);
+  if (
+    actorProfile !== undefined &&
+    (codePointLength(actorProfile) < 1 ||
+      codePointLength(actorProfile) > 40 ||
+      !ACTOR_PROFILE_RE.test(actorProfile))
+  ) {
+    throw new HubError(400, "BAD_REQUEST", "Invalid actor_profile format.");
+  }
+
+  return {
+    idempotencyKey,
+    model,
+    effort,
+    timeoutSec,
+    actorProfile
+  };
+}
+
+export function parseListRunsQuery(searchParams: URLSearchParams): {
+  nodeId?: string;
+  threadId?: string;
+  status?: RunStatus;
+  rootRunId?: string;
+  planId?: string;
+  boardTopicId?: string;
+  limit: number;
+} {
+  const nodeId = searchParams.get("node_id")?.trim() || undefined;
+  const threadId = searchParams.get("thread_id")?.trim() || undefined;
+  const statusRaw = searchParams.get("status")?.trim() || undefined;
+  let status: RunStatus | undefined;
+  if (statusRaw !== undefined) {
+    if (!RUN_STATUSES.has(statusRaw as RunStatus)) {
+      throw new HubError(400, "BAD_REQUEST", `Invalid run status '${statusRaw}'.`);
+    }
+    status = statusRaw as RunStatus;
+  }
+  const rootRunId = searchParams.get("root_run_id")?.trim() || undefined;
+  const planId = searchParams.get("plan_id")?.trim() || undefined;
+  if (planId !== undefined && !PLAN_ID_RE.test(planId)) {
+    throw new HubError(400, "BAD_REQUEST", "Invalid plan_id format.");
+  }
+  const boardTopicId = searchParams.get("board_topic_id")?.trim() || undefined;
+  if (boardTopicId !== undefined && !BOARD_TOPIC_ID_RE.test(boardTopicId)) {
+    throw new HubError(400, "BAD_REQUEST", "Invalid board_topic_id format.");
+  }
+  const limitRaw = searchParams.get("limit")?.trim();
+  let limit = 50;
+  if (limitRaw !== undefined && limitRaw !== "") {
+    if (!/^-?\d+$/.test(limitRaw)) {
+      throw new HubError(400, "BAD_REQUEST", "Query 'limit' must be an integer.");
+    }
+    const parsed = Number.parseInt(limitRaw, 10);
+    if (!Number.isSafeInteger(parsed)) {
+      throw new HubError(400, "BAD_REQUEST", "Query 'limit' must be a finite integer.");
+    }
+    limit = Math.min(Math.max(parsed, 1), 200);
+  }
+  return { nodeId, threadId, status, rootRunId, planId, boardTopicId, limit };
 }
 
 export function parsePatchNodeRequest(raw: unknown): {
@@ -1105,7 +1526,7 @@ export function parseNodeWsFrame(raw: unknown): NodeInboundFrame {
         type: "run.state",
         run_id: runId,
         lease_owner: asRequiredString(obj, "lease_owner", 4, 256),
-        status: statusRaw as Exclude<RunStatus, "queued" | "claimed">,
+        status: statusRaw as Exclude<RunStatus, "waiting" | "queued" | "claimed">,
         remote_control_url: asOptionalString(obj, "remote_control_url", 1024),
         resolved_model: asOptionalString(obj, "resolved_model", 256),
         resolved_effort: asOptionalString(obj, "resolved_effort", 64),

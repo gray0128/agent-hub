@@ -14,6 +14,7 @@ interface TaskState {
   upsertThread: (thread: ThreadRecord) => void;
   setRuns: (runs: RunRecord[]) => void;
   upsertRun: (run: RunRecord) => void;
+  upsertRuns: (runs: RunRecord[]) => void;
   appendEvents: (runId: string, incoming: RunEventItem[]) => void;
   setFullOutput: (runId: string, outputMd: string) => void;
   selectThread: (threadId: string | null) => void;
@@ -49,17 +50,24 @@ function mergeBoundedEvents(existing: RunEventItem[], incoming: RunEventItem[]):
 
 function runStatusRank(status: RunRecord["status"]): number {
   switch (status) {
-    case "queued":
+    case "waiting":
       return 0;
-    case "claimed":
+    case "queued":
       return 1;
+    case "claimed":
+      return 2;
     case "running":
     case "needs_approval":
-      return 2;
+      return 3;
     case "done":
     case "failed":
     case "cancelled":
-      return 3;
+      return 4;
+    default: {
+      const _exhaustive: never = status;
+      void _exhaustive;
+      return 0;
+    }
   }
 }
 
@@ -89,7 +97,9 @@ function mergeRunRecordWithMeta(
         output_preview: existing.output_preview ?? incoming.output_preview,
         output_md: existing.output_md ?? incoming.output_md,
         truncated: existing.truncated ?? incoming.truncated,
-        deliveries_summary: existing.deliveries_summary ?? incoming.deliveries_summary
+        deliveries_summary: existing.deliveries_summary ?? incoming.deliveries_summary,
+        depends_on_run_ids: existing.depends_on_run_ids ?? incoming.depends_on_run_ids,
+        blocked_reason: existing.status === "waiting" ? (existing.blocked_reason ?? null) : null
       },
       outputInvalidated: false
     };
@@ -110,10 +120,39 @@ function mergeRunRecordWithMeta(
         ? incoming.truncated
         : (incoming.truncated ?? existing.truncated);
 
+  const nextPlanId = incoming.plan_id !== undefined ? incoming.plan_id : existing.plan_id;
+  const nextPlanKey = incoming.plan_key !== undefined ? incoming.plan_key : existing.plan_key;
+  const nextScheduledAt =
+    incoming.scheduled_at !== undefined ? incoming.scheduled_at : existing.scheduled_at;
+  const nextRetryOfRunId =
+    incoming.retry_of_run_id !== undefined ? incoming.retry_of_run_id : existing.retry_of_run_id;
+  const nextActorProfile =
+    incoming.actor_profile !== undefined ? incoming.actor_profile : existing.actor_profile;
+  const nextBoardTopicId =
+    incoming.board_topic_id !== undefined ? incoming.board_topic_id : existing.board_topic_id;
+  const nextDependsOnRunIds =
+    incoming.depends_on_run_ids !== undefined
+      ? incoming.depends_on_run_ids
+      : existing.depends_on_run_ids;
+  const nextBlockedReason =
+    incoming.status !== "waiting"
+      ? null
+      : incoming.blocked_reason !== undefined
+        ? incoming.blocked_reason
+        : (existing.blocked_reason ?? null);
+
   return {
     run: {
       ...existing,
       ...incoming,
+      plan_id: nextPlanId,
+      plan_key: nextPlanKey,
+      scheduled_at: nextScheduledAt,
+      retry_of_run_id: nextRetryOfRunId,
+      actor_profile: nextActorProfile,
+      board_topic_id: nextBoardTopicId,
+      depends_on_run_ids: nextDependsOnRunIds,
+      blocked_reason: nextBlockedReason,
       prompt: incoming.prompt ?? existing.prompt,
       output_preview: nextOutputPreview,
       output_md: nextOutputMd,
@@ -251,6 +290,42 @@ export const useTaskStore = create<TaskState>((set) => ({
         ...(nextFullOutput !== state.fullOutputByRunId ? { fullOutputByRunId: nextFullOutput } : {}),
         threads: nextThreads,
         selectedRunId: state.selectedRunId ?? mergedRun.id
+      };
+    }),
+
+  upsertRuns: (incomingRuns) =>
+    set((state) => {
+      if (incomingRuns.length === 0) return state;
+      const byId = new Map(state.runs.map((r) => [r.id, r]));
+      const nextFullOutput = { ...state.fullOutputByRunId };
+      let fullChanged = false;
+
+      for (const r of incomingRuns) {
+        const prev = byId.get(r.id);
+        if (!prev) {
+          byId.set(r.id, r.status !== "waiting" ? { ...r, blocked_reason: null } : r);
+          if (r.output_md !== undefined && nextFullOutput[r.id] !== r.output_md) {
+            nextFullOutput[r.id] = r.output_md;
+            fullChanged = true;
+          }
+          continue;
+        }
+        const res = mergeRunRecordWithMeta(prev, r);
+        byId.set(r.id, res.run);
+        if (res.run.output_md !== undefined) {
+          if (nextFullOutput[res.run.id] !== res.run.output_md) {
+            nextFullOutput[res.run.id] = res.run.output_md;
+            fullChanged = true;
+          }
+        } else if (res.outputInvalidated && res.run.id in nextFullOutput) {
+          delete nextFullOutput[res.run.id];
+          fullChanged = true;
+        }
+      }
+
+      return {
+        runs: sortRuns(Array.from(byId.values())),
+        ...(fullChanged ? { fullOutputByRunId: nextFullOutput } : {})
       };
     }),
 

@@ -6,6 +6,14 @@
 
 ## Done
 
+- [x] `RFC-0001 Slice 1b`（`912ed81`）：交付 Web 协同板四栏 `@dnd-kit` 看板（`todo`/`in_progress`/`blocked`/`done` 跨栏拖拽、列内排序与乐观回滚）、「近期主题」快速跳转与键盘快捷键面板
+
+- [x] `RFC-0001 Slice 1a`（`9736292`）：交付跨机协同板（[0008_board_coordination_and_questions.sql](./apps/hub-worker/migrations/0008_board_coordination_and_questions.sql)、`board_topics` / `board_messages` / `board_events`、阻塞式问答 `ahub board` CLI、`--as <profile>` 归属标识、`error.next` 恢复建议、Board-First 三工作区控制台与统一「收件箱」）
+
+- [x] `c8cb336`：上线「汇流派发枢（Mux Chevron Hub）」SVG 品牌图标与全平台 PWA 图标体系（零外部依赖 Chrome CDP 单源生成脚本 `apps/web/scripts/generate-icons.mjs` 与主题自适应 `BrandMark.tsx`）
+
+- [x] `v0.1.8`（`6dfca57`）：治理原生通知高频噪声与合并防抖（[0007_node_default_notify_events.sql](./apps/hub-worker/migrations/0007_node_default_notify_events.sql)、`agy`/`claude`/`grok` 子代理事件过滤、`nodes.default_notify_events` 精细筛选与 `60s` 静默聚合 / `300s` 同会话冷却）
+
 - [x] 优化 `agent-hub` Web 页面的移动端体验（补齐 `viewport-fit=cover` 与四向安全区适配、`Input`/`Textarea` 移动端 `>= 16px` 防 iOS 缩放与标识符输入属性、顶栏连接指示点/右抽屉态势角标/窄屏更多菜单、左抽屉禁用工作区拖拽并修复分叉与队列跳转抽屉收起闭环、右抽屉 5-Tab 单行横向滚动与自动定位、全量高频按钮与弹窗控件 `>= 44px` 触控热区、`MouseSensor` + `TouchSensor` 防滚动误触、Markdown 宽表局部横向滚动容器与阅读态 Composer 一键收折，同步更新 [05-web-frontend-spec.md](./docs/05-web-frontend-spec.md)、[lint-hygiene.mjs](./evals/web/lint-hygiene.mjs) 与 [cdp-runtime-eval.mjs](./evals/web/cdp-runtime-eval.mjs) 移动端评测与变异门禁）
 
 - [x] `v0.1.7`（`71ee56a`）：交付独立「原生活动」账本与零依赖标准 Web Push 通知渠道（新增 [0006_native_activity_and_web_push.sql](./apps/hub-worker/migrations/0006_native_activity_and_web_push.sql)、`progress` 事件类型与 30 天 Cron 清理、只读 `ahub activity` CLI、统一多渠道投递明细账本 `notification_deliveries` 及单通道重推、RFC 8291/8292 [web-push.ts](./apps/hub-worker/src/web-push.ts)、零回源 [sw.js](./apps/web/public/sw.js) / [manifest.webmanifest](./apps/web/public/manifest.webmanifest) 与三栏「原生活动」视图 [NativeActivityPane.tsx](./apps/web/src/components/workbench/NativeActivityPane.tsx) / [BrowserNotifyDialog.tsx](./apps/web/src/components/workbench/BrowserNotifyDialog.tsx)）

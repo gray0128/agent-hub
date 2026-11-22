@@ -919,7 +919,7 @@ test("Board REST upsert, reorder, idempotency, symmetric redaction, capacity cap
   );
   assert.equal(idemConflict.status, 409);
   assert.equal(idemConflict.json.error.code, "IDEMPOTENCY_CONFLICT");
-  assert.equal(idemConflict.json.error.next.includes(`ahub board read ${topicId} --json`), true);
+  assert.equal(idemConflict.json.error.next.includes(`ahub board read --topic ${topicId} --json`), true);
 
   // 4. Question interlock: in_progress -> blocked (previous_status='in_progress'), 2nd question keeps previous_status
   const q1Res = await harness.callApi(
@@ -968,6 +968,7 @@ test("Board REST upsert, reorder, idempotency, symmetric redaction, capacity cap
   const winner = ansA.status === 200 ? ansA : ansB;
   const loser = ansA.status === 409 ? ansA : ansB;
   assert.equal(loser.json.error.code, "INVALID_STATE_TRANSITION");
+  assert.equal(loser.json.error.next.includes(`ahub board read --topic ${topicId} --json`), true);
   assertMatchesBoardSchema(winner.json, "POST /answer winner");
   assert.equal(winner.json.topic.status, "blocked");
   assert.equal(winner.json.topic.previous_status, "in_progress");
@@ -1666,6 +1667,7 @@ test("Board CAS answer rejects TOCTOU race even when both callers pass pre-check
   assert.deepEqual([resA.status, resB.status].sort(), [200, 409]);
   const loser = resA.status === 409 ? resA : resB;
   assert.equal(loser.json.error.code, "INVALID_STATE_TRANSITION");
+  assert.equal(loser.json.error.next.includes(`ahub board read --topic ${topicId} --json`), true);
 
   const tl = await harness.callApi("GET", `/api/v1/board/topics/${topicId}/messages`, adminTok);
   assert.equal(tl.status, 200);

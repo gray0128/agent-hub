@@ -1,4 +1,10 @@
-import { ensureNodeAllowedForClient, ensureRunAccessible, isNodeVisibleToPrincipal } from "./auth";
+import {
+  ensureBoardChannelAllowed,
+  ensureNodeAllowedForClient,
+  ensureRunAccessible,
+  isNodeVisibleToPrincipal
+} from "./auth";
+import { postSystemRunHandoffToBoard, type SystemRunHandoffResult } from "./board";
 import { buildPromptPreview, redactSecrets } from "./redact";
 import {
   type AgentName,
@@ -6,6 +12,7 @@ import {
   type ApiScope,
   type AttentionState,
   type AuthPrincipal,
+  type BlockedReason,
   type DeliveriesSummary,
   type DeliveryChannelKind,
   type DeliverySourceKind,
@@ -40,6 +47,7 @@ import {
 import { newId, nowIso, sanitizeTailPreview, truncateUtf8Bytes } from "./ulid";
 import {
   type ApprovalCheckpointInput,
+  codePointLength,
   DEFAULT_NODE_NOTIFY_EVENTS,
   type ParsedCreateRun,
   type ParsedNativeEventCreate,
@@ -192,6 +200,12 @@ export interface RunRow {
   duration_ms: number;
   created_at: string;
   updated_at: string;
+  plan_id?: string | null;
+  plan_key?: string | null;
+  scheduled_at?: string | null;
+  retry_of_run_id?: string | null;
+  actor_profile?: string;
+  board_topic_id?: string | null;
 }
 
 interface ApiKeyRow {
@@ -223,7 +237,7 @@ export function parseJsonObject(raw: string): Record<string, unknown> {
   return {};
 }
 
-function parseWorkspaces(raw: string): WorkspaceEntry[] {
+export function parseWorkspaces(raw: string): WorkspaceEntry[] {
   try {
     const parsed = JSON.parse(raw);
     if (Array.isArray(parsed)) {
@@ -623,6 +637,146 @@ export function sanitizeNodeForScope(node: NodeRecord, scope: ApiScope): NodeRec
   return copy;
 }
 
+export function deriveBlockedReason(
+  status: RunStatus,
+  scheduledAt: string | null | undefined,
+  upstreamStatuses: ReadonlyArray<RunStatus | null>,
+  nowIsoStr = nowIso()
+): BlockedReason | null {
+  if (status !== "waiting") {
+    return null;
+  }
+  if (upstreamStatuses.some((s) => s === "failed")) {
+    return "UPSTREAM_FAILED";
+  }
+  if (upstreamStatuses.some((s) => s === "cancelled")) {
+    return "UPSTREAM_CANCELLED";
+  }
+  if (upstreamStatuses.some((s) => s !== "done")) {
+    return "DEPENDENCY_PENDING";
+  }
+  if (scheduledAt && scheduledAt > nowIsoStr) {
+    return "SCHEDULED";
+  }
+  if (scheduledAt) {
+    return "SCHEDULED";
+  }
+  return "DEPENDENCY_PENDING";
+}
+
+export async function getRunDependencyInfoMap(
+  db: D1Database,
+  runIds: string[]
+): Promise<Map<string, { dependsOnRunIds: string[]; upstreamStatuses: Array<RunStatus | null> }>> {
+  const out = new Map<string, { dependsOnRunIds: string[]; upstreamStatuses: Array<RunStatus | null> }>();
+  const uniqueIds = Array.from(new Set(runIds.filter((id) => Boolean(id))));
+  if (uniqueIds.length === 0) {
+    return out;
+  }
+  const chunkSize = 50;
+  for (let i = 0; i < uniqueIds.length; i += chunkSize) {
+    const chunk = uniqueIds.slice(i, i + chunkSize);
+    const placeholders = chunk.map((_, idx) => `?${idx + 1}`).join(", ");
+    const res = await db
+      .prepare(
+        `SELECT d.run_id, d.depends_on_run_id, up.status AS upstream_status
+         FROM run_dependencies d
+         LEFT JOIN runs up ON up.id = d.depends_on_run_id
+         WHERE d.run_id IN (${placeholders})
+         ORDER BY d.created_at ASC, d.depends_on_run_id ASC`
+      )
+      .bind(...chunk)
+      .all<{ run_id: string; depends_on_run_id: string; upstream_status: RunStatus | null }>();
+    for (const row of res.results ?? []) {
+      let entry = out.get(row.run_id);
+      if (!entry) {
+        entry = { dependsOnRunIds: [], upstreamStatuses: [] };
+        out.set(row.run_id, entry);
+      }
+      if (!entry.dependsOnRunIds.includes(row.depends_on_run_id)) {
+        entry.dependsOnRunIds.push(row.depends_on_run_id);
+        entry.upstreamStatuses.push(row.upstream_status ?? null);
+      }
+    }
+  }
+  return out;
+}
+
+export async function dependencySetsMatchWithRetryLineage(
+  db: D1Database,
+  expectedDepIds: readonly string[],
+  actualDepIds: readonly string[]
+): Promise<boolean> {
+  const expectedUnique = Array.from(new Set(expectedDepIds));
+  const actualUnique = Array.from(new Set(actualDepIds));
+  if (expectedUnique.length !== actualUnique.length) {
+    return false;
+  }
+  if (expectedUnique.length === 0) {
+    return true;
+  }
+
+  const expectedSet = new Set(expectedUnique);
+  const matchedExpected = new Set<string>();
+  const unmatchedActual: string[] = [];
+
+  for (const actualId of actualUnique) {
+    if (expectedSet.has(actualId)) {
+      matchedExpected.add(actualId);
+    } else {
+      unmatchedActual.push(actualId);
+    }
+  }
+
+  if (unmatchedActual.length === 0) {
+    return matchedExpected.size === expectedUnique.length;
+  }
+
+  const retryParentCache = new Map<string, string | null>();
+  const visited = new Set<string>(unmatchedActual);
+  let frontier = [...unmatchedActual];
+  const chunkSize = 50;
+
+  while (frontier.length > 0) {
+    const toFetch = frontier.filter((id) => !retryParentCache.has(id));
+    for (let i = 0; i < toFetch.length; i += chunkSize) {
+      const chunk = toFetch.slice(i, i + chunkSize);
+      const placeholders = chunk.map((_, idx) => `?${idx + 1}`).join(", ");
+      const res = await db
+        .prepare(`SELECT id, retry_of_run_id FROM runs WHERE id IN (${placeholders})`)
+        .bind(...chunk)
+        .all<{ id: string; retry_of_run_id: string | null }>();
+      const foundIds = new Set<string>();
+      for (const row of res.results ?? []) {
+        retryParentCache.set(row.id, row.retry_of_run_id ?? null);
+        foundIds.add(row.id);
+      }
+      for (const id of chunk) {
+        if (!foundIds.has(id)) {
+          retryParentCache.set(id, null);
+        }
+      }
+    }
+
+    const nextFrontier: string[] = [];
+    for (const id of frontier) {
+      const parentId = retryParentCache.get(id) ?? null;
+      if (!parentId || visited.has(parentId)) {
+        continue;
+      }
+      if (expectedSet.has(parentId)) {
+        matchedExpected.add(parentId);
+      } else {
+        visited.add(parentId);
+        nextFrontier.push(parentId);
+      }
+    }
+    frontier = nextFrontier;
+  }
+
+  return matchedExpected.size === expectedUnique.length;
+}
+
 export function mapRunRow(
   row: RunRow,
   options: {
@@ -631,11 +785,20 @@ export function mapRunRow(
     promptMode?: RunPromptMode;
     webhookArmed?: boolean;
     deliveriesSummary?: DeliveriesSummary;
+    dependsOnRunIds?: string[];
+    blockedReason?: BlockedReason | null;
   } = {}
 ): RunRecord {
   const view = options.view ?? "summary";
   const tailBytes = options.tailBytes ?? 16384;
   const promptMode = options.promptMode ?? "preview";
+  const scheduledAt = row.scheduled_at ?? null;
+  const blockedReason =
+    options.blockedReason !== undefined
+      ? options.blockedReason
+      : row.status === "waiting"
+        ? (scheduledAt && scheduledAt > nowIso() ? "SCHEDULED" : "DEPENDENCY_PENDING")
+        : null;
   const record: RunRecord = {
     id: row.id,
     thread_id: row.thread_id,
@@ -651,6 +814,14 @@ export function mapRunRow(
     sandbox: row.sandbox === 1,
     timeout_sec: row.timeout_sec,
     status: row.status,
+    plan_id: row.plan_id ?? null,
+    plan_key: row.plan_key ?? null,
+    scheduled_at: scheduledAt,
+    retry_of_run_id: row.retry_of_run_id ?? null,
+    actor_profile: row.actor_profile ?? "",
+    board_topic_id: row.board_topic_id ?? null,
+    depends_on_run_ids: options.dependsOnRunIds ?? [],
+    blocked_reason: blockedReason,
     priority_order: row.priority_order,
     resolved_model: row.resolved_model,
     resolved_effort: row.resolved_effort,
@@ -691,6 +862,77 @@ export function mapRunRow(
     record.truncated = tail.truncated || row.output_bytes > tail.totalBytes;
   }
   return record;
+}
+
+export async function hydrateRunRecords(
+  db: D1Database,
+  rows: RunRow[],
+  options: {
+    view?: "summary" | "full" | "list";
+    tailBytes?: number;
+    promptMode?: RunPromptMode;
+    includeDeliveries?: boolean;
+    deliveriesSummaryMap?: Map<string, DeliveriesSummary>;
+  } = {}
+): Promise<RunRecord[]> {
+  if (rows.length === 0) return [];
+  const runIds = rows.map((r) => r.id);
+  const [depInfoMap, deliveriesMap] = await Promise.all([
+    getRunDependencyInfoMap(db, runIds),
+    options.deliveriesSummaryMap
+      ? Promise.resolve(options.deliveriesSummaryMap)
+      : options.includeDeliveries
+        ? getDeliveriesSummaryMap(db, "run", runIds)
+        : Promise.resolve(new Map<string, DeliveriesSummary>())
+  ]);
+  const nowStr = nowIso();
+  return rows.map((row) => {
+    const depInfo = depInfoMap.get(row.id);
+    const dependsOnRunIds = depInfo?.dependsOnRunIds ?? [];
+    const blockedReason = deriveBlockedReason(
+      row.status,
+      row.scheduled_at,
+      depInfo?.upstreamStatuses ?? [],
+      nowStr
+    );
+    return mapRunRow(row, {
+      view: options.view,
+      tailBytes: options.tailBytes,
+      promptMode: options.promptMode,
+      deliveriesSummary: deliveriesMap.get(row.id),
+      dependsOnRunIds,
+      blockedReason
+    });
+  });
+}
+
+export async function hydrateRunRecord(
+  db: D1Database,
+  row: RunRow,
+  options: {
+    view?: "summary" | "full" | "list";
+    tailBytes?: number;
+    promptMode?: RunPromptMode;
+    webhookArmed?: boolean;
+    includeDeliveries?: boolean;
+    deliveriesSummary?: DeliveriesSummary;
+  } = {}
+): Promise<RunRecord> {
+  const deliveriesMap =
+    options.deliveriesSummary !== undefined
+      ? new Map([[row.id, options.deliveriesSummary]])
+      : undefined;
+  const [record] = await hydrateRunRecords(db, [row], {
+    view: options.view,
+    tailBytes: options.tailBytes,
+    promptMode: options.promptMode,
+    includeDeliveries: options.includeDeliveries,
+    deliveriesSummaryMap: deliveriesMap
+  });
+  if (options.webhookArmed !== undefined) {
+    record!.webhook_armed = options.webhookArmed;
+  }
+  return record!;
 }
 
 export function mapApiKeyRow(row: ApiKeyRow): ApiKeyRecord {
@@ -750,7 +992,8 @@ export function resolveWorkspace(
       400,
       "WORKDIR_AMBIGUOUS",
       `Multiple workspaces matched project key '${normalized}'.`,
-      { candidates: keyMatches.map((m) => m.path) }
+      { candidates: keyMatches.map((m) => m.path) },
+      ["ahub nodes --online --json"]
     );
   }
 
@@ -769,14 +1012,17 @@ export function resolveWorkspace(
       400,
       "WORKDIR_AMBIGUOUS",
       `Multiple workspaces matched '${normalized}'.`,
-      { candidates: suffixMatches.map((m) => m.path) }
+      { candidates: suffixMatches.map((m) => m.path) },
+      ["ahub nodes --online --json"]
     );
   }
 
   throw new HubError(
     400,
     "WORKDIR_NOT_FOUND",
-    `No workspace matched '${normalized}' on target node.`
+    `No workspace matched '${normalized}' on target node.`,
+    undefined,
+    ["ahub nodes --json"]
   );
 }
 
@@ -828,7 +1074,7 @@ function makeRecalcNodeActiveRunsStmt(db: D1Database, nodeId: string, now: strin
     .bind(nodeId, now);
 }
 
-async function assertNoDelegationCycle(
+export async function assertNoDelegationCycle(
   db: D1Database,
   parentRunId: string,
   targetNodeId: string,
@@ -892,7 +1138,9 @@ export async function patchNode(
 ): Promise<NodeRecord> {
   const existing = await db.prepare(`SELECT * FROM nodes WHERE id = ?1`).bind(nodeId).first<NodeRow>();
   if (!existing) {
-    throw new HubError(404, "NODE_NOT_FOUND", `Node '${nodeId}' not found.`);
+    throw new HubError(404, "NODE_NOT_FOUND", `Node '${nodeId}' not found.`, undefined, [
+      "ahub nodes --json"
+    ]);
   }
 
   let nextDefaultNotifyKeyId = existing.default_notify_key_id ?? null;
@@ -1058,7 +1306,24 @@ export async function createRun(
     );
   }
 
+  if (headerIdempotencyKey !== undefined) {
+    const hdrLen = codePointLength(headerIdempotencyKey);
+    if (hdrLen < 8 || hdrLen > 128) {
+      throw new HubError(400, "BAD_REQUEST", "Idempotency-Key header must have length 8..128.");
+    }
+  }
   const effectiveIdemKey = input.idempotencyKey ?? headerIdempotencyKey;
+
+  if (input.boardTopicId) {
+    const topicRow = await db
+      .prepare(`SELECT id, channel FROM board_topics WHERE id = ?1 LIMIT 1`)
+      .bind(input.boardTopicId)
+      .first<{ id: string; channel: string }>();
+    if (!topicRow) {
+      throw new HubError(404, "NOT_FOUND", `Board topic '${input.boardTopicId}' not found.`);
+    }
+    ensureBoardChannelAllowed(principal, topicRow.channel);
+  }
 
   let threadRow: ThreadRow | null = null;
   let targetNodeId: string;
@@ -1087,7 +1352,9 @@ export async function createRun(
     }
     const nodeRow = await db.prepare(`SELECT * FROM nodes WHERE id = ?1`).bind(targetNodeId).first<NodeRow>();
     if (!nodeRow) {
-      throw new HubError(404, "NODE_NOT_FOUND", `Node '${targetNodeId}' not found.`);
+      throw new HubError(404, "NODE_NOT_FOUND", `Node '${targetNodeId}' not found.`, undefined, [
+        "ahub nodes --json"
+      ]);
     }
     if (nodeRow.status === "draining") {
       throw new HubError(409, "NODE_DRAINING", `Node '${targetNodeId}' is draining.`);
@@ -1105,12 +1372,62 @@ export async function createRun(
   if (input.threadId) {
     const nodeRow = await db.prepare(`SELECT status FROM nodes WHERE id = ?1`).bind(targetNodeId).first<{ status: NodeStatus }>();
     if (!nodeRow) {
-      throw new HubError(404, "NODE_NOT_FOUND", `Node '${targetNodeId}' not found.`);
+      throw new HubError(404, "NODE_NOT_FOUND", `Node '${targetNodeId}' not found.`, undefined, [
+        "ahub nodes --json"
+      ]);
     }
     if (nodeRow.status === "draining") {
       throw new HubError(409, "NODE_DRAINING", `Node '${targetNodeId}' is draining.`);
     }
   }
+
+  const depRunIds = input.dependsOn ?? [];
+  let hasUnmetDeps = false;
+  if (depRunIds.length > 0) {
+    const placeholders = depRunIds.map((_, idx) => `?${idx + 1}`).join(", ");
+    const depRes = await db
+      .prepare(`SELECT id, node_id, created_by_key_id, status FROM runs WHERE id IN (${placeholders})`)
+      .bind(...depRunIds)
+      .all<{ id: string; node_id: string; created_by_key_id: string | null; status: RunStatus }>();
+    const depById = new Map((depRes.results ?? []).map((r) => [r.id, r]));
+    for (const depId of depRunIds) {
+      const depRow = depById.get(depId);
+      if (!depRow) {
+        throw new HubError(400, "BAD_REQUEST", `Dependency run '${depId}' not found.`);
+      }
+      ensureRunAccessible(principal, depRow);
+      if (depRow.status !== "done") {
+        hasUnmetDeps = true;
+      }
+    }
+  }
+
+  const checkExistingIdempotency = async (existing: RunRow): Promise<{ run: RunRow; deduplicated: boolean }> => {
+    ensureRunAccessible(principal, existing);
+    const existingDepsRes = await db
+      .prepare(`SELECT depends_on_run_id FROM run_dependencies WHERE run_id = ?1`)
+      .bind(existing.id)
+      .all<{ depends_on_run_id: string }>();
+    const actualDeps = (existingDepsRes.results ?? []).map((r) => r.depends_on_run_id);
+    const depsEqual = await dependencySetsMatchWithRetryLineage(db, depRunIds, actualDeps);
+    if (
+      existing.node_id !== targetNodeId ||
+      existing.workdir !== resolvedWorkdir ||
+      existing.agent !== agent ||
+      existing.prompt !== input.prompt ||
+      (existing.board_topic_id ?? null) !== (input.boardTopicId ?? null) ||
+      (existing.actor_profile ?? "") !== (input.actorProfile ?? "") ||
+      (existing.scheduled_at ?? null) !== (input.scheduledAt ?? null) ||
+      !depsEqual
+    ) {
+      throw new HubError(
+        409,
+        "IDEMPOTENCY_CONFLICT",
+        "Idempotency-Key already used with different run parameters."
+      );
+    }
+    return { run: existing, deduplicated: true };
+  };
 
   if (effectiveIdemKey) {
     const existing = await db
@@ -1118,19 +1435,7 @@ export async function createRun(
       .bind(effectiveIdemKey)
       .first<RunRow>();
     if (existing) {
-      if (
-        existing.node_id !== targetNodeId ||
-        existing.workdir !== resolvedWorkdir ||
-        existing.agent !== agent ||
-        existing.prompt !== input.prompt
-      ) {
-        throw new HubError(
-          409,
-          "IDEMPOTENCY_CONFLICT",
-          "Idempotency-Key already used with different run parameters."
-        );
-      }
-      return { run: existing, deduplicated: true };
+      return checkExistingIdempotency(existing);
     }
   }
 
@@ -1175,6 +1480,9 @@ export async function createRun(
   }
 
   const now = nowIso();
+  const scheduledAt = input.scheduledAt ?? null;
+  const initialStatus: RunStatus =
+    hasUnmetDeps || (scheduledAt !== null && scheduledAt > now) ? "waiting" : "queued";
   const statements: D1PreparedStatement[] = [];
 
   let threadId = threadRow?.id;
@@ -1210,12 +1518,14 @@ export async function createRun(
            id, thread_id, root_run_id, parent_run_id, depth, max_depth,
            node_id, workdir, agent, model, effort, sandbox, timeout_sec, prompt,
            status, priority_order, idempotency_key, created_by_key_id,
-           native_session_id, notify_policy_json, notify_status, created_at, updated_at
+           native_session_id, notify_policy_json, notify_status, created_at, updated_at,
+           plan_id, plan_key, scheduled_at, retry_of_run_id, actor_profile, board_topic_id
          ) VALUES (
            ?1, ?2, ?3, ?4, ?5, ?6,
            ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-           'queued', ?15, ?16, ?17,
-           ?18, ?19, 'none', ?20, ?20
+           ?15, ?16, ?17, ?18,
+           ?19, ?20, 'none', ?21, ?21,
+           NULL, NULL, ?22, NULL, ?23, ?24
          )`
       )
       .bind(
@@ -1233,16 +1543,45 @@ export async function createRun(
         input.sandbox ? 1 : 0,
         input.timeoutSec,
         input.prompt,
+        initialStatus,
         nextPriority,
         effectiveIdemKey ?? null,
         principal.keyId,
         threadRow?.native_session_id ?? null,
         JSON.stringify(input.notify),
-        now
+        now,
+        scheduledAt,
+        input.actorProfile ?? "",
+        input.boardTopicId ?? null
       )
   );
 
-  await db.batch(statements);
+  for (const depId of depRunIds) {
+    statements.push(
+      db
+        .prepare(
+          `INSERT INTO run_dependencies (run_id, depends_on_run_id, created_at)
+           VALUES (?1, ?2, ?3)`
+        )
+        .bind(runId, depId, now)
+    );
+  }
+
+  try {
+    await db.batch(statements);
+  } catch (err) {
+    if (effectiveIdemKey) {
+      const raced = await db
+        .prepare(`SELECT * FROM runs WHERE idempotency_key = ?1 LIMIT 1`)
+        .bind(effectiveIdemKey)
+        .first<RunRow>();
+      if (raced) {
+        return checkExistingIdempotency(raced);
+      }
+    }
+    throw err;
+  }
+
   const created = await db.prepare(`SELECT * FROM runs WHERE id = ?1`).bind(runId).first<RunRow>();
   return { run: created!, deduplicated: false };
 }
@@ -1259,7 +1598,9 @@ export async function claimRunsForNode(
     .bind(nodeId)
     .first<{ status: NodeStatus; max_concurrency: number }>();
   if (!node) {
-    throw new HubError(404, "NODE_NOT_FOUND", `Node '${nodeId}' not found.`);
+    throw new HubError(404, "NODE_NOT_FOUND", `Node '${nodeId}' not found.`, undefined, [
+      "ahub nodes --json"
+    ]);
   }
   const now = nowIso();
   if (node.status === "draining") {
@@ -2153,7 +2494,9 @@ export async function createNativeEvent(
 
   const node = await getNodeById(db, nodeId);
   if (!node) {
-    throw new HubError(404, "NODE_NOT_FOUND", `Node '${nodeId}' not found.`);
+    throw new HubError(404, "NODE_NOT_FOUND", `Node '${nodeId}' not found.`, undefined, [
+      "ahub nodes --json"
+    ]);
   }
 
   const sanitizedTitle = redactSecrets(input.title).slice(0, 200);
@@ -2405,6 +2748,149 @@ export async function createNativeEvent(
   };
 }
 
+const WAKE_WAITING_CAS_SQL = `UPDATE runs
+  SET status = 'queued',
+      updated_at = ?1
+  WHERE id = ?2
+    AND status = 'waiting'
+    AND (scheduled_at IS NULL OR scheduled_at <= ?1)
+    AND NOT EXISTS (
+      SELECT 1
+      FROM run_dependencies d
+      JOIN runs up ON up.id = d.depends_on_run_id
+      WHERE d.run_id = runs.id
+        AND up.status != 'done'
+    )`;
+
+export async function listDirectWaitingDependentsForRuns(
+  db: D1Database,
+  upstreamRunIds: string[]
+): Promise<RunRow[]> {
+  const uniqueIds = Array.from(new Set(upstreamRunIds.filter((id) => Boolean(id))));
+  if (uniqueIds.length === 0) return [];
+  const outById = new Map<string, RunRow>();
+  const chunkSize = 50;
+  for (let i = 0; i < uniqueIds.length; i += chunkSize) {
+    const chunk = uniqueIds.slice(i, i + chunkSize);
+    const placeholders = chunk.map((_, idx) => `?${idx + 1}`).join(", ");
+    const res = await db
+      .prepare(
+        `SELECT DISTINCT r.*
+         FROM run_dependencies d
+         JOIN runs r ON r.id = d.run_id
+         WHERE d.depends_on_run_id IN (${placeholders})
+           AND r.status = 'waiting'
+         ORDER BY r.priority_order ASC, r.created_at ASC`
+      )
+      .bind(...chunk)
+      .all<RunRow>();
+    for (const row of res.results ?? []) {
+      outById.set(row.id, row);
+    }
+  }
+  return Array.from(outById.values());
+}
+
+export async function wakeReadyWaitingDependents(
+  db: D1Database,
+  completedRunId: string,
+  now = nowIso()
+): Promise<{ wokenRuns: RunRow[]; remainingWaitingRuns: RunRow[] }> {
+  const candidatesRes = await db
+    .prepare(
+      `SELECT r.id
+       FROM run_dependencies d
+       JOIN runs r ON r.id = d.run_id
+       WHERE d.depends_on_run_id = ?1
+         AND r.status = 'waiting'
+       ORDER BY r.priority_order ASC, r.created_at ASC`
+    )
+    .bind(completedRunId)
+    .all<{ id: string }>();
+
+  const candidateIds = (candidatesRes.results ?? []).map((r) => r.id);
+  const wokenRuns: RunRow[] = [];
+  const wokenSet = new Set<string>();
+
+  for (const candId of candidateIds) {
+    const casRes = await db.prepare(WAKE_WAITING_CAS_SQL).bind(now, candId).run();
+    if ((casRes.meta.changes ?? 0) === 1) {
+      wokenSet.add(candId);
+      await db
+        .prepare(
+          `INSERT OR IGNORE INTO run_events (run_id, seq, kind, payload_json, created_at)
+           VALUES (?1, COALESCE((SELECT MAX(seq) FROM run_events WHERE run_id = ?1), 0) + 1, 'status', ?2, ?3)`
+        )
+        .bind(candId, JSON.stringify({ status: "queued", reason: "dependencies_satisfied" }), now)
+        .run();
+      const fresh = await db.prepare(`SELECT * FROM runs WHERE id = ?1`).bind(candId).first<RunRow>();
+      if (fresh) {
+        wokenRuns.push(fresh);
+      }
+    }
+  }
+
+  const remainingIds = candidateIds.filter((id) => !wokenSet.has(id));
+  const remainingWaitingRuns: RunRow[] = [];
+  if (remainingIds.length > 0) {
+    const placeholders = remainingIds.map((_, idx) => `?${idx + 1}`).join(", ");
+    const remRes = await db
+      .prepare(`SELECT * FROM runs WHERE id IN (${placeholders}) AND status = 'waiting'`)
+      .bind(...remainingIds)
+      .all<RunRow>();
+    for (const row of remRes.results ?? []) {
+      remainingWaitingRuns.push(row);
+    }
+  }
+
+  return { wokenRuns, remainingWaitingRuns };
+}
+
+export async function wakeDueWaitingRuns(
+  db: D1Database,
+  nowMs = Date.now()
+): Promise<RunRow[]> {
+  const now = new Date(nowMs).toISOString();
+  const dueRes = await db
+    .prepare(
+      `SELECT id
+       FROM runs
+       WHERE status = 'waiting'
+         AND scheduled_at IS NOT NULL
+         AND scheduled_at <= ?1
+         AND NOT EXISTS (
+           SELECT 1
+           FROM run_dependencies d
+           JOIN runs up ON up.id = d.depends_on_run_id
+           WHERE d.run_id = runs.id
+             AND up.status != 'done'
+         )
+       ORDER BY scheduled_at ASC
+       LIMIT 100`
+    )
+    .bind(now)
+    .all<{ id: string }>();
+
+  const wokenRuns: RunRow[] = [];
+  for (const row of dueRes.results ?? []) {
+    const casRes = await db.prepare(WAKE_WAITING_CAS_SQL).bind(now, row.id).run();
+    if ((casRes.meta.changes ?? 0) === 1) {
+      await db
+        .prepare(
+          `INSERT OR IGNORE INTO run_events (run_id, seq, kind, payload_json, created_at)
+           VALUES (?1, COALESCE((SELECT MAX(seq) FROM run_events WHERE run_id = ?1), 0) + 1, 'status', ?2, ?3)`
+        )
+        .bind(row.id, JSON.stringify({ status: "queued", reason: "scheduled_due" }), now)
+        .run();
+      const fresh = await db.prepare(`SELECT * FROM runs WHERE id = ?1`).bind(row.id).first<RunRow>();
+      if (fresh) {
+        wokenRuns.push(fresh);
+      }
+    }
+  }
+  return wokenRuns;
+}
+
 export async function completeRun(
   db: D1Database,
   env: Env,
@@ -2423,7 +2909,12 @@ export async function completeRun(
     errorCode: string;
     errorMessage: string;
   }
-): Promise<RunRow> {
+): Promise<{
+  run: RunRow;
+  wokenRuns: RunRow[];
+  waitingDependents: RunRow[];
+  boardHandoff: SystemRunHandoffResult | null;
+}> {
   const now = nowIso();
   const truncatedOut = truncateUtf8Bytes(input.outputMd, MAX_OUTPUT_MD_BYTES);
   const storedBytes = Math.max(input.outputBytes, truncatedOut.originalBytes);
@@ -2515,7 +3006,25 @@ export async function completeRun(
   await db.batch(postStmts);
 
   await enqueueRunNotificationIfNeeded(db, env, updated, input.status);
-  return (await db.prepare(`SELECT * FROM runs WHERE id = ?1`).bind(runId).first<RunRow>())!;
+  const finalRow = (await db.prepare(`SELECT * FROM runs WHERE id = ?1`).bind(runId).first<RunRow>())!;
+  const boardHandoff = await postSystemRunHandoffToBoard(db, finalRow);
+
+  let wokenRuns: RunRow[] = [];
+  let waitingDependents: RunRow[] = [];
+  if (input.status === "done") {
+    const wakeResult = await wakeReadyWaitingDependents(db, runId, now);
+    wokenRuns = wakeResult.wokenRuns;
+    waitingDependents = wakeResult.remainingWaitingRuns;
+  } else {
+    waitingDependents = await listDirectWaitingDependentsForRuns(db, [runId]);
+  }
+
+  return {
+    run: finalRow,
+    wokenRuns,
+    waitingDependents,
+    boardHandoff
+  };
 }
 
 export async function checkpointRunApproval(
@@ -2635,7 +3144,13 @@ export async function resolveRunApproval(
   principal: AuthPrincipal,
   runId: string,
   input: ResolveRunInput
-): Promise<{ run: RunRow; alreadyTerminal: boolean }> {
+): Promise<{
+  run: RunRow;
+  alreadyTerminal: boolean;
+  wokenRuns: RunRow[];
+  waitingDependents: RunRow[];
+  boardHandoff: SystemRunHandoffResult | null;
+}> {
   if (principal.scope !== "admin" && principal.scope !== "client") {
     throw new HubError(403, "FORBIDDEN_SCOPE", "Node keys cannot resolve approvals.");
   }
@@ -2646,7 +3161,13 @@ export async function resolveRunApproval(
   ensureRunAccessible(principal, existing);
 
   if (existing.status === "done") {
-    return { run: existing, alreadyTerminal: true };
+    return {
+      run: existing,
+      alreadyTerminal: true,
+      wokenRuns: [],
+      waitingDependents: [],
+      boardHandoff: null
+    };
   }
   if (existing.status !== "needs_approval") {
     throw new HubError(
@@ -2681,7 +3202,13 @@ export async function resolveRunApproval(
       throw new HubError(404, "NOT_FOUND", `Run '${runId}' not found.`);
     }
     if (fresh.status === "done") {
-      return { run: fresh, alreadyTerminal: true };
+      return {
+        run: fresh,
+        alreadyTerminal: true,
+        wokenRuns: [],
+        waitingDependents: [],
+        boardHandoff: null
+      };
     }
     throw new HubError(
       409,
@@ -2703,7 +3230,15 @@ export async function resolveRunApproval(
   const updated = (await db.prepare(`SELECT * FROM runs WHERE id = ?1`).bind(runId).first<RunRow>())!;
   await enqueueRunNotificationIfNeeded(db, env, updated, "done");
   const finalRow = (await db.prepare(`SELECT * FROM runs WHERE id = ?1`).bind(runId).first<RunRow>())!;
-  return { run: finalRow, alreadyTerminal: false };
+  const boardHandoff = await postSystemRunHandoffToBoard(db, finalRow);
+  const wakeRes = await wakeReadyWaitingDependents(db, runId, now);
+  return {
+    run: finalRow,
+    alreadyTerminal: false,
+    wokenRuns: wakeRes.wokenRuns,
+    waitingDependents: wakeRes.remainingWaitingRuns,
+    boardHandoff
+  };
 }
 
 export async function cancelRun(
@@ -2712,25 +3247,72 @@ export async function cancelRun(
   principal: AuthPrincipal,
   runId: string,
   options: { cascade: boolean; reason: string }
-): Promise<{ cancelledRuns: RunRow[]; abortTargets: Array<{ nodeId: string; runId: string }> }> {
+): Promise<{
+  cancelledRuns: RunRow[];
+  abortTargets: Array<{ nodeId: string; runId: string }>;
+  waitingDependents: RunRow[];
+  boardHandoffs: SystemRunHandoffResult[];
+}> {
   const target = await db.prepare(`SELECT * FROM runs WHERE id = ?1`).bind(runId).first<RunRow>();
   if (!target) {
     throw new HubError(404, "NOT_FOUND", `Run '${runId}' not found.`);
   }
   ensureRunAccessible(principal, target);
 
-  const candidatesRes = options.cascade
-    ? await db
-        .prepare(`SELECT * FROM runs WHERE root_run_id = ?1 ORDER BY depth ASC, created_at ASC`)
-        .bind(target.root_run_id)
-        .all<RunRow>()
-    : { results: [target] };
+  const candidates: RunRow[] = [];
+  const seenCandidateIds = new Set<string>();
+  const addCandidate = (row: RunRow) => {
+    if (!seenCandidateIds.has(row.id)) {
+      seenCandidateIds.add(row.id);
+      candidates.push(row);
+    }
+  };
 
-  const candidates = candidatesRes.results ?? [];
+  if (options.cascade) {
+    const treeRes = await db
+      .prepare(`SELECT * FROM runs WHERE root_run_id = ?1 ORDER BY depth ASC, created_at ASC`)
+      .bind(target.root_run_id)
+      .all<RunRow>();
+    const treeRows = (treeRes.results ?? []).filter(
+      (r) =>
+        principal.scope === "admin" ||
+        (isNodeVisibleToPrincipal(principal, r.node_id) && r.created_by_key_id === principal.keyId)
+    );
+    if (treeRows.length === 0) {
+      addCandidate(target);
+    } else {
+      for (const r of treeRows) addCandidate(r);
+    }
+
+    // BFS transitive downstream waiting runs via run_dependencies
+    let frontier = candidates.map((r) => r.id);
+    while (frontier.length > 0) {
+      const nextWaiting = await listDirectWaitingDependentsForRuns(db, frontier);
+      const nextFrontier: string[] = [];
+      for (const depRow of nextWaiting) {
+        if (seenCandidateIds.has(depRow.id)) continue;
+        if (
+          principal.scope !== "admin" &&
+          (!isNodeVisibleToPrincipal(principal, depRow.node_id) ||
+            depRow.created_by_key_id !== principal.keyId)
+        ) {
+          continue;
+        }
+        addCandidate(depRow);
+        nextFrontier.push(depRow.id);
+      }
+      frontier = nextFrontier;
+    }
+  } else {
+    addCandidate(target);
+  }
+
   const now = nowIso();
   const cancelledRuns: RunRow[] = [];
+  const cancelledIds: string[] = [];
   const abortTargets: Array<{ nodeId: string; runId: string }> = [];
   const affectedNodes = new Set<string>();
+  const boardHandoffs: SystemRunHandoffResult[] = [];
 
   for (const r of candidates) {
     if (r.status === "done" || r.status === "failed" || r.status === "cancelled") {
@@ -2747,21 +3329,28 @@ export async function cancelRun(
              updated_at = ?1,
              error_code = 'CANCELLED',
              error_message = ?2
-         WHERE id = ?3 AND status IN ('queued', 'claimed', 'running', 'needs_approval')`
+         WHERE id = ?3 AND status IN ('waiting', 'queued', 'claimed', 'running', 'needs_approval')`
       )
       .bind(now, options.reason, r.id)
       .run();
 
     if ((res.meta.changes ?? 0) === 1) {
-      affectedNodes.add(r.node_id);
       if (wasActive) {
+        affectedNodes.add(r.node_id);
         abortTargets.push({ nodeId: r.node_id, runId: r.id });
       }
       const fresh = await db.prepare(`SELECT * FROM runs WHERE id = ?1`).bind(r.id).first<RunRow>();
       if (fresh) {
         await enqueueRunNotificationIfNeeded(db, env, fresh, "cancelled");
         const finalRow = await db.prepare(`SELECT * FROM runs WHERE id = ?1`).bind(r.id).first<RunRow>();
-        if (finalRow) cancelledRuns.push(finalRow);
+        if (finalRow) {
+          cancelledRuns.push(finalRow);
+          cancelledIds.push(finalRow.id);
+          const handoff = await postSystemRunHandoffToBoard(db, finalRow);
+          if (handoff) {
+            boardHandoffs.push(handoff);
+          }
+        }
       }
     }
   }
@@ -2782,11 +3371,14 @@ export async function cancelRun(
     await db.batch(stmts);
   }
 
+  const waitingDependents =
+    cancelledIds.length > 0 ? await listDirectWaitingDependentsForRuns(db, cancelledIds) : [];
+
   if (cancelledRuns.length === 0) {
     cancelledRuns.push(target);
   }
 
-  return { cancelledRuns, abortTargets };
+  return { cancelledRuns, abortTargets, waitingDependents, boardHandoffs };
 }
 
 export async function patchQueuedRun(
@@ -2806,11 +3398,11 @@ export async function patchQueuedRun(
     throw new HubError(404, "NOT_FOUND", `Run '${runId}' not found.`);
   }
   ensureRunAccessible(principal, existing);
-  if (existing.status !== "queued") {
+  if (existing.status !== "queued" && existing.status !== "waiting") {
     throw new HubError(
       409,
       "INVALID_STATE_TRANSITION",
-      `Run '${runId}' is '${existing.status}' and can only be modified while 'queued'.`
+      `Run '${runId}' is '${existing.status}' and can only be modified while 'queued' or 'waiting'.`
     );
   }
 
@@ -2825,7 +3417,9 @@ export async function patchQueuedRun(
     }
     const node = await db.prepare(`SELECT * FROM nodes WHERE id = ?1`).bind(nextNodeId).first<NodeRow>();
     if (!node) {
-      throw new HubError(404, "NODE_NOT_FOUND", `Node '${nextNodeId}' not found.`);
+      throw new HubError(404, "NODE_NOT_FOUND", `Node '${nextNodeId}' not found.`, undefined, [
+        "ahub nodes --json"
+      ]);
     }
     if (node.status === "draining") {
       throw new HubError(409, "NODE_DRAINING", `Node '${nextNodeId}' is draining.`);
@@ -2869,7 +3463,7 @@ export async function patchQueuedRun(
            effort = ?4,
            priority_order = ?5,
            updated_at = ?6
-       WHERE id = ?7 AND status = 'queued'`
+       WHERE id = ?7 AND status IN ('queued', 'waiting')`
     )
     .bind(
       nextNodeId,
@@ -2886,7 +3480,7 @@ export async function patchQueuedRun(
     throw new HubError(
       409,
       "INVALID_STATE_TRANSITION",
-      `Run '${runId}' left 'queued' state during update.`
+      `Run '${runId}' left 'queued'/'waiting' state during update.`
     );
   }
   if (threadChanged && nextProjectKey !== null) {
@@ -3096,6 +3690,8 @@ export async function listRuns(
     threadId?: string;
     status?: RunStatus;
     rootRunId?: string;
+    planId?: string;
+    boardTopicId?: string;
     limit: number;
   }
 ): Promise<RunRecord[]> {
@@ -3118,6 +3714,14 @@ export async function listRuns(
     binds.push(filters.rootRunId);
     where.push(`root_run_id = ?${binds.length}`);
   }
+  if (filters.planId) {
+    binds.push(filters.planId);
+    where.push(`plan_id = ?${binds.length}`);
+  }
+  if (filters.boardTopicId) {
+    binds.push(filters.boardTopicId);
+    where.push(`board_topic_id = ?${binds.length}`);
+  }
   if (principal.scope === "client" && principal.keyId) {
     binds.push(principal.keyId);
     where.push(`created_by_key_id = ?${binds.length}`);
@@ -3129,18 +3733,11 @@ export async function listRuns(
                LIMIT ?${binds.length}`;
   const res = await db.prepare(sql).bind(...binds).all<RunRow>();
   const visible = (res.results ?? []).filter((r) => isNodeVisibleToPrincipal(principal, r.node_id));
-  const summaryMap = await getDeliveriesSummaryMap(
-    db,
-    "run",
-    visible.map((r) => r.id)
-  );
-  return visible.map((r) =>
-    mapRunRow(r, {
-      view: "list",
-      promptMode: "preview",
-      deliveriesSummary: summaryMap.get(r.id)
-    })
-  );
+  return hydrateRunRecords(db, visible, {
+    view: "list",
+    promptMode: "preview",
+    includeDeliveries: true
+  });
 }
 
 export async function getRunById(
@@ -3155,12 +3752,11 @@ export async function getRunById(
     throw new HubError(404, "NOT_FOUND", `Run '${runId}' not found.`);
   }
   ensureRunAccessible(principal, row);
-  const summaryMap = await getDeliveriesSummaryMap(db, "run", [row.id]);
-  return mapRunRow(row, {
+  return hydrateRunRecord(db, row, {
     view,
     tailBytes,
     promptMode: view === "full" ? "full_redacted" : "preview",
-    deliveriesSummary: summaryMap.get(row.id)
+    includeDeliveries: true
   });
 }
 
@@ -3388,7 +3984,14 @@ export async function revokeApiKey(
   return { revokedAt: now, scope: row.scope, boundNodeId: row.bound_node_id };
 }
 
-export async function reapExpiredLeases(db: D1Database, env: Env): Promise<RunRow[]> {
+export async function reapExpiredLeases(
+  db: D1Database,
+  env: Env
+): Promise<{
+  reapedRuns: RunRow[];
+  waitingDependents: RunRow[];
+  boardHandoffs: SystemRunHandoffResult[];
+}> {
   const now = nowIso();
   const expiredRes = await db
     .prepare(
@@ -3401,8 +4004,10 @@ export async function reapExpiredLeases(db: D1Database, env: Env): Promise<RunRo
     .all<RunRow>();
 
   const expired = expiredRes.results ?? [];
-  const reaped: RunRow[] = [];
+  const reapedRuns: RunRow[] = [];
+  const reapedIds: string[] = [];
   const affectedNodes = new Set<string>();
+  const boardHandoffs: SystemRunHandoffResult[] = [];
 
   for (const r of expired) {
     const res = await db
@@ -3426,7 +4031,14 @@ export async function reapExpiredLeases(db: D1Database, env: Env): Promise<RunRo
       if (updated) {
         await enqueueRunNotificationIfNeeded(db, env, updated, "failed");
         const finalRow = await db.prepare(`SELECT * FROM runs WHERE id = ?1`).bind(r.id).first<RunRow>();
-        if (finalRow) reaped.push(finalRow);
+        if (finalRow) {
+          reapedRuns.push(finalRow);
+          reapedIds.push(finalRow.id);
+          const handoff = await postSystemRunHandoffToBoard(db, finalRow);
+          if (handoff) {
+            boardHandoffs.push(handoff);
+          }
+        }
       }
     }
   }
@@ -3447,7 +4059,10 @@ export async function reapExpiredLeases(db: D1Database, env: Env): Promise<RunRo
     await db.batch(stmts);
   }
 
-  return reaped;
+  const waitingDependents =
+    reapedIds.length > 0 ? await listDirectWaitingDependentsForRuns(db, reapedIds) : [];
+
+  return { reapedRuns, waitingDependents, boardHandoffs };
 }
 
 function mapWebPushSubscriptionRow(row: WebPushSubscriptionRow): WebPushSubscriptionRecord {
@@ -3679,7 +4294,7 @@ export async function redeliverSourceDeliveries(
     getDeliveriesSummaryMap(db, "run", [sourceId])
   ]);
   return {
-    run: mapRunRow(freshRun!, {
+    run: await hydrateRunRecord(db, freshRun!, {
       view: "summary",
       tailBytes: 16384,
       promptMode: "preview",
