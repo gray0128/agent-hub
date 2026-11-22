@@ -82,6 +82,9 @@ import {
   type CenterPaneMode,
   type InspectorTab,
   type LeftRailTab,
+  MAX_LABEL_FILTERS,
+  parseLabelFilterKv,
+  runMatchesLabelFilters,
   type WorkspaceMode,
   useWorkbenchStore
 } from "@/stores/workbench-store";
@@ -121,6 +124,7 @@ declare global {
         leftTab: LeftRailTab;
         centerMode: CenterPaneMode;
         activeTab: InspectorTab;
+        labelFilters: string[];
         nativeEvents: ReturnType<typeof useNativeActivityStore.getState>["events"];
         openInteractionCount: number;
         selectedNativeSessionKey: string | null;
@@ -149,6 +153,26 @@ declare global {
 
 function isKanbanColumnStatus(value: unknown): value is BoardKanbanColumnStatus {
   return value === "todo" || value === "in_progress" || value === "blocked" || value === "done";
+}
+
+function areLabelFiltersEqual(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((item, idx) => item === b[idx]);
+}
+
+function computeMatchedRunIds(
+  fetchedRuns: RunRecord[],
+  allRuns: RunRecord[],
+  filters: string[]
+): Set<string> {
+  const nextIds = new Set(fetchedRuns.map((r) => r.id));
+  for (const r of allRuns) {
+    if (runMatchesLabelFilters(r, filters)) {
+      nextIds.add(r.id);
+    } else if (r.labels !== undefined) {
+      nextIds.delete(r.id);
+    }
+  }
+  return nextIds;
 }
 
 const boardAwareCollisionDetection: CollisionDetection = (args) => {
@@ -232,6 +256,7 @@ export function App() {
   const centerMode = useWorkbenchStore((s) => s.centerMode);
   const activeTab = useWorkbenchStore((s) => s.activeTab);
   const threadQuery = useWorkbenchStore((s) => s.threadQuery);
+  const labelFilters = useWorkbenchStore((s) => s.labelFilters);
   const onboardingOpen = useWorkbenchStore((s) => s.onboardingOpen);
   const keysDialogOpen = useWorkbenchStore((s) => s.keysDialogOpen);
   const browserNotifyOpen = useWorkbenchStore((s) => s.browserNotifyOpen);
@@ -254,6 +279,9 @@ export function App() {
   const setCenterMode = useWorkbenchStore((s) => s.setCenterMode);
   const setActiveTab = useWorkbenchStore((s) => s.setActiveTab);
   const setThreadQuery = useWorkbenchStore((s) => s.setThreadQuery);
+  const addLabelFilter = useWorkbenchStore((s) => s.addLabelFilter);
+  const removeLabelFilter = useWorkbenchStore((s) => s.removeLabelFilter);
+  const clearLabelFilters = useWorkbenchStore((s) => s.clearLabelFilters);
   const setOnboardingOpen = useWorkbenchStore((s) => s.setOnboardingOpen);
   const setKeysDialogOpen = useWorkbenchStore((s) => s.setKeysDialogOpen);
   const setBrowserNotifyOpen = useWorkbenchStore((s) => s.setBrowserNotifyOpen);
@@ -341,6 +369,10 @@ export function App() {
   const [retryingRunIds, setRetryingRunIds] = useState<Record<string, boolean>>({});
   const [boardLinkedRunsLoading, setBoardLinkedRunsLoading] = useState(false);
   const [boardDispatchingRun, setBoardDispatchingRun] = useState(false);
+  const [labelMatchedRunIds, setLabelMatchedRunIds] = useState<Set<string> | null>(null);
+  const [labelFilterLoading, setLabelFilterLoading] = useState(false);
+  const [labelFilterError, setLabelFilterError] = useState<string | null>(null);
+  const labelMatchedRunIdsRef = useRef<Set<string> | null>(null);
   const wsClientRef = useRef<HubStreamClient | null>(null);
   const hasConnectedOnceRef = useRef<boolean>(false);
   const boardInFlightTopicMsgRef = useRef<Set<string>>(new Set());
@@ -392,6 +424,7 @@ export function App() {
           leftTab: wb.leftTab,
           centerMode: wb.centerMode,
           activeTab: wb.activeTab,
+          labelFilters: wb.labelFilters,
           nativeEvents: native.events,
           openInteractionCount: native.openInteractionCount,
           selectedNativeSessionKey: native.selectedSessionKey,
@@ -729,14 +762,42 @@ export function App() {
                     setOpenBoardQuestionCount(frame.open_board_question_count);
                   }
                   syncDefaultSelection();
-                  if (hasConnectedOnceRef.current) {
+                  const applyFetchedLabelRuns = (
+                    fetchedRuns: RunRecord[],
+                    expectedFilters: string[]
+                  ) => {
+                    if (cancelled) return;
+                    const currentFilters = useWorkbenchStore.getState().labelFilters;
+                    if (
+                      currentFilters.length === 0 ||
+                      !areLabelFiltersEqual(currentFilters, expectedFilters)
+                    ) {
+                      return;
+                    }
+                    upsertRuns(fetchedRuns);
+                    const nextIds = computeMatchedRunIds(
+                      fetchedRuns,
+                      useTaskStore.getState().runs,
+                      currentFilters
+                    );
+                    labelMatchedRunIdsRef.current = nextIds;
+                    setLabelMatchedRunIds(nextIds);
+                    setLabelFilterError(null);
+                  };
+                  const activeLabelFilters = [...useWorkbenchStore.getState().labelFilters];
+                  const isReconnect = hasConnectedOnceRef.current;
+                  hasConnectedOnceRef.current = true;
+                  if (isReconnect) {
                     void Promise.allSettled([
                       apiClient.fetchNodes(token),
                       apiClient.fetchThreads(token),
                       apiClient.fetchRuns(token, { limit: 200 }),
                       apiClient.fetchNativeEvents(token, { limit: 100 }),
-                      hydrateBoardSafe(meRes.principal)
-                    ]).then(([nRes, tRes, rRes, evRes]) => {
+                      hydrateBoardSafe(meRes.principal),
+                      activeLabelFilters.length > 0
+                        ? apiClient.fetchRuns(token, { limit: 200, labels: activeLabelFilters })
+                        : Promise.resolve(null)
+                    ]).then(([nRes, tRes, rRes, evRes, _boardRes, lblRes]) => {
                       if (cancelled) return;
                       if (nRes.status === "fulfilled") setNodes(nRes.value.nodes);
                       if (tRes.status === "fulfilled") setThreads(tRes.value.threads);
@@ -746,6 +807,23 @@ export function App() {
                           evRes.value.events,
                           evRes.value.open_interaction_count
                         );
+                      }
+                      const currentFilters = [...useWorkbenchStore.getState().labelFilters];
+                      if (currentFilters.length > 0) {
+                        if (
+                          areLabelFiltersEqual(currentFilters, activeLabelFilters) &&
+                          lblRes.status === "fulfilled" &&
+                          lblRes.value
+                        ) {
+                          applyFetchedLabelRuns(lblRes.value.runs, activeLabelFilters);
+                        } else {
+                          void apiClient
+                            .fetchRuns(token, { limit: 200, labels: currentFilters })
+                            .then((freshLblRes) => {
+                              applyFetchedLabelRuns(freshLblRes.runs, currentFilters);
+                            })
+                            .catch(() => {});
+                        }
                       }
                       const activeTopicId = useBoardStore.getState().selectedTopicId;
                       if (activeTopicId) {
@@ -760,8 +838,14 @@ export function App() {
                           .catch(() => {});
                       }
                     });
+                  } else if (activeLabelFilters.length > 0) {
+                    void apiClient
+                      .fetchRuns(token, { limit: 200, labels: activeLabelFilters })
+                      .then((lblRes) => {
+                        applyFetchedLabelRuns(lblRes.runs, activeLabelFilters);
+                      })
+                      .catch(() => {});
                   }
-                  hasConnectedOnceRef.current = true;
                   break;
                 }
                 case "node.status":
@@ -770,6 +854,20 @@ export function App() {
                 case "run.updated": {
                   const prevRun = useTaskStore.getState().runs.find((r) => r.id === frame.run.id);
                   upsertRun(frame.run);
+                  const activeLabelFilters = useWorkbenchStore.getState().labelFilters;
+                  if (activeLabelFilters.length > 0 && labelMatchedRunIdsRef.current !== null) {
+                    const mergedRun =
+                      useTaskStore.getState().runs.find((r) => r.id === frame.run.id) ?? frame.run;
+                    const matches = runMatchesLabelFilters(mergedRun, activeLabelFilters);
+                    const nextIds = new Set(labelMatchedRunIdsRef.current);
+                    if (matches) {
+                      nextIds.add(mergedRun.id);
+                    } else {
+                      nextIds.delete(mergedRun.id);
+                    }
+                    labelMatchedRunIdsRef.current = nextIds;
+                    setLabelMatchedRunIds(nextIds);
+                  }
                   const filterKey = mapRunStatusToFilterKey(frame.run.status);
                   if (
                     filterKey &&
@@ -975,8 +1073,57 @@ export function App() {
     upsertDelivery,
     upsertNativeEvent,
     upsertNode,
-    upsertRun
+    upsertRun,
+    upsertRuns
   ]);
+
+  // Fetch runs matching active ?label=k=v filters (without restarting WebSocket)
+  useEffect(() => {
+    if (labelFilters.length === 0) {
+      labelMatchedRunIdsRef.current = null;
+      setLabelMatchedRunIds(null);
+      setLabelFilterLoading(false);
+      setLabelFilterError(null);
+      return;
+    }
+    if (!hasSession || authStatus !== "authenticated") {
+      return;
+    }
+    let cancelled = false;
+    labelMatchedRunIdsRef.current = null;
+    setLabelFilterLoading(true);
+    setLabelFilterError(null);
+    void apiClient
+      .fetchRuns(token, { limit: 200, labels: labelFilters })
+      .then((res) => {
+        if (cancelled) return;
+        const currentFilters = useWorkbenchStore.getState().labelFilters;
+        if (!areLabelFiltersEqual(currentFilters, labelFilters)) return;
+        upsertRuns(res.runs);
+        const nextIds = computeMatchedRunIds(
+          res.runs,
+          useTaskStore.getState().runs,
+          labelFilters
+        );
+        labelMatchedRunIdsRef.current = nextIds;
+        setLabelMatchedRunIds(nextIds);
+        setLabelFilterError(null);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setLabelFilterError(
+          err instanceof ApiClientError ? err.message : "按标签筛选任务失败"
+        );
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setLabelFilterLoading(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [authStatus, hasSession, labelFilters, token, upsertRuns]);
 
   // Fetch board messages for active selected topic
   useEffect(() => {
@@ -1215,6 +1362,17 @@ export function App() {
       .slice()
       .sort((a, b) => b.created_at.localeCompare(a.created_at) || a.id.localeCompare(b.id));
   }, [runs, selectedBoardTopicId]);
+
+  const labelMatchedThreadIds = useMemo(() => {
+    if (labelMatchedRunIds === null) return null;
+    const matched = new Set<string>();
+    for (const r of runs) {
+      if (labelMatchedRunIds.has(r.id)) {
+        matched.add(r.thread_id);
+      }
+    }
+    return matched;
+  }, [labelMatchedRunIds, runs]);
 
   // Hydrate outputs for runs in active thread (auto full up to 128 KB, summary preview above 128 KB)
   useEffect(() => {
@@ -2461,6 +2619,46 @@ export function App() {
     }
   }
 
+  function handleAddLabelFilter(rawKv: string): boolean {
+    const parsed = parseLabelFilterKv(rawKv);
+    if (!parsed.ok) {
+      setLabelFilterError(parsed.error);
+      return false;
+    }
+    if (labelFilters.includes(parsed.kv)) {
+      setLabelFilterError(null);
+      return true;
+    }
+    if (labelFilters.length >= MAX_LABEL_FILTERS) {
+      setLabelFilterError(`最多同时筛选 ${MAX_LABEL_FILTERS} 个标签`);
+      return false;
+    }
+    setLabelFilterError(null);
+    addLabelFilter(parsed.kv);
+    return true;
+  }
+
+  function handleRemoveLabelFilter(kv: string) {
+    setLabelFilterError(null);
+    removeLabelFilter(kv);
+  }
+
+  function handleClearLabelFilters() {
+    setLabelFilterError(null);
+    clearLabelFilters();
+  }
+
+  function handleToggleLabelFilter(kv: string) {
+    if (labelFilters.includes(kv)) {
+      handleRemoveLabelFilter(kv);
+    } else {
+      handleAddLabelFilter(kv);
+    }
+    if (leftTab !== "threads") {
+      setLeftTab("threads");
+    }
+  }
+
   const fleetProps = {
     nodes,
     selectedNodeId,
@@ -2470,6 +2668,13 @@ export function App() {
     activeWorkdir: composer.workdir,
     activeTargetNodeId: composer.nodeId,
     threadQuery,
+    labelFilters,
+    labelMatchedThreadIds,
+    labelFilterLoading,
+    labelFilterError,
+    onAddLabelFilter: handleAddLabelFilter,
+    onRemoveLabelFilter: handleRemoveLabelFilter,
+    onClearLabelFilters: handleClearLabelFilters,
     canViewNative: authScope === "admin",
     leftTab,
     onLeftTabChange: handleLeftTabChange,
@@ -2551,6 +2756,8 @@ export function App() {
         composerNotice={composerNotice}
         submitting={submitting}
         retryingRunIds={retryingRunIds}
+        activeLabelFilters={labelFilters}
+        onToggleLabelFilter={handleToggleLabelFilter}
         onPatchComposer={patchComposer}
         onDismissComposerNotice={() => setComposerNotice(null)}
         onSelectRun={selectRun}

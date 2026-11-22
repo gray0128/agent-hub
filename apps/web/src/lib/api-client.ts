@@ -160,6 +160,7 @@ export const apiClient = {
       status?: RunStatus;
       thread_id?: string;
       node_id?: string;
+      labels?: string[];
     } = {}
   ) {
     const sp = new URLSearchParams({ limit: String(params.limit ?? 100) });
@@ -169,6 +170,14 @@ export const apiClient = {
     if (params.status) sp.set("status", params.status);
     if (params.thread_id) sp.set("thread_id", params.thread_id);
     if (params.node_id) sp.set("node_id", params.node_id);
+    if (params.labels && params.labels.length > 0) {
+      const validLabels = params.labels
+        .filter((raw) => typeof raw === "string" && raw.length > 0 && raw.includes("="))
+        .slice(0, 8);
+      for (const kv of validLabels) {
+        sp.append("label", kv);
+      }
+    }
     return requestJson<{ ok: true; runs: RunRecord[] }>(`/api/v1/runs?${sp.toString()}`, token);
   },
 

@@ -190,4 +190,8 @@ func TestMapAndValueRedactsNestedSecretsAndPreservesTypes(t *testing.T) {
 	if Map(nil) != nil || Value(nil) != nil {
 		t.Fatalf("expected nil Map/Value to stay nil")
 	}
+
+	if got := Text(`{"AHUB_TOKEN":"__MISSING__","AWS_SECRET_ACCESS_KEY":"__MISSING__"}`); got != `{"AHUB_TOKEN":"__MISSING__","AWS_SECRET_ACCESS_KEY":"__MISSING__"}` {
+		t.Fatalf("expected __MISSING__ sentinel preserved, got %q", got)
+	}
 }

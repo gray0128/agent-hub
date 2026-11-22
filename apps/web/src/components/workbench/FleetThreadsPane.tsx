@@ -15,7 +15,9 @@ import {
   Pin,
   Plus,
   Search,
-  Server
+  Server,
+  Tag,
+  X
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -24,7 +26,11 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ALL_AGENTS } from "@/lib/capabilities";
 import { cn, formatShortTime } from "@/lib/utils";
 import { getNativeSessionKey, groupNativeSessions } from "@/stores/native-activity-store";
-import type { LeftRailTab } from "@/stores/workbench-store";
+import {
+  type LeftRailTab,
+  MAX_LABEL_FILTERS,
+  parseLabelFilterKv
+} from "@/stores/workbench-store";
 import type {
   AgentName,
   NativeEventView,
@@ -274,6 +280,13 @@ export interface FleetThreadsPaneProps {
   onNativeOnlySelectedNodeChange?: (only: boolean) => void;
   onNativeSearchQueryChange?: (q: string) => void;
   onThreadQueryChange: (q: string) => void;
+  labelFilters?: string[];
+  labelMatchedThreadIds?: Set<string> | null;
+  labelFilterLoading?: boolean;
+  labelFilterError?: string | null;
+  onAddLabelFilter?: (kv: string) => boolean;
+  onRemoveLabelFilter?: (kv: string) => void;
+  onClearLabelFilters?: () => void;
   onSelectNode: (nodeId: string) => void;
   onPickWorkspace: (nodeId: string, workdir: string) => void;
   onSelectThread: (threadId: string) => void;
@@ -310,6 +323,13 @@ export function FleetThreadsPane({
   onNativeOnlySelectedNodeChange,
   onNativeSearchQueryChange,
   onThreadQueryChange,
+  labelFilters = [],
+  labelMatchedThreadIds = null,
+  labelFilterLoading = false,
+  labelFilterError = null,
+  onAddLabelFilter,
+  onRemoveLabelFilter,
+  onClearLabelFilters,
   onSelectNode,
   onPickWorkspace,
   onSelectThread,
@@ -320,6 +340,9 @@ export function FleetThreadsPane({
   const [collapsedNodes, setCollapsedNodes] = useState<Record<string, boolean>>({});
   const [statusFilter, setStatusFilter] = useState<ThreadFilterMode>("all");
   const [onlySelectedNode, setOnlySelectedNode] = useState(false);
+  const [labelDraft, setLabelDraft] = useState("");
+  const [localLabelError, setLocalLabelError] = useState<string | null>(null);
+  const effectiveLabelError = localLabelError ?? labelFilterError ?? null;
 
   const latestRunByThread = useMemo(() => {
     const map = new Map<string, RunRecord>();
@@ -350,6 +373,9 @@ export function FleetThreadsPane({
   const filteredThreads = useMemo(() => {
     const q = threadQuery.trim().toLowerCase();
     return threads.filter((t) => {
+      if (labelMatchedThreadIds !== null && !labelMatchedThreadIds.has(t.id)) {
+        return false;
+      }
       if (onlySelectedNode && selectedNodeId && t.node_id !== selectedNodeId) {
         return false;
       }
@@ -377,7 +403,15 @@ export function FleetThreadsPane({
         t.agent.toLowerCase().includes(q)
       );
     });
-  }, [latestRunByThread, onlySelectedNode, selectedNodeId, statusFilter, threadQuery, threads]);
+  }, [
+    labelMatchedThreadIds,
+    latestRunByThread,
+    onlySelectedNode,
+    selectedNodeId,
+    statusFilter,
+    threadQuery,
+    threads
+  ]);
 
   const onlineNodeCount = useMemo(
     () => nodes.filter((n) => n.status === "online").length,
@@ -392,7 +426,9 @@ export function FleetThreadsPane({
     [nodes]
   );
   const hasExpandedNode = nodesWithWorkspaces.some((n) => !collapsedNodes[n.id]);
-  const hasActiveFilter = Boolean(threadQuery.trim() || statusFilter !== "all" || onlySelectedNode);
+  const hasActiveFilter = Boolean(
+    threadQuery.trim() || statusFilter !== "all" || onlySelectedNode || labelFilters.length > 0
+  );
 
   const filteredNativeEvents = useMemo(() => {
     const q = nativeSearchQuery.trim().toLowerCase();
@@ -539,6 +575,99 @@ export function FleetThreadsPane({
               />
             </div>
 
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (!labelDraft) {
+                  setLocalLabelError("请输入 key=value 格式标签");
+                  return;
+                }
+                const parsed = parseLabelFilterKv(labelDraft);
+                if (!parsed.ok) {
+                  setLocalLabelError(parsed.error);
+                  return;
+                }
+                if (labelFilters.length >= MAX_LABEL_FILTERS && !labelFilters.includes(parsed.kv)) {
+                  setLocalLabelError(`最多同时筛选 ${MAX_LABEL_FILTERS} 个标签`);
+                  return;
+                }
+                setLocalLabelError(null);
+                const added = onAddLabelFilter ? onAddLabelFilter(parsed.kv) : true;
+                if (added) {
+                  setLabelDraft("");
+                }
+              }}
+              className="flex items-center gap-1.5"
+            >
+              <div className="relative flex min-w-0 flex-1 items-center">
+                <Tag
+                  className="pointer-events-none absolute left-2.5 h-3.5 w-3.5 text-muted-foreground"
+                  strokeWidth={1.75}
+                  aria-hidden="true"
+                />
+                <Input
+                  aria-label="按标签筛选任务"
+                  data-testid="thread-label-filter-input"
+                  value={labelDraft}
+                  onChange={(e) => {
+                    setLabelDraft(e.target.value);
+                    if (localLabelError) setLocalLabelError(null);
+                  }}
+                  placeholder="按标签筛选 (k=v)..."
+                  autoComplete="off"
+                  autoCorrect="off"
+                  autoCapitalize="none"
+                  spellCheck={false}
+                  enterKeyHint="search"
+                  className="pl-8 font-mono"
+                />
+              </div>
+              <Button
+                type="submit"
+                size="sm"
+                variant="outline"
+                data-testid="thread-label-filter-apply"
+                disabled={labelFilterLoading}
+                className="min-h-11 min-w-11 md:min-h-0 md:min-w-0 md:h-8 shrink-0 px-2.5 md:px-2 text-xs md:text-[11px]"
+              >
+                筛选
+              </Button>
+            </form>
+
+            {effectiveLabelError ? (
+              <p
+                role="alert"
+                data-testid="thread-label-filter-error"
+                className="text-[11px] text-[var(--status-failed)] text-pretty"
+              >
+                {effectiveLabelError}
+              </p>
+            ) : null}
+
+            {labelFilters.length > 0 ? (
+              <div
+                data-testid="active-label-filters"
+                className="flex flex-wrap items-center gap-1"
+              >
+                {labelFilters.map((kv) => (
+                  <button
+                    key={kv}
+                    type="button"
+                    data-testid={`active-label-filter-${kv}`}
+                    onClick={() => {
+                      setLocalLabelError(null);
+                      onRemoveLabelFilter?.(kv);
+                    }}
+                    title={`移除标签筛选：${kv}`}
+                    className="inline-flex min-h-11 min-w-11 md:min-h-0 md:min-w-0 md:h-6 max-w-full items-center gap-1 rounded-[4px] border border-[var(--status-running)]/50 bg-[var(--status-running)]/12 px-2.5 md:px-2 font-mono text-xs md:text-[10px] text-foreground transition-[color,background-color,border-color] duration-150 hover:bg-[var(--status-running)]/20 cursor-pointer"
+                  >
+                    <span className="truncate">{kv}</span>
+                    <X className="h-3 w-3 shrink-0" strokeWidth={1.75} aria-hidden="true" />
+                  </button>
+                ))}
+              </div>
+            ) : null}
+
             <div className="flex flex-wrap items-center gap-1">
               <button
                 type="button"
@@ -616,6 +745,9 @@ export function FleetThreadsPane({
                       onThreadQueryChange("");
                       setStatusFilter("all");
                       setOnlySelectedNode(false);
+                      setLabelDraft("");
+                      setLocalLabelError(null);
+                      onClearLabelFilters?.();
                     }}
                     className="min-h-11 md:min-h-0 md:h-7"
                   >

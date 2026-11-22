@@ -4928,6 +4928,70 @@ try {
     throw new Error(`Expected quickRun.board_topic_id=${s2Topic.id}, got ${JSON.stringify(quickRun)}`);
   }
 
+  // T5-05: BoardTopicInspector 1-minute preset ("60") includes 2s client clock-skew buffer (>= +61.5s)
+  await clickDomMatch(
+    cdpClient,
+    `() => document.querySelector('[data-testid="board-quick-dispatch-toggle"]')`,
+    "Reopen BoardTopicInspector quick dispatch for T5-05"
+  );
+  await sleep(150);
+  await clickDomMatch(
+    cdpClient,
+    `() => document.querySelector('[data-testid="board-quick-dispatch-delay"]')`,
+    "BoardTopicInspector delay select trigger"
+  );
+  await sleep(150);
+  await clickDomMatch(
+    cdpClient,
+    `() => Array.from(document.querySelectorAll('[role="option"]')).find((el) => (el.textContent || "").includes("1 分钟后唤醒")) || null`,
+    "Select 1 minute delay option"
+  );
+  await sleep(100);
+  await cdpClient.fillInput(
+    '[data-testid="board-quick-dispatch-prompt"]',
+    JSON.stringify({ summary: "T5-05 1m skew buffer check", directives: [{ op: "sleep", ms: 5 }] })
+  );
+  await sleep(100);
+  const t505SubmitMs = Date.now();
+  await clickDomMatch(
+    cdpClient,
+    `() => {
+      const btn = document.querySelector('[data-testid="board-quick-dispatch-submit"]');
+      return btn && !btn.disabled ? btn : null;
+    }`,
+    "Submit T5-05 1-minute quick dispatch"
+  );
+  let t505Run = null;
+  for (let i = 0; i < 30; i++) {
+    const linked = (await apiJson(hubUrl, adminToken, `/api/v1/runs?board_topic_id=${s2Topic.id}`)).runs;
+    const candidate = linked.find(
+      (r) => r.id !== quickRun.id && !beforeQuickDispatchIds.includes(r.id)
+    );
+    if (candidate) {
+      t505Run = candidate;
+      break;
+    }
+    if (i === 29) {
+      throw new Error("T5-05 1-minute quick dispatch run was not created in D1");
+    }
+    await sleep(150);
+  }
+  const t505ScheduledMs = Date.parse(t505Run.scheduled_at ?? "");
+  if (
+    t505Run.status !== "waiting" ||
+    t505Run.blocked_reason !== "SCHEDULED" ||
+    !Number.isFinite(t505ScheduledMs) ||
+    t505ScheduledMs - t505SubmitMs < 61_500
+  ) {
+    throw new Error(
+      `T5-05 clock-skew buffer missing: deltaMs=${t505ScheduledMs - t505SubmitMs}, run=${JSON.stringify(t505Run)}`
+    );
+  }
+  await apiJson(hubUrl, adminToken, `/api/v1/runs/${t505Run.id}/cancel`, {
+    method: "POST",
+    body: JSON.stringify({ cascade: false, reason: "cleanup T5-05" })
+  });
+
   const s2ModeAfterDispatch = await cdpClient.evalJS(`window.__AHUB_EVAL__.getState().workspaceMode`);
   if (s2ModeAfterDispatch !== "board") {
     await cdpClient.clickSelector('[data-testid="workspace-tab-board"]');
@@ -4949,6 +5013,651 @@ try {
   await cdpClient.clickSelector('[data-testid="workspace-tab-runs"]');
   await sleep(250);
   await assertViewportContainment(cdpClient, "mobile-390x844-slice2-runs");
+  await cdpClient.setViewport(1440, 900, false);
+  await sleep(200);
+
+  // Phase 4d: RFC-0001 Slice 3 — Run labels chips, ?label=k=v filter parity with D1, structured result JSON viewer + redaction, RESULT_SCHEMA_MISMATCH preserving output_md
+  const s3ResultSchema = {
+    type: "object",
+    required: ["ok", "count"],
+    properties: {
+      ok: { type: "boolean" },
+      count: { type: "integer" },
+      note: { type: "string" }
+    },
+    additionalProperties: false
+  };
+  const s3OkSecret = "sk-proj-CdpResultSecret1234567890abcdef";
+  const s3OkLabels = { env: "eval", suite: "slice3-ok", "team/area": "web" };
+  const s3MismatchLabels = { env: "eval", suite: "slice3-mismatch" };
+
+  const s3OkSeedRes = await apiJson(hubUrl, adminToken, "/api/v1/runs?wait_ms=0", {
+    method: "POST",
+    body: JSON.stringify({
+      node_id: "macmini",
+      workdir: wsAlpha,
+      agent: "agy",
+      title: "Slice 3 结构化产物通过验收",
+      labels: s3OkLabels,
+      result_schema: s3ResultSchema,
+      prompt: JSON.stringify({
+        summary: "Slice 3 结构化产物校验通过",
+        response: "SLICE3_OK_OUTPUT_MD",
+        directives: [
+          {
+            op: "write_result_file",
+            result: { ok: true, count: 7, note: s3OkSecret }
+          }
+        ]
+      })
+    })
+  });
+  const s3OkRun = await waitForSeedRunDone(s3OkSeedRes.run.id, "Slice 3 s3OkRun");
+  if (
+    !s3OkRun.result ||
+    s3OkRun.result.ok !== true ||
+    s3OkRun.result.count !== 7 ||
+    !String(s3OkRun.result.note ?? "").includes("[REDACTED]") ||
+    JSON.stringify(s3OkRun.result).includes(s3OkSecret)
+  ) {
+    throw new Error(`Expected s3OkRun redacted result in D1, got ${JSON.stringify(s3OkRun)}`);
+  }
+
+  const s3MismatchSeedRes = await apiJson(hubUrl, adminToken, "/api/v1/runs?wait_ms=0", {
+    method: "POST",
+    body: JSON.stringify({
+      node_id: "mbp",
+      workdir: wsMbp,
+      agent: "pi",
+      title: "Slice 3 结构化产物校验失败保留输出",
+      labels: s3MismatchLabels,
+      result_schema: s3ResultSchema,
+      prompt: JSON.stringify({
+        summary: "Slice 3 产物不匹配但保留输出",
+        response: "MISMATCH_OUTPUT_KEPT_E2E",
+        directives: [
+          {
+            op: "write_result_file",
+            result: { ok: "wrong" }
+          }
+        ]
+      })
+    })
+  });
+  let s3MismatchRun = null;
+  for (let i = 0; i < 40; i++) {
+    const r = await apiJson(hubUrl, adminToken, `/api/v1/runs/${s3MismatchSeedRes.run.id}`);
+    if (r.run.status === "failed") {
+      s3MismatchRun = r.run;
+      break;
+    }
+    if (r.run.status === "done" || r.run.status === "cancelled") {
+      throw new Error(`Expected s3MismatchRun to fail with RESULT_SCHEMA_MISMATCH, got ${JSON.stringify(r.run)}`);
+    }
+    await sleep(200);
+  }
+  if (!s3MismatchRun || s3MismatchRun.error_code !== "RESULT_SCHEMA_MISMATCH") {
+    throw new Error(`Expected s3MismatchRun failed with RESULT_SCHEMA_MISMATCH in D1, got ${JSON.stringify(s3MismatchRun)}`);
+  }
+  if (
+    !(s3MismatchRun.output_md ?? s3MismatchRun.output_preview ?? "").includes("MISMATCH_OUTPUT_KEPT_E2E") ||
+    s3MismatchRun.result != null
+  ) {
+    throw new Error(`Expected s3MismatchRun to preserve MISMATCH_OUTPUT_KEPT_E2E and keep result=null in D1, got ${JSON.stringify(s3MismatchRun)}`);
+  }
+
+  async function inspectSlice3RunRow(cdp, runId, expectedLabels, expectedResultCheck) {
+    return cdp.evalJS(`
+      (() => {
+        const row = document.querySelector('[data-testid="run-row-' + ${JSON.stringify(runId)} + '"]');
+        if (!row) return { foundRow: false };
+        const nonEmoji = new Set(["©", "®", "™", "↗", "↘", "↔"]);
+        const emojiMatches = (row.textContent || "").match(/\\p{Extended_Pictographic}/gu) || [];
+        const decorativeEmojis = emojiMatches.filter((ch) => !nonEmoji.has(ch));
+
+        const cmdPreview = row.querySelector('[data-testid="run-cmd-preview-' + ${JSON.stringify(runId)} + '"]');
+        const isOutsidePromptAndCmd = (el) => {
+          if (cmdPreview && cmdPreview.contains(el)) return false;
+          const md = el.closest(".ahub-markdown");
+          if (md) return false;
+          const promptBox = el.closest(".bg-muted\\\\/30");
+          if (promptBox && (promptBox.textContent || "").includes("任务指令")) return false;
+          return true;
+        };
+
+        const hasActiveTransitionAll = (el) => {
+          const s = getComputedStyle(el);
+          const props = (s.transitionProperty || "").split(",").map((x) => x.trim());
+          const durs = (s.transitionDuration || "").split(",").map((x) => parseFloat(x) || 0);
+          const hasDurAll = props.some(
+            (p, idx) => p === "all" && (durs[idx % Math.max(durs.length, 1)] || 0) > 0
+          );
+          return el.classList.contains("transition-all") || hasDurAll;
+        };
+
+        const labels = ${JSON.stringify(expectedLabels)};
+        const chipResults = {};
+        for (const [k, v] of Object.entries(labels)) {
+          const kvText = k + "=" + v;
+          const colonText = k + ": " + v;
+          const direct =
+            row.querySelector('[data-testid="run-label-chip-' + ${JSON.stringify(runId)} + '-' + k + '"]') ||
+            row.querySelector('[data-testid="run-label-chip-' + k + '"]') ||
+            row.querySelector('[data-testid^="run-label-chip-"][data-label-key="' + k + '"]');
+          const labelsContainer =
+            row.querySelector('[data-testid="run-labels-' + ${JSON.stringify(runId)} + '"]') ||
+            row.querySelector('[data-testid^="run-labels-"]');
+          const searchScope = labelsContainer || row;
+          const candidates = Array.from(searchScope.querySelectorAll("button, span, a, div")).filter((el) => {
+            if (!isOutsidePromptAndCmd(el)) return false;
+            const txt = (el.textContent || "").trim();
+            if (txt !== kvText && txt !== colonText) return false;
+            return !Array.from(el.children).some((c) => {
+              const ct = (c.textContent || "").trim();
+              return ct === kvText || ct === colonText;
+            });
+          });
+          const chip = direct || candidates[0] || null;
+          if (!chip) {
+            chipResults[k] = { found: false };
+            continue;
+          }
+          const rect = chip.getBoundingClientRect();
+          const cs = getComputedStyle(chip);
+          const isMono =
+            chip.classList.contains("font-mono") ||
+            /mono|consolas|menlo|courier|sfmono/i.test(cs.fontFamily || "");
+          const hasTransitionAll = hasActiveTransitionAll(chip);
+          chipResults[k] = {
+            found: rect.width > 0 && rect.height > 0,
+            text: (chip.textContent || "").trim(),
+            isMono,
+            hasTransitionAll,
+            clickable: chip.tagName === "BUTTON" || chip.getAttribute("role") === "button"
+          };
+        }
+
+        const expectedRes = ${JSON.stringify(expectedResultCheck)};
+        let resultInfo = null;
+        if (expectedRes) {
+          const directViewer =
+            row.querySelector('[data-testid="run-result-viewer-' + ${JSON.stringify(runId)} + '"]') ||
+            row.querySelector('[data-testid="run-result-' + ${JSON.stringify(runId)} + '"]') ||
+            row.querySelector('[data-testid^="run-result-viewer"]') ||
+            row.querySelector('[data-testid*="result-viewer"]');
+          const fallbackPre = Array.from(row.querySelectorAll("pre")).find((pre) => {
+            if (!isOutsidePromptAndCmd(pre)) return false;
+            const t = pre.textContent || "";
+            return t.includes(expectedRes.preSnippet);
+          });
+          const viewer = directViewer || (fallbackPre ? (fallbackPre.closest('[data-testid*="result"]') || fallbackPre.parentElement) : null);
+          if (!viewer) {
+            resultInfo = { found: false };
+          } else {
+            const vRect = viewer.getBoundingClientRect();
+            const preEl = viewer.querySelector("pre") || fallbackPre || viewer;
+            const preText = (preEl.textContent || "").trim();
+            const viewerText = viewer.textContent || "";
+            let parsedJson = null;
+            try {
+              parsedJson = JSON.parse(preText);
+            } catch {
+              parsedJson = null;
+            }
+            const allViewerEls = [viewer, ...Array.from(viewer.querySelectorAll("*"))];
+            const hasTabular = allViewerEls.some((el) => {
+              const cs = getComputedStyle(el);
+              return el.classList.contains("tabular-nums") || (cs.fontVariantNumeric || "").includes("tabular-nums");
+            });
+            const hasTransitionAll = allViewerEls.some((el) => hasActiveTransitionAll(el));
+            resultInfo = {
+              found: vRect.width > 0 && vRect.height > 0,
+              preText,
+              viewerText,
+              parsedOk: parsedJson ? parsedJson.ok === expectedRes.ok && parsedJson.count === expectedRes.count : null,
+              hasCountSnippet: new RegExp('"count"\\\\s*:\\\\s*' + expectedRes.count).test(preText),
+              hasTabular,
+              hasTransitionAll
+            };
+          }
+        }
+        return {
+          foundRow: true,
+          decorativeEmojis,
+          chipResults,
+          resultInfo
+        };
+      })()
+    `);
+  }
+
+  async function applySlice3LabelFilter(cdp, runId, key, value) {
+    const filterExpr = `${key}=${value}`;
+    const beforeCount = await cdp.evalJS(
+      `document.querySelectorAll('[data-testid="fleet-threads-pane"] [data-testid^="thread-item-"]').length`
+    );
+    const chipClickable = await cdp.evalJS(`
+      (() => {
+        const row = document.querySelector('[data-testid="run-row-' + ${JSON.stringify(runId)} + '"]');
+        if (!row) return false;
+        const direct =
+          row.querySelector('[data-testid="run-label-chip-' + ${JSON.stringify(runId)} + '-' + ${JSON.stringify(key)} + '"]') ||
+          row.querySelector('[data-testid="run-label-chip-' + ${JSON.stringify(key)} + '"]') ||
+          row.querySelector('[data-testid^="run-label-chip-"][data-label-key="' + ${JSON.stringify(key)} + '"]');
+        if (direct && (direct.tagName === "BUTTON" || direct.getAttribute("role") === "button")) return true;
+        const kvText = ${JSON.stringify(filterExpr)};
+        const colonText = ${JSON.stringify(key + ": " + value)};
+        return Array.from(row.querySelectorAll('button, [role="button"]')).some((el) => {
+          const t = (el.textContent || "").trim();
+          return t === kvText || t === colonText;
+        });
+      })()
+    `);
+
+    let filteredByChip = false;
+    if (chipClickable) {
+      await clickDomMatch(
+        cdp,
+        `() => {
+          const row = document.querySelector('[data-testid="run-row-' + ${JSON.stringify(runId)} + '"]');
+          if (!row) return null;
+          const direct =
+            row.querySelector('[data-testid="run-label-chip-' + ${JSON.stringify(runId)} + '-' + ${JSON.stringify(key)} + '"]') ||
+            row.querySelector('[data-testid="run-label-chip-' + ${JSON.stringify(key)} + '"]') ||
+            row.querySelector('[data-testid^="run-label-chip-"][data-label-key="' + ${JSON.stringify(key)} + '"]');
+          if (direct && (direct.tagName === "BUTTON" || direct.getAttribute("role") === "button")) return direct;
+          const kvText = ${JSON.stringify(filterExpr)};
+          const colonText = ${JSON.stringify(key + ": " + value)};
+          return Array.from(row.querySelectorAll('button, [role="button"]')).find((el) => {
+            const t = (el.textContent || "").trim();
+            return t === kvText || t === colonText;
+          }) || null;
+        }`,
+        `Slice 3 label chip ${filterExpr} on ${runId}`
+      );
+      await sleep(350);
+      const chipEffect = await cdp.evalJS(`
+        (() => {
+          const pane = document.querySelector('[data-testid="fleet-threads-pane"]');
+          const afterCount = pane ? pane.querySelectorAll('[data-testid^="thread-item-"]').length : 0;
+          const inputs = pane ? Array.from(pane.querySelectorAll("input")) : [];
+          const hasInputVal = inputs.some((inp) => (inp.value || "").includes(${JSON.stringify(filterExpr)}));
+          const paneText = pane?.textContent ?? "";
+          return { afterCount, hasInputVal, showsExprInPane: paneText.includes(${JSON.stringify(filterExpr)}) };
+        })()
+      `);
+      filteredByChip = chipEffect.afterCount < beforeCount || chipEffect.hasInputVal || chipEffect.showsExprInPane;
+    }
+
+    if (!filteredByChip) {
+      const filled = await cdp.evalJS(`
+        (() => {
+          const pane = document.querySelector('[data-testid="fleet-threads-pane"]');
+          if (!pane) return false;
+          const inp =
+            pane.querySelector('[data-testid="run-label-filter"]') ||
+            pane.querySelector('[data-testid="thread-label-filter-input"]') ||
+            pane.querySelector('[data-testid="label-filter-input"]') ||
+            pane.querySelector('[data-testid="fleet-label-filter-input"]') ||
+            Array.from(pane.querySelectorAll("input")).find((el) => {
+              const tid = el.getAttribute("data-testid") || "";
+              if (tid === "thread-search-input" || tid === "native-search-input") return false;
+              const meta = [
+                el.getAttribute("placeholder") || "",
+                el.getAttribute("aria-label") || "",
+                el.getAttribute("name") || "",
+                tid
+              ].join(" ");
+              return /label|标签|k=v|key=value/i.test(meta);
+            });
+          if (!inp) return false;
+          inp.focus();
+          const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+          setter?.call(inp, ${JSON.stringify(filterExpr)});
+          inp.dispatchEvent(new Event("input", { bubbles: true }));
+          inp.dispatchEvent(new Event("change", { bubbles: true }));
+          return true;
+        })()
+      `);
+      if (!filled) {
+        throw new Error(`Slice 3 label filter control not found for ${filterExpr}`);
+      }
+      await cdp.pressKey("Enter");
+      await sleep(300);
+    }
+  }
+
+  async function clearSlice3LabelFilter(cdp, runId, key, value) {
+    const filterExpr = `${key}=${value}`;
+    const findClearBtnSrc = `() => {
+      const pane = document.querySelector('[data-testid="fleet-threads-pane"]');
+      if (!pane) return null;
+      const direct =
+        pane.querySelector('[data-testid="active-label-filter-' + ${JSON.stringify(filterExpr)} + '"]') ||
+        pane.querySelector('[data-testid="run-label-filter-clear"]') ||
+        pane.querySelector('[data-testid="thread-label-filter-clear"]') ||
+        pane.querySelector('[data-testid="clear-label-filter-btn"]') ||
+        pane.querySelector('[data-testid="label-filter-clear"]');
+      if (direct) return direct;
+      const byTextOrLabel = Array.from(pane.querySelectorAll("button")).find((b) => {
+        const t = ((b.textContent || "") + " " + (b.getAttribute("aria-label") || "") + " " + (b.getAttribute("title") || "")).trim();
+        return /清除.*标签|清除筛选|清空标签|移除.*标签|取消.*标签|Clear.*label|Reset.*label/i.test(t);
+      });
+      if (byTextOrLabel) return byTextOrLabel;
+      const inp =
+        pane.querySelector('[data-testid="run-label-filter"]') ||
+        pane.querySelector('[data-testid="thread-label-filter-input"]') ||
+        pane.querySelector('[data-testid="label-filter-input"]') ||
+        pane.querySelector('[data-testid="fleet-label-filter-input"]') ||
+        Array.from(pane.querySelectorAll("input")).find((el) => {
+          const tid = el.getAttribute("data-testid") || "";
+          if (tid === "thread-search-input" || tid === "native-search-input") return false;
+          const meta = [
+            el.getAttribute("placeholder") || "",
+            el.getAttribute("aria-label") || "",
+            el.getAttribute("name") || "",
+            tid
+          ].join(" ");
+          return /label|标签|k=v|key=value/i.test(meta);
+        });
+      const wrap = inp?.parentElement;
+      if (wrap) {
+        const inlineClear = Array.from(wrap.querySelectorAll("button")).find((b) => {
+          const t = ((b.textContent || "") + " " + (b.getAttribute("aria-label") || "") + " " + (b.getAttribute("title") || "")).trim();
+          return /清除|清空|取消|重置|移除|clear|reset|remove/i.test(t) || Boolean(b.querySelector("svg"));
+        });
+        if (inlineClear) return inlineClear;
+      }
+      return null;
+    }`;
+    const hasClearBtn = await cdp.evalJS(`Boolean((${findClearBtnSrc})())`);
+    if (hasClearBtn) {
+      await clickDomMatch(cdp, findClearBtnSrc, "Clear Slice 3 label filter button");
+      await sleep(250);
+    }
+
+    const clearedInput = await cdp.evalJS(`
+      (() => {
+        const pane = document.querySelector('[data-testid="fleet-threads-pane"]');
+        if (!pane) return false;
+        const inp =
+          pane.querySelector('[data-testid="run-label-filter"]') ||
+          pane.querySelector('[data-testid="thread-label-filter-input"]') ||
+          pane.querySelector('[data-testid="label-filter-input"]') ||
+          pane.querySelector('[data-testid="fleet-label-filter-input"]') ||
+          Array.from(pane.querySelectorAll("input")).find((el) => {
+            const tid = el.getAttribute("data-testid") || "";
+            if (tid === "thread-search-input" || tid === "native-search-input") return false;
+            const meta = [
+              el.getAttribute("placeholder") || "",
+              el.getAttribute("aria-label") || "",
+              el.getAttribute("name") || "",
+              tid
+            ].join(" ");
+            return /label|标签|k=v|key=value/i.test(meta);
+          });
+        if (!inp || !inp.value) return false;
+        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+        setter?.call(inp, "");
+        inp.dispatchEvent(new Event("input", { bubbles: true }));
+        inp.dispatchEvent(new Event("change", { bubbles: true }));
+        inp.blur();
+        return true;
+      })()
+    `);
+    if (clearedInput) {
+      await cdp.pressKey("Enter");
+      await sleep(250);
+    }
+
+    const activeChipToToggle = await cdp.evalJS(`
+      (() => {
+        const row = document.querySelector('[data-testid="run-row-' + ${JSON.stringify(runId)} + '"]');
+        if (!row) return false;
+        const direct =
+          row.querySelector('[data-testid="run-label-chip-' + ${JSON.stringify(runId)} + '-' + ${JSON.stringify(key)} + '"]') ||
+          row.querySelector('[data-testid="run-label-chip-' + ${JSON.stringify(key)} + '"]') ||
+          row.querySelector('[data-testid^="run-label-chip-"][data-label-key="' + ${JSON.stringify(key)} + '"]');
+        const chip = direct || Array.from(row.querySelectorAll('button, [role="button"]')).find((el) => {
+          const t = (el.textContent || "").trim();
+          return t === ${JSON.stringify(filterExpr)} || t === ${JSON.stringify(key + ": " + value)};
+        });
+        return Boolean(chip && (chip.getAttribute("aria-pressed") === "true" || chip.getAttribute("data-active") === "true"));
+      })()
+    `);
+    if (activeChipToToggle) {
+      await clickDomMatch(
+        cdp,
+        `() => {
+          const row = document.querySelector('[data-testid="run-row-' + ${JSON.stringify(runId)} + '"]');
+          if (!row) return null;
+          return (
+            row.querySelector('[data-testid="run-label-chip-' + ${JSON.stringify(runId)} + '-' + ${JSON.stringify(key)} + '"]') ||
+            row.querySelector('[data-testid="run-label-chip-' + ${JSON.stringify(key)} + '"]') ||
+            row.querySelector('[data-testid^="run-label-chip-"][data-label-key="' + ${JSON.stringify(key)} + '"]') ||
+            Array.from(row.querySelectorAll('button, [role="button"]')).find((el) => {
+              const t = (el.textContent || "").trim();
+              return t === ${JSON.stringify(filterExpr)} || t === ${JSON.stringify(key + ": " + value)};
+            }) ||
+            null
+          );
+        }`,
+        `Toggle off Slice 3 label chip ${filterExpr}`
+      );
+      await sleep(250);
+    }
+  }
+
+  // Ensure runs workspace & threads tab at 1440x900
+  if ((await cdpClient.evalJS(`window.__AHUB_EVAL__?.getState()?.workspaceMode`)) !== "runs") {
+    await cdpClient.clickSelector('[data-testid="workspace-tab-runs"]');
+    await sleep(200);
+  }
+  await cdpClient.clickSelector('[data-testid="fleet-tab-threads"]');
+  await sleep(150);
+
+  for (let i = 0; i < 40; i++) {
+    const bothThreadsReady = await cdpClient.evalJS(`
+      Boolean(document.querySelector('[data-testid="thread-item-${s3OkRun.thread_id}"] button:nth-of-type(2)')) &&
+      Boolean(document.querySelector('[data-testid="thread-item-${s3MismatchRun.thread_id}"] button:nth-of-type(2)'))
+    `);
+    if (bothThreadsReady) break;
+    if (i === 39) {
+      throw new Error(`Slice 3 threads did not hydrate in UI (${s3OkRun.thread_id}, ${s3MismatchRun.thread_id})`);
+    }
+    await sleep(150);
+  }
+
+  // Reset CLS at start of Phase 4d steady checks
+  await cdpClient.evalJS(`window.__AHUB_CLS__ = 0; window.__AHUB_CLS_SOURCES__ = [];`);
+
+  // Select s3OkRun thread & run -> verify label chips + structured result viewer + secret redaction + tabular-nums + zero transition-all/emoji
+  await cdpClient.clickSelector(`[data-testid="thread-item-${s3OkRun.thread_id}"] button:nth-of-type(2)`);
+  for (let i = 0; i < 30; i++) {
+    if (await cdpClient.evalJS(`Boolean(document.querySelector('[data-testid="run-row-${s3OkRun.id}"]'))`)) break;
+    if (i === 29) throw new Error(`s3OkRun row ${s3OkRun.id} did not render in ConversationPane`);
+    await sleep(150);
+  }
+  await cdpClient.clickSelector(`[data-testid="run-row-${s3OkRun.id}"]`);
+
+  let s3OkUi = null;
+  for (let i = 0; i < 30; i++) {
+    s3OkUi = await inspectSlice3RunRow(cdpClient, s3OkRun.id, s3OkLabels, {
+      preSnippet: '"count"',
+      ok: true,
+      count: 7
+    });
+    const chipsOk = Object.keys(s3OkLabels).every((k) => s3OkUi?.chipResults?.[k]?.found);
+    if (s3OkUi?.foundRow && chipsOk && s3OkUi?.resultInfo?.found) break;
+    await sleep(150);
+  }
+  for (const [k, v] of Object.entries(s3OkLabels)) {
+    const chip = s3OkUi?.chipResults?.[k];
+    if (!chip?.found || !chip.isMono || chip.hasTransitionAll) {
+      throw new Error(`Slice 3 label chip check failed for ${k}=${v} on ${s3OkRun.id}: ${JSON.stringify(s3OkUi)}`);
+    }
+  }
+  if ((s3OkUi?.decorativeEmojis?.length ?? 0) > 0) {
+    throw new Error(`Slice 3 run row ${s3OkRun.id} contains prohibited decorative emoji: ${JSON.stringify(s3OkUi.decorativeEmojis)}`);
+  }
+  if (
+    !s3OkUi?.resultInfo?.found ||
+    (!s3OkUi.resultInfo.parsedOk && !s3OkUi.resultInfo.hasCountSnippet) ||
+    !s3OkUi.resultInfo.viewerText.includes("[REDACTED]") ||
+    s3OkUi.resultInfo.viewerText.includes(s3OkSecret) ||
+    !s3OkUi.resultInfo.hasTabular ||
+    s3OkUi.resultInfo.hasTransitionAll
+  ) {
+    throw new Error(`Slice 3 structured result viewer check failed on ${s3OkRun.id}: ${JSON.stringify(s3OkUi)}`);
+  }
+
+  // Trigger ?label=suite=slice3-ok filter -> verify UI matches GET /api/v1/runs?label=suite=slice3-ok -> clear filter
+  const d1Slice3Filtered = (
+    await apiJson(hubUrl, adminToken, `/api/v1/runs?label=${encodeURIComponent("suite=slice3-ok")}`)
+  ).runs;
+  if (
+    !d1Slice3Filtered.some((r) => r.id === s3OkRun.id) ||
+    d1Slice3Filtered.some((r) => r.id === s3MismatchRun.id)
+  ) {
+    throw new Error(`D1 ?label=suite=slice3-ok parity check invalid: ${JSON.stringify(d1Slice3Filtered.map((r) => r.id))}`);
+  }
+  const expectedFilteredThreadIds = [...new Set(d1Slice3Filtered.map((r) => r.thread_id))];
+
+  await applySlice3LabelFilter(cdpClient, s3OkRun.id, "suite", "slice3-ok");
+  let filterParityOk = false;
+  let lastFilterDbg = null;
+  for (let i = 0; i < 30; i++) {
+    const visibleThreadIds = await cdpClient.evalJS(`
+      Array.from(document.querySelectorAll('[data-testid="fleet-threads-pane"] [data-testid^="thread-item-"]'))
+        .map((el) => (el.getAttribute("data-testid") || "").replace(/^thread-item-/, ""))
+        .filter(Boolean)
+    `);
+    const hasOk = visibleThreadIds.includes(s3OkRun.thread_id);
+    const hasMismatch = visibleThreadIds.includes(s3MismatchRun.thread_id);
+    const matchesD1 =
+      expectedFilteredThreadIds.every((tid) => visibleThreadIds.includes(tid)) &&
+      visibleThreadIds.every((tid) => expectedFilteredThreadIds.includes(tid));
+    lastFilterDbg = { visibleThreadIds, expectedFilteredThreadIds };
+    if (hasOk && !hasMismatch && matchesD1) {
+      filterParityOk = true;
+      break;
+    }
+    await sleep(150);
+  }
+  if (!filterParityOk) {
+    throw new Error(`Slice 3 ?label=suite=slice3-ok UI!=D1 filter parity failed: ${JSON.stringify(lastFilterDbg)}`);
+  }
+
+  await clearSlice3LabelFilter(cdpClient, s3OkRun.id, "suite", "slice3-ok");
+  for (let i = 0; i < 30; i++) {
+    const mismatchReappeared = await cdpClient.evalJS(
+      `Boolean(document.querySelector('[data-testid="fleet-threads-pane"] [data-testid="thread-item-${s3MismatchRun.thread_id}"]'))`
+    );
+    if (mismatchReappeared) break;
+    if (i === 29) {
+      throw new Error(`s3MismatchRun thread ${s3MismatchRun.thread_id} did not reappear after clearing label filter`);
+    }
+    await sleep(150);
+  }
+
+  // Select s3MismatchRun -> verify RESULT_SCHEMA_MISMATCH banner AND MISMATCH_OUTPUT_KEPT_E2E output_md visibly rendered below
+  await cdpClient.clickSelector(`[data-testid="thread-item-${s3MismatchRun.thread_id}"] button:nth-of-type(2)`);
+  for (let i = 0; i < 30; i++) {
+    if (await cdpClient.evalJS(`Boolean(document.querySelector('[data-testid="run-row-${s3MismatchRun.id}"]'))`)) break;
+    if (i === 29) throw new Error(`s3MismatchRun row ${s3MismatchRun.id} did not render`);
+    await sleep(150);
+  }
+  await cdpClient.clickSelector(`[data-testid="run-row-${s3MismatchRun.id}"]`);
+
+  let s3MismatchUi = null;
+  for (let i = 0; i < 30; i++) {
+    s3MismatchUi = await cdpClient.evalJS(`
+      (() => {
+        const row = document.querySelector('[data-testid="run-row-${s3MismatchRun.id}"]');
+        if (!row) return { foundRow: false };
+        const failedBadge = Boolean(row.querySelector('[data-run-status="failed"]'));
+        const cmdPreview = row.querySelector('[data-testid="run-cmd-preview-${s3MismatchRun.id}"]');
+        const isOutsidePromptAndCmd = (el) => {
+          if (cmdPreview && cmdPreview.contains(el)) return false;
+          const promptBox = el.closest(".bg-muted\\\\/30");
+          if (promptBox && (promptBox.textContent || "").includes("任务指令")) return false;
+          return true;
+        };
+        const directBanner =
+          row.querySelector('[data-testid="run-schema-mismatch-banner-${s3MismatchRun.id}"]') ||
+          row.querySelector('[data-testid="result-schema-mismatch-${s3MismatchRun.id}"]') ||
+          row.querySelector('[data-testid="result-schema-mismatch-banner-${s3MismatchRun.id}"]') ||
+          row.querySelector('[data-testid^="result-schema-mismatch"]') ||
+          row.querySelector('[data-error-code="RESULT_SCHEMA_MISMATCH"]');
+        const fallbackBanner = Array.from(row.querySelectorAll("div, p, span, section")).find((el) => {
+          if (!isOutsidePromptAndCmd(el) || el.closest(".ahub-markdown")) return false;
+          if (!(el.textContent || "").includes("RESULT_SCHEMA_MISMATCH")) return false;
+          return !Array.from(el.children).some((c) => (c.textContent || "").includes("RESULT_SCHEMA_MISMATCH"));
+        });
+        const bannerEl = directBanner || (fallbackBanner ? (fallbackBanner.closest('[data-testid], div') || fallbackBanner) : null);
+        const outputEl =
+          Array.from(row.querySelectorAll(".ahub-markdown")).find((el) =>
+            (el.textContent || "").includes("MISMATCH_OUTPUT_KEPT_E2E")
+          ) ||
+          Array.from(row.querySelectorAll("div, p, pre")).find((el) => {
+            if (!isOutsidePromptAndCmd(el)) return false;
+            return (el.textContent || "").includes("MISMATCH_OUTPUT_KEPT_E2E");
+          });
+        const hasUnexpectedResultViewer = Boolean(
+          row.querySelector(
+            '[data-testid="run-result-viewer-${s3MismatchRun.id}"], [data-testid="run-result-${s3MismatchRun.id}"], [data-testid^="run-result-viewer"]'
+          )
+        );
+        const bannerRect = bannerEl ? bannerEl.getBoundingClientRect() : null;
+        const outputRect = outputEl ? outputEl.getBoundingClientRect() : null;
+        return {
+          foundRow: true,
+          failedBadge,
+          hasBanner: Boolean(bannerEl && bannerEl.offsetHeight > 0),
+          hasOutput: Boolean(outputEl && outputEl.offsetHeight > 0),
+          outputBelowBanner: Boolean(bannerRect && outputRect && outputRect.top >= bannerRect.top),
+          hasUnexpectedResultViewer
+        };
+      })()
+    `);
+    if (
+      s3MismatchUi?.foundRow &&
+      s3MismatchUi.failedBadge &&
+      s3MismatchUi.hasBanner &&
+      s3MismatchUi.hasOutput &&
+      s3MismatchUi.outputBelowBanner
+    ) {
+      break;
+    }
+    await sleep(150);
+  }
+  if (
+    !s3MismatchUi?.foundRow ||
+    !s3MismatchUi.failedBadge ||
+    !s3MismatchUi.hasBanner ||
+    !s3MismatchUi.hasOutput ||
+    !s3MismatchUi.outputBelowBanner ||
+    s3MismatchUi.hasUnexpectedResultViewer
+  ) {
+    throw new Error(`Slice 3 RESULT_SCHEMA_MISMATCH + preserved output_md check failed: ${JSON.stringify(s3MismatchUi)}`);
+  }
+
+  // Verify CLS <= 0.001 & viewport containment at 1440x900 and 390x844 mobile
+  const slice3Cls = await cdpClient.evalJS(`window.__AHUB_CLS__ ?? 0`);
+  const slice3ClsSources = await cdpClient.evalJS(`window.__AHUB_CLS_SOURCES__ ?? []`);
+  if (slice3Cls > 0.001) {
+    throw new Error(`Expected zero CLS in Slice 3 Phase 4d, got ${slice3Cls}; sources=${JSON.stringify(slice3ClsSources)}`);
+  }
+  await assertViewportContainment(cdpClient, "desktop-1440x900-slice3");
+
+  await cdpClient.setViewport(390, 844, true);
+  await sleep(250);
+  await assertViewportContainment(cdpClient, "mobile-390x844-slice3-mismatch");
+  await cdpClient.clickSelector('[data-testid="mobile-left-trigger"]');
+  await sleep(250);
+  await cdpClient.clickSelector(`[data-testid="thread-item-${s3OkRun.thread_id}"] button:nth-of-type(2)`);
+  await sleep(250);
+  await assertViewportContainment(cdpClient, "mobile-390x844-slice3-ok");
   await cdpClient.setViewport(1440, 900, false);
   await sleep(200);
 
@@ -4982,6 +5691,30 @@ try {
     })
   });
   const clientS2Run = await waitForSeedRunDone(clientS2RunRes.run.id, "Phase 5 clientBoardKey Slice 2 run");
+
+  const clientS3Labels = { env: "client-eval", owner: "client-board" };
+  const clientS3RunRes = await apiJson(hubUrl, clientBoardKey.token, "/api/v1/runs?wait_ms=0", {
+    method: "POST",
+    body: JSON.stringify({
+      node_id: "macmini",
+      workdir: wsAlpha,
+      agent: "agy",
+      labels: clientS3Labels,
+      result_schema: s3ResultSchema,
+      title: "Phase 5 client Slice 3 标签与结果校验任务",
+      prompt: JSON.stringify({
+        summary: "client scope Slice 3 完成",
+        response: "client slice3 result ok",
+        directives: [
+          {
+            op: "write_result_file",
+            result: { ok: true, count: 3, note: "client scope ok" }
+          }
+        ]
+      })
+    })
+  });
+  const clientS3Run = await waitForSeedRunDone(clientS3RunRes.run.id, "Phase 5 clientBoardKey Slice 3 run");
 
   // Test A: clientBoardKey with allowed_board_prefixes: ["proj/demo"]
   await cdpClient.setViewport(1440, 900, false);
@@ -5165,6 +5898,92 @@ try {
     throw new Error(`clientBoardKey leaked admin controls in runs workspace: ${JSON.stringify(clientBoardInspectorCheck)}`);
   }
 
+  // Verify clientBoardKey-owned Slice 3 labeled run & ?label= filter in runs workspace produce 0 403s & 0 consoleErrors
+  await cdpClient.clickSelector('[data-testid="fleet-tab-threads"]');
+  await sleep(150);
+  for (let i = 0; i < 30; i++) {
+    const clientS3ThreadReady = await cdpClient.evalJS(
+      `Boolean(document.querySelector('[data-testid="thread-item-${clientS3Run.thread_id}"] button:nth-of-type(2)'))`
+    );
+    if (clientS3ThreadReady) break;
+    if (i === 29) {
+      throw new Error(`clientBoardKey Slice 3 thread ${clientS3Run.thread_id} did not appear in FleetThreadsPane`);
+    }
+    await sleep(150);
+  }
+  await cdpClient.clickSelector(`[data-testid="thread-item-${clientS3Run.thread_id}"] button:nth-of-type(2)`);
+  for (let i = 0; i < 30; i++) {
+    if (await cdpClient.evalJS(`Boolean(document.querySelector('[data-testid="run-row-${clientS3Run.id}"]'))`)) break;
+    if (i === 29) throw new Error(`clientBoardKey Slice 3 run row ${clientS3Run.id} did not render`);
+    await sleep(150);
+  }
+  await cdpClient.clickSelector(`[data-testid="run-row-${clientS3Run.id}"]`);
+  let clientS3Ui = null;
+  for (let i = 0; i < 30; i++) {
+    clientS3Ui = await inspectSlice3RunRow(cdpClient, clientS3Run.id, clientS3Labels, {
+      preSnippet: '"count"',
+      ok: true,
+      count: 3
+    });
+    const chipsOk = Object.keys(clientS3Labels).every((k) => clientS3Ui?.chipResults?.[k]?.found);
+    if (clientS3Ui?.foundRow && chipsOk && clientS3Ui?.resultInfo?.found) break;
+    await sleep(150);
+  }
+  if (
+    !clientS3Ui?.foundRow ||
+    !Object.keys(clientS3Labels).every((k) => clientS3Ui?.chipResults?.[k]?.found) ||
+    !clientS3Ui?.resultInfo?.found ||
+    (!clientS3Ui.resultInfo.parsedOk && !clientS3Ui.resultInfo.hasCountSnippet)
+  ) {
+    throw new Error(`clientBoardKey Slice 3 label/result rendering check failed: ${JSON.stringify(clientS3Ui)}`);
+  }
+
+  const clientD1Labeled = (
+    await apiJson(hubUrl, clientBoardKey.token, `/api/v1/runs?label=${encodeURIComponent("owner=client-board")}`)
+  ).runs;
+  if (
+    !clientD1Labeled.some((r) => r.id === clientS3Run.id) ||
+    clientD1Labeled.some((r) => r.id === s3OkRun.id) ||
+    clientD1Labeled.some((r) => r.id === clientS2Run.id)
+  ) {
+    throw new Error(`clientBoardKey ?label=owner=client-board D1 isolation failed: ${JSON.stringify(clientD1Labeled.map((r) => r.id))}`);
+  }
+  await applySlice3LabelFilter(cdpClient, clientS3Run.id, "owner", "client-board");
+  let clientFilterOk = false;
+  let lastClientFilterDbg = null;
+  for (let i = 0; i < 30; i++) {
+    const visibleIds = await cdpClient.evalJS(`
+      Array.from(document.querySelectorAll('[data-testid="fleet-threads-pane"] [data-testid^="thread-item-"]'))
+        .map((el) => (el.getAttribute("data-testid") || "").replace(/^thread-item-/, ""))
+        .filter(Boolean)
+    `);
+    lastClientFilterDbg = visibleIds;
+    if (
+      visibleIds.includes(clientS3Run.thread_id) &&
+      !visibleIds.includes(clientS2Run.thread_id) &&
+      !visibleIds.includes(s3OkRun.thread_id)
+    ) {
+      clientFilterOk = true;
+      break;
+    }
+    await sleep(150);
+  }
+  if (!clientFilterOk) {
+    throw new Error(`clientBoardKey ?label=owner=client-board UI filter parity failed: ${JSON.stringify(lastClientFilterDbg)}`);
+  }
+  await clearSlice3LabelFilter(cdpClient, clientS3Run.id, "owner", "client-board");
+  for (let i = 0; i < 30; i++) {
+    const restored = await cdpClient.evalJS(`({
+      hasClientS2: Boolean(document.querySelector('[data-testid="fleet-threads-pane"] [data-testid="thread-item-${clientS2Run.thread_id}"]')),
+      hasAdminS3: Boolean(document.querySelector('[data-testid="fleet-threads-pane"] [data-testid="thread-item-${s3OkRun.thread_id}"]'))
+    })`);
+    if (restored.hasClientS2 && !restored.hasAdminS3) break;
+    if (i === 29) {
+      throw new Error(`clientBoardKey label filter clear / isolation failed: ${JSON.stringify(restored)}`);
+    }
+    await sleep(150);
+  }
+
   // Test B: clientScopeKey with default allowed_board_prefixes: []
   const clientScopeKey = await apiJson(hubUrl, adminToken, "/api/v1/keys", {
     method: "POST",
@@ -5282,7 +6101,7 @@ try {
   }
 
   console.log(
-    `L2 CDP Runtime Eval PASSED: UI==D1 parity ok, flood ring-buffer=${floodCount}, stream CLS=${floodCls}, DnD priority_order persisted, mobile overflow=0, zero-token CF Access cookie ok, 5 screenshots written to ${screenshotDir}`
+    `L2 CDP Runtime Eval PASSED: UI==D1 parity ok, flood ring-buffer=${floodCount}, stream CLS=${floodCls}, DnD priority_order persisted, Slice 3 labels/result ok, mobile overflow=0, zero-token CF Access cookie ok, 5 screenshots written to ${screenshotDir}`
   );
 } finally {
   if (cdpTab2) cdpTab2.close();

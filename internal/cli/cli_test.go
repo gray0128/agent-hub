@@ -532,3 +532,164 @@ func TestRunsCancelResolveSanitizePromptLeaseAndBound(t *testing.T) {
 	}
 	assertCleanRecord("resolve", outResolve, resolvePayload.Run)
 }
+
+func TestResultSanitizesSummaryOutputAndRemoteControlURL(t *testing.T) {
+	const (
+		secSummary = "sk-proj-CLISUMMARYSECRET1234"
+		secPreview = "ahub_adm_CLIPREVIEWSECRET999"
+		secFull    = "ghp_CLIFULLSECRET1234567890ab"
+		secRC      = "https://user:pass123@example.com/rc?token=rc_secret_999"
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/api/v1/runs/run_sec_1" {
+			http.NotFound(w, r)
+			return
+		}
+		isFull := r.URL.Query().Get("view") == "full"
+		rec := api.RunRecord{
+			ID:               "run_sec_1",
+			ThreadID:         "thr_sec_1",
+			RootRunID:        "run_sec_1",
+			NodeID:           "macmini",
+			Workdir:          "/workspace/demo",
+			Agent:            "claude",
+			Status:           "done",
+			LeaseOwner:       "leak_lease",
+			RemoteControlURL: secRC,
+			Summary:          "Summary with " + secSummary,
+		}
+		if isFull {
+			rec.OutputMD = "Full md with " + secFull
+		} else {
+			rec.OutputPreview = "Preview with " + secPreview
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"ok":  true,
+			"run": rec,
+		})
+	}))
+	defer srv.Close()
+
+	codeSum, outSum := captureExecute(t, []string{
+		"--url", srv.URL,
+		"--token", "tok_test",
+		"--json",
+		"result", "run_sec_1",
+	}, "")
+	if codeSum != 0 {
+		t.Fatalf("result summary exit=%d out=%s", codeSum, outSum)
+	}
+	for _, forbidden := range []string{secSummary, secPreview, "pass123", "rc_secret_999", "leak_lease"} {
+		if strings.Contains(outSum, forbidden) {
+			t.Fatalf("result summary leaked %q: %s", forbidden, outSum)
+		}
+	}
+	var sumRun api.RunRecord
+	if err := json.Unmarshal([]byte(outSum), &sumRun); err != nil {
+		t.Fatalf("decode summary run: %v (%s)", err, outSum)
+	}
+	if sumRun.RemoteControlURL != "https://[REDACTED]@example.com/rc?token=[REDACTED]" {
+		t.Fatalf("unexpected summary RemoteControlURL: %q", sumRun.RemoteControlURL)
+	}
+	if !strings.Contains(sumRun.Summary, "[REDACTED]") || !strings.Contains(sumRun.OutputPreview, "ahub_adm_[REDACTED]") {
+		t.Fatalf("expected redacted summary & output_preview, got %+v", sumRun)
+	}
+
+	codeFull, outFull := captureExecute(t, []string{
+		"--url", srv.URL,
+		"--token", "tok_test",
+		"--json",
+		"result", "run_sec_1", "--full",
+	}, "")
+	if codeFull != 0 {
+		t.Fatalf("result --full exit=%d out=%s", codeFull, outFull)
+	}
+	for _, forbidden := range []string{secSummary, secFull, "pass123", "rc_secret_999"} {
+		if strings.Contains(outFull, forbidden) {
+			t.Fatalf("result --full leaked %q: %s", forbidden, outFull)
+		}
+	}
+	var fullRun api.RunRecord
+	if err := json.Unmarshal([]byte(outFull), &fullRun); err != nil {
+		t.Fatalf("decode full run: %v (%s)", err, outFull)
+	}
+	if !strings.Contains(fullRun.OutputMD, "[REDACTED]") {
+		t.Fatalf("expected redacted OutputMD, got %q", fullRun.OutputMD)
+	}
+
+	// Verify benign soft_approval URL stays intact
+	benign := sanitizeRunRecord(api.RunRecord{
+		ID:               "run_benign",
+		RemoteControlURL: "https://claude.ai/code/session_01FAKE",
+	}, false)
+	if benign.RemoteControlURL != "https://claude.ai/code/session_01FAKE" {
+		t.Fatalf("benign RemoteControlURL altered: %q", benign.RemoteControlURL)
+	}
+}
+
+func TestThreadsRedactsTitleInJSONAndPlainOutput(t *testing.T) {
+	const (
+		secOpenAI = "sk-proj-CliThreadSecret1234567890abcd"
+		secAhub   = "ahub_cli_CliThreadToken9876543210"
+		secURL    = "https://user:pass999@ahub.bobocai.win/cb?token=url_thr_sec_123456"
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/threads" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"ok": true,
+			"threads": []api.ThreadRecord{
+				{
+					ID:         "thr_01CLIREDACT0000000000001",
+					Title:      "Check token=" + secOpenAI + " and " + secAhub + " " + secURL,
+					NodeID:     "macmini",
+					Workdir:    "/workspace/demo",
+					ProjectKey: "demo",
+					Agent:      "codex",
+					Status:     "active",
+					CreatedAt:  "2026-11-22T00:00:00Z",
+					UpdatedAt:  "2026-11-22T00:00:00Z",
+				},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	codeJSON, outJSON := captureExecute(t, []string{"--url", srv.URL, "--token", "tok_test", "--json", "threads"}, "")
+	if codeJSON != 0 {
+		t.Fatalf("threads --json exit=%d out=%s", codeJSON, outJSON)
+	}
+	for _, forbidden := range []string{secOpenAI, secAhub, "pass999", "url_thr_sec_123456"} {
+		if strings.Contains(outJSON, forbidden) {
+			t.Fatalf("threads --json leaked %q: %s", forbidden, outJSON)
+		}
+	}
+	var jsonPayload struct {
+		OK      bool               `json:"ok"`
+		Threads []api.ThreadRecord `json:"threads"`
+	}
+	if err := json.Unmarshal([]byte(outJSON), &jsonPayload); err != nil || !jsonPayload.OK || len(jsonPayload.Threads) != 1 {
+		t.Fatalf("invalid threads --json payload: err=%v out=%s", err, outJSON)
+	}
+	gotTitle := jsonPayload.Threads[0].Title
+	if !strings.Contains(gotTitle, "token=[REDACTED]") || !strings.Contains(gotTitle, "ahub_cli_[REDACTED]") || !strings.Contains(gotTitle, "https://[REDACTED]@ahub.bobocai.win/cb?token=[REDACTED]") {
+		t.Fatalf("unexpected redacted thread title in JSON: %q", gotTitle)
+	}
+
+	codePlain, outPlain := captureExecute(t, []string{"--url", srv.URL, "--token", "tok_test", "threads"}, "")
+	if codePlain != 0 {
+		t.Fatalf("threads plain exit=%d out=%s", codePlain, outPlain)
+	}
+	for _, forbidden := range []string{secOpenAI, secAhub, "pass999", "url_thr_sec_123456"} {
+		if strings.Contains(outPlain, forbidden) {
+			t.Fatalf("threads plain leaked %q: %s", forbidden, outPlain)
+		}
+	}
+	if !strings.Contains(outPlain, "[REDACTED]") {
+		t.Fatalf("expected [REDACTED] in plain threads output: %s", outPlain)
+	}
+}

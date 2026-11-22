@@ -1711,8 +1711,12 @@ func TestInvariant_NodeDefaultNotifyAndNativeEventsIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(fullAdminRun.OutputMD, "raw_secret_prompt_999") {
-		t.Fatalf("expected fakeagent execution output to reflect raw claim prompt, got %q", fullAdminRun.OutputMD)
+	wantPromptSHA := fmt.Sprintf("prompt_sha256=%x", sha256.Sum256([]byte(promptWithSecret)))
+	if !strings.Contains(fullAdminRun.OutputMD, wantPromptSHA) {
+		t.Fatalf("expected fakeagent execution output to reflect raw claim prompt (%s), got %q", wantPromptSHA, fullAdminRun.OutputMD)
+	}
+	if strings.Contains(fullAdminRun.OutputMD, "raw_secret_prompt_999") || !strings.Contains(fullAdminRun.OutputMD, "token=[REDACTED]") {
+		t.Fatalf("expected GET /runs/:id?view=full output_md redacted, got %q", fullAdminRun.OutputMD)
 	}
 	if strings.Contains(fullAdminRun.Prompt, "raw_secret_prompt_999") || !strings.Contains(fullAdminRun.Prompt, "token=[REDACTED]") {
 		t.Fatalf("expected GET /runs/:id?view=full prompt redacted, got %q", fullAdminRun.Prompt)

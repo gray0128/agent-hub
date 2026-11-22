@@ -289,10 +289,10 @@ function buildRunWebhookPayload(row: RunWebhookRow, env: Env): Record<string, un
     resolved_effort: row.resolved_effort,
     native_session_id: row.native_session_id ?? "",
     duration_ms: row.duration_ms,
-    remote_control_url: row.remote_control_url,
+    remote_control_url: redactSecrets(row.remote_control_url ?? ""),
     prompt_preview: promptPreview,
     prompt_truncated: promptTruncated,
-    summary: row.summary,
+    summary: redactSecrets(row.summary ?? ""),
     output_bytes: row.output_bytes,
     fetch_full_cmd: `ahub result ${row.id} --full --json`
   };

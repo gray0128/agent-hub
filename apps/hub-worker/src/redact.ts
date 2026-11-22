@@ -21,7 +21,7 @@ const SECRET_JSON_KEY_RE =
 const KV_SECRET_RE =
   /\b([A-Za-z0-9_]*(?:PASSWORD|PASSWD|TOKEN|SECRET|API_?KEY|WEBHOOK_?KEY|PRIVATE_?KEY|ENCRYPTION_?KEY))\s*([:=])\s*(\\"(?:[^"\\\r\n]|\\[^"\r\n])*\\"|"(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*'|[^\s'"`;|&]+)/gi;
 
-const PLACEHOLDER_WORDS = new Set(["true", "false", "null", "none", "env", "file", "flag"]);
+const PLACEHOLDER_WORDS = new Set(["true", "false", "null", "none", "env", "file", "flag", "__missing__"]);
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}/;
 const LETTERS_ONLY_RE = /^[A-Za-z]+$/;
 const HAS_ALNUM_RE = /[A-Za-z0-9]/;

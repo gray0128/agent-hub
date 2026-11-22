@@ -347,3 +347,183 @@ func TestRetryRunListRunsWithOptionsAndCancelRequest(t *testing.T) {
 		t.Fatalf("unexpected CancelRun body: %+v", seenCancelBody)
 	}
 }
+
+func TestSlice3MarshalingAndLabelQueryEncoding(t *testing.T) {
+	// 1. CreateRunRequest & PlanNodeSpec omit unset Slice 3 fields and preserve empty schema `{}`
+	rawOmit, err := json.Marshal(CreateRunRequest{
+		NodeID:  "macmini",
+		Workdir: "~/workspace/demo",
+		Agent:   "agy",
+		Prompt:  "hi",
+	})
+	if err != nil {
+		t.Fatalf("marshal CreateRunRequest: %v", err)
+	}
+	var omitMap map[string]interface{}
+	if err := json.Unmarshal(rawOmit, &omitMap); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"labels", "result_schema"} {
+		if _, exists := omitMap[k]; exists {
+			t.Fatalf("expected %q omitted when unset, got %s", k, string(rawOmit))
+		}
+	}
+
+	rawEmptySchema, err := json.Marshal(CreateRunRequest{
+		NodeID:       "macmini",
+		Workdir:      "~/workspace/demo",
+		Agent:        "agy",
+		Prompt:       "hi",
+		Labels:       map[string]string{"env": "prod", "empty": ""},
+		ResultSchema: json.RawMessage("{}"),
+	})
+	if err != nil {
+		t.Fatalf("marshal CreateRunRequest with {}: %v", err)
+	}
+	if !strings.Contains(string(rawEmptySchema), `"result_schema":{}`) {
+		t.Fatalf("expected result_schema:{} preserved, got %s", string(rawEmptySchema))
+	}
+
+	rawNode, err := json.Marshal(PlanNodeSpec{
+		Key:          "step1",
+		NodeID:       "macmini",
+		Workdir:      "/w",
+		Agent:        "codex",
+		Prompt:       "go",
+		Labels:       map[string]string{"stage": "build"},
+		ResultSchema: json.RawMessage("{}"),
+	})
+	if err != nil {
+		t.Fatalf("marshal PlanNodeSpec: %v", err)
+	}
+	if !strings.Contains(string(rawNode), `"result_schema":{}`) || !strings.Contains(string(rawNode), `"stage":"build"`) {
+		t.Fatalf("expected PlanNodeSpec labels & result_schema:{}, got %s", string(rawNode))
+	}
+
+	// 2. RunRecord omits unset Slice 3 fields and preserves primitives, null, and >2^53 integers
+	rawMin, err := json.Marshal(RunRecord{
+		ID:        "run_s3_min",
+		ThreadID:  "thr_s3",
+		RootRunID: "run_s3_min",
+		NodeID:    "macmini",
+		Workdir:   "/w",
+		Agent:     "agy",
+		Status:    "done",
+		CreatedAt: "2026-11-22T00:00:00Z",
+		UpdatedAt: "2026-11-22T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var minMap map[string]interface{}
+	_ = json.Unmarshal(rawMin, &minMap)
+	for _, k := range []string{"labels", "result_schema", "result"} {
+		if _, exists := minMap[k]; exists {
+			t.Fatalf("expected %q omitted on minimal RunRecord, got %s", k, string(rawMin))
+		}
+	}
+
+	for _, rawVal := range []string{
+		`false`,
+		`0`,
+		`""`,
+		`[]`,
+		`{}`,
+		`null`,
+		`{"big":9007199254740993}`,
+	} {
+		rec := RunRecord{
+			ID:           "run_s3_val",
+			ThreadID:     "thr_s3",
+			RootRunID:    "run_s3_val",
+			NodeID:       "macmini",
+			Workdir:      "/w",
+			Agent:        "agy",
+			Status:       "done",
+			Labels:       map[string]string{"env": "prod"},
+			ResultSchema: json.RawMessage(`{"type":["object","array","string","number","boolean","null"]}`),
+			Result:       json.RawMessage(rawVal),
+			CreatedAt:    "2026-11-22T00:00:00Z",
+			UpdatedAt:    "2026-11-22T00:00:00Z",
+		}
+		b, err := json.Marshal(rec)
+		if err != nil {
+			t.Fatalf("marshal RunRecord with result %s: %v", rawVal, err)
+		}
+		var roundTrip RunRecord
+		if err := json.Unmarshal(b, &roundTrip); err != nil {
+			t.Fatalf("unmarshal RunRecord with result %s: %v", rawVal, err)
+		}
+		if string(roundTrip.Result) != rawVal {
+			t.Fatalf("RunRecord.Result round-trip mismatch: got %s, want %s", string(roundTrip.Result), rawVal)
+		}
+	}
+
+	// 3. CompleteRunRequest omits nil Result / empty ResultError, preserves explicit null Result
+	compOmit, err := json.Marshal(CompleteRunRequest{
+		LeaseOwner: "macmini:n1",
+		Status:     "done",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(compOmit), `"result"`) || strings.Contains(string(compOmit), `"result_error"`) {
+		t.Fatalf("expected result & result_error omitted when unset, got %s", string(compOmit))
+	}
+
+	compNull, err := json.Marshal(CompleteRunRequest{
+		LeaseOwner: "macmini:n1",
+		Status:     "done",
+		Result:     json.RawMessage("null"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(compNull), `"result":null`) || strings.Contains(string(compNull), `"result_error"`) {
+		t.Fatalf("expected explicit result:null without result_error, got %s", string(compNull))
+	}
+
+	compErr, err := json.Marshal(CompleteRunRequest{
+		LeaseOwner:  "macmini:n1",
+		Status:      "done",
+		ResultError: "AHUB_RESULT_FILE invalid JSON",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(compErr), `"result":`) || !strings.Contains(string(compErr), `"result_error":"AHUB_RESULT_FILE invalid JSON"`) {
+		t.Fatalf("expected result_error without result, got %s", string(compErr))
+	}
+
+	// 4. BuildListRunsQuery & ListRunsWithOptions repeatable label=k=v encoding
+	q := BuildListRunsQuery(ListRunsOptions{
+		Status: "done",
+		Labels: []string{"env=prod", "ahub.plan=pln_1", "k=a=b"},
+	})
+	gotLabels := q["label"]
+	if len(gotLabels) != 3 || gotLabels[0] != "env=prod" || gotLabels[1] != "ahub.plan=pln_1" || gotLabels[2] != "k=a=b" {
+		t.Fatalf("unexpected BuildListRunsQuery labels: %#v", gotLabels)
+	}
+	encoded := q.Encode()
+	if !strings.Contains(encoded, "label=env%3Dprod&label=ahub.plan%3Dpln_1&label=k%3Da%3Db") {
+		t.Fatalf("unexpected encoded query: %q", encoded)
+	}
+
+	var seenQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"runs":[]}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "ahub_cli_test")
+	if _, err := c.ListRunsWithOptions(context.Background(), ListRunsOptions{
+		Labels: []string{"env=prod", "ahub.plan=pln_1", "k=a=b"},
+	}); err != nil {
+		t.Fatalf("ListRunsWithOptions failed: %v", err)
+	}
+	if !strings.Contains(seenQuery, "label=env%3Dprod&label=ahub.plan%3Dpln_1&label=k%3Da%3Db") {
+		t.Fatalf("server received unexpected query: %q", seenQuery)
+	}
+}

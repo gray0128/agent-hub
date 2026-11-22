@@ -5,7 +5,8 @@ import {
   isNodeVisibleToPrincipal
 } from "./auth";
 import { postSystemRunHandoffToBoard, type SystemRunHandoffResult } from "./board";
-import { buildPromptPreview, redactSecrets } from "./redact";
+import { deepEqualJson, isPlainJsonObject, validateValueAgainstSchema } from "./json-schema-subset";
+import { buildPromptPreview, redactJsonValue, redactSecrets } from "./redact";
 import {
   type AgentName,
   type ApiKeyRecord,
@@ -52,11 +53,13 @@ import {
   type ParsedCreateRun,
   type ParsedNativeEventCreate,
   type ResolveRunInput,
+  utf8ByteLength,
   VALID_PUSH_EVENT_FILTER_KEYS
 } from "./validation";
 import { type WebPushSendResult } from "./web-push";
 
 const MAX_OUTPUT_MD_BYTES = 900 * 1024;
+const MAX_RESULT_JSON_BYTES = 65536;
 
 interface NodeRow {
   id: string;
@@ -206,6 +209,9 @@ export interface RunRow {
   retry_of_run_id?: string | null;
   actor_profile?: string;
   board_topic_id?: string | null;
+  labels_json?: string;
+  result_schema_json?: string | null;
+  result_json?: string | null;
 }
 
 interface ApiKeyRow {
@@ -235,6 +241,51 @@ export function parseJsonObject(raw: string): Record<string, unknown> {
     // fall through
   }
   return {};
+}
+
+export function parseRunLabelsJson(raw: string | null | undefined): Record<string, string> {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    if (!isPlainJsonObject(parsed)) return {};
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(parsed)) {
+      if (typeof v === "string") {
+        Object.defineProperty(out, k, {
+          value: v,
+          enumerable: true,
+          writable: true,
+          configurable: true
+        });
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+export function parseNullableJsonObject(
+  raw: string | null | undefined
+): Record<string, unknown> | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return isPlainJsonObject(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+export function parseNullableRedactedJsonValue(raw: string | null | undefined): unknown | null {
+  if (raw === null || raw === undefined || raw === "") {
+    return null;
+  }
+  try {
+    return redactJsonValue(JSON.parse(raw));
+  } catch {
+    return null;
+  }
 }
 
 export function parseWorkspaces(raw: string): WorkspaceEntry[] {
@@ -604,10 +655,23 @@ export function mapNativeEventRow(
   return record;
 }
 
+export function deriveThreadTitle(title: string | undefined, prompt: string): string {
+  const explicit = title?.trim();
+  if (explicit) {
+    return redactSecrets(explicit).slice(0, 200);
+  }
+  const trimmedPrompt = prompt.trim();
+  const firstLine = trimmedPrompt.split(/\r?\n/)[0] ?? "";
+  const redactedLine = firstLine.includes("-----BEGIN ")
+    ? (redactSecrets(trimmedPrompt).split(/\r?\n/)[0] ?? "")
+    : redactSecrets(firstLine);
+  return redactedLine.slice(0, 80);
+}
+
 export function mapThreadRow(row: ThreadRow): ThreadRecord {
   return {
     id: row.id,
-    title: row.title,
+    title: redactSecrets(row.title),
     node_id: row.node_id,
     workdir: row.workdir,
     project_key: row.project_key,
@@ -822,15 +886,18 @@ export function mapRunRow(
     board_topic_id: row.board_topic_id ?? null,
     depends_on_run_ids: options.dependsOnRunIds ?? [],
     blocked_reason: blockedReason,
+    labels: parseRunLabelsJson(row.labels_json),
+    result_schema: parseNullableJsonObject(row.result_schema_json),
+    result: parseNullableRedactedJsonValue(row.result_json),
     priority_order: row.priority_order,
     resolved_model: row.resolved_model,
     resolved_effort: row.resolved_effort,
     native_session_id: row.native_session_id,
-    remote_control_url: row.remote_control_url,
-    summary: row.summary,
+    remote_control_url: redactSecrets(row.remote_control_url),
+    summary: redactSecrets(row.summary),
     output_bytes: row.output_bytes,
     error_code: row.error_code,
-    error_message: row.error_message,
+    error_message: redactSecrets(row.error_message),
     notify_status: row.notify_status,
     lease_expires_at: row.lease_expires_at,
     started_at: row.started_at,
@@ -854,10 +921,10 @@ export function mapRunRow(
     record.deliveries_summary = options.deliveriesSummary;
   }
   if (view === "full") {
-    record.output_md = row.output_md;
+    record.output_md = redactSecrets(row.output_md);
     record.truncated = false;
   } else if (view === "summary") {
-    const tail = sanitizeTailPreview(row.output_md, tailBytes);
+    const tail = sanitizeTailPreview(redactSecrets(row.output_md), tailBytes);
     record.output_preview = tail.preview;
     record.truncated = tail.truncated || row.output_bytes > tail.totalBytes;
   }
@@ -1120,6 +1187,28 @@ async function ensureThreadAccessible(
   }
 }
 
+export async function ensureParentRunDelegatable(
+  db: D1Database,
+  principal: AuthPrincipal,
+  parent: { node_id: string; created_by_key_id: string | null }
+): Promise<void> {
+  if (principal.scope === "admin") return;
+  ensureNodeAllowedForClient(principal, parent.node_id);
+  if (parent.created_by_key_id !== null && parent.created_by_key_id !== principal.keyId) {
+    const owner = await db
+      .prepare(`SELECT scope FROM api_keys WHERE id = ?1 LIMIT 1`)
+      .bind(parent.created_by_key_id)
+      .first<{ scope: ApiScope }>();
+    if (!owner || owner.scope !== "admin") {
+      throw new HubError(
+        403,
+        "FORBIDDEN_SCOPE",
+        "Client key cannot delegate from a parent run created by another client key."
+      );
+    }
+  }
+}
+
 export async function getNodeById(db: D1Database, nodeId: string): Promise<NodeRecord | null> {
   const row = await db.prepare(`${NODE_SELECT_SQL} WHERE n.id = ?1`).bind(nodeId).first<NodeRow>();
   return row ? mapNodeRow(row) : null;
@@ -1313,6 +1402,7 @@ export async function createRun(
     }
   }
   const effectiveIdemKey = input.idempotencyKey ?? headerIdempotencyKey;
+  const dbIdemKey = effectiveIdemKey ? `run:${effectiveIdemKey}` : null;
 
   if (input.boardTopicId) {
     const topicRow = await db
@@ -1402,43 +1492,6 @@ export async function createRun(
     }
   }
 
-  const checkExistingIdempotency = async (existing: RunRow): Promise<{ run: RunRow; deduplicated: boolean }> => {
-    ensureRunAccessible(principal, existing);
-    const existingDepsRes = await db
-      .prepare(`SELECT depends_on_run_id FROM run_dependencies WHERE run_id = ?1`)
-      .bind(existing.id)
-      .all<{ depends_on_run_id: string }>();
-    const actualDeps = (existingDepsRes.results ?? []).map((r) => r.depends_on_run_id);
-    const depsEqual = await dependencySetsMatchWithRetryLineage(db, depRunIds, actualDeps);
-    if (
-      existing.node_id !== targetNodeId ||
-      existing.workdir !== resolvedWorkdir ||
-      existing.agent !== agent ||
-      existing.prompt !== input.prompt ||
-      (existing.board_topic_id ?? null) !== (input.boardTopicId ?? null) ||
-      (existing.actor_profile ?? "") !== (input.actorProfile ?? "") ||
-      (existing.scheduled_at ?? null) !== (input.scheduledAt ?? null) ||
-      !depsEqual
-    ) {
-      throw new HubError(
-        409,
-        "IDEMPOTENCY_CONFLICT",
-        "Idempotency-Key already used with different run parameters."
-      );
-    }
-    return { run: existing, deduplicated: true };
-  };
-
-  if (effectiveIdemKey) {
-    const existing = await db
-      .prepare(`SELECT * FROM runs WHERE idempotency_key = ?1 LIMIT 1`)
-      .bind(effectiveIdemKey)
-      .first<RunRow>();
-    if (existing) {
-      return checkExistingIdempotency(existing);
-    }
-  }
-
   const defaultMaxDepth = Number.parseInt(env.DEFAULT_MAX_DEPTH || "1", 10);
   const baseMaxDepth = Number.isFinite(defaultMaxDepth) ? Math.min(Math.max(defaultMaxDepth, 0), 3) : 1;
 
@@ -1450,7 +1503,10 @@ export async function createRun(
 
   if (input.parentRunId) {
     const parent = await db
-      .prepare(`SELECT id, root_run_id, depth, max_depth, node_id, workdir FROM runs WHERE id = ?1`)
+      .prepare(
+        `SELECT id, root_run_id, depth, max_depth, node_id, workdir, created_by_key_id
+         FROM runs WHERE id = ?1`
+      )
       .bind(input.parentRunId)
       .first<{
         id: string;
@@ -1459,10 +1515,12 @@ export async function createRun(
         max_depth: number;
         node_id: string;
         workdir: string;
+        created_by_key_id: string | null;
       }>();
     if (!parent) {
       throw new HubError(400, "BAD_REQUEST", `Parent run '${input.parentRunId}' not found.`);
     }
+    await ensureParentRunDelegatable(db, principal, parent);
     parentRunId = parent.id;
     rootRunId = parent.root_run_id;
     depth = parent.depth + 1;
@@ -1479,6 +1537,64 @@ export async function createRun(
     await assertNoDelegationCycle(db, parent.id, targetNodeId, resolvedWorkdir);
   }
 
+  const checkExistingIdempotency = async (existing: RunRow): Promise<{ run: RunRow; deduplicated: boolean }> => {
+    ensureRunAccessible(principal, existing);
+    if (existing.plan_id !== null || existing.retry_of_run_id !== null) {
+      throw new HubError(
+        409,
+        "IDEMPOTENCY_CONFLICT",
+        "Idempotency-Key already used by a plan or retry run."
+      );
+    }
+    const existingDepsRes = await db
+      .prepare(`SELECT depends_on_run_id FROM run_dependencies WHERE run_id = ?1`)
+      .bind(existing.id)
+      .all<{ depends_on_run_id: string }>();
+    const actualDeps = (existingDepsRes.results ?? []).map((r) => r.depends_on_run_id);
+    const depsEqual = await dependencySetsMatchWithRetryLineage(db, depRunIds, actualDeps);
+    const labelsEqual = deepEqualJson(parseRunLabelsJson(existing.labels_json), input.labels ?? {});
+    const schemaEqual = deepEqualJson(
+      parseNullableJsonObject(existing.result_schema_json),
+      input.resultSchema ?? null
+    );
+    if (
+      existing.node_id !== targetNodeId ||
+      existing.workdir !== resolvedWorkdir ||
+      existing.agent !== agent ||
+      existing.model !== input.model ||
+      existing.effort !== input.effort ||
+      (existing.sandbox === 1) !== input.sandbox ||
+      existing.timeout_sec !== input.timeoutSec ||
+      existing.prompt !== input.prompt ||
+      existing.notify_policy_json !== JSON.stringify(input.notify) ||
+      (existing.parent_run_id ?? null) !== (input.parentRunId ?? null) ||
+      (input.threadId !== undefined && existing.thread_id !== input.threadId) ||
+      (existing.board_topic_id ?? null) !== (input.boardTopicId ?? null) ||
+      (existing.actor_profile ?? "") !== (input.actorProfile ?? "") ||
+      (existing.scheduled_at ?? null) !== (input.scheduledAt ?? null) ||
+      !depsEqual ||
+      !labelsEqual ||
+      !schemaEqual
+    ) {
+      throw new HubError(
+        409,
+        "IDEMPOTENCY_CONFLICT",
+        "Idempotency-Key already used with different run parameters."
+      );
+    }
+    return { run: existing, deduplicated: true };
+  };
+
+  if (dbIdemKey) {
+    const existing = await db
+      .prepare(`SELECT * FROM runs WHERE idempotency_key = ?1 LIMIT 1`)
+      .bind(dbIdemKey)
+      .first<RunRow>();
+    if (existing) {
+      return checkExistingIdempotency(existing);
+    }
+  }
+
   const now = nowIso();
   const scheduledAt = input.scheduledAt ?? null;
   const initialStatus: RunStatus =
@@ -1488,7 +1604,7 @@ export async function createRun(
   let threadId = threadRow?.id;
   if (!threadId) {
     threadId = newId("thr");
-    const derivedTitle = input.title?.trim() || input.prompt.trim().split(/\r?\n/)[0]!.slice(0, 80);
+    const derivedTitle = deriveThreadTitle(input.title, input.prompt);
     statements.push(
       db
         .prepare(
@@ -1511,6 +1627,9 @@ export async function createRun(
     .first<{ max_p: number }>();
   const nextPriority = (priorityRow?.max_p ?? 0) + 100;
 
+  const labelsJson = JSON.stringify(input.labels ?? {});
+  const resultSchemaJson = input.resultSchema ? JSON.stringify(input.resultSchema) : null;
+
   statements.push(
     db
       .prepare(
@@ -1519,13 +1638,15 @@ export async function createRun(
            node_id, workdir, agent, model, effort, sandbox, timeout_sec, prompt,
            status, priority_order, idempotency_key, created_by_key_id,
            native_session_id, notify_policy_json, notify_status, created_at, updated_at,
-           plan_id, plan_key, scheduled_at, retry_of_run_id, actor_profile, board_topic_id
+           plan_id, plan_key, scheduled_at, retry_of_run_id, actor_profile, board_topic_id,
+           labels_json, result_schema_json, result_json
          ) VALUES (
            ?1, ?2, ?3, ?4, ?5, ?6,
            ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
            ?15, ?16, ?17, ?18,
            ?19, ?20, 'none', ?21, ?21,
-           NULL, NULL, ?22, NULL, ?23, ?24
+           NULL, NULL, ?22, NULL, ?23, ?24,
+           ?25, ?26, NULL
          )`
       )
       .bind(
@@ -1545,14 +1666,16 @@ export async function createRun(
         input.prompt,
         initialStatus,
         nextPriority,
-        effectiveIdemKey ?? null,
+        dbIdemKey,
         principal.keyId,
         threadRow?.native_session_id ?? null,
         JSON.stringify(input.notify),
         now,
         scheduledAt,
         input.actorProfile ?? "",
-        input.boardTopicId ?? null
+        input.boardTopicId ?? null,
+        labelsJson,
+        resultSchemaJson
       )
   );
 
@@ -1570,10 +1693,10 @@ export async function createRun(
   try {
     await db.batch(statements);
   } catch (err) {
-    if (effectiveIdemKey) {
+    if (dbIdemKey) {
       const raced = await db
         .prepare(`SELECT * FROM runs WHERE idempotency_key = ?1 LIMIT 1`)
-        .bind(effectiveIdemKey)
+        .bind(dbIdemKey)
         .first<RunRow>();
       if (raced) {
         return checkExistingIdempotency(raced);
@@ -1792,6 +1915,7 @@ export async function applyRunStateFrame(
       .run();
     if ((res.meta.changes ?? 0) === 0) return null;
   } else if (targetStatus === "needs_approval") {
+    const redactedRemoteControlUrl = redactSecrets(extra.remoteControlUrl ?? "");
     const res = await db
       .prepare(
         `UPDATE runs
@@ -1801,7 +1925,7 @@ export async function applyRunStateFrame(
              updated_at = ?3
          WHERE id = ?4 AND node_id = ?5 AND lease_owner = ?6 AND status IN ('claimed', 'running')`
       )
-      .bind(extra.remoteControlUrl ?? "", nextExpiry, now, runId, nodeId, leaseOwner)
+      .bind(redactedRemoteControlUrl, nextExpiry, now, runId, nodeId, leaseOwner)
       .run();
     if ((res.meta.changes ?? 0) === 0) return null;
   } else {
@@ -1830,7 +1954,7 @@ export async function appendRunEvents(
         `INSERT OR IGNORE INTO run_events (run_id, seq, kind, payload_json, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5)`
       )
-      .bind(runId, ev.seq, ev.kind, JSON.stringify(ev.payload), ev.ts)
+      .bind(runId, ev.seq, ev.kind, JSON.stringify(redactJsonValue(ev.payload)), ev.ts)
   );
   await db.batch(stmts);
   return true;
@@ -2908,6 +3032,9 @@ export async function completeRun(
     durationMs: number;
     errorCode: string;
     errorMessage: string;
+    hasResult?: boolean;
+    result?: unknown;
+    resultError?: string;
   }
 ): Promise<{
   run: RunRow;
@@ -2915,8 +3042,104 @@ export async function completeRun(
   waitingDependents: RunRow[];
   boardHandoff: SystemRunHandoffResult | null;
 }> {
+  const existingPre = await db
+    .prepare(`SELECT status, node_id, lease_owner, result_schema_json FROM runs WHERE id = ?1 LIMIT 1`)
+    .bind(runId)
+    .first<{
+      status: RunStatus;
+      node_id: string;
+      lease_owner: string | null;
+      result_schema_json: string | null;
+    }>();
+  if (!existingPre) {
+    throw new HubError(404, "NOT_FOUND", `Run '${runId}' not found.`);
+  }
+  if (existingPre.node_id !== nodeId) {
+    throw new HubError(403, "FORBIDDEN_SCOPE", "Node key cannot complete another node's run.");
+  }
+  if (
+    existingPre.lease_owner !== input.leaseOwner ||
+    (existingPre.status !== "claimed" &&
+      existingPre.status !== "running" &&
+      existingPre.status !== "needs_approval")
+  ) {
+    throw new HubError(
+      409,
+      "INVALID_STATE_TRANSITION",
+      `Run '${runId}' cannot transition from '${existingPre.status}' to '${input.status}' with provided lease.`
+    );
+  }
+
+  let finalStatus: "done" | "failed" | "cancelled" = input.status;
+  let finalErrorCode = input.errorCode;
+  let finalErrorMessage = Array.from(redactSecrets(input.errorMessage)).slice(0, 4096).join("");
+  let finalResultJson: string | null = null;
+
+  if (input.status === "done") {
+    const schema = parseNullableJsonObject(existingPre.result_schema_json);
+    const hasResult = input.hasResult ?? input.result !== undefined;
+    const trimmedResultError = (input.resultError ?? "").trim();
+
+    let redactedResult: unknown = undefined;
+    let serializedResult: string | null = null;
+    let resultBytes = 0;
+    let serializeError = "";
+
+    if (hasResult) {
+      redactedResult = redactJsonValue(input.result);
+      try {
+        const s = JSON.stringify(redactedResult);
+        if (typeof s === "string") {
+          serializedResult = s;
+          resultBytes = utf8ByteLength(s);
+        } else {
+          serializeError = "Structured result is not JSON-serializable.";
+        }
+      } catch {
+        serializeError = "Structured result is not JSON-serializable.";
+      }
+    }
+
+    if (schema !== null) {
+      let mismatchReason = "";
+      if (trimmedResultError !== "") {
+        mismatchReason = trimmedResultError;
+      } else if (!hasResult) {
+        mismatchReason = "Structured result is required by result_schema, but no result was provided.";
+      } else if (serializeError !== "") {
+        mismatchReason = serializeError;
+      } else if (resultBytes > MAX_RESULT_JSON_BYTES) {
+        mismatchReason = `Structured result exceeds ${MAX_RESULT_JSON_BYTES} UTF-8 byte limit after redaction (${resultBytes} bytes).`;
+      } else {
+        const check = validateValueAgainstSchema(schema, redactedResult);
+        if (!check.valid) {
+          mismatchReason = `Structured result failed schema validation: ${check.errors.join("; ")}`;
+        }
+      }
+
+      if (mismatchReason !== "") {
+        finalStatus = "failed";
+        finalErrorCode = "RESULT_SCHEMA_MISMATCH";
+        finalErrorMessage = Array.from(redactSecrets(mismatchReason)).slice(0, 4096).join("");
+        finalResultJson = null;
+      } else {
+        finalResultJson = serializedResult;
+      }
+    } else if (
+      trimmedResultError === "" &&
+      hasResult &&
+      serializeError === "" &&
+      serializedResult !== null &&
+      resultBytes <= MAX_RESULT_JSON_BYTES
+    ) {
+      finalResultJson = serializedResult;
+    }
+  }
+
   const now = nowIso();
-  const truncatedOut = truncateUtf8Bytes(input.outputMd, MAX_OUTPUT_MD_BYTES);
+  const redactedSummary = redactSecrets(input.summary);
+  const redactedOutputMd = redactSecrets(input.outputMd);
+  const truncatedOut = truncateUtf8Bytes(redactedOutputMd, MAX_OUTPUT_MD_BYTES);
   const storedBytes = Math.max(input.outputBytes, truncatedOut.originalBytes);
   const res = await db
     .prepare(
@@ -2933,25 +3156,27 @@ export async function completeRun(
            duration_ms = ?8,
            error_code = ?9,
            error_message = ?10,
-           started_at = COALESCE(started_at, ?11),
-           finished_at = ?11,
-           updated_at = ?11
-       WHERE id = ?12
-         AND node_id = ?13
-         AND lease_owner = ?14
+           result_json = ?11,
+           started_at = COALESCE(started_at, ?12),
+           finished_at = ?12,
+           updated_at = ?12
+       WHERE id = ?13
+         AND node_id = ?14
+         AND lease_owner = ?15
          AND status IN ('claimed', 'running', 'needs_approval')`
     )
     .bind(
-      input.status,
+      finalStatus,
       input.nativeSessionId ?? "",
       input.resolvedModel,
       input.resolvedEffort,
-      input.summary,
+      redactedSummary,
       truncatedOut.value,
       storedBytes,
       input.durationMs,
-      input.errorCode,
-      input.errorMessage,
+      finalErrorCode,
+      finalErrorMessage,
+      finalResultJson,
       now,
       runId,
       nodeId,
@@ -3005,13 +3230,13 @@ export async function completeRun(
   ];
   await db.batch(postStmts);
 
-  await enqueueRunNotificationIfNeeded(db, env, updated, input.status);
+  await enqueueRunNotificationIfNeeded(db, env, updated, finalStatus);
   const finalRow = (await db.prepare(`SELECT * FROM runs WHERE id = ?1`).bind(runId).first<RunRow>())!;
   const boardHandoff = await postSystemRunHandoffToBoard(db, finalRow);
 
   let wokenRuns: RunRow[] = [];
   let waitingDependents: RunRow[] = [];
-  if (input.status === "done") {
+  if (finalStatus === "done") {
     const wakeResult = await wakeReadyWaitingDependents(db, runId, now);
     wokenRuns = wakeResult.wokenRuns;
     waitingDependents = wakeResult.remainingWaitingRuns;
@@ -3063,8 +3288,11 @@ export async function checkpointRunApproval(
 
   const now = nowIso();
   const nextExpiry = nowIso(leaseTtlSeconds * 1000);
-  const truncatedOut = truncateUtf8Bytes(input.outputMd, MAX_OUTPUT_MD_BYTES);
-  const storedBytes = input.outputMd ? Math.max(input.outputBytes, truncatedOut.originalBytes) : input.outputBytes;
+  const redactedRemoteControlUrl = redactSecrets(input.remoteControlUrl);
+  const redactedSummary = redactSecrets(input.summary);
+  const redactedOutputMd = redactSecrets(input.outputMd);
+  const truncatedOut = truncateUtf8Bytes(redactedOutputMd, MAX_OUTPUT_MD_BYTES);
+  const storedBytes = redactedOutputMd ? Math.max(input.outputBytes, truncatedOut.originalBytes) : input.outputBytes;
   const firstTransition = existing.status !== "needs_approval";
 
   const res = await db
@@ -3089,11 +3317,11 @@ export async function checkpointRunApproval(
     )
     .bind(
       nextExpiry,
-      input.remoteControlUrl,
+      redactedRemoteControlUrl,
       input.nativeSessionId ?? "",
       input.resolvedModel,
       input.resolvedEffort,
-      input.summary,
+      redactedSummary,
       truncatedOut.value,
       storedBytes,
       input.durationMs,
@@ -3178,9 +3406,9 @@ export async function resolveRunApproval(
   }
 
   const now = nowIso();
-  const nextSummary = input.summary?.trim()
-    ? input.summary.trim()
-    : existing.summary || "远控审批已完成并放行";
+  const nextSummary = redactSecrets(
+    input.summary?.trim() ? input.summary.trim() : existing.summary || "远控审批已完成并放行"
+  );
 
   const res = await db
     .prepare(
@@ -3308,6 +3536,7 @@ export async function cancelRun(
   }
 
   const now = nowIso();
+  const redactedReason = redactSecrets(options.reason);
   const cancelledRuns: RunRow[] = [];
   const cancelledIds: string[] = [];
   const abortTargets: Array<{ nodeId: string; runId: string }> = [];
@@ -3318,8 +3547,10 @@ export async function cancelRun(
     if (r.status === "done" || r.status === "failed" || r.status === "cancelled") {
       continue;
     }
-    const wasActive = r.status === "claimed" || r.status === "running" || r.status === "needs_approval";
-    const res = await db
+    let cancelledThisRun = false;
+    let cancelledFromActive = false;
+
+    const passiveRes = await db
       .prepare(
         `UPDATE runs
          SET status = 'cancelled',
@@ -3329,13 +3560,36 @@ export async function cancelRun(
              updated_at = ?1,
              error_code = 'CANCELLED',
              error_message = ?2
-         WHERE id = ?3 AND status IN ('waiting', 'queued', 'claimed', 'running', 'needs_approval')`
+         WHERE id = ?3 AND status IN ('waiting', 'queued')`
       )
-      .bind(now, options.reason, r.id)
+      .bind(now, redactedReason, r.id)
       .run();
 
-    if ((res.meta.changes ?? 0) === 1) {
-      if (wasActive) {
+    if ((passiveRes.meta.changes ?? 0) === 1) {
+      cancelledThisRun = true;
+    } else {
+      const activeRes = await db
+        .prepare(
+          `UPDATE runs
+           SET status = 'cancelled',
+               lease_owner = NULL,
+               lease_expires_at = NULL,
+               finished_at = ?1,
+               updated_at = ?1,
+               error_code = 'CANCELLED',
+               error_message = ?2
+           WHERE id = ?3 AND status IN ('claimed', 'running', 'needs_approval')`
+        )
+        .bind(now, redactedReason, r.id)
+        .run();
+      if ((activeRes.meta.changes ?? 0) === 1) {
+        cancelledThisRun = true;
+        cancelledFromActive = true;
+      }
+    }
+
+    if (cancelledThisRun) {
+      if (cancelledFromActive) {
         affectedNodes.add(r.node_id);
         abortTargets.push({ nodeId: r.node_id, runId: r.id });
       }
@@ -3616,6 +3870,8 @@ export async function patchThread(
   await ensureThreadAccessible(db, principal, existing);
 
   const now = nowIso();
+  const nextTitle =
+    patch.title !== undefined ? redactSecrets(patch.title.trim()).slice(0, 160) : redactSecrets(existing.title);
   await db
     .prepare(
       `UPDATE threads
@@ -3623,7 +3879,7 @@ export async function patchThread(
        WHERE id = ?6`
     )
     .bind(
-      patch.title ?? existing.title,
+      nextTitle,
       patch.status ?? existing.status,
       patch.pinned !== undefined ? (patch.pinned ? 1 : 0) : existing.pinned,
       patch.sortOrder ?? existing.sort_order,
@@ -3653,14 +3909,17 @@ export async function forkThread(
     .bind(threadId)
     .first<{ summary: string; output_md: string; prompt: string }>();
 
-  const contextExcerpt = latestRun?.summary?.trim()
-    ? latestRun.summary.trim()
-    : (latestRun?.output_md?.slice(0, 1200) || latestRun?.prompt || "");
+  const contextExcerpt = redactSecrets(
+    latestRun?.summary?.trim()
+      ? latestRun.summary.trim()
+      : (latestRun?.output_md?.slice(0, 1200) || latestRun?.prompt || "")
+  );
 
   const forkPrompt = contextExcerpt
     ? `Forked from thread ${source.id} (${source.node_id}:${source.workdir}).\n\nPrevious context summary:\n${contextExcerpt}\n\nPlease inspect this workspace and confirm readiness to continue.`
     : `Forked from thread ${source.id}. Please inspect this workspace and summarize current status.`;
 
+  const forkTitle = redactSecrets(input.title?.trim() || `${redactSecrets(source.title)} (fork)`);
   const created = await createRun(db, env, principal, {
     nodeId: input.nodeId,
     workdir: input.workdir,
@@ -3670,7 +3929,7 @@ export async function forkThread(
     sandbox: true,
     timeoutSec: 900,
     prompt: forkPrompt,
-    title: input.title ?? `${source.title} (fork)`,
+    title: forkTitle,
     notify: { target: "none" }
   });
 
@@ -3692,6 +3951,7 @@ export async function listRuns(
     rootRunId?: string;
     planId?: string;
     boardTopicId?: string;
+    labels?: Array<{ key: string; value: string }>;
     limit: number;
   }
 ): Promise<RunRecord[]> {
@@ -3722,9 +3982,23 @@ export async function listRuns(
     binds.push(filters.boardTopicId);
     where.push(`board_topic_id = ?${binds.length}`);
   }
-  if (principal.scope === "client" && principal.keyId) {
-    binds.push(principal.keyId);
-    where.push(`created_by_key_id = ?${binds.length}`);
+  if (filters.labels && filters.labels.length > 0) {
+    for (const label of filters.labels) {
+      binds.push(label.key, label.value);
+      const kIdx = binds.length - 1;
+      const vIdx = binds.length;
+      where.push(
+        `EXISTS (SELECT 1 FROM json_each(runs.labels_json) AS j WHERE j.key = ?${kIdx} AND j.type = 'text' AND j.value = ?${vIdx})`
+      );
+    }
+  }
+  if (principal.scope === "client") {
+    if (principal.keyId) {
+      binds.push(principal.keyId);
+      where.push(`created_by_key_id = ?${binds.length}`);
+    } else {
+      where.push(`1 = 0`);
+    }
   }
 
   binds.push(filters.limit);

@@ -38,7 +38,7 @@ func (c *Client) RetryRun(ctx context.Context, runID string, req RetryRunRequest
 	return &res, nil
 }
 
-func (c *Client) ListRunsWithOptions(ctx context.Context, opts ListRunsOptions) ([]RunRecord, error) {
+func BuildListRunsQuery(opts ListRunsOptions) url.Values {
 	q := url.Values{}
 	if opts.NodeID != "" {
 		q.Set("node_id", opts.NodeID)
@@ -58,9 +58,19 @@ func (c *Client) ListRunsWithOptions(ctx context.Context, opts ListRunsOptions) 
 	if opts.BoardTopicID != "" {
 		q.Set("board_topic_id", opts.BoardTopicID)
 	}
+	for _, lbl := range opts.Labels {
+		if lbl != "" {
+			q.Add("label", lbl)
+		}
+	}
 	if opts.Limit > 0 {
 		q.Set("limit", strconv.Itoa(opts.Limit))
 	}
+	return q
+}
+
+func (c *Client) ListRunsWithOptions(ctx context.Context, opts ListRunsOptions) ([]RunRecord, error) {
+	q := BuildListRunsQuery(opts)
 	path := "/api/v1/runs"
 	if encoded := q.Encode(); encoded != "" {
 		path += "?" + encoded

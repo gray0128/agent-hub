@@ -5,6 +5,7 @@ import {
   AlertTriangle,
   ArrowLeftRight,
   Bell,
+  Braces,
   ChevronDown,
   ChevronUp,
   Clock,
@@ -62,6 +63,32 @@ const NOTIFY_LABELS: Record<ComposerDraft["notifyTarget"], string> = {
   webhook: "Bot Webhook",
   grok: "Grok"
 };
+const RESULT_TEXT_ENCODER = new TextEncoder();
+
+function formatStructuredResult(value: unknown): {
+  formatted: string;
+  bytes: number;
+  metricLabel: string;
+} {
+  let formatted: string;
+  try {
+    formatted = JSON.stringify(value, null, 2) ?? String(value);
+  } catch {
+    formatted = String(value);
+  }
+  const bytes = RESULT_TEXT_ENCODER.encode(formatted).length;
+  let metricLabel: string;
+  if (Array.isArray(value)) {
+    metricLabel = `${value.length} 项`;
+  } else if (typeof value === "object" && value !== null) {
+    metricLabel = `${Object.keys(value as Record<string, unknown>).length} 字段`;
+  } else if (typeof value === "string") {
+    metricLabel = `${[...value].length} 字符`;
+  } else {
+    metricLabel = typeof value;
+  }
+  return { formatted, bytes, metricLabel };
+}
 
 export interface ConversationPaneProps {
   nodes: NodeRecord[];
@@ -76,6 +103,8 @@ export interface ConversationPaneProps {
   composerNotice?: string | null;
   submitting: boolean;
   retryingRunIds?: Record<string, boolean>;
+  activeLabelFilters?: string[];
+  onToggleLabelFilter?: (kv: string) => void;
   onPatchComposer: (patch: Partial<ComposerDraft>) => void;
   onDismissComposerNotice?: () => void;
   onSelectRun: (runId: string) => void;
@@ -105,6 +134,8 @@ export function ConversationPane({
   composerNotice,
   submitting,
   retryingRunIds = {},
+  activeLabelFilters = [],
+  onToggleLabelFilter,
   onPatchComposer,
   onDismissComposerNotice,
   onSelectRun,
@@ -399,6 +430,11 @@ export function ConversationPane({
             const isLongOutput =
               hasFullOutput && (fullText.length > LONG_OUTPUT_CHARS || lineCount > LONG_OUTPUT_LINES);
             const outputExpanded = Boolean(expandedOutputs[run.id]);
+            const labelEntries = Object.entries(run.labels ?? {}).slice(0, 16);
+            const structuredResult =
+              run.result !== null && run.result !== undefined
+                ? formatStructuredResult(run.result)
+                : null;
 
             return (
               <article
@@ -611,6 +647,47 @@ export function ConversationPane({
                   </div>
                 </div>
 
+                {labelEntries.length > 0 ? (
+                  <div
+                    data-testid={`run-labels-${run.id}`}
+                    onClick={(e) => e.stopPropagation()}
+                    className="mt-1.5 flex min-w-0 flex-wrap items-center gap-1 cursor-auto"
+                  >
+                    {labelEntries.map(([k, v]) => {
+                      const kv = `${k}=${v}`;
+                      const isActiveLabel = activeLabelFilters.includes(kv);
+                      return onToggleLabelFilter ? (
+                        <button
+                          key={k}
+                          type="button"
+                          data-testid={`run-label-chip-${run.id}-${k}`}
+                          data-label-kv={kv}
+                          aria-pressed={isActiveLabel}
+                          onClick={() => onToggleLabelFilter(kv)}
+                          title={isActiveLabel ? `取消按标签筛选：${kv}` : `按标签筛选：${kv}`}
+                          className={cn(
+                            "inline-flex min-h-11 min-w-11 md:min-h-0 md:min-w-0 max-w-full items-center gap-1 rounded-[4px] border px-2 md:px-1.5 py-0.5 font-mono text-xs md:text-[10px] transition-[color,background-color,border-color] duration-150 cursor-pointer",
+                            isActiveLabel
+                              ? "border-[var(--status-running)]/60 bg-[var(--status-running)]/12 text-foreground"
+                              : "border-border bg-background/60 text-muted-foreground hover:border-foreground/30 hover:text-foreground"
+                          )}
+                        >
+                          <span className="truncate">{kv}</span>
+                        </button>
+                      ) : (
+                        <span
+                          key={k}
+                          data-testid={`run-label-chip-${run.id}-${k}`}
+                          data-label-kv={kv}
+                          className="inline-flex max-w-full items-center rounded-[4px] border border-border bg-background/60 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground"
+                        >
+                          <span className="truncate">{kv}</span>
+                        </span>
+                      );
+                    })}
+                  </div>
+                ) : null}
+
                 {cmdExpanded ? (
                   <div
                     onClick={(e) => e.stopPropagation()}
@@ -720,9 +797,72 @@ export function ConversationPane({
                   </div>
                 ) : null}
 
-                {run.error_message ? (
-                  <div className="mt-2 border-l-2 border-[var(--status-failed)] pl-3 text-xs text-[var(--status-failed)] font-mono">
+                {run.error_code === "RESULT_SCHEMA_MISMATCH" ? (
+                  <div
+                    data-testid={`run-schema-mismatch-banner-${run.id}`}
+                    data-error-code="RESULT_SCHEMA_MISMATCH"
+                    role="alert"
+                    onClick={(e) => e.stopPropagation()}
+                    className="mt-2 rounded-[6px] border border-[var(--status-failed)]/40 bg-[var(--status-failed)]/10 px-3 py-2 text-xs text-[var(--status-failed)] cursor-auto"
+                  >
+                    <div className="flex items-center gap-1.5 font-medium">
+                      <AlertTriangle
+                        className="h-3.5 w-3.5 shrink-0"
+                        strokeWidth={1.75}
+                        aria-hidden="true"
+                      />
+                      <span>结构化结果校验失败 (RESULT_SCHEMA_MISMATCH)</span>
+                    </div>
+                    {run.error_message ? (
+                      <p className="mt-1 font-mono text-[11px] break-words text-pretty">
+                        {run.error_message}
+                      </p>
+                    ) : null}
+                  </div>
+                ) : run.error_message ? (
+                  <div
+                    data-testid={`run-error-banner-${run.id}`}
+                    data-error-code={run.error_code || "ERROR"}
+                    className="mt-2 border-l-2 border-[var(--status-failed)] pl-3 text-xs text-[var(--status-failed)] font-mono"
+                  >
                     [{run.error_code || "ERROR"}] {run.error_message}
+                  </div>
+                ) : null}
+
+                {structuredResult ? (
+                  <div
+                    data-testid={`run-result-viewer-${run.id}`}
+                    onClick={(e) => e.stopPropagation()}
+                    className="mt-2 min-w-0 max-w-full overflow-hidden rounded-[6px] border border-border bg-muted/30 p-2.5 cursor-auto"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-muted-foreground tabular-nums">
+                      <div className="flex min-w-0 flex-wrap items-center gap-2">
+                        <span className="inline-flex items-center gap-1.5 font-medium text-foreground">
+                          <Braces
+                            className="h-3.5 w-3.5 shrink-0 text-[var(--status-done)]"
+                            strokeWidth={1.75}
+                            aria-hidden="true"
+                          />
+                          结构化结果 (result)
+                        </span>
+                        <span className="font-mono text-[10px] text-muted-foreground tabular-nums">
+                          {structuredResult.metricLabel} · {formatBytes(structuredResult.bytes)}
+                        </span>
+                      </div>
+                      <CopyButton
+                        text={structuredResult.formatted}
+                        label="复制 JSON"
+                        copiedLabel="已复制"
+                        variant="outline"
+                        testId={`copy-run-result-${run.id}`}
+                      />
+                    </div>
+                    <pre
+                      data-testid={`run-result-json-${run.id}`}
+                      className="mt-1.5 max-h-72 max-w-full overflow-auto rounded-[4px] border border-border bg-background/70 p-2 font-mono text-[11px] leading-relaxed text-foreground whitespace-pre-wrap break-all"
+                    >
+                      {structuredResult.formatted}
+                    </pre>
                   </div>
                 ) : null}
 

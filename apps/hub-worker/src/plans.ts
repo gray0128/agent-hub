@@ -6,12 +6,17 @@ import {
 import {
   assertNoDelegationCycle,
   dependencySetsMatchWithRetryLineage,
+  deriveThreadTitle,
+  ensureParentRunDelegatable,
   getNodeById,
   hydrateRunRecord,
   hydrateRunRecords,
+  parseNullableJsonObject,
+  parseRunLabelsJson,
   resolveWorkspace,
   type RunRow
 } from "./db";
+import { deepEqualJson } from "./json-schema-subset";
 import {
   type AuthPrincipal,
   type Env,
@@ -200,6 +205,7 @@ export async function createPlan(
     max_depth: number;
     node_id: string;
     workdir: string;
+    created_by_key_id: string | null;
   } | null = null;
   let depth = 0;
   let maxDepth =
@@ -207,7 +213,10 @@ export async function createPlan(
 
   if (input.parentRunId) {
     parentRun = await db
-      .prepare(`SELECT id, root_run_id, depth, max_depth, node_id, workdir FROM runs WHERE id = ?1`)
+      .prepare(
+        `SELECT id, root_run_id, depth, max_depth, node_id, workdir, created_by_key_id
+         FROM runs WHERE id = ?1`
+      )
       .bind(input.parentRunId)
       .first<{
         id: string;
@@ -216,10 +225,12 @@ export async function createPlan(
         max_depth: number;
         node_id: string;
         workdir: string;
+        created_by_key_id: string | null;
       }>();
     if (!parentRun) {
       throw new HubError(400, "BAD_REQUEST", `Parent run '${input.parentRunId}' not found.`);
     }
+    await ensureParentRunDelegatable(db, principal, parentRun);
     depth = parentRun.depth + 1;
     maxDepth =
       principal.scope === "client"
@@ -325,6 +336,20 @@ export async function createPlan(
       }
     }
 
+    const existingThreadIds = Array.from(new Set(existingRows.map((r) => r.thread_id)));
+    const threadTitleById = new Map<string, string>();
+    for (let i = 0; i < existingThreadIds.length; i += chunkSize) {
+      const chunk = existingThreadIds.slice(i, i + chunkSize);
+      const placeholders = chunk.map((_, idx) => `?${idx + 1}`).join(", ");
+      const threadRes = await db
+        .prepare(`SELECT id, title FROM threads WHERE id IN (${placeholders})`)
+        .bind(...chunk)
+        .all<{ id: string; title: string }>();
+      for (const row of threadRes.results ?? []) {
+        threadTitleById.set(row.id, row.title);
+      }
+    }
+
     for (const spec of input.nodes) {
       const existing = existingByKey.get(spec.key);
       if (!existing) {
@@ -352,6 +377,16 @@ export async function createPlan(
       }
 
       const depsEqual = await dependencySetsMatchWithRetryLineage(db, expectedDepIds, actualDepIds);
+      const labelsEqual = deepEqualJson(parseRunLabelsJson(existing.labels_json), spec.labels);
+      const schemaEqual = deepEqualJson(
+        parseNullableJsonObject(existing.result_schema_json),
+        spec.resultSchema ?? null
+      );
+      const expectedTitle = deriveThreadTitle(spec.title, spec.prompt);
+      const actualTitle = threadTitleById.get(existing.thread_id);
+      const titleMatches = actualTitle !== undefined && actualTitle === expectedTitle;
+      const priorityMatches =
+        spec.priorityOrder === undefined || Number(existing.priority_order) === spec.priorityOrder;
       if (
         existing.node_id !== spec.nodeId ||
         existing.workdir !== resolved.workdir ||
@@ -366,7 +401,11 @@ export async function createPlan(
         (existing.actor_profile ?? "") !== input.actorProfile ||
         (existing.parent_run_id ?? null) !== (input.parentRunId ?? null) ||
         !scheduleMatches ||
-        !depsEqual
+        !depsEqual ||
+        !labelsEqual ||
+        !schemaEqual ||
+        !priorityMatches ||
+        !titleMatches
       ) {
         throw new HubError(
           409,
@@ -446,8 +485,7 @@ export async function createPlan(
       priorityOrder = (maxPriorityByNode.get(spec.nodeId) ?? 0) + offset * 100;
     }
 
-    const derivedTitle =
-      spec.title?.trim() || spec.prompt.trim().split(/\r?\n/)[0]!.slice(0, 80);
+    const derivedTitle = deriveThreadTitle(spec.title, spec.prompt);
 
     statements.push(
       db
@@ -475,13 +513,15 @@ export async function createPlan(
              node_id, workdir, agent, model, effort, sandbox, timeout_sec, prompt,
              status, priority_order, idempotency_key, created_by_key_id,
              native_session_id, notify_policy_json, notify_status, created_at, updated_at,
-             plan_id, plan_key, scheduled_at, retry_of_run_id, actor_profile, board_topic_id
+             plan_id, plan_key, scheduled_at, retry_of_run_id, actor_profile, board_topic_id,
+             labels_json, result_schema_json, result_json
            ) VALUES (
              ?1, ?2, ?3, ?4, ?5, ?6,
              ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
              ?15, ?16, ?17, ?18,
              NULL, ?19, 'none', ?20, ?20,
-             ?21, ?22, ?23, NULL, ?24, ?25
+             ?21, ?22, ?23, NULL, ?24, ?25,
+             ?26, ?27, NULL
            )`
         )
         .bind(
@@ -509,7 +549,9 @@ export async function createPlan(
           spec.key,
           scheduledAt,
           input.actorProfile,
-          input.boardTopicId ?? null
+          input.boardTopicId ?? null,
+          JSON.stringify(spec.labels),
+          spec.resultSchema ? JSON.stringify(spec.resultSchema) : null
         )
     );
   }
@@ -714,13 +756,15 @@ export async function retryRun(
            node_id, workdir, agent, model, effort, sandbox, timeout_sec, prompt,
            status, priority_order, idempotency_key, created_by_key_id,
            native_session_id, notify_policy_json, notify_status, created_at, updated_at,
-           plan_id, plan_key, scheduled_at, retry_of_run_id, actor_profile, board_topic_id
+           plan_id, plan_key, scheduled_at, retry_of_run_id, actor_profile, board_topic_id,
+           labels_json, result_schema_json, result_json
          ) VALUES (
            ?1, ?2, ?3, ?4, ?5, ?6,
            ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
            ?15, ?16, ?17, ?18,
            ?19, ?20, 'none', ?21, ?21,
-           ?22, ?23, ?24, ?25, ?26, ?27
+           ?22, ?23, ?24, ?25, ?26, ?27,
+           ?28, ?29, NULL
          )`
       )
       .bind(
@@ -750,7 +794,9 @@ export async function retryRun(
         nextScheduledAt,
         runId,
         nextActorProfile,
-        target.board_topic_id ?? null
+        target.board_topic_id ?? null,
+        target.labels_json ?? "{}",
+        target.result_schema_json ?? null
       )
   ];
 

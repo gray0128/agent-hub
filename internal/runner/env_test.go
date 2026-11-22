@@ -9,6 +9,7 @@ import (
 
 func TestBuildSanitizedEnvStripsSecretsAndInjectsLineage(t *testing.T) {
 	t.Setenv("AHUB_TOKEN", "ahub_adm_supersecret_should_never_leak")
+	t.Setenv("AHUB_RESULT_FILE", "/tmp/inherited-result-should-be-stripped.json")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "secret-aws-key")
 	t.Setenv("XDG_CONFIG_HOME", "/tmp/xdg-cfg")
 
@@ -19,7 +20,14 @@ func TestBuildSanitizedEnvStripsSecretsAndInjectsLineage(t *testing.T) {
 		Depth:     1,
 	}
 
-	env := BuildSanitizedEnv(run, "http://127.0.0.1:8787", "")
+	baseEnv := BuildBaseSanitizedEnv()
+	for _, entry := range baseEnv {
+		if strings.HasPrefix(entry, "AHUB_TOKEN=") || strings.HasPrefix(entry, "AHUB_RESULT_FILE=") {
+			t.Fatalf("BuildBaseSanitizedEnv must strip AHUB_TOKEN and AHUB_RESULT_FILE, got %q", entry)
+		}
+	}
+
+	env := BuildSanitizedEnv(run, "http://127.0.0.1:8787", "", "")
 	kv := make(map[string]string, len(env))
 	for _, item := range env {
 		idx := strings.IndexByte(item, '=')
@@ -31,6 +39,9 @@ func TestBuildSanitizedEnvStripsSecretsAndInjectsLineage(t *testing.T) {
 	if _, ok := kv["AHUB_TOKEN"]; ok {
 		t.Fatalf("expected AHUB_TOKEN to be stripped when delegationToken is empty")
 	}
+	if _, ok := kv["AHUB_RESULT_FILE"]; ok {
+		t.Fatalf("expected inherited AHUB_RESULT_FILE to be stripped when resultFile is empty")
+	}
 	if _, ok := kv["AWS_SECRET_ACCESS_KEY"]; ok {
 		t.Fatalf("expected AWS_SECRET_ACCESS_KEY to be stripped")
 	}
@@ -41,7 +52,22 @@ func TestBuildSanitizedEnvStripsSecretsAndInjectsLineage(t *testing.T) {
 		t.Fatalf("lineage vars mismatch: %+v", kv)
 	}
 
-	envWithDelegation := BuildSanitizedEnv(run, "http://127.0.0.1:8787", "ahub_del_ephemeral")
+	envWithResult := BuildSanitizedEnv(run, "http://127.0.0.1:8787", "", "/tmp/ahub-result-123/result.json")
+	kvRes := make(map[string]string, len(envWithResult))
+	for _, item := range envWithResult {
+		idx := strings.IndexByte(item, '=')
+		if idx > 0 {
+			kvRes[item[:idx]] = item[idx+1:]
+		}
+	}
+	if _, ok := kvRes["AHUB_TOKEN"]; ok {
+		t.Fatalf("expected AHUB_TOKEN stripped even when AHUB_RESULT_FILE is injected")
+	}
+	if kvRes["AHUB_RESULT_FILE"] != "/tmp/ahub-result-123/result.json" {
+		t.Fatalf("expected AHUB_RESULT_FILE injected, got %q", kvRes["AHUB_RESULT_FILE"])
+	}
+
+	envWithDelegation := BuildSanitizedEnv(run, "http://127.0.0.1:8787", "ahub_del_ephemeral", "/tmp/ahub-result-456/result.json")
 	kv2 := make(map[string]string, len(envWithDelegation))
 	for _, item := range envWithDelegation {
 		idx := strings.IndexByte(item, '=')
@@ -49,7 +75,7 @@ func TestBuildSanitizedEnvStripsSecretsAndInjectsLineage(t *testing.T) {
 			kv2[item[:idx]] = item[idx+1:]
 		}
 	}
-	if kv2["AHUB_TOKEN"] != "ahub_del_ephemeral" || kv2["AHUB_URL"] != "http://127.0.0.1:8787" {
-		t.Fatalf("expected ephemeral delegation token & URL, got %+v", kv2)
+	if kv2["AHUB_TOKEN"] != "ahub_del_ephemeral" || kv2["AHUB_URL"] != "http://127.0.0.1:8787" || kv2["AHUB_RESULT_FILE"] != "/tmp/ahub-result-456/result.json" {
+		t.Fatalf("expected ephemeral delegation token, URL, and AHUB_RESULT_FILE, got %+v", kv2)
 	}
 }

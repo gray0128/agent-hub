@@ -1,3 +1,5 @@
+import { validateResultSchemaDefinition } from "./json-schema-subset";
+import { redactSecrets } from "./redact";
 import {
   type AgentName,
   type ApiScope,
@@ -101,6 +103,11 @@ export const BOARD_PREFIX_RE = /^(\*|[a-z0-9][a-z0-9_-]*(?:\/[a-z0-9][a-z0-9_-]*
 export const ACTOR_PROFILE_RE = /^[a-z0-9][a-z0-9._@-]{0,39}$/;
 export const BOARD_TOPIC_ID_RE = /^top_[A-Za-z0-9]+$/;
 export const BOARD_MESSAGE_ID_RE = /^msg_[A-Za-z0-9]+$/;
+export const RUN_LABEL_KEY_RE = /^[a-z0-9][a-z0-9._/-]{0,63}$/;
+export const RUN_LABEL_VALUE_RE = /^[^\u0000-\u001f\u007f]*$/;
+export const MAX_RUN_LABELS = 16;
+export const MAX_RUN_LABEL_VALUE_CHARS = 128;
+export const MAX_RUN_LABEL_FILTERS = 8;
 const BOARD_TOPIC_STATUSES = new Set<BoardTopicStatus>([
   "todo",
   "in_progress",
@@ -285,6 +292,110 @@ export function parseScheduledAtIso(raw: string, nowMs = Date.now()): string {
   return new Date(ms).toISOString();
 }
 
+export function parseRunLabels(raw: unknown, fieldName = "labels"): Record<string, string> {
+  const obj = asRecord(raw, fieldName);
+  const entries = Object.entries(obj);
+  if (entries.length > MAX_RUN_LABELS) {
+    throw new HubError(
+      400,
+      "BAD_REQUEST",
+      `Field '${fieldName}' exceeds maxProperties ${MAX_RUN_LABELS}.`
+    );
+  }
+  const out: Record<string, string> = {};
+  for (const [k, v] of entries) {
+    const kLen = codePointLength(k);
+    if (kLen < 1 || kLen > 64 || !RUN_LABEL_KEY_RE.test(k)) {
+      throw new HubError(
+        400,
+        "BAD_REQUEST",
+        `Invalid label key '${k}' in '${fieldName}': must match ^[a-z0-9][a-z0-9._/-]{0,63}$.`
+      );
+    }
+    if (k.startsWith("ahub.")) {
+      throw new HubError(
+        400,
+        "BAD_REQUEST",
+        `Label key '${k}' uses reserved 'ahub.' prefix.`
+      );
+    }
+    if (typeof v !== "string") {
+      throw new HubError(400, "BAD_REQUEST", `Label '${k}' value must be a string.`);
+    }
+    if (!RUN_LABEL_VALUE_RE.test(v)) {
+      throw new HubError(
+        400,
+        "BAD_REQUEST",
+        `Label '${k}' value contains forbidden control characters.`
+      );
+    }
+    if (codePointLength(v) > MAX_RUN_LABEL_VALUE_CHARS) {
+      throw new HubError(
+        400,
+        "BAD_REQUEST",
+        `Label '${k}' value exceeds max length ${MAX_RUN_LABEL_VALUE_CHARS}.`
+      );
+    }
+    const clean = redactSecrets(v);
+    if (codePointLength(clean) > MAX_RUN_LABEL_VALUE_CHARS) {
+      throw new HubError(
+        400,
+        "BAD_REQUEST",
+        `Label '${k}' value exceeds max length ${MAX_RUN_LABEL_VALUE_CHARS} after redaction.`
+      );
+    }
+    Object.defineProperty(out, k, {
+      value: clean,
+      enumerable: true,
+      writable: true,
+      configurable: true
+    });
+  }
+  return out;
+}
+
+export function parseRunLabelFilters(
+  rawFilters: string[]
+): Array<{ key: string; value: string }> {
+  if (rawFilters.length > MAX_RUN_LABEL_FILTERS) {
+    throw new HubError(
+      400,
+      "BAD_REQUEST",
+      `Query 'label' exceeds max filter count ${MAX_RUN_LABEL_FILTERS}.`
+    );
+  }
+  const out: Array<{ key: string; value: string }> = [];
+  for (const raw of rawFilters) {
+    const eqIdx = raw.indexOf("=");
+    if (eqIdx <= 0) {
+      throw new HubError(
+        400,
+        "BAD_REQUEST",
+        "Query 'label' filter must use 'key=value' format."
+      );
+    }
+    const key = raw.slice(0, eqIdx);
+    const value = raw.slice(eqIdx + 1);
+    const kLen = codePointLength(key);
+    if (kLen < 1 || kLen > 64 || !RUN_LABEL_KEY_RE.test(key)) {
+      throw new HubError(
+        400,
+        "BAD_REQUEST",
+        `Invalid label filter key '${key}': must match ^[a-z0-9][a-z0-9._/-]{0,63}$.`
+      );
+    }
+    if (!RUN_LABEL_VALUE_RE.test(value) || codePointLength(value) > MAX_RUN_LABEL_VALUE_CHARS) {
+      throw new HubError(
+        400,
+        "BAD_REQUEST",
+        `Invalid label filter value for '${key}'.`
+      );
+    }
+    out.push({ key, value });
+  }
+  return out;
+}
+
 export interface ParsedCreateRun {
   threadId?: string;
   nodeId?: string;
@@ -302,6 +413,8 @@ export interface ParsedCreateRun {
   scheduledAt?: string;
   boardTopicId?: string;
   actorProfile?: string;
+  labels?: Record<string, string>;
+  resultSchema?: Record<string, unknown>;
   notify: NotifyPolicy;
 }
 
@@ -326,6 +439,8 @@ export function parseCreateRunRequest(raw: unknown, nowMs = Date.now()): ParsedC
       "scheduled_at",
       "board_topic_id",
       "actor_profile",
+      "labels",
+      "result_schema",
       "notify"
     ],
     "CreateRunRequest"
@@ -425,6 +540,12 @@ export function parseCreateRunRequest(raw: unknown, nowMs = Date.now()): ParsedC
     throw new HubError(400, "BAD_REQUEST", "Invalid actor_profile format.");
   }
 
+  const labels = obj["labels"] !== undefined ? parseRunLabels(obj["labels"]) : undefined;
+  const resultSchema =
+    obj["result_schema"] !== undefined
+      ? validateResultSchemaDefinition(obj["result_schema"])
+      : undefined;
+
   const notify = parseNotifyPolicyField(obj["notify"]);
 
   return {
@@ -444,6 +565,8 @@ export function parseCreateRunRequest(raw: unknown, nowMs = Date.now()): ParsedC
     scheduledAt,
     boardTopicId,
     actorProfile,
+    labels,
+    resultSchema,
     notify
   };
 }
@@ -463,6 +586,8 @@ export interface ParsedPlanNodeSpec {
   scheduledAt?: string;
   inSec?: number;
   priorityOrder?: number;
+  labels: Record<string, string>;
+  resultSchema?: Record<string, unknown>;
   notify: NotifyPolicy;
 }
 
@@ -537,6 +662,8 @@ export function parseCreatePlanRequest(raw: unknown, nowMs = Date.now()): Parsed
         "scheduled_at",
         "in_sec",
         "priority_order",
+        "labels",
+        "result_schema",
         "notify"
       ],
       ctxLabel
@@ -625,6 +752,12 @@ export function parseCreatePlanRequest(raw: unknown, nowMs = Date.now()): Parsed
     }
 
     const priorityOrder = asOptionalNumber(nObj, "priority_order");
+    const labels =
+      nObj["labels"] !== undefined ? parseRunLabels(nObj["labels"], `${ctxLabel}.labels`) : {};
+    const resultSchema =
+      nObj["result_schema"] !== undefined
+        ? validateResultSchemaDefinition(nObj["result_schema"])
+        : undefined;
     const notify = parseNotifyPolicyField(nObj["notify"]);
 
     nodes.push({
@@ -642,6 +775,8 @@ export function parseCreatePlanRequest(raw: unknown, nowMs = Date.now()): Parsed
       scheduledAt,
       inSec,
       priorityOrder,
+      labels,
+      resultSchema,
       notify
     });
   }
@@ -715,6 +850,7 @@ export function parseListRunsQuery(searchParams: URLSearchParams): {
   rootRunId?: string;
   planId?: string;
   boardTopicId?: string;
+  labels?: Array<{ key: string; value: string }>;
   limit: number;
 } {
   const nodeId = searchParams.get("node_id")?.trim() || undefined;
@@ -736,6 +872,7 @@ export function parseListRunsQuery(searchParams: URLSearchParams): {
   if (boardTopicId !== undefined && !BOARD_TOPIC_ID_RE.test(boardTopicId)) {
     throw new HubError(400, "BAD_REQUEST", "Invalid board_topic_id format.");
   }
+  const labels = parseRunLabelFilters(searchParams.getAll("label"));
   const limitRaw = searchParams.get("limit")?.trim();
   let limit = 50;
   if (limitRaw !== undefined && limitRaw !== "") {
@@ -748,7 +885,16 @@ export function parseListRunsQuery(searchParams: URLSearchParams): {
     }
     limit = Math.min(Math.max(parsed, 1), 200);
   }
-  return { nodeId, threadId, status, rootRunId, planId, boardTopicId, limit };
+  return {
+    nodeId,
+    threadId,
+    status,
+    rootRunId,
+    planId,
+    boardTopicId,
+    ...(labels.length > 0 ? { labels } : {}),
+    limit
+  };
 }
 
 export function parsePatchNodeRequest(raw: unknown): {
@@ -963,6 +1109,9 @@ export function parseCompleteRequest(raw: unknown): {
   durationMs: number;
   errorCode: string;
   errorMessage: string;
+  hasResult: boolean;
+  result?: unknown;
+  resultError: string;
 } {
   const obj = asRecord(raw, "CompleteRunRequest");
   rejectUnknownKeys(
@@ -978,7 +1127,9 @@ export function parseCompleteRequest(raw: unknown): {
       "output_bytes",
       "duration_ms",
       "error_code",
-      "error_message"
+      "error_message",
+      "result",
+      "result_error"
     ],
     "CompleteRunRequest"
   );
@@ -998,6 +1149,9 @@ export function parseCompleteRequest(raw: unknown): {
   const durationMs = asOptionalInt(obj, "duration_ms", 0, 86_400_000) ?? 0;
   const errorCode = asOptionalString(obj, "error_code", 128) ?? "";
   const errorMessage = asOptionalString(obj, "error_message", 4096) ?? "";
+  const hasResult = Object.prototype.hasOwnProperty.call(obj, "result") && obj["result"] !== undefined;
+  const result = hasResult ? obj["result"] : undefined;
+  const resultError = asOptionalString(obj, "result_error", 4096) ?? "";
   return {
     leaseOwner,
     status: statusRaw,
@@ -1009,7 +1163,10 @@ export function parseCompleteRequest(raw: unknown): {
     outputBytes,
     durationMs,
     errorCode,
-    errorMessage
+    errorMessage,
+    hasResult,
+    result,
+    resultError
   };
 }
 

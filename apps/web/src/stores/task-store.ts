@@ -99,7 +99,11 @@ function mergeRunRecordWithMeta(
         truncated: existing.truncated ?? incoming.truncated,
         deliveries_summary: existing.deliveries_summary ?? incoming.deliveries_summary,
         depends_on_run_ids: existing.depends_on_run_ids ?? incoming.depends_on_run_ids,
-        blocked_reason: existing.status === "waiting" ? (existing.blocked_reason ?? null) : null
+        blocked_reason: existing.status === "waiting" ? (existing.blocked_reason ?? null) : null,
+        labels: existing.labels !== undefined ? existing.labels : incoming.labels,
+        result_schema:
+          existing.result_schema !== undefined ? existing.result_schema : incoming.result_schema,
+        result: existing.result !== undefined ? existing.result : incoming.result
       },
       outputInvalidated: false
     };
@@ -140,6 +144,10 @@ function mergeRunRecordWithMeta(
       : incoming.blocked_reason !== undefined
         ? incoming.blocked_reason
         : (existing.blocked_reason ?? null);
+  const nextLabels = incoming.labels !== undefined ? incoming.labels : existing.labels;
+  const nextResultSchema =
+    incoming.result_schema !== undefined ? incoming.result_schema : existing.result_schema;
+  const nextResult = incoming.result !== undefined ? incoming.result : existing.result;
 
   return {
     run: {
@@ -153,6 +161,9 @@ function mergeRunRecordWithMeta(
       board_topic_id: nextBoardTopicId,
       depends_on_run_ids: nextDependsOnRunIds,
       blocked_reason: nextBlockedReason,
+      labels: nextLabels,
+      result_schema: nextResultSchema,
+      result: nextResult,
       prompt: incoming.prompt ?? existing.prompt,
       output_preview: nextOutputPreview,
       output_md: nextOutputMd,

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,10 +15,13 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gray0128/agent-hub/internal/api"
 	"github.com/gray0128/agent-hub/internal/config"
 )
+
+const MaxResultFileBytes = 65536
 
 type Callbacks struct {
 	OnEvent func(kind string, payload map[string]interface{})
@@ -36,6 +40,8 @@ type Result struct {
 	DurationMs       int64
 	ErrorCode        string
 	ErrorMessage     string
+	StructuredResult json.RawMessage
+	ResultError      string
 }
 
 var urlRegex = regexp.MustCompile(`https?://[^\s"']+`)
@@ -192,6 +198,18 @@ func ExecuteRun(
 		}
 	}
 
+	resultDir, err := os.MkdirTemp("", "ahub-result-*")
+	if err != nil {
+		return Result{
+			Status:       "failed",
+			DurationMs:   time.Since(startedAt).Milliseconds(),
+			ErrorCode:    "SPAWN_FAILED",
+			ErrorMessage: fmt.Sprintf("create result temp dir: %v", err),
+		}
+	}
+	defer os.RemoveAll(resultDir)
+	resultFile := filepath.Join(resultDir, "result.json")
+
 	timeout := time.Duration(run.TimeoutSec) * time.Second
 	if timeout <= 0 {
 		timeout = 900 * time.Second
@@ -201,7 +219,7 @@ func ExecuteRun(
 
 	cmd := exec.Command(bin, args...)
 	cmd.Dir = run.Workdir
-	cmd.Env = BuildSanitizedEnv(run, cfg.HubURL, cfg.DelegationToken)
+	cmd.Env = BuildSanitizedEnv(run, cfg.HubURL, cfg.DelegationToken, resultFile)
 	configureProcGroup(cmd)
 
 	if stdinPrompt != "" {
@@ -737,6 +755,8 @@ func ExecuteRun(
 		finalSummary = buildSummary(outputMD, "Completed")
 	}
 
+	structuredResult, resultErr := readResultFile(resultFile)
+
 	return Result{
 		Status:           "done",
 		NativeSessionID:  nativeSessionID,
@@ -747,7 +767,70 @@ func ExecuteRun(
 		OutputMD:         outputMD,
 		OutputBytes:      len(outputMD),
 		DurationMs:       durationMs,
+		StructuredResult: structuredResult,
+		ResultError:      resultErr,
 	}
+}
+
+func readResultFile(path string) (json.RawMessage, string) {
+	linfo, err := os.Lstat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, ""
+		}
+		return nil, truncateStr(fmt.Sprintf("stat AHUB_RESULT_FILE: %v", err), 512)
+	}
+	if linfo.Mode()&os.ModeSymlink != 0 {
+		return nil, "AHUB_RESULT_FILE must not be a symlink"
+	}
+	if linfo.IsDir() {
+		return nil, "AHUB_RESULT_FILE must not be a directory"
+	}
+	if !linfo.Mode().IsRegular() {
+		return nil, "AHUB_RESULT_FILE must be a regular file"
+	}
+	if linfo.Size() > MaxResultFileBytes {
+		return nil, fmt.Sprintf("AHUB_RESULT_FILE exceeds %d bytes (%d)", MaxResultFileBytes, linfo.Size())
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, ""
+		}
+		return nil, truncateStr(fmt.Sprintf("open AHUB_RESULT_FILE: %v", err), 512)
+	}
+	defer f.Close()
+
+	finfo, err := f.Stat()
+	if err != nil {
+		return nil, truncateStr(fmt.Sprintf("stat opened AHUB_RESULT_FILE: %v", err), 512)
+	}
+	if !finfo.Mode().IsRegular() || !os.SameFile(linfo, finfo) {
+		return nil, "AHUB_RESULT_FILE changed during read"
+	}
+
+	raw, err := io.ReadAll(io.LimitReader(f, MaxResultFileBytes+1))
+	if err != nil {
+		return nil, truncateStr(fmt.Sprintf("read AHUB_RESULT_FILE: %v", err), 512)
+	}
+	if len(raw) > MaxResultFileBytes {
+		return nil, fmt.Sprintf("AHUB_RESULT_FILE exceeds %d bytes", MaxResultFileBytes)
+	}
+
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return nil, "AHUB_RESULT_FILE is empty"
+	}
+	if !utf8.Valid(trimmed) {
+		return nil, "AHUB_RESULT_FILE contains invalid UTF-8"
+	}
+
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, trimmed); err != nil {
+		return nil, truncateStr(fmt.Sprintf("AHUB_RESULT_FILE invalid JSON: %v", err), 512)
+	}
+	return json.RawMessage(compact.Bytes()), ""
 }
 
 type localAuthHealthSnapshot struct {
@@ -1161,4 +1244,3 @@ func RunCommandOutputBounded(ctx context.Context, timeout time.Duration, env []s
 	}
 	return stdout.Bytes(), nil
 }
-

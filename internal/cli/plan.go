@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gray0128/agent-hub/internal/api"
 	"github.com/gray0128/agent-hub/internal/config"
@@ -20,19 +21,24 @@ import (
 )
 
 const (
-	planMaxBytes      = 5 << 20
-	planMaxNodes      = 20
-	planMaxNodeDeps   = 10
-	planMaxTotalEdges = 60
-	delayMin          = 1 * time.Minute
-	delayMax          = 7 * 24 * time.Hour
-	delaySkewBuffer   = 2 * time.Second
+	planMaxBytes         = 5 << 20
+	planMaxNodes         = 20
+	planMaxNodeDeps      = 10
+	planMaxTotalEdges    = 60
+	runMaxLabels         = 16
+	runMaxLabelFilters   = 8
+	labelValueMaxRunes   = 128
+	resultSchemaMaxBytes = 16384
+	delayMin             = 1 * time.Minute
+	delayMax             = 7 * 24 * time.Hour
+	delaySkewBuffer      = 2 * time.Second
 )
 
 var (
 	planIDRe       = regexp.MustCompile(`^pln_[A-Za-z0-9]+$`)
 	boardTopicIDRe = regexp.MustCompile(`^top_[A-Za-z0-9]+$`)
 	runIDStrictRe  = regexp.MustCompile(`^run_[A-Za-z0-9]+$`)
+	runLabelKeyRe  = regexp.MustCompile(`^[a-z0-9][a-z0-9._/-]{0,63}$`)
 )
 
 func runPlan(g globalOpts, args []string) int {
@@ -104,7 +110,7 @@ func runPlan(g globalOpts, args []string) int {
 	}
 
 	totalEdges := 0
-	for _, n := range req.Nodes {
+	for i, n := range req.Nodes {
 		if len(n.DependsOn) > planMaxNodeDeps {
 			return failUsage(g.JSON, fmt.Sprintf("plan node %q exceeds max %d depends_on entries", n.Key, planMaxNodeDeps))
 		}
@@ -114,6 +120,16 @@ func runPlan(g globalOpts, args []string) int {
 		}
 		if n.InSec != nil && (*n.InSec < 60 || *n.InSec > 604800) {
 			return failUsage(g.JSON, fmt.Sprintf("plan node %q in_sec must be between 60 and 604800", n.Key))
+		}
+		if err := validateLabelsMap(n.Labels, false); err != nil {
+			return failUsage(g.JSON, fmt.Sprintf("plan node %q: %v", n.Key, err))
+		}
+		if len(bytes.TrimSpace(n.ResultSchema)) > 0 {
+			normalizedSchema, err := validateResultSchemaRaw(n.ResultSchema)
+			if err != nil {
+				return failUsage(g.JSON, fmt.Sprintf("plan node %q: %v", n.Key, err))
+			}
+			req.Nodes[i].ResultSchema = normalizedSchema
 		}
 	}
 	if totalEdges > planMaxTotalEdges {
@@ -411,4 +427,183 @@ func computeScheduledAt(dur time.Duration) string {
 		effective -= delaySkewBuffer
 	}
 	return time.Now().UTC().Add(effective).Truncate(time.Millisecond).Format("2006-01-02T15:04:05.000Z")
+}
+
+func validateLabelKey(key string, allowReservedAhub bool) error {
+	if !runLabelKeyRe.MatchString(key) {
+		return fmt.Errorf("invalid label key %q (must match ^[a-z0-9][a-z0-9._/-]{0,63}$)", key)
+	}
+	if !allowReservedAhub && strings.HasPrefix(key, "ahub.") {
+		return fmt.Errorf("label key %q uses reserved prefix ahub.", key)
+	}
+	return nil
+}
+
+func validateLabelValue(val string) error {
+	if !utf8.ValidString(val) {
+		return errors.New("label value must be valid UTF-8")
+	}
+	if utf8.RuneCountInString(val) > labelValueMaxRunes {
+		return fmt.Errorf("label value exceeds %d characters", labelValueMaxRunes)
+	}
+	for _, r := range val {
+		if r < 0x20 || r == 0x7f {
+			return errors.New("label value must not contain control characters")
+		}
+	}
+	return nil
+}
+
+func parseRunLabelsFlag(entries []string) (map[string]string, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]string, len(entries))
+	for _, entry := range entries {
+		if entry == "" {
+			return nil, errors.New("--label cannot be empty (expected key=value)")
+		}
+		idx := strings.IndexByte(entry, '=')
+		if idx <= 0 {
+			return nil, fmt.Errorf("invalid --label %q (expected key=value)", entry)
+		}
+		key := entry[:idx]
+		val := entry[idx+1:]
+		if err := validateLabelKey(key, false); err != nil {
+			return nil, err
+		}
+		if err := validateLabelValue(val); err != nil {
+			return nil, fmt.Errorf("label %q: %w", key, err)
+		}
+		out[key] = val
+		if len(out) > runMaxLabels {
+			return nil, fmt.Errorf("at most %d labels are allowed", runMaxLabels)
+		}
+	}
+	return out, nil
+}
+
+func validateLabelsMap(labels map[string]string, allowReservedAhub bool) error {
+	if len(labels) == 0 {
+		return nil
+	}
+	if len(labels) > runMaxLabels {
+		return fmt.Errorf("at most %d labels are allowed (got %d)", runMaxLabels, len(labels))
+	}
+	for k, v := range labels {
+		if err := validateLabelKey(k, allowReservedAhub); err != nil {
+			return err
+		}
+		if err := validateLabelValue(v); err != nil {
+			return fmt.Errorf("label %q: %w", k, err)
+		}
+	}
+	return nil
+}
+
+func parseRunLabelFilters(entries []string) ([]string, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	if len(entries) > runMaxLabelFilters {
+		return nil, fmt.Errorf("at most %d --label filters are allowed", runMaxLabelFilters)
+	}
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry == "" {
+			return nil, errors.New("--label cannot be empty (expected key=value)")
+		}
+		idx := strings.IndexByte(entry, '=')
+		if idx <= 0 {
+			return nil, fmt.Errorf("invalid --label %q (expected key=value)", entry)
+		}
+		key := entry[:idx]
+		val := entry[idx+1:]
+		if err := validateLabelKey(key, true); err != nil {
+			return nil, err
+		}
+		if err := validateLabelValue(val); err != nil {
+			return nil, fmt.Errorf("label %q: %w", key, err)
+		}
+		out = append(out, entry)
+	}
+	return out, nil
+}
+
+func validateResultSchemaRaw(rawBytes []byte) (json.RawMessage, error) {
+	if !utf8.Valid(rawBytes) {
+		return nil, errors.New("result_schema must be valid UTF-8")
+	}
+	dec := json.NewDecoder(bytes.NewReader(rawBytes))
+	dec.UseNumber()
+	var decoded interface{}
+	if err := dec.Decode(&decoded); err != nil {
+		return nil, fmt.Errorf("invalid result_schema JSON: %w", err)
+	}
+	var trailing interface{}
+	if err := dec.Decode(&trailing); err != io.EOF {
+		return nil, errors.New("result_schema must contain a single JSON object")
+	}
+	obj, ok := decoded.(map[string]interface{})
+	if !ok || obj == nil {
+		return nil, errors.New("result_schema must be a JSON object")
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(obj); err != nil {
+		return nil, fmt.Errorf("encode result_schema: %w", err)
+	}
+	compact := bytes.TrimSpace(buf.Bytes())
+	if !utf8.Valid(compact) {
+		return nil, errors.New("result_schema must be valid UTF-8")
+	}
+	if len(compact) > resultSchemaMaxBytes {
+		return nil, fmt.Errorf("result_schema exceeds %d bytes after compact serialization (got %d)", resultSchemaMaxBytes, len(compact))
+	}
+	return json.RawMessage(compact), nil
+}
+
+func parseResultSchemaFlag(rawFlag string, promptUsedStdin bool) (json.RawMessage, error) {
+	trimmed := strings.TrimSpace(rawFlag)
+	if trimmed == "" {
+		return nil, errors.New("--result-schema cannot be empty")
+	}
+	const maxReadBytes = 1 << 20
+	var rawBytes []byte
+	switch {
+	case trimmed == "-":
+		if promptUsedStdin {
+			return nil, errors.New("cannot read both prompt and --result-schema from stdin")
+		}
+		b, err := io.ReadAll(io.LimitReader(os.Stdin, maxReadBytes+1))
+		if err != nil {
+			return nil, fmt.Errorf("read --result-schema from stdin: %w", err)
+		}
+		if len(b) > maxReadBytes {
+			return nil, fmt.Errorf("--result-schema stdin exceeds %d bytes", maxReadBytes)
+		}
+		rawBytes = b
+	case strings.HasPrefix(trimmed, "@"):
+		path := strings.TrimSpace(strings.TrimPrefix(trimmed, "@"))
+		if path == "" {
+			return nil, errors.New("invalid --result-schema @file path")
+		}
+		expanded := config.ExpandPath(path)
+		info, err := os.Stat(expanded)
+		if err != nil {
+			return nil, fmt.Errorf("read --result-schema file: %w", err)
+		}
+		if info.Size() > maxReadBytes {
+			return nil, fmt.Errorf("--result-schema file exceeds %d bytes", maxReadBytes)
+		}
+		b, err := os.ReadFile(expanded)
+		if err != nil {
+			return nil, fmt.Errorf("read --result-schema file: %w", err)
+		}
+		rawBytes = b
+	default:
+		rawBytes = []byte(trimmed)
+	}
+	return validateResultSchemaRaw(rawBytes)
 }
