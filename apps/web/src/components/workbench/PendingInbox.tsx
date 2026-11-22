@@ -14,6 +14,11 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import {
+  isNonListInteractiveControl,
+  shouldIgnoreActivationShortcut,
+  shouldIgnoreGlobalShortcut
+} from "@/lib/keyboard";
 import { cn, formatShortTime } from "@/lib/utils";
 import type { AuthScope } from "@/stores/workbench-store";
 import type {
@@ -27,6 +32,23 @@ import { MARKDOWN_COMPONENTS } from "./markdown-components";
 import { BoardTopicStatusBadge, RunStatusBadge } from "./StatusBadge";
 
 export type InboxDomainFilter = "all" | "board" | "runs" | "native";
+
+const INBOX_ITEM_SELECTOR = '[data-testid^="inbox-item-"]';
+
+function getDomFocusedInboxKey(node: EventTarget | null): string | null {
+  if (!(node instanceof Element)) return null;
+  const itemEl = node.closest(INBOX_ITEM_SELECTOR);
+  if (!itemEl) return null;
+  const explicit = itemEl.getAttribute("data-inbox-key");
+  if (explicit) return explicit;
+  const testId = itemEl.getAttribute("data-testid") ?? "";
+  return testId.startsWith("inbox-item-") ? testId.slice("inbox-item-".length) || null : null;
+}
+
+function findInboxItemElement(key: string): HTMLElement | null {
+  const el = document.querySelector(`[data-testid="inbox-item-${key}"]`);
+  return el instanceof HTMLElement ? el : null;
+}
 
 export type UnifiedInboxItem =
   | {
@@ -93,6 +115,9 @@ export function PendingInbox({
   const [domainFilter, setDomainFilter] = useState<InboxDomainFilter>("all");
   const [answerDraftByMsgId, setAnswerDraftByMsgId] = useState<Record<string, string>>({});
   const [mobileShowDetail, setMobileShowDetail] = useState(false);
+  const [stagedOptionIdx, setStagedOptionIdx] = useState<number | null>(null);
+  const [mobileFocusedKey, setMobileFocusedKey] = useState<string | null>(null);
+  const [desktopDetailDismissed, setDesktopDetailDismissed] = useState(false);
   const seenSelectedKeyRef = useRef<string | null>(null);
 
   const topicById = useMemo(() => new Map(topics.map((t) => [t.id, t])), [topics]);
@@ -165,8 +190,21 @@ export function PendingInbox({
       const exact = filteredItems.find((i) => i.key === selectedItemKey);
       if (exact) return exact;
     }
-    return isDesktop ? (filteredItems[0] ?? null) : null;
-  }, [filteredItems, isDesktop, selectedItemKey]);
+    if (isDesktop && !desktopDetailDismissed) {
+      return filteredItems[0] ?? null;
+    }
+    return null;
+  }, [desktopDetailDismissed, filteredItems, isDesktop, selectedItemKey]);
+
+  useEffect(() => {
+    setStagedOptionIdx(null);
+  }, [domainFilter, selectedItem?.key]);
+
+  useEffect(() => {
+    if (mobileFocusedKey && !filteredItems.some((i) => i.key === mobileFocusedKey)) {
+      setMobileFocusedKey(null);
+    }
+  }, [filteredItems, mobileFocusedKey]);
 
   useEffect(() => {
     if (!isAdmin && domainFilter === "native") {
@@ -216,6 +254,7 @@ export function PendingInbox({
       ...(text ? { answer_text: text } : {})
     });
     if (ok) {
+      setStagedOptionIdx(null);
       setAnswerDraftByMsgId((prev) => {
         const next = { ...prev };
         delete next[messageId];
@@ -223,6 +262,170 @@ export function PendingInbox({
       });
     }
   }
+
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if (shouldIgnoreGlobalShortcut(event) || shouldIgnoreActivationShortcut(event)) {
+        return;
+      }
+
+      const key = event.key;
+      const lower = key.toLowerCase();
+      const domFocusedKey =
+        getDomFocusedInboxKey(event.target) ?? getDomFocusedInboxKey(document.activeElement);
+
+      if (lower === "j" || lower === "k") {
+        event.preventDefault();
+        if (filteredItems.length === 0) return;
+
+        const currentKey =
+          domFocusedKey ??
+          (isDesktop ? selectedItem?.key ?? null : mobileFocusedKey ?? selectedItem?.key ?? null);
+        let nextIdx = 0;
+        if (currentKey === null) {
+          nextIdx = lower === "k" ? filteredItems.length - 1 : 0;
+        } else {
+          const curIdx = filteredItems.findIndex((i) => i.key === currentKey);
+          if (curIdx < 0) {
+            nextIdx = 0;
+          } else if (lower === "j") {
+            nextIdx = Math.min(filteredItems.length - 1, curIdx + 1);
+          } else {
+            nextIdx = Math.max(0, curIdx - 1);
+          }
+        }
+
+        const nextItem = filteredItems[nextIdx];
+        if (!nextItem) return;
+        setStagedOptionIdx(null);
+
+        if (isDesktop) {
+          setDesktopDetailDismissed(false);
+          onSelectItemKey(nextItem.key);
+        } else {
+          setMobileFocusedKey(nextItem.key);
+          if (mobileShowDetail) {
+            onSelectItemKey(nextItem.key);
+          }
+        }
+
+        const el = findInboxItemElement(nextItem.key);
+        const activeEl = document.activeElement;
+        if (
+          activeEl instanceof HTMLElement &&
+          activeEl !== el &&
+          (isNonListInteractiveControl(activeEl) || Boolean(activeEl.closest(INBOX_ITEM_SELECTOR)))
+        ) {
+          activeEl.blur();
+        }
+        if (el) {
+          el.scrollIntoView({ block: "nearest" });
+          el.focus({ preventScroll: true });
+        } else {
+          requestAnimationFrame(() => {
+            const deferredEl = findInboxItemElement(nextItem.key);
+            if (deferredEl) {
+              deferredEl.scrollIntoView({ block: "nearest" });
+              deferredEl.focus({ preventScroll: true });
+            }
+          });
+        }
+        return;
+      }
+
+      if (key === "1" || key === "2" || key === "3" || key === "4") {
+        if (!selectedItem || selectedItem.domain !== "board" || !isAdmin) {
+          return;
+        }
+        const optionIdx = Number(key) - 1;
+        if (optionIdx < selectedItem.message.question_options.length) {
+          event.preventDefault();
+          setStagedOptionIdx(optionIdx);
+        }
+        return;
+      }
+
+      if (key === "Enter") {
+        event.preventDefault();
+        if (!isDesktop && !mobileShowDetail) {
+          const targetKey = domFocusedKey ?? mobileFocusedKey ?? filteredItems[0]?.key ?? null;
+          if (targetKey) {
+            setMobileFocusedKey(targetKey);
+            onSelectItemKey(targetKey);
+            setMobileShowDetail(true);
+          }
+          return;
+        }
+        if (!selectedItem) {
+          const targetKey = domFocusedKey ?? filteredItems[0]?.key ?? null;
+          if (targetKey) {
+            setDesktopDetailDismissed(false);
+            setMobileFocusedKey(targetKey);
+            onSelectItemKey(targetKey);
+          }
+          return;
+        }
+        if (domFocusedKey && domFocusedKey !== selectedItem.key) {
+          setDesktopDetailDismissed(false);
+          setMobileFocusedKey(domFocusedKey);
+          onSelectItemKey(domFocusedKey);
+          return;
+        }
+        if (selectedItem.domain === "board") {
+          if (!isAdmin) return;
+          if (stagedOptionIdx !== null) {
+            const opt = selectedItem.message.question_options[stagedOptionIdx];
+            if (opt) {
+              void handleAnswer(selectedItem.message.id, opt);
+            }
+          } else if ((answerDraftByMsgId[selectedItem.message.id] ?? "").trim()) {
+            void handleAnswer(selectedItem.message.id);
+          }
+          return;
+        }
+        if (selectedItem.domain === "runs") {
+          void onResolveRun(selectedItem.run.id);
+          return;
+        }
+        if (selectedItem.domain === "native") {
+          void onAckNativeEvent(selectedItem.event.id, "single");
+        }
+        return;
+      }
+
+      if (key === "Escape") {
+        event.preventDefault();
+        if (stagedOptionIdx !== null) {
+          setStagedOptionIdx(null);
+          return;
+        }
+        if (!isDesktop && mobileShowDetail) {
+          setMobileShowDetail(false);
+          onSelectItemKey(null);
+          return;
+        }
+        if (isDesktop && selectedItem !== null) {
+          setDesktopDetailDismissed(true);
+          onSelectItemKey(null);
+        }
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [
+    answerDraftByMsgId,
+    filteredItems,
+    isAdmin,
+    isDesktop,
+    mobileFocusedKey,
+    mobileShowDetail,
+    onAckNativeEvent,
+    onResolveRun,
+    onSelectItemKey,
+    selectedItem,
+    stagedOptionIdx
+  ]);
 
   const listPane = (
     <div
@@ -247,7 +450,11 @@ export function PendingInbox({
           <button
             type="button"
             data-testid="inbox-filter-all"
-            onClick={() => setDomainFilter("all")}
+            aria-pressed={domainFilter === "all"}
+            onClick={() => {
+              setDesktopDetailDismissed(false);
+              setDomainFilter("all");
+            }}
             className={cn(
               "shrink-0 min-h-11 md:min-h-0 md:h-7 rounded-[4px] border px-2.5 md:px-2 text-xs md:text-[11px] tabular-nums transition-colors cursor-pointer",
               domainFilter === "all"
@@ -260,7 +467,11 @@ export function PendingInbox({
           <button
             type="button"
             data-testid="inbox-filter-board"
-            onClick={() => setDomainFilter("board")}
+            aria-pressed={domainFilter === "board"}
+            onClick={() => {
+              setDesktopDetailDismissed(false);
+              setDomainFilter("board");
+            }}
             className={cn(
               "shrink-0 min-h-11 md:min-h-0 md:h-7 rounded-[4px] border px-2.5 md:px-2 text-xs md:text-[11px] tabular-nums transition-colors cursor-pointer",
               domainFilter === "board"
@@ -273,7 +484,11 @@ export function PendingInbox({
           <button
             type="button"
             data-testid="inbox-filter-runs"
-            onClick={() => setDomainFilter("runs")}
+            aria-pressed={domainFilter === "runs"}
+            onClick={() => {
+              setDesktopDetailDismissed(false);
+              setDomainFilter("runs");
+            }}
             className={cn(
               "shrink-0 min-h-11 md:min-h-0 md:h-7 rounded-[4px] border px-2.5 md:px-2 text-xs md:text-[11px] tabular-nums transition-colors cursor-pointer",
               domainFilter === "runs"
@@ -287,7 +502,11 @@ export function PendingInbox({
             <button
               type="button"
               data-testid="inbox-filter-native"
-              onClick={() => setDomainFilter("native")}
+              aria-pressed={domainFilter === "native"}
+              onClick={() => {
+                setDesktopDetailDismissed(false);
+                setDomainFilter("native");
+              }}
               className={cn(
                 "shrink-0 min-h-11 md:min-h-0 md:h-7 rounded-[4px] border px-2.5 md:px-2 text-xs md:text-[11px] tabular-nums transition-colors cursor-pointer",
                 domainFilter === "native"
@@ -312,6 +531,13 @@ export function PendingInbox({
         ) : (
           filteredItems.map((item) => {
             const active = selectedItem?.key === item.key;
+            const focused = isDesktop ? active : mobileFocusedKey === item.key || active;
+            const handleItemClick = () => {
+              setDesktopDetailDismissed(false);
+              setMobileFocusedKey(item.key);
+              onSelectItemKey(item.key);
+              if (!isDesktop) setMobileShowDetail(true);
+            };
             if (item.domain === "board") {
               const title = item.topic?.title || item.message.channel;
               const actor = `${item.message.actor_profile || item.message.actor_scope}${item.message.source_node ? `@${item.message.source_node}` : ""}`;
@@ -320,13 +546,11 @@ export function PendingInbox({
                   key={item.key}
                   type="button"
                   data-testid={`inbox-item-${item.key}`}
-                  onClick={() => {
-                    onSelectItemKey(item.key);
-                    if (!isDesktop) setMobileShowDetail(true);
-                  }}
+                  data-focused={focused ? "true" : "false"}
+                  onClick={handleItemClick}
                   className={cn(
                     "flex w-full min-h-11 flex-col gap-1.5 border-l-2 border-l-[var(--status-approval)] px-3 py-2.5 text-left transition-colors cursor-pointer",
-                    active ? "bg-accent/70" : "hover:bg-accent/40"
+                    active ? "bg-accent/70" : focused ? "bg-accent/50" : "hover:bg-accent/40"
                   )}
                 >
                   <div className="flex items-center justify-between gap-2">
@@ -353,13 +577,11 @@ export function PendingInbox({
                   key={item.key}
                   type="button"
                   data-testid={`inbox-item-${item.key}`}
-                  onClick={() => {
-                    onSelectItemKey(item.key);
-                    if (!isDesktop) setMobileShowDetail(true);
-                  }}
+                  data-focused={focused ? "true" : "false"}
+                  onClick={handleItemClick}
                   className={cn(
                     "flex w-full min-h-11 flex-col gap-1.5 border-l-2 border-l-[var(--status-approval)] px-3 py-2.5 text-left transition-colors cursor-pointer",
-                    active ? "bg-accent/70" : "hover:bg-accent/40"
+                    active ? "bg-accent/70" : focused ? "bg-accent/50" : "hover:bg-accent/40"
                   )}
                 >
                   <div className="flex items-center justify-between gap-2">
@@ -383,13 +605,11 @@ export function PendingInbox({
                 key={item.key}
                 type="button"
                 data-testid={`inbox-item-${item.key}`}
-                onClick={() => {
-                  onSelectItemKey(item.key);
-                  if (!isDesktop) setMobileShowDetail(true);
-                }}
+                data-focused={focused ? "true" : "false"}
+                onClick={handleItemClick}
                 className={cn(
                   "flex w-full min-h-11 flex-col gap-1.5 border-l-2 border-l-[var(--status-approval)] px-3 py-2.5 text-left transition-colors cursor-pointer",
-                  active ? "bg-accent/70" : "hover:bg-accent/40"
+                  active ? "bg-accent/70" : focused ? "bg-accent/50" : "hover:bg-accent/40"
                 )}
               >
                 <div className="flex items-center justify-between gap-2">
@@ -423,7 +643,11 @@ export function PendingInbox({
       {!selectedItem ? (
         <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center text-xs text-muted-foreground">
           <CheckCircle2 className="h-6 w-6 text-[var(--status-done)]" strokeWidth={1.75} aria-hidden="true" />
-          <p>当前没有待确认或待审批的阻塞事项。</p>
+          <p>
+            {filteredItems.length > 0
+              ? "按 J/K 切换条目，按 Enter 展开详情。"
+              : "当前没有待确认或待审批的阻塞事项。"}
+          </p>
         </div>
       ) : selectedItem.domain === "board" ? (
         (() => {
@@ -517,19 +741,29 @@ export function PendingInbox({
                   <>
                     {message.question_options.length > 0 ? (
                       <div className="flex flex-wrap gap-1.5">
-                        {message.question_options.map((opt, idx) => (
-                          <Button
-                            key={`${message.id}-inbox-opt-${idx}`}
-                            type="button"
-                            variant="outline"
-                            disabled={busy}
-                            data-testid={`inbox-question-option-${idx}`}
-                            onClick={() => void handleAnswer(message.id, opt)}
-                            className="min-h-11 min-w-11 md:min-h-0 md:min-w-0 md:h-8 border-[var(--status-approval)]/50 bg-background hover:bg-accent"
-                          >
-                            {opt}
-                          </Button>
-                        ))}
+                        {message.question_options.map((opt, idx) => {
+                          const isStaged = stagedOptionIdx === idx;
+                          return (
+                            <Button
+                              key={`${message.id}-inbox-opt-${idx}`}
+                              type="button"
+                              variant="outline"
+                              disabled={busy}
+                              aria-pressed={isStaged}
+                              data-selected={isStaged ? "true" : "false"}
+                              data-testid={`inbox-question-option-${idx}`}
+                              onClick={() => void handleAnswer(message.id, opt)}
+                              className={cn(
+                                "min-h-11 min-w-11 md:min-h-0 md:min-w-0 md:h-8 bg-background hover:bg-accent",
+                                isStaged
+                                  ? "border-[var(--status-running)] bg-[var(--status-running)]/15 text-foreground ring-1 ring-[var(--status-running)]"
+                                  : "border-[var(--status-approval)]/50"
+                              )}
+                            >
+                              {opt}
+                            </Button>
+                          );
+                        })}
                       </div>
                     ) : null}
                     <div className="flex items-center gap-2">
@@ -746,6 +980,12 @@ export function PendingInbox({
     <section
       aria-label="统一待决收件箱"
       data-testid="pending-inbox"
+      onFocusCapture={(event) => {
+        const key = getDomFocusedInboxKey(event.target);
+        if (key && !isDesktop && key !== mobileFocusedKey) {
+          setMobileFocusedKey(key);
+        }
+      }}
       className="relative flex h-full w-full overflow-hidden bg-background tabular-nums"
     >
       {isDesktop ? (

@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { FolderTree, HelpCircle, Layers, Plus } from "lucide-react";
+import { Clock, FolderTree, HelpCircle, Layers, Plus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { BoardTopicFilter } from "@/stores/board-store";
@@ -144,6 +144,26 @@ export function BoardChannelTree({
               )}
             >
               {openBoardQuestionCount}
+            </span>
+          </button>
+
+          <button
+            type="button"
+            data-testid="board-filter-recent"
+            onClick={() => onSelectView(null, "recent")}
+            className={cn(
+              "flex w-full min-h-11 md:min-h-8 items-center justify-between gap-2 rounded-[6px] px-2.5 text-xs transition-colors cursor-pointer",
+              selectedChannel === null && topicFilter === "recent"
+                ? "bg-accent text-accent-foreground font-medium"
+                : "text-muted-foreground hover:bg-accent/50 hover:text-foreground"
+            )}
+          >
+            <span className="flex min-w-0 items-center gap-2">
+              <Clock className="h-3.5 w-3.5 shrink-0" strokeWidth={1.75} aria-hidden="true" />
+              <span className="truncate">近期动态</span>
+            </span>
+            <span className="shrink-0 font-mono text-[11px] tabular-nums">
+              {totalActiveCount}
             </span>
           </button>
         </div>

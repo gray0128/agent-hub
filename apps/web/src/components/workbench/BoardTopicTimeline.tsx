@@ -25,7 +25,11 @@ import {
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { cn, formatShortTime } from "@/lib/utils";
-import type { BoardTopicFilter } from "@/stores/board-store";
+import {
+  type BoardTopicFilter,
+  type BoardViewMode,
+  filterAndSortBoardTopics
+} from "@/stores/board-store";
 import type { AuthScope } from "@/stores/workbench-store";
 import type {
   AnswerBoardQuestionPayload,
@@ -42,6 +46,10 @@ export interface BoardTopicTimelineProps {
   topics: BoardTopic[];
   selectedChannel: string | null;
   selectedTopic: BoardTopic | null;
+  focusedTopicId: string | null;
+  viewMode: BoardViewMode;
+  statusFilter: "all" | BoardTopicStatus;
+  stagedQuestionOptionIdx: number | null;
   messages: BoardMessage[];
   messagesLoading: boolean;
   topicFilter: BoardTopicFilter;
@@ -54,7 +62,9 @@ export interface BoardTopicTimelineProps {
   submittingMessage: boolean;
   answeringIds: Record<string, boolean>;
   onSearchQueryChange: (q: string) => void;
+  onStatusFilterChange: (filter: "all" | BoardTopicStatus) => void;
   onSelectTopic: (topicId: string) => void;
+  onOpenTopicDetail: (topicId: string) => void;
   onMobileBackToList: () => void;
   onToggleInspector: () => void;
   onOpenNewTopic: () => void;
@@ -115,6 +125,10 @@ export function BoardTopicTimeline({
   topics,
   selectedChannel,
   selectedTopic,
+  focusedTopicId,
+  viewMode,
+  statusFilter,
+  stagedQuestionOptionIdx,
   messages,
   messagesLoading,
   topicFilter,
@@ -127,14 +141,15 @@ export function BoardTopicTimeline({
   submittingMessage,
   answeringIds,
   onSearchQueryChange,
+  onStatusFilterChange,
   onSelectTopic,
+  onOpenTopicDetail,
   onMobileBackToList,
   onToggleInspector,
   onOpenNewTopic,
   onPostMessage,
   onAnswerQuestion
 }: BoardTopicTimelineProps) {
-  const [statusFilter, setStatusFilter] = useState<"all" | BoardTopicStatus>("all");
   const [composerKind, setComposerKind] = useState<"note" | "handoff" | "question" | "artifact">("note");
   const [composerText, setComposerText] = useState("");
   const [composerProfile, setComposerProfile] = useState("");
@@ -145,23 +160,17 @@ export function BoardTopicTimeline({
 
   const isAdmin = authScope === "admin";
 
-  const filteredTopics = useMemo(() => {
-    const q = searchQuery.trim().toLowerCase();
-    return topics.filter((t) => {
-      if (selectedChannel && t.channel !== selectedChannel) return false;
-      if (topicFilter === "open_questions" && (t.open_question_count ?? 0) <= 0) return false;
-      if (statusFilter === "all") {
-        if (topicFilter === "active" && t.status === "archived") return false;
-      } else if (t.status !== statusFilter) {
-        return false;
-      }
-      if (q) {
-        const hay = `${t.title}\n${t.channel}\n${t.external_ref}\n${t.id}`.toLowerCase();
-        if (!hay.includes(q)) return false;
-      }
-      return true;
-    });
-  }, [searchQuery, selectedChannel, statusFilter, topicFilter, topics]);
+  const filteredTopics = useMemo(
+    () =>
+      filterAndSortBoardTopics({
+        topics,
+        selectedChannel,
+        topicFilter,
+        statusFilter,
+        searchQuery
+      }),
+    [searchQuery, selectedChannel, statusFilter, topicFilter, topics]
+  );
 
   const openQuestions = useMemo(
     () => messages.filter((m) => m.kind === "question" && m.question_state === "open"),
@@ -281,7 +290,7 @@ export function BoardTopicTimeline({
             <button
               key={pill.key}
               type="button"
-              onClick={() => setStatusFilter(pill.key)}
+              onClick={() => onStatusFilterChange(pill.key)}
               className={cn(
                 "shrink-0 min-h-11 md:min-h-0 md:h-6 rounded-[4px] border px-2.5 md:px-2 text-xs md:text-[11px] transition-colors cursor-pointer",
                 statusFilter === pill.key
@@ -309,16 +318,23 @@ export function BoardTopicTimeline({
         ) : (
           filteredTopics.map((topic) => {
             const active = selectedTopic?.id === topic.id;
+            const focused = focusedTopicId === topic.id;
             const openCount = topic.open_question_count ?? 0;
             return (
               <button
                 key={topic.id}
                 type="button"
                 data-testid={`board-topic-item-${topic.id}`}
+                data-topic-id={topic.id}
+                data-focused={focused ? "true" : "false"}
                 onClick={() => onSelectTopic(topic.id)}
                 className={cn(
                   "flex w-full min-h-11 flex-col gap-1.5 px-3 py-2.5 text-left transition-colors cursor-pointer",
-                  active ? "bg-accent/70" : "hover:bg-accent/35"
+                  focused
+                    ? "bg-[var(--status-running)]/12 ring-1 ring-inset ring-[var(--status-running)]/60"
+                    : active
+                      ? "bg-accent/70"
+                      : "hover:bg-accent/35"
                 )}
               >
                 <div className="flex items-start justify-between gap-2">
@@ -395,20 +411,31 @@ export function BoardTopicTimeline({
           <div className="space-y-2">
             {q.question_options.length > 0 ? (
               <div className="flex flex-wrap gap-1.5">
-                {q.question_options.map((opt, idx) => (
-                  <Button
-                    key={`${q.id}-opt-${idx}`}
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    disabled={busy}
-                    data-testid={`board-question-option-${q.id}-${idx}`}
-                    onClick={() => void handleAnswerSubmit(q, opt)}
-                    className="min-h-11 md:min-h-0 md:h-7 border-[var(--status-approval)]/50 bg-background/80 hover:bg-accent"
-                  >
-                    {opt}
-                  </Button>
-                ))}
+                {q.question_options.map((opt, idx) => {
+                  const isStaged =
+                    q.id === primaryOpenQuestion?.id && stagedQuestionOptionIdx === idx;
+                  return (
+                    <Button
+                      key={`${q.id}-opt-${idx}`}
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={busy}
+                      aria-pressed={isStaged}
+                      data-selected={isStaged ? "true" : "false"}
+                      data-testid={`board-question-option-${q.id}-${idx}`}
+                      onClick={() => void handleAnswerSubmit(q, opt)}
+                      className={cn(
+                        "min-h-11 md:min-h-0 md:h-7 bg-background/80 hover:bg-accent",
+                        isStaged
+                          ? "border-[var(--status-running)] bg-[var(--status-running)]/15 text-foreground ring-1 ring-[var(--status-running)]"
+                          : "border-[var(--status-approval)]/50"
+                      )}
+                    >
+                      {opt}
+                    </Button>
+                  );
+                })}
               </div>
             ) : null}
 
@@ -807,19 +834,29 @@ export function BoardTopicTimeline({
                   <div className="space-y-2">
                     {primaryOpenQuestion.question_options.length > 0 ? (
                       <div className="flex flex-wrap gap-1.5">
-                        {primaryOpenQuestion.question_options.map((opt, idx) => (
-                          <Button
-                            key={`mob-${primaryOpenQuestion.id}-opt-${idx}`}
-                            type="button"
-                            variant="outline"
-                            disabled={Boolean(answeringIds[primaryOpenQuestion.id])}
-                            data-testid={`board-mobile-question-option-${idx}`}
-                            onClick={() => void handleAnswerSubmit(primaryOpenQuestion, opt)}
-                            className="min-h-11 min-w-11 border-[var(--status-approval)]/50 bg-background text-xs"
-                          >
-                            {opt}
-                          </Button>
-                        ))}
+                        {primaryOpenQuestion.question_options.map((opt, idx) => {
+                          const isStaged = stagedQuestionOptionIdx === idx;
+                          return (
+                            <Button
+                              key={`mob-${primaryOpenQuestion.id}-opt-${idx}`}
+                              type="button"
+                              variant="outline"
+                              disabled={Boolean(answeringIds[primaryOpenQuestion.id])}
+                              aria-pressed={isStaged}
+                              data-selected={isStaged ? "true" : "false"}
+                              data-testid={`board-mobile-question-option-${idx}`}
+                              onClick={() => void handleAnswerSubmit(primaryOpenQuestion, opt)}
+                              className={cn(
+                                "min-h-11 min-w-11 bg-background text-xs",
+                                isStaged
+                                  ? "border-[var(--status-running)] bg-[var(--status-running)]/15 text-foreground ring-1 ring-[var(--status-running)]"
+                                  : "border-[var(--status-approval)]/50"
+                              )}
+                            >
+                              {opt}
+                            </Button>
+                          );
+                        })}
                       </div>
                     ) : null}
                     <div className="flex items-center gap-2">
@@ -872,11 +909,171 @@ export function BoardTopicTimeline({
     </div>
   );
 
+  const listViewElement = (
+    <div
+      data-testid="board-list-view"
+      className="flex min-h-0 flex-1 flex-col bg-background overflow-hidden"
+    >
+      <div className="shrink-0 space-y-2 border-b border-border p-3">
+        <div className="flex items-center gap-2">
+          <div className="relative flex min-w-0 flex-1 items-center">
+            <Search
+              className="pointer-events-none absolute left-2.5 h-3.5 w-3.5 text-muted-foreground"
+              strokeWidth={1.75}
+              aria-hidden="true"
+            />
+            <Input
+              value={searchQuery}
+              onChange={(e) => onSearchQueryChange(e.target.value)}
+              placeholder="搜索主题、频道或 external_ref..."
+              aria-label="搜索协同主题"
+              autoComplete="off"
+              autoCorrect="off"
+              autoCapitalize="none"
+              spellCheck={false}
+              enterKeyHint="search"
+              data-testid="board-search-input"
+              className="pl-8"
+            />
+          </div>
+          {!isDesktop && !boardPermissionDenied ? (
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={onOpenNewTopic}
+              className="min-h-11 shrink-0 px-3"
+            >
+              <Plus className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
+              新建
+            </Button>
+          ) : null}
+        </div>
+
+        <div className="flex items-center gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+          {(
+            [
+              { key: "all", label: "全部" },
+              { key: "in_progress", label: "进行中" },
+              { key: "blocked", label: "阻塞" },
+              { key: "todo", label: "待办" },
+              { key: "done", label: "已完成" },
+              { key: "archived", label: "归档" }
+            ] as const
+          ).map((pill) => (
+            <button
+              key={pill.key}
+              type="button"
+              onClick={() => onStatusFilterChange(pill.key)}
+              className={cn(
+                "shrink-0 min-h-11 md:min-h-0 md:h-6 rounded-[4px] border px-2.5 md:px-2 text-xs md:text-[11px] transition-colors cursor-pointer",
+                statusFilter === pill.key
+                  ? "border-[var(--status-running)]/50 bg-[var(--status-running)]/12 text-foreground font-medium"
+                  : "border-border bg-transparent text-muted-foreground hover:text-foreground"
+              )}
+            >
+              {pill.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="min-h-0 flex-1 overflow-y-auto divide-y divide-border">
+        {boardPermissionDenied ? (
+          <div className="p-6 text-center text-xs text-muted-foreground text-pretty">
+            当前凭证尚未分配协同板频道前缀权限（`allowed_board_prefixes`）。请联系管理员在凭证管理中授权后再访问。
+          </div>
+        ) : filteredTopics.length === 0 ? (
+          <div className="p-6 text-center text-xs text-muted-foreground text-pretty">
+            {topics.length === 0
+              ? "暂无协同主题。点击新建主题或通过 `ahub board post` 发起跨机协作。"
+              : "当前筛选条件下没有匹配的协同主题。"}
+          </div>
+        ) : (
+          filteredTopics.map((topic) => {
+            const active = selectedTopic?.id === topic.id;
+            const focused = focusedTopicId === topic.id;
+            const openCount = topic.open_question_count ?? 0;
+            return (
+              <button
+                key={topic.id}
+                type="button"
+                data-testid={`board-list-item-${topic.id}`}
+                data-topic-id={topic.id}
+                data-focused={focused ? "true" : "false"}
+                onClick={() => onOpenTopicDetail(topic.id)}
+                className={cn(
+                  "flex w-full min-h-11 flex-col gap-1.5 px-3.5 py-3 text-left transition-colors cursor-pointer",
+                  focused
+                    ? "bg-[var(--status-running)]/12 ring-1 ring-inset ring-[var(--status-running)]/60"
+                    : active
+                      ? "bg-accent/55"
+                      : "hover:bg-accent/35"
+                )}
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex min-w-0 items-center gap-1.5">
+                    {topic.pinned ? (
+                      <Pin className="h-3 w-3 shrink-0 text-[var(--status-running)]" strokeWidth={1.75} aria-hidden="true" />
+                    ) : null}
+                    <span className="truncate text-xs font-medium text-foreground">
+                      {topic.title}
+                    </span>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-1.5">
+                    {openCount > 0 ? (
+                      <span className="rounded bg-[var(--status-approval)] px-1.5 py-0.5 font-mono text-[10px] font-semibold text-black tabular-nums">
+                        提问 {openCount}
+                      </span>
+                    ) : null}
+                    <BoardTopicStatusBadge status={topic.status} />
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center justify-between gap-2 font-mono text-[10px] text-muted-foreground tabular-nums">
+                  <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                    <span className="rounded border border-border bg-background/60 px-1.5 py-px">
+                      {topic.channel}
+                    </span>
+                    {topic.external_ref ? (
+                      <span className="truncate rounded border border-border px-1.5 py-px text-foreground/80">
+                        {topic.external_ref}
+                      </span>
+                    ) : null}
+                    {topic.latest_handoff ? (
+                      <span className="truncate">
+                        交接：{topic.latest_handoff.actor_profile || "agent"}
+                        {topic.latest_handoff.source_node ? `@${topic.latest_handoff.source_node}` : ""}
+                      </span>
+                    ) : null}
+                  </div>
+                  <span className="shrink-0">{formatShortTime(topic.updated_at)}</span>
+                </div>
+              </button>
+            );
+          })
+        )}
+      </div>
+    </div>
+  );
+
+  if (viewMode === "list" && !showMobileDetail) {
+    return (
+      <section
+        aria-label="协同板主题列表"
+        data-testid="board-topic-timeline"
+        className="relative flex min-h-0 flex-1 flex-col overflow-hidden bg-background"
+      >
+        {listViewElement}
+      </section>
+    );
+  }
+
   return (
     <section
       aria-label="协同板主题列表与时间线"
       data-testid="board-topic-timeline"
-      className="relative flex h-full flex-col xl:flex-row overflow-hidden bg-background"
+      className="relative flex min-h-0 flex-1 flex-col xl:flex-row overflow-hidden bg-background"
     >
       {isDesktop ? (
         <>

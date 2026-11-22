@@ -1,11 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  closestCorners,
+  type CollisionDetection,
   DndContext,
   DragOverlay,
   type DragEndEvent,
   type DragStartEvent,
   KeyboardSensor,
   MouseSensor,
+  pointerWithin,
+  rectIntersection,
   TouchSensor,
   useSensor,
   useSensors
@@ -61,7 +65,12 @@ import {
 import { getAvailableAgents, resolveInitialComposerModelAndEffort } from "@/lib/capabilities";
 import { AUTO_FULL_OUTPUT_MAX_BYTES, cn } from "@/lib/utils";
 import { HubStreamClient } from "@/lib/ws-client";
-import { useBoardStore } from "@/stores/board-store";
+import {
+  type BoardKanbanColumnStatus,
+  type BoardViewMode,
+  compareTopicsKanban,
+  useBoardStore
+} from "@/stores/board-store";
 import { useFleetStore } from "@/stores/fleet-store";
 import {
   getDeliverySourceKey,
@@ -127,11 +136,43 @@ declare global {
         openBoardQuestionCount: number;
         selectedBoardChannel: string | null;
         selectedBoardTopicId: string | null;
+        focusedBoardTopicId: string | null;
+        boardTopicFilter: ReturnType<typeof useBoardStore.getState>["topicFilter"];
+        boardViewMode: BoardViewMode;
+        boardKanbanMobileStatus: BoardKanbanColumnStatus;
         boardPermissionDenied: boolean;
       };
     };
   }
 }
+
+function isKanbanColumnStatus(value: unknown): value is BoardKanbanColumnStatus {
+  return value === "todo" || value === "in_progress" || value === "blocked" || value === "done";
+}
+
+const boardAwareCollisionDetection: CollisionDetection = (args) => {
+  const activeType = args.active.data.current?.type;
+  if (activeType === "board-topic") {
+    const boardArgs = {
+      ...args,
+      droppableContainers: args.droppableContainers.filter((c) => {
+        const idStr = String(c.id);
+        return idStr.startsWith("board-topic:") || idStr.startsWith("board-col:");
+      })
+    };
+    const pointerHits = pointerWithin(boardArgs);
+    const cardHits = pointerHits.filter((c) => String(c.id).startsWith("board-topic:"));
+    if (cardHits.length > 0) {
+      return cardHits;
+    }
+    const colHits = pointerHits.filter((c) => String(c.id).startsWith("board-col:"));
+    if (colHits.length > 0) {
+      return colHits;
+    }
+    return closestCorners(boardArgs);
+  }
+  return rectIntersection(args);
+};
 
 function useIsDesktop(): boolean {
   const [isDesktop, setIsDesktop] = useState(() =>
@@ -229,19 +270,26 @@ export function App() {
   const openBoardQuestionCount = useBoardStore((s) => s.openBoardQuestionCount);
   const selectedBoardChannel = useBoardStore((s) => s.selectedChannel);
   const selectedBoardTopicId = useBoardStore((s) => s.selectedTopicId);
+  const focusedBoardTopicId = useBoardStore((s) => s.focusedTopicId);
   const boardTopicFilter = useBoardStore((s) => s.topicFilter);
+  const boardViewMode = useBoardStore((s) => s.viewMode);
+  const boardKanbanMobileStatus = useBoardStore((s) => s.kanbanMobileStatus);
   const boardSearchQuery = useBoardStore((s) => s.searchQuery);
   const boardPermissionDenied = useBoardStore((s) => s.boardPermissionDenied);
 
   const hydrateBoard = useBoardStore((s) => s.hydrateBoard);
   const setOpenBoardQuestionCount = useBoardStore((s) => s.setOpenBoardQuestionCount);
   const upsertBoardTopic = useBoardStore((s) => s.upsertTopic);
+  const upsertBoardTopics = useBoardStore((s) => s.upsertTopics);
   const setBoardTopicMessages = useBoardStore((s) => s.setTopicMessages);
   const appendBoardMessage = useBoardStore((s) => s.appendMessage);
   const applyBoardQuestionAnswered = useBoardStore((s) => s.applyQuestionAnswered);
   const selectBoardChannel = useBoardStore((s) => s.selectChannel);
   const selectBoardTopic = useBoardStore((s) => s.selectTopic);
+  const setFocusedBoardTopicId = useBoardStore((s) => s.setFocusedTopicId);
   const setBoardTopicFilter = useBoardStore((s) => s.setTopicFilter);
+  const setBoardViewMode = useBoardStore((s) => s.setViewMode);
+  const setBoardKanbanMobileStatus = useBoardStore((s) => s.setKanbanMobileStatus);
   const setBoardSearchQuery = useBoardStore((s) => s.setSearchQuery);
   const setBoardPermissionDenied = useBoardStore((s) => s.setBoardPermissionDenied);
   const resetBoard = useBoardStore((s) => s.reset);
@@ -275,6 +323,7 @@ export function App() {
 
   const [submitting, setSubmitting] = useState(false);
   const [dragLabel, setDragLabel] = useState<string | null>(null);
+  const [isDraggingBoardTopic, setIsDraggingBoardTopic] = useState(false);
   const [botKeys, setBotKeys] = useState<import("@/types").ApiKeyRecord[]>([]);
   const [localEndpointShaPrefix, setLocalEndpointShaPrefix] = useState<string | null>(null);
   const [inPageFallbackEnabled, setInPageFallbackEnabled] = useState<boolean>(() =>
@@ -352,6 +401,10 @@ export function App() {
           openBoardQuestionCount: board.openBoardQuestionCount,
           selectedBoardChannel: board.selectedChannel,
           selectedBoardTopicId: board.selectedTopicId,
+          focusedBoardTopicId: board.focusedTopicId,
+          boardTopicFilter: board.topicFilter,
+          boardViewMode: board.viewMode,
+          boardKanbanMobileStatus: board.kanbanMobileStatus,
           boardPermissionDenied: board.boardPermissionDenied
         };
       }
@@ -416,7 +469,7 @@ export function App() {
       try {
         const [chRes, topicsRes] = await Promise.all([
           apiClient.fetchBoardChannels(token),
-          apiClient.fetchBoardTopics(token, { limit: 100 })
+          apiClient.fetchBoardTopics(token, { limit: 200 })
         ]);
         hydrateBoard({
           channels: chRes.channels,
@@ -1867,9 +1920,20 @@ export function App() {
 
   function handleDragStart(event: DragStartEvent) {
     const data = event.active.data.current as
-      | { type?: string; nodeId?: string; workdir?: string; threadId?: string; runId?: string }
+      | {
+          type?: string;
+          nodeId?: string;
+          workdir?: string;
+          threadId?: string;
+          runId?: string;
+          topicId?: string;
+        }
       | undefined;
-    if (data?.type === "workspace" && data.workdir) {
+    if (data?.type === "board-topic" && data.topicId) {
+      const t = boardTopics.find((item) => item.id === data.topicId);
+      setDragLabel(t?.title || data.topicId);
+      setIsDraggingBoardTopic(true);
+    } else if (data?.type === "workspace" && data.workdir) {
       const key = data.workdir.split("/").pop() || data.workdir;
       setDragLabel(`${data.nodeId ?? "node"}:${key}`);
     } else if (data?.type === "queued" && data.runId) {
@@ -1884,11 +1948,154 @@ export function App() {
 
   function handleDragEnd(event: DragEndEvent) {
     setDragLabel(null);
+    setIsDraggingBoardTopic(false);
     const { active, over } = event;
     if (!over) return;
     const activeData = active.data.current as
-      | { type?: string; nodeId?: string; workdir?: string; threadId?: string; runId?: string }
+      | {
+          type?: string;
+          nodeId?: string;
+          workdir?: string;
+          threadId?: string;
+          runId?: string;
+          topicId?: string;
+          channel?: string;
+        }
       | undefined;
+
+    if (activeData?.type === "board-topic" && activeData.topicId) {
+      if (selectedBoardChannel === null) return;
+      const activeTopic = boardTopics.find((t) => t.id === activeData.topicId);
+      if (!activeTopic || activeTopic.channel !== selectedBoardChannel) return;
+
+      const overData = over.data.current as
+        | { type?: string; status?: unknown; topicId?: string }
+        | undefined;
+
+      let targetStatus: BoardKanbanColumnStatus | null = null;
+      if (overData?.type === "board-column" && isKanbanColumnStatus(overData.status)) {
+        targetStatus = overData.status;
+      } else if (overData?.type === "board-topic" && overData.topicId) {
+        const overTopic = boardTopics.find((t) => t.id === overData.topicId);
+        if (overTopic && isKanbanColumnStatus(overTopic.status)) {
+          targetStatus = overTopic.status;
+        } else if (isKanbanColumnStatus(overData.status)) {
+          targetStatus = overData.status;
+        }
+      }
+      if (!targetStatus) return;
+
+      let orderedTopics: BoardTopic[];
+      if (activeTopic.status === targetStatus) {
+        const colTopics = boardTopics
+          .filter((t) => t.channel === activeTopic.channel && t.status === targetStatus)
+          .sort(compareTopicsKanban);
+        const pinnedCol = colTopics.filter((t) => Boolean(t.pinned));
+        const unpinnedCol = colTopics.filter((t) => !t.pinned);
+        const activeGroup = activeTopic.pinned ? pinnedCol : unpinnedCol;
+        const oldIdx = activeGroup.findIndex((t) => t.id === activeTopic.id);
+        if (oldIdx < 0) return;
+
+        let newIdx: number;
+        if (overData?.type === "board-topic" && overData.topicId) {
+          const overTopic = colTopics.find((t) => t.id === overData.topicId);
+          if (!overTopic || Boolean(overTopic.pinned) !== Boolean(activeTopic.pinned)) {
+            return;
+          }
+          newIdx = activeGroup.findIndex((t) => t.id === overTopic.id);
+        } else {
+          newIdx = activeGroup.length - 1;
+        }
+        if (newIdx < 0 || oldIdx === newIdx) return;
+        const movedGroup = arrayMove(activeGroup, oldIdx, newIdx);
+        orderedTopics = activeTopic.pinned
+          ? [...movedGroup, ...unpinnedCol]
+          : [...pinnedCol, ...movedGroup];
+      } else {
+        const destTopics = boardTopics
+          .filter(
+            (t) =>
+              t.channel === activeTopic.channel &&
+              t.status === targetStatus &&
+              t.id !== activeTopic.id
+          )
+          .sort(compareTopicsKanban);
+        const destPinned = destTopics.filter((t) => Boolean(t.pinned));
+        const destUnpinned = destTopics.filter((t) => !t.pinned);
+        const nextPreviousStatus: BoardTopic["previous_status"] =
+          targetStatus === "blocked"
+            ? activeTopic.status === "todo" || activeTopic.status === "in_progress"
+              ? activeTopic.status
+              : activeTopic.previous_status
+            : "";
+        const movedTopic: BoardTopic = {
+          ...activeTopic,
+          status: targetStatus,
+          previous_status: nextPreviousStatus
+        };
+
+        if (movedTopic.pinned) {
+          let insertIdx = destPinned.length;
+          if (overData?.type === "board-topic" && overData.topicId) {
+            const foundIdx = destPinned.findIndex((t) => t.id === overData.topicId);
+            if (foundIdx >= 0) {
+              insertIdx = foundIdx;
+            }
+          }
+          orderedTopics = [
+            ...destPinned.slice(0, insertIdx),
+            movedTopic,
+            ...destPinned.slice(insertIdx),
+            ...destUnpinned
+          ];
+        } else {
+          let insertIdx = destUnpinned.length;
+          if (overData?.type === "board-topic" && overData.topicId) {
+            const foundIdx = destUnpinned.findIndex((t) => t.id === overData.topicId);
+            if (foundIdx >= 0) {
+              insertIdx = foundIdx;
+            } else if (destPinned.some((t) => t.id === overData.topicId)) {
+              insertIdx = 0;
+            }
+          }
+          orderedTopics = [
+            ...destPinned,
+            ...destUnpinned.slice(0, insertIdx),
+            movedTopic,
+            ...destUnpinned.slice(insertIdx)
+          ];
+        }
+      }
+
+      const snapshotTopics = orderedTopics
+        .map((item) => boardTopics.find((orig) => orig.id === item.id))
+        .filter((item): item is BoardTopic => Boolean(item));
+      const optimisticTopics = orderedTopics.map((item, idx) => ({
+        ...item,
+        sort_order: (idx + 1) * 100
+      }));
+
+      upsertBoardTopics(optimisticTopics);
+      selectBoardTopic(activeTopic.id);
+      setFocusedBoardTopicId(activeTopic.id);
+
+      if (hasSession) {
+        void apiClient
+          .reorderBoardTopics(token, {
+            channel: activeTopic.channel,
+            status: targetStatus,
+            ordered_topic_ids: optimisticTopics.map((t) => t.id)
+          })
+          .then((res) => {
+            upsertBoardTopics(res.topics);
+          })
+          .catch((err) => {
+            upsertBoardTopics(snapshotTopics);
+            setErrorBanner(err instanceof ApiClientError ? err.message : "看板排序保存失败");
+          });
+      }
+      return;
+    }
 
     if (activeData?.type === "workspace" && over.id === "composer-workdir-dropzone") {
       if (activeData.nodeId && activeData.workdir) {
@@ -2152,8 +2359,12 @@ export function App() {
   return (
     <DndContext
       sensors={sensors}
+      collisionDetection={boardAwareCollisionDetection}
       onDragStart={handleDragStart}
-      onDragCancel={() => setDragLabel(null)}
+      onDragCancel={() => {
+        setDragLabel(null);
+        setIsDraggingBoardTopic(false);
+      }}
       onDragEnd={handleDragEnd}
     >
       <div className="relative flex h-dvh w-full flex-col overflow-hidden bg-background text-foreground">
@@ -2453,11 +2664,15 @@ export function App() {
               openBoardQuestionCount={openBoardQuestionCount}
               selectedChannel={selectedBoardChannel}
               selectedTopicId={selectedBoardTopicId}
+              focusedTopicId={focusedBoardTopicId}
               topicFilter={boardTopicFilter}
+              viewMode={boardViewMode}
+              kanbanMobileStatus={boardKanbanMobileStatus}
               searchQuery={boardSearchQuery}
               boardPermissionDenied={boardPermissionDenied}
               authScope={authScope}
               isDesktop={isDesktop}
+              isDragging={isDraggingBoardTopic}
               mobileLeftOpen={boardMobileLeftOpen}
               mobileRightOpen={boardMobileRightOpen}
               mobileShowDetail={boardMobileShowDetail}
@@ -2471,8 +2686,17 @@ export function App() {
               onSelectView={(ch, filter) => {
                 selectBoardChannel(ch);
                 setBoardTopicFilter(filter);
+                if (filter === "recent" && hasSession && !boardPermissionDenied) {
+                  void apiClient
+                    .fetchBoardTopics(token, { sort: "recent", limit: 200 })
+                    .then((res) => upsertBoardTopics(res.topics))
+                    .catch(() => {});
+                }
               }}
+              onViewModeChange={setBoardViewMode}
+              onKanbanMobileStatusChange={setBoardKanbanMobileStatus}
               onSelectTopic={selectBoardTopic}
+              onFocusedTopicIdChange={setFocusedBoardTopicId}
               onSearchQueryChange={setBoardSearchQuery}
               onCreateTopic={handleCreateBoardTopic}
               onUpdateTopicStatus={handleUpdateBoardTopicStatus}
