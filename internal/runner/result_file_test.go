@@ -36,7 +36,7 @@ PRE_EXISTS="no"
 if [[ -e "$RF" ]]; then
   PRE_EXISTS="yes"
 fi
-DIR_MODE="$(stat -f '%Lp' "$(dirname "$RF")" 2>/dev/null || stat -c '%a' "$(dirname "$RF")")"
+DIR_MODE="$(stat -c '%a' "$(dirname "$RF")" 2>/dev/null || stat -f '%Lp' "$(dirname "$RF")")"
 printf 'RF=%s\nTOK=%s\nPRE=%s\nMODE=%s\n' "$RF" "$TOK" "$PRE_EXISTS" "$DIR_MODE" > "` + captureFile + `"
 printf '{"ok":true,"count":9007199254740993}\n' > "$RF"
 printf '{"type":"result","session_id":"sess_rf_1","result":"completed"}\n'
