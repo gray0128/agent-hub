@@ -599,6 +599,18 @@ CREATE INDEX IF NOT EXISTS idx_run_dependencies_dep
 PRAGMA foreign_keys = ON;
 ```
 
+### 1.5 增量迁移：`migrations/0010_labels_and_structured_result.sql`（Slice 3）
+
+Slice 3（RFC-0001 第 6 节）仅在 `runs` 表新增三列，**不修改 `runs.status` 的 8 态 `CHECK` 约束**，也不改变既有 7 个 `runs` 索引及外键关系，因此无需执行表重建与 `run_events` 暂存，直接使用 `ALTER TABLE` 增量迁移即可：
+
+```sql
+PRAGMA foreign_keys = ON;
+
+ALTER TABLE runs ADD COLUMN labels_json TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE runs ADD COLUMN result_schema_json TEXT;
+ALTER TABLE runs ADD COLUMN result_json TEXT;
+```
+
 ### 字段语义与容量边界
 
 - 所有时间字段统一使用 RFC 3339 UTC 字符串（精度至毫秒，例如 `2026-11-13T04:15:30.123Z`），确保按字典序比较与索引扫描结果一致。
@@ -614,10 +626,22 @@ PRAGMA foreign_keys = ON;
   - 单次 `POST /api/v1/plans` 最多 `20` 个节点、`60` 条边（`sum(depends_on.length) <= 60`）；单个 `Run` 的直接前置依赖上限为 `10` 条（`depends_on.length <= 10`）；建图前必须执行 `O(V + E)` Kahn 拓扑排序环检测，成环返回 `400 DEPENDENCY_CYCLE_DETECTED`。
   - `scheduled_at`（或 `PlanNodeSpec.in_sec` 换算后的目标时间）必须处于 `[now + 60s, now + 7d]`（`60..604800` 秒）区间；同一节点规格不得同时传入 `scheduled_at` 与 `in_sec`。
   - `blocked_reason` 仅在服务端/前端读取时按上游与定时状态确定性派生，不单独落盘冗余列：当 `status !== 'waiting'` 时恒为 `null`；当 `status === 'waiting'` 时严格按优先级求值：`UPSTREAM_FAILED`（任意直接前置处于 `failed`）> `UPSTREAM_CANCELLED`（任意直接前置处于 `cancelled`）> `DEPENDENCY_PENDING`（仍有前置处于非终态 `waiting`/`queued`/`claimed`/`running`/`needs_approval`）> `SCHEDULED`（全部前置已 `done` 或无前置，但 `scheduled_at > now`）。
+- Slice 3 标签与结构化产物边界（`0010_labels_and_structured_result.sql`）：
+  - `runs.labels_json`：JSON 对象，最多 `16` 个键值对；键长 `1..64` 字符，匹配正则 `^[a-z0-9][a-z0-9._/-]{0,63}$`；**`ahub.*` 前缀保留给控制面内部使用**，调用方在 `POST /api/v1/runs` 与 `POST /api/v1/plans` 传入 `ahub.*` 键一律返回 `400 BAD_REQUEST`；值为字符串，长度 `<= 128` Unicode 码位且禁止控制字符（`^[^\u0000-\u001f\u007f]*$`），落库前须先执行对称 `redactSecrets` 脱敏并复核码位上限 `<= 128`。
+  - `runs.result_schema_json`（可选）：由 `apps/hub-worker/src/json-schema-subset.ts` 在 Workers 运行时无 `eval` / 无 `new Function` 校验的受限 JSON Schema Draft 2020-12 子集：
+    - 建单边界强校验（不合规一律返回 `400 BAD_REQUEST`）：根值必须为普通 JSON 对象，序列化后 UTF-8 字节长度 `<= 16384`（`16 KB`），最大嵌套深度 `<= 16`，总 Schema 节点数 `<= 256`，单条 `pattern` 长度 `<= 256` 且必须可被 `new RegExp(p, "u")` 正常编译。
+    - 允许关键字：元数据（校验时忽略）`$schema`、`$id`、`title`、`description`、`default`、`examples`、`$comment`；类型与常量 `type`（单个字符串或非空无重复数组，枚举值限 `object | array | string | number | integer | boolean | null`）、`enum`、`const`；对象约束 `properties`、`required`、`additionalProperties`（`boolean` 或子 Schema）、`minProperties`、`maxProperties`；数组约束 `items`（子 Schema）、`minItems`、`maxItems`、`uniqueItems`；字符串约束 `minLength`、`maxLength`、`pattern`、`format`（限 `date-time | date | email | uri | uuid`）；数值约束 `minimum`、`maximum`、`exclusiveMinimum`、`exclusiveMaximum`、`multipleOf`（须 `> 0`）；组合子 `allOf`、`anyOf`、`oneOf`。
+    - 显式拒绝（返回 `400 BAD_REQUEST`）：`$ref`、`$defs`、`definitions`、`$dynamicRef`、`$anchor`、`patternProperties`、`propertyNames`、`unevaluatedProperties`、`unevaluatedItems`、`if`、`then`、`else`、`not`、`contains`、`prefixItems`、`dependentRequired`、`dependentSchemas`、任何未知关键字，以及类型/边界/正则非法的声明。
+  - `runs.result_json` 与 `/complete` 结构化产物结算不变量：
+    - 控制面收到 `POST /api/v1/runs/:id/complete` 时，若携带 `result`，**必须先执行递归脱敏 `redactJsonValue(result)`**，再对脱敏后的序列化结果执行 UTF-8 字节上限（`<= 65536` 字节 / `64 KB`）与 `result_schema_json` 校验。
+    - 当请求 `status === "done"` 且任务 `result_schema_json != null` 时：若缺失 `result`、携带非空 `result_error`、脱敏后体积超出 `64 KB` 或未通过 `result_schema` 校验，控制面必须在同一事务中原子结算为 `status = 'failed'`、`error_code = 'RESULT_SCHEMA_MISMATCH'`、`error_message = redactSecrets(...)`、`result_json = NULL`，**完整保留 `output_md`、`output_bytes`、`summary`、`duration_ms`、`native_session_id`、`resolved_model` 与 `resolved_effort`**，同步触发协同板 `handoff` 自动回写（`error_code: 'RESULT_SCHEMA_MISMATCH'`）与通知入队，并返回 HTTP `200`（不返回 HTTP `4xx`，避免节点任务卡死等待租约过期）。
+    - 当 `result_schema_json == null` 且请求 `status === "done"` 时：若 `result` 存在、无 `result_error` 且脱敏后 `<= 64 KB`，则脱敏并落库 `result_json`；**绝不对未声明 `result_schema` 的任务判定 `RESULT_SCHEMA_MISMATCH`**。
+    - 当上报 `status !== "done"`（如 `failed`、`cancelled`、`needs_approval`）时，**绝不**将状态覆盖为 `RESULT_SCHEMA_MISMATCH`，也**绝不**写入 `result_json`。
+  - 幂等与重试继承不变量：`createRun` 与 `createPlan` 的 `Idempotency-Key` 载荷一致性比对必须纳入 `labels` 与 `result_schema`（不一致返回 `409 IDEMPOTENCY_CONFLICT`）；`retryRun` 创建替代 `Run` 时必须复制原任务的 `labels_json` 与 `result_schema_json`，并将 `result_json` 置为 `NULL`。
 
 ## 2. 状态机定义与合法迁移
 
-> **Slice 2 边界声明**：Slice 2 将受控 `Run` 状态机由 7 态扩展为 **8 态**（在 `queued` 前新增零资源占用的 `waiting`），落地 `0009_waiting_dag_and_schedule.sql`、`run_dependencies`、`POST /api/v1/plans`、`POST /api/v1/runs/:id/retry` 与 `board_topic_id` 终态自动 `handoff` 回写；`runs.labels_json` 与 `result_schema_json` / `result_json` 延后至 **Slice 3（`0010`）**。
+> **Slice 2 / Slice 3 边界声明**：Slice 2 将受控 `Run` 状态机由 7 态扩展为 **8 态**（在 `queued` 前新增零资源占用的 `waiting`），落地 `0009_waiting_dag_and_schedule.sql`、`run_dependencies`、`POST /api/v1/plans`、`POST /api/v1/runs/:id/retry` 与 `board_topic_id` 终态自动 `handoff` 回写；Slice 3（`0010_labels_and_structured_result.sql`）仅增 `runs.labels_json`、`result_schema_json` 与 `result_json` 三列及边界校验，不新增状态或状态迁移边。
 
 ```mermaid
 stateDiagram-v2
@@ -663,7 +687,7 @@ stateDiagram-v2
 | `claimed` / `running` / `needs_approval` | `needs_approval` | 节点事件或检查点 `POST /runs/:id/approval` | `WHERE id = ? AND status IN ('claimed','running','needs_approval') AND lease_owner = ?` | 续期租约、原子持久化 `remote_control_url` / `native_session_id` / `summary` / `output_md`、回填 `threads.native_session_id`、仅首入时触发通知队列 |
 | `needs_approval` | `running` | 节点事件 | `WHERE id = ? AND status = 'needs_approval' AND lease_owner = ?` | 续期 `lease_expires_at` |
 | `needs_approval` | `done` | 人工放行结算 `POST /runs/:id/resolve` | `WHERE id = ? AND status = 'needs_approval'` | 写入 `finished_at`、释放 `lease_owner`/`lease_expires_at`、递减 `nodes.active_runs_count`、下发 `hub.abort(approval_resolved)`、触发通知队列、唤醒就绪下游 `waiting`、若 `board_topic_id != null` 则触发系统 `handoff` 回写 |
-| `claimed` / `running` / `needs_approval` | `done` | 节点完成上报 | `WHERE id = ? AND status IN ('claimed','running','needs_approval') AND lease_owner = ?` | 回填 `threads.native_session_id`、释放 `lease_owner`、递减 `nodes.active_runs_count`、触发通知队列、扫描 `run_dependencies` 唤醒就绪下游 `waiting -> queued` + `hub.wake`、若 `board_topic_id != null` 则触发系统 `handoff` 回写 |
+| `claimed` / `running` / `needs_approval` | `done` | 节点完成上报 | `WHERE id = ? AND status IN ('claimed','running','needs_approval') AND lease_owner = ?` | 先对可选 `result` 脱敏并校验 `<= 64 KB` 与 `result_schema_json`（若配置 `result_schema_json` 且缺失/超限/不匹配/携带 `result_error`，原子改落 `status = 'failed'`, `error_code = 'RESULT_SCHEMA_MISMATCH'`, `result_json = NULL` 并保留 `output_md` 等执行产物）；通过则落盘 `result_json`、回填 `threads.native_session_id`、释放 `lease_owner`、递减 `nodes.active_runs_count`、触发通知队列、扫描 `run_dependencies` 唤醒就绪下游 `waiting -> queued` + `hub.wake`、若 `board_topic_id != null` 则触发系统 `handoff` 回写 |
 | `claimed` / `running` / `needs_approval` | `failed` | 节点上报或 Cron 超时 | `WHERE id = ? AND status IN ('claimed','running','needs_approval')`（节点上报需带 `lease_owner`） | 释放 `lease_owner`、递减 `nodes.active_runs_count`、触发通知队列（审批超时写入 `APPROVAL_TIMEOUT`）、向下游 `waiting` 依赖方广播派生 `blocked_reason = 'UPSTREAM_FAILED'` 的 `run.updated`、若 `board_topic_id != null` 则触发系统 `handoff` 回写 |
 | `claimed` / `running` / `needs_approval` | `cancelled` | 用户或级联取消 | `WHERE id = ? AND status IN ('claimed','running','needs_approval')` | 向 DO 发 `hub.abort`、递减 `nodes.active_runs_count`、触发通知队列、向下游 `waiting` 依赖方广播派生 `blocked_reason = 'UPSTREAM_CANCELLED'` 的 `run.updated`（`cascade` 模式则同步级联取消）、若 `board_topic_id != null` 则触发系统 `handoff` 回写 |
 
