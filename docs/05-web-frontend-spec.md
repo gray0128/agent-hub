@@ -19,7 +19,7 @@
 | **图标体系** | `lucide-react` | 按需具名导入，统一线宽 `strokeWidth={1.75}` | `@radix-ui/react-icons`、`@heroicons/*`、`react-icons`、`@tabler/icons-react` |
 | **动效引擎** | `motion` | 统一从 `"motion/react"` 导入 `motion`、`AnimatePresence`、`MotionConfig` | `framer-motion`（旧包名）、`gsap`、`react-spring`、`@formkit/auto-animate` |
 | **分栏布局** | `react-resizable-panels`（v4） | 用于桌面端三栏控制台布局与尺寸持久化 | `allotment`、`react-split`、手写 `mousedown` 拖拽分割条 |
-| **拖拽交互** | `@dnd-kit/core`、`@dnd-kit/sortable`、`@dnd-kit/utilities`、`@dnd-kit/modifiers` | Slice 1a 仅用于既有三处受控列表/队列编排；协同板 4 列看板拖拽（消费 `POST /api/v1/board/topics/reorder`）延后至 **Slice 1b** | `react-beautiful-dnd`、`@hello-pangea/dnd`、`react-dnd`、`sortablejs` |
+| **拖拽交互** | `@dnd-kit/core`、`@dnd-kit/sortable`、`@dnd-kit/utilities`、`@dnd-kit/modifiers` | 用于执行台既有三处受控列表/队列编排，以及协同板 4 列看板同列重排与跨列流转（消费 `POST /api/v1/board/topics/reorder`，仅单频道选中态启用拖拽） | `react-beautiful-dnd`、`@hello-pangea/dnd`、`react-dnd`、`sortablejs` |
 | **状态管理** | `zustand` | 拆分 `fleet`、`task`、`workbench`、`native-activity`、`board` 五个 Store；浏览器推送协调器 `apps/web/src/lib/browser-notify.ts` 与 `public/sw.js` 仅使用浏览器原生 Push / Notification / `navigator.locks` / `BroadcastChannel` API，**零新增第三方依赖** | `redux`、`@reduxjs/toolkit`、`jotai`、`recoil`、`mobx`、`valtio` |
 | **Markdown 与代码** | `react-markdown` + `remark-gfm` | 渲染任务输出 `output_md` 与行内代码 | 不引入重型富文本编辑器 |
 
@@ -48,7 +48,7 @@
 
 ### 2.3 排版与微交互规范
 
-- **字体平滑与等宽对齐**：根节点设置 `-webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;`。所有动态更新数字（运行耗时、队列计数、字节大小、时间戳、租约倒计时，以及 `NativeActivityPane.tsx`、`BrowserNotifyDialog.tsx`、`BoardWorkspace.tsx`、`PendingInbox.tsx`、`BoardTopicTimeline.tsx`、`InspectorPane`「投递明细」与顶栏「待决 / 互动」计数徽标）统一施加 `tabular-nums`（`font-variant-numeric: tabular-nums`），防止数字刷新时引发横向抖动。
+- **字体平滑与等宽对齐**：根节点设置 `-webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;`。所有动态更新数字（运行耗时、队列计数、字节大小、时间戳、租约倒计时，以及 `NativeActivityPane.tsx`、`BrowserNotifyDialog.tsx`、`BoardWorkspace.tsx`、`BoardKanbanView.tsx`、`PendingInbox.tsx`、`BoardTopicTimeline.tsx`、`InspectorPane`「投递明细」与顶栏「待决 / 互动」计数徽标）统一施加 `tabular-nums`（`font-variant-numeric: tabular-nums`），防止数字刷新时引发横向抖动。
 - **网络调用与 Service Worker 边界（L1/L2 门禁）**：全仓前端仅允许 `apps/web/src/lib/api-client.ts` 调用 `fetch(`，任何组件、Store 或 `public/sw.js` 均严禁直接发起裸 `fetch`（`sw.js` 严禁请求 `/api/`，保持零回源）。
 - **移动端触控与零溢出约束**：`<head>` 须声明 `<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content" />`；在 `:root` 中定义 `--safe-top`/`--safe-right`/`--safe-bottom`/`--safe-left`（绑定 `env(safe-area-inset-*, 0px)`），供顶栏、底栏、左右抽屉与居中弹窗避让刘海屏与底部手势条。移动端（`< 640px`）所有 `Input` 与 `Textarea` 表单控件计算字号须保持 `>= 16px`（`text-base sm:text-xs`），防止 iOS Safari / Standalone PWA 聚焦时强制放大视口；节点 ID、目录、Token、模型 ID、Webhook URL 与搜索框等标识符输入字段须显式关闭自动纠错与首字母大写（`autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false}`）。在 `< 768px`（含 `360×780`、`390×844` 视口）下，顶栏、抽屉标签页与筛选/操作按钮均须保持 `>= 44×44px` 触控热区（如 `min-h-11` / `h-11 w-11`），进入待决问答或含 `open` 提问的协同主题详情时，选项按钮与回复提交栏**吸底固定在 `--safe-bottom` 安全区**，页面横向与纵向溢出始终为 `0`（`document.documentElement.scrollWidth <= document.documentElement.clientWidth`）。
 - **标题与正文折行**：标题设置 `text-wrap: balance`，长段提示文案设置 `text-wrap: pretty`。节点 ID、工作区路径、`run_id`、模型名称与事件日志流统一使用等宽字体（`font-mono`）。Markdown 表格须包裹于可键盘聚焦的局部横向滚动容器（`.ahub-table-scroll`，`role="region"`、`tabIndex={0}`、`aria-label="数据表格"`），确保多列表格在窄屏不被挤压成单字竖排且不撑宽页面。
@@ -89,13 +89,17 @@
 └──────────────────┴───────────────────────────────────────────────┴─────────────────────┘
 ```
 
-- **左栏（频道与视图导航）**：提供「全部活跃」与「待我确认」快速筛选（`近期动态 Recent Topics` 跨频道总览属 **Slice 1b** 延后项）、路径式 `Channels` 树（展示各频道活跃主题数与未答复提问数，`tabular-nums`）与「`+ 新建主题`」弹窗触发器。
-- **中栏（列表与话题时间线 `BoardWorkspace.tsx` / `BoardTopicTimeline.tsx`）**：展示当前频道/筛选条件下的主题列表与选中主题时间线。主题内存在 `open` 提问时在顶部置顶待答复横幅（`admin` 可直接点选建议选项或输入答复提交；`client` 仅展示只读状态提示）。时间线混合呈现 `note`、`handoff`、`question`、`answer` 与 `artifact`，显式标示每条消息的 `actor_scope`、`actor_profile` 与 `source_node`；底部提供统一 Composer 提交新备注/交接/提问/产物（`note`/`handoff`/`artifact` 明确提示不触发外发推送）。（注：4 列 `@dnd-kit` 看板拖拽视角与 `J`/`K`/`1`–`4` 快捷键延后至 **Slice 1b**。）
+- **左栏（频道与视图导航）**：提供「全部活跃」（`active`）、「待我确认」（`open_questions`）与跨频道「近期动态」（`recent`，聚合全部未归档跨频道活跃主题并按最近活跃时间 `updated_at DESC, id DESC` 倒序呈现）三个快速筛选视图、路径式 `Channels` 树（展示各频道活跃主题数与未答复提问数，`tabular-nums`）与「`+ 新建主题`」弹窗触发器。
+- **中栏（三视角画布 `BoardWorkspace.tsx` / `BoardTopicTimeline.tsx` / `BoardKanbanView.tsx`）**：顶部提供「`话题流`（`timeline`，默认以兼容 Slice 1a）| `列表`（`list`）| `看板`（`kanban`）」三视角切换器（移动端保持 `>= 44×44px` 触控高度）：
+  - **话题流（`timeline`）**：展示当前频道/筛选条件下的主题列表与选中主题时间线。主题内存在 `open` 提问时在顶部置顶待答复横幅（`admin` 可直接点选建议选项或输入答复提交；`client` 仅展示只读状态提示）。时间线混合呈现 `note`、`handoff`、`question`、`answer` 与 `artifact`，显式标示每条消息的 `actor_scope`、`actor_profile` 与 `source_node`；底部提供统一 Composer 提交新备注/交接/提问/产物（`note`/`handoff`/`artifact` 明确提示不触发外发推送）。
+  - **列表（`list`）**：全宽展示匹配频道/筛选/搜索的主题清单（含频道、状态、置顶、外部锚点 `external_ref`、最近交接署名、未答复提问角标与 `tabular-nums` 更新时间），点击或回车进入主题时间线详情。
+  - **看板（`kanban`）**：以 4 个活跃状态列（`待开始`/`todo`、`进行中`/`in_progress`、`待确认`/`blocked`、`已完成`/`done`，排除 `archived`）呈现主题卡片，列内按 `pinned DESC, sort_order ASC, updated_at DESC, id ASC` 排序（与后端 `sort=order` 严格对齐，同列与跨列拖拽均保持置顶分区与未置顶分区顺序一致）。卡片保留整卡指针/触摸拖拽，同时将 `@dnd-kit` `KeyboardSensor`（`Enter`/`Space` 键盘拖拽）隔离绑定到卡片内独立拖拽手柄按钮（`GripVertical`），确保焦点位于看板卡片本体时按 `Enter` 稳定进入话题详情而不被键盘拖拽劫持。**单频道拖拽约束**：仅当 `selectedChannel !== null` 且处于桌面端时启用 `@dnd-kit` 同列重排与跨列状态流转，乐观更新后调用 `POST /api/v1/board/topics/reorder` 持久化目标列 `ordered_topic_ids`（失败时自动回滚并提示错误）；当 `selectedChannel === null` 时禁用拖拽并在看板顶部展示单频道引导与一键切换频道入口。
+  - **协同板键盘快捷流（`J`/`K`/`1`–`4`/`Enter`/`Esc`）**：焦点不在输入框、文本域、下拉选择框、IME 组合态或弹窗/抽屉内时生效（且当焦点位于非列表/卡片交互控件如按钮、链接或标签页时，`Enter`/`Space` 保留原生控件激活，不被全局快捷键劫持）：`J`/`K` 上下移动主题列表/卡片焦点；`Enter` 选中聚焦主题并进入详情（在已聚焦选项时确认提交答复）；`Esc` 清除预选选项或从详情退回列表（若从 `list`/`kanban` 进入则同步恢复原视角，切换频道或筛选视图时清理残留返回视角）；`1`–`4` 在主题详情存在 `open` 提问时，若为 `admin` 且选项序号存在则预选第 `1`–`4` 个建议选项（再按 `Enter` 提交），否则保持无操作且绝不回退修改主题状态；仅在无 `open` 提问时快捷切换当前聚焦/选中主题状态（`1=todo`、`2=in_progress`、`3=blocked`、`4=done`）。
 - **右栏（主题上下文检视器）**：支持 5 态切换（`todo` / `in_progress` / `blocked` / `done` / `archived`）、置顶开关、`external_ref` 锚点展示、参与节点/角色摘要，以及**最新 `handoff` 交接快照**（提取 `data` 中的 `repo` / `branch` / `commit_sha` / `pr_url` / `next_action` 与一键复制 `ahub board read` 命令）。
 
 #### 待决收件箱（`inbox`）桌面端 Master-Detail 双栏布局（`PendingInbox.tsx`）
 
-- 左栏列出全部跨三域待决条目（按紧急度与时间排序，标明来源域 `board` / `runs` / `native`、频道/节点与角色署名），右栏展开完整上下文并支持就地答复协同板提问（仅 `admin`）、打开远控/标记放行 `needs_approval` 任务，或标记原生互动已处理。（注：`J`/`K`/`1`–`4`/`Enter`/`Esc` 键盘快捷流延后至 **Slice 1b**。）
+- 左栏列出全部跨三域待决条目（按紧急度与时间排序，标明来源域 `board` / `runs` / `native`、频道/节点与角色署名），右栏展开完整上下文并支持就地答复协同板提问（仅 `admin`）、打开远控/标记放行 `needs_approval` 任务，或标记原生互动已处理。支持 `J`/`K`/`1`–`4`/`Enter`/`Esc` 键盘快捷流（`J`/`K` 切换焦点条目；`1`–`4` 在 `admin` 作用域下预选当前 `board` 提问的第 `1`–`4` 个建议选项并高亮，绝不在 `client` 作用域触发 `/answer`；`Enter` 确认提交预选选项或执行当前条目主操作；`Esc` 取消预选选项或退回列表；焦点位于输入控件、IME 组合态或弹窗内时自动屏蔽，同时保留鼠标点击选项按钮即时提交行为）。
 
 #### 执行台（`runs`）桌面端三栏布局（`>= 768px`，`autoSaveId="ahub-workbench-layout"`）
 
@@ -146,8 +150,9 @@
 
 ### 3.2 移动端响应式降级（`< 768px`）
 
-- **协同板与待决收件箱（`< 768px` 单列栈式 + 吸底安全区问答条）**：
-  - 「`协同板`」在 `< 768px` 下隐藏三栏分割线，频道树收敛入左侧响应式 `Sheet` 抽屉、主题检视器收敛入右侧 `Sheet` 抽屉；主屏单列栈式展示主题列表或选中主题时间线（顶部提供返回列表按钮），选定频道或主题后自动收起左抽屉。
+- **协同板与待决收件箱（`< 768px` 单列栈式、看板分段胶囊与吸底安全区问答条）**：
+  - 「`协同板`」在 `< 768px` 下隐藏三栏分割线，频道树收敛入左侧响应式 `Sheet` 抽屉、主题检视器收敛入右侧 `Sheet` 抽屉；主屏顶部保留「`话题流` | `列表` | `看板`」切换器，单列栈式展示主题列表或选中主题时间线（顶部提供返回列表按钮），选定频道或主题后自动收起左抽屉。
+  - 「`协同板 -> 看板`」在 `< 768px` 下自动降级为「状态分段胶囊（`待开始` / `进行中` / `待确认` / `已完成`，单列均分且高度 `>= 44px`）+ 单列主题列表」，禁止多列横向溢出或窄屏看板拖拽。
   - 「`待决收件箱`」在 `< 768px` 下切换为单列 Master-Detail 栈式视图（列表项点击进入详情页并提供返回按钮）。
   - 进入任意待决问答或包含 `open` 提问的主题详情时，选项按钮与答复提交栏**吸底固定在 `--safe-bottom` 安全区**，保障单手拇指即可完成选答与发送，且所有交互按钮维持 `>= 44×44px` 触控热区、输入框 `>= 16px`、`360×780` 与 `390×844` 视口下横向溢出严格为 `0`。
 - **执行台（`< 768px`）**：隐藏三栏分割线，主屏幕专注渲染中栏「当前会话消息流 + 底部紧贴派发台」（或「原生活动详情流」）。
@@ -173,9 +178,9 @@
   - 当当前设备已启用且激活 Web Push 主通道时，自动抑制同源页内 `window.Notification` 重复弹窗（由 Web Push + `tag` 唯一负责系统级提示）。
   - 当尚未配置 VAPID、未订阅 Web Push 或处于仅页内提醒降级模式时，利用 `navigator.locks.request("ahub-notify-" + eventKey, { ifAvailable: true }, ...)` 与 `BroadcastChannel("ahub-notify-dedup")` 协调多标签页，确保同一事件在多开标签页中至多弹出一次页内系统通知。
 
-## 4. `@dnd-kit` 三处高价值拖拽交互规格（Slice 1a 保留）
+## 4. `@dnd-kit` 四处高价值拖拽交互规格
 
-Slice 1a 仅在以下三处保留既有的高价值 `@dnd-kit` 拖拽（协同板 4 列看板拖拽交互延后至 **Slice 1b**）：
+协同板与执行台共享顶层唯一 `<DndContext>` 与 `<DragOverlay dropAnimation={null}>`，在以下四处高价值场景启用 `@dnd-kit` 拖拽：
 
 1. **待执行队列优先级重排**
    - 作用域：右栏「节点排队甲板」中状态为 `queued` 的任务列表（`SortableContext` + `verticalListSortingStrategy`）。
@@ -185,6 +190,9 @@ Slice 1a 仅在以下三处保留既有的高价值 `@dnd-kit` 拖拽（协同�
    - 交互结果：拖入 `queued` Run 时直接调用 `PATCH /api/v1/runs/:id` 改派目标节点（自动校验目标节点是否存在同名 `project_key`；仅允许未建连的单轮新会话改派并同步更新线程节点与目录，多轮历史会话改派返回 `409 INVALID_STATE_TRANSITION`）；拖入已有 `Thread` 时弹出确认对话框，执行「Fork 到目标节点」（`POST /api/v1/threads/:id/fork`）。
 3. **常用会话置顶排序**
    - 作用域：左栏置顶会话区（`pinned === true`），拖拽调整日常高频会话顺序并调用 `PATCH /api/v1/threads/:id` 持久化 `sort_order`。
+4. **协同板 4 列看板同列重排与跨列流转（Slice 1b）**
+   - 作用域：协同板 `看板` 视角中处于 `todo` / `in_progress` / `blocked` / `done` 4 个活跃列的主题卡片，且**仅当桌面端选中单个频道（`selectedChannel !== null`）时启用**（未选频道或 `< 768px` 移动端禁用拖拽）。
+   - 交互结果：释放拖拽后乐观更新目标列 `status` 与 `sort_order` 顺序，调用 `POST /api/v1/board/topics/reorder` 提交目标列的 `{ channel, status, ordered_topic_ids }` 持久化并接收 `board.topic_updated` 广播校准；若请求失败则完整回滚本地列表并提示错误。
 
 ### 传感器与防误触约束
 
@@ -299,6 +307,10 @@ export interface NativeActivityState {
 }
 
 // 5. 跨机协同板与待决提问切片 (apps/web/src/stores/board-store.ts)
+export type BoardTopicFilter = "active" | "open_questions" | "recent";
+export type BoardViewMode = "timeline" | "list" | "kanban";
+export type BoardKanbanColumnStatus = "todo" | "in_progress" | "blocked" | "done";
+
 export interface BoardState {
   channels: BoardChannelSummary[];
   topics: BoardTopic[];
@@ -307,8 +319,12 @@ export interface BoardState {
   openBoardQuestionCount: number;
   selectedChannel: string | null;
   selectedTopicId: string | null;
-  topicFilter: "active" | "open_questions";
+  focusedTopicId: string | null;
+  topicFilter: BoardTopicFilter;
+  viewMode: BoardViewMode;
+  kanbanMobileStatus: BoardKanbanColumnStatus;
   searchQuery: string;
+  boardPermissionDenied: boolean;
   hydrateBoard: (payload: {
     channels: BoardChannelSummary[];
     topics: BoardTopic[];
@@ -317,6 +333,7 @@ export interface BoardState {
   }) => void;
   setOpenBoardQuestionCount: (count: number) => void;
   upsertTopic: (topic: BoardTopic) => void;
+  upsertTopics: (topics: BoardTopic[]) => void;
   setTopicMessages: (topicId: string, messages: BoardMessage[], cursor?: number) => void;
   appendMessage: (topicId: string, message: BoardMessage, cursor?: number) => void;
   applyQuestionAnswered: (payload: {
@@ -328,8 +345,13 @@ export interface BoardState {
   }) => void;
   selectChannel: (channel: string | null) => void;
   selectTopic: (topicId: string | null) => void;
-  setTopicFilter: (filter: BoardState["topicFilter"]) => void;
+  setFocusedTopicId: (topicId: string | null) => void;
+  setTopicFilter: (filter: BoardTopicFilter) => void;
+  setViewMode: (mode: BoardViewMode) => void;
+  setKanbanMobileStatus: (status: BoardKanbanColumnStatus) => void;
   setSearchQuery: (q: string) => void;
+  setBoardPermissionDenied: (denied: boolean) => void;
+  reset: () => void;
 }
 ```
 
@@ -369,3 +391,4 @@ export interface BoardState {
 | 空状态：待决收件箱全清空 | 「当前没有待确认或待审批的阻塞事项。」 |
 | 移动端吸底问答确认提示 | 「提交答复后将立即唤醒等待中的本地或远端会话。」 |
 | 危险操作：吊销凭证 | 「确认吊销此凭证？吊销立即生效；若该凭证属于在线节点，对应节点连接将被立即断开。」 |
+| 看板未选单频道拖拽引导 | 「当前处于跨频道聚合视图，看板拖拽仅在单个频道内启用。请先从左侧频道树或下方按钮切换至单个频道。」 |

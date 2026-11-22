@@ -419,6 +419,7 @@ for (const pane of [
 const slice1aTabularTargets = new Set([
   "BoardWorkspace.tsx",
   "BoardTopicTimeline.tsx",
+  "BoardKanbanView.tsx",
   "PendingInbox.tsx"
 ]);
 const foundSlice1aFiles = findFilesByBasename(path.join(srcDir, "components"), slice1aTabularTargets);

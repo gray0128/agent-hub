@@ -251,6 +251,44 @@ class CDPClient {
     });
   }
 
+  async pressKey(key) {
+    const codeMap = {
+      j: { code: "KeyJ", vk: 74 },
+      k: { code: "KeyK", vk: 75 },
+      " ": { code: "Space", vk: 32 },
+      Tab: { code: "Tab", vk: 9 },
+      "1": { code: "Digit1", vk: 49 },
+      "2": { code: "Digit2", vk: 50 },
+      "3": { code: "Digit3", vk: 51 },
+      "4": { code: "Digit4", vk: 52 },
+      Enter: { code: "Enter", vk: 13 },
+      Escape: { code: "Escape", vk: 27 }
+    };
+    const meta = codeMap[key] ?? { code: key, vk: key.charCodeAt(0) };
+    const textPayload =
+      key === "Enter"
+        ? { text: "\r", unmodifiedText: "\r" }
+        : key.length === 1
+          ? { text: key, unmodifiedText: key }
+          : {};
+    await this.send("Input.dispatchKeyEvent", {
+      type: "keyDown",
+      key,
+      code: meta.code,
+      windowsVirtualKeyCode: meta.vk,
+      nativeVirtualKeyCode: meta.vk,
+      ...textPayload
+    });
+    await this.send("Input.dispatchKeyEvent", {
+      type: "keyUp",
+      key,
+      code: meta.code,
+      windowsVirtualKeyCode: meta.vk,
+      nativeVirtualKeyCode: meta.vk
+    });
+    await sleep(120);
+  }
+
   async setViewport(width, height, mobile = false) {
     await this.send("Emulation.setDeviceMetricsOverride", {
       width,
@@ -3003,6 +3041,893 @@ try {
     await sleep(150);
   }
 
+  // Phase 4b: RFC-0001 Slice 1b — 3-view switcher, 4-col @dnd-kit Kanban, <768px pills, Recent Topics & J/K/1-4/Enter/Esc
+  const kbTopicARes = await apiJson(hubUrl, adminToken, "/api/v1/board/topics", {
+    method: "POST",
+    body: JSON.stringify({
+      channel: "proj/demo",
+      title: "Slice 1b 看板任务 A",
+      status: "todo"
+    })
+  });
+  const kbTopicA = kbTopicARes.topic;
+
+  const kbTopicBRes = await apiJson(hubUrl, adminToken, "/api/v1/board/topics", {
+    method: "POST",
+    body: JSON.stringify({
+      channel: "proj/demo",
+      title: "Slice 1b 看板任务 B",
+      status: "todo"
+    })
+  });
+  const kbTopicB = kbTopicBRes.topic;
+
+  const kbPinnedTopicRes = await apiJson(hubUrl, adminToken, "/api/v1/board/topics", {
+    method: "POST",
+    body: JSON.stringify({
+      channel: "proj/demo",
+      title: "Slice 1b 看板置顶任务 P",
+      status: "todo",
+      pinned: true
+    })
+  });
+  const kbPinnedTopic = kbPinnedTopicRes.topic;
+
+  const kbRecentRes = await apiJson(hubUrl, adminToken, "/api/v1/board/topics", {
+    method: "POST",
+    body: JSON.stringify({
+      channel: "ops/fleet",
+      title: "Slice 1b 近期动态跨频道任务",
+      status: "in_progress"
+    })
+  });
+  const kbRecentTopic = kbRecentRes.topic;
+
+  const kbLongChannelRes = await apiJson(hubUrl, adminToken, "/api/v1/board/topics", {
+    method: "POST",
+    body: JSON.stringify({
+      channel: "org/long-channel-name-for-mobile-360px-button-clipping-check",
+      title: "Slice 1b 超长频道名移动端按钮截断检查",
+      status: "todo"
+    })
+  });
+  const kbLongChannelTopic = kbLongChannelRes.topic;
+
+  const kbQTopic1Res = await apiJson(hubUrl, adminToken, "/api/v1/board/topics", {
+    method: "POST",
+    body: JSON.stringify({
+      channel: "proj/demo",
+      title: "Slice 1b 收件箱键盘作答主题",
+      status: "todo"
+    })
+  });
+  const kbQTopic1 = kbQTopic1Res.topic;
+  const kbInboxQ1Res = await apiJson(hubUrl, adminToken, `/api/v1/board/topics/${kbQTopic1.id}/messages`, {
+    method: "POST",
+    body: JSON.stringify({
+      kind: "question",
+      actor_profile: "agy-worker",
+      source_node: "macmini",
+      text_md: "Slice 1b 收件箱快捷键作答测试问题？",
+      question_options: ["选项甲", "选项乙"]
+    })
+  });
+  const kbInboxQ1 = kbInboxQ1Res.message;
+
+  const kbQTopic2Res = await apiJson(hubUrl, adminToken, "/api/v1/board/topics", {
+    method: "POST",
+    body: JSON.stringify({
+      channel: "proj/demo",
+      title: "Slice 1b 协同板详情快捷键作答主题",
+      status: "todo"
+    })
+  });
+  const kbQTopic2 = kbQTopic2Res.topic;
+  const kbBoardQ2Res = await apiJson(hubUrl, adminToken, `/api/v1/board/topics/${kbQTopic2.id}/messages`, {
+    method: "POST",
+    body: JSON.stringify({
+      kind: "question",
+      actor_profile: "codex-worker",
+      source_node: "macmini",
+      text_md: "Slice 1b 协同板详情快捷键作答测试问题？",
+      question_options: ["同意方案一", "保持现状"]
+    })
+  });
+  const kbBoardQ2 = kbBoardQ2Res.message;
+
+  await cdpClient.setViewport(1440, 900, false);
+  await cdpClient.clickSelector('[data-testid="workspace-tab-board"]');
+  for (let i = 0; i < 30; i++) {
+    const hydrated1b = await cdpClient.evalJS(`
+      (() => {
+        const s = window.__AHUB_EVAL__?.getState();
+        if (!s || s.workspaceMode !== "board") return false;
+        const ids = new Set(s.boardTopics.map(t => t.id));
+        return ids.has(${JSON.stringify(kbTopicA.id)}) &&
+          ids.has(${JSON.stringify(kbTopicB.id)}) &&
+          ids.has(${JSON.stringify(kbPinnedTopic.id)}) &&
+          ids.has(${JSON.stringify(kbRecentTopic.id)}) &&
+          ids.has(${JSON.stringify(kbLongChannelTopic.id)}) &&
+          ids.has(${JSON.stringify(kbQTopic1.id)}) &&
+          ids.has(${JSON.stringify(kbQTopic2.id)});
+      })()
+    `);
+    if (hydrated1b) break;
+    if (i === 29) throw new Error("Slice 1b seeded board topics did not hydrate via WebSocket in time");
+    await sleep(150);
+  }
+
+  // 1) Central 3-view switcher: 话题流 | 列表 | 看板
+  const switcherCheck = await cdpClient.evalJS(`({
+    viewMode: window.__AHUB_EVAL__.getState().boardViewMode,
+    hasSwitcher: Boolean(document.querySelector('[data-testid="board-view-switcher"]')),
+    hasTimelineTab: Boolean(document.querySelector('[data-testid="board-view-tab-timeline"]')),
+    hasListTab: Boolean(document.querySelector('[data-testid="board-view-tab-list"]')),
+    hasKanbanTab: Boolean(document.querySelector('[data-testid="board-view-tab-kanban"]'))
+  })`);
+  if (
+    switcherCheck.viewMode !== "timeline" ||
+    !switcherCheck.hasSwitcher ||
+    !switcherCheck.hasTimelineTab ||
+    !switcherCheck.hasListTab ||
+    !switcherCheck.hasKanbanTab
+  ) {
+    throw new Error(`Slice 1b 3-view switcher check failed: ${JSON.stringify(switcherCheck)}`);
+  }
+
+  // Regression: focusing a <button> (board-new-topic-btn / board-view-tab-kanban) + Enter activates the button cleanly without shortcut hijack
+  const focusedNewBtn = await cdpClient.evalJS(`(() => {
+    const btn = document.querySelector('[data-testid="board-new-topic-btn"]');
+    if (!(btn instanceof HTMLElement)) return false;
+    btn.focus();
+    return document.activeElement === btn;
+  })()`);
+  if (!focusedNewBtn) {
+    throw new Error("Slice 1b failed to focus board-new-topic-btn");
+  }
+  await cdpClient.pressKey("Enter");
+  await sleep(150);
+  const newDialogOpenedByEnter = await cdpClient.evalJS(
+    `Boolean(document.querySelector('[data-testid="board-new-topic-dialog"]'))`
+  );
+  if (!newDialogOpenedByEnter) {
+    throw new Error("Slice 1b regression: Enter on focused board-new-topic-btn did not open dialog (hijacked)");
+  }
+  await cdpClient.pressKey("Escape");
+  await sleep(150);
+
+  const focusedKanbanTab = await cdpClient.evalJS(`(() => {
+    const btn = document.querySelector('[data-testid="board-view-tab-kanban"]');
+    if (!(btn instanceof HTMLElement)) return false;
+    btn.focus();
+    return document.activeElement === btn;
+  })()`);
+  if (!focusedKanbanTab) {
+    throw new Error("Slice 1b failed to focus board-view-tab-kanban");
+  }
+  await cdpClient.pressKey("Enter");
+  await sleep(150);
+  const kanbanTabActivatedByEnter = await cdpClient.evalJS(
+    `window.__AHUB_EVAL__.getState().boardViewMode`
+  );
+  if (kanbanTabActivatedByEnter !== "kanban") {
+    throw new Error(`Slice 1b regression: Enter on focused board-view-tab-kanban did not switch to kanban (got ${kanbanTabActivatedByEnter})`);
+  }
+  await cdpClient.clickSelector('[data-testid="board-view-tab-timeline"]');
+  await sleep(150);
+
+  await cdpClient.clickSelector('[data-testid="board-view-tab-list"]');
+  await sleep(150);
+  const listViewCheck = await cdpClient.evalJS(`({
+    viewMode: window.__AHUB_EVAL__.getState().boardViewMode,
+    hasListView: Boolean(document.querySelector('[data-testid="board-list-view"]')),
+    hasTopicA: Boolean(document.querySelector('[data-testid="board-list-item-${kbTopicA.id}"]'))
+  })`);
+  if (listViewCheck.viewMode !== "list" || !listViewCheck.hasListView || !listViewCheck.hasTopicA) {
+    throw new Error(`Slice 1b list view check failed: ${JSON.stringify(listViewCheck)}`);
+  }
+
+  // 2) Unselected-channel Kanban guard + 1-click channel switch
+  await cdpClient.clickSelector('[data-testid="board-filter-active"]');
+  await sleep(150);
+  await cdpClient.clickSelector('[data-testid="board-view-tab-kanban"]');
+  await sleep(200);
+  const kanbanGuardCheck = await cdpClient.evalJS(`({
+    viewMode: window.__AHUB_EVAL__.getState().boardViewMode,
+    selectedChannel: window.__AHUB_EVAL__.getState().selectedBoardChannel,
+    hasKanbanView: Boolean(document.querySelector('[data-testid="board-kanban-view"]')),
+    hasChannelGuard: Boolean(document.querySelector('[data-testid="board-kanban-channel-guard"]')),
+    hasSwitchBtn: Boolean(document.querySelector('[data-testid="board-kanban-switch-channel-proj/demo"]')),
+    cols: ["todo", "in_progress", "blocked", "done"].filter(s => Boolean(document.querySelector('[data-testid="board-kanban-column-' + s + '"]'))),
+    hasArchivedCol: Boolean(document.querySelector('[data-testid="board-kanban-column-archived"]'))
+  })`);
+  if (
+    kanbanGuardCheck.viewMode !== "kanban" ||
+    kanbanGuardCheck.selectedChannel !== null ||
+    !kanbanGuardCheck.hasKanbanView ||
+    !kanbanGuardCheck.hasChannelGuard ||
+    !kanbanGuardCheck.hasSwitchBtn ||
+    kanbanGuardCheck.cols.length !== 4 ||
+    kanbanGuardCheck.hasArchivedCol
+  ) {
+    throw new Error(`Slice 1b Kanban unselected-channel guard check failed: ${JSON.stringify(kanbanGuardCheck)}`);
+  }
+
+  await cdpClient.clickSelector('[data-testid="board-kanban-switch-channel-proj/demo"]');
+  await sleep(200);
+  const kanbanChannelSwitched = await cdpClient.evalJS(`({
+    selectedChannel: window.__AHUB_EVAL__.getState().selectedBoardChannel,
+    hasChannelGuard: Boolean(document.querySelector('[data-testid="board-kanban-channel-guard"]')),
+    todoCardIds: Array.from(document.querySelectorAll('[data-testid="board-kanban-column-todo"] [data-testid^="board-kanban-card-"]')).map(el => el.getAttribute("data-topic-id"))
+  })`);
+  if (
+    kanbanChannelSwitched.selectedChannel !== "proj/demo" ||
+    kanbanChannelSwitched.hasChannelGuard ||
+    !kanbanChannelSwitched.todoCardIds.includes(kbTopicA.id) ||
+    !kanbanChannelSwitched.todoCardIds.includes(kbTopicB.id)
+  ) {
+    throw new Error(`Slice 1b Kanban 1-click channel switch failed: ${JSON.stringify(kanbanChannelSwitched)}`);
+  }
+
+  // Regression: Kanban card selection button and drag-handle button must be siblings (zero nested interactive controls)
+  const nestedInteractiveCheck = await cdpClient.evalJS(`(() => {
+    const cards = Array.from(document.querySelectorAll('[data-testid^="board-kanban-card-"]'));
+    const handles = Array.from(document.querySelectorAll('[data-testid^="board-kanban-drag-handle-"]'));
+    const cardViolations = cards
+      .filter((card) => Boolean(card.querySelector('button, [role="button"], a[href]')))
+      .map((card) => card.getAttribute('data-testid'));
+    const handleViolations = handles
+      .filter((handle) => Boolean(handle.parentElement?.closest('button, [role="button"], a[href]')))
+      .map((handle) => handle.getAttribute('data-testid'));
+    return {
+      cardCount: cards.length,
+      handleCount: handles.length,
+      cardViolations,
+      handleViolations
+    };
+  })()`);
+  if (
+    nestedInteractiveCheck.cardCount < 3 ||
+    nestedInteractiveCheck.handleCount < 3 ||
+    nestedInteractiveCheck.cardViolations.length > 0 ||
+    nestedInteractiveCheck.handleViolations.length > 0
+  ) {
+    throw new Error(`Slice 1b Kanban nested interactive violation: ${JSON.stringify(nestedInteractiveCheck)}`);
+  }
+
+  // 3) Single-channel @dnd-kit Kanban intra-column reorder (respecting pinned/unpinned partition) + cross-column drag + D1 persistence
+  const todoBefore = kanbanChannelSwitched.todoCardIds;
+  if (todoBefore.length < 3 || todoBefore[0] !== kbPinnedTopic.id) {
+    throw new Error(`Slice 1b expected pinned ${kbPinnedTopic.id} first + >= 2 unpinned cards in todo, got ${JSON.stringify(todoBefore)}`);
+  }
+  // Regression: dragging unpinned card onto pinned card in same column must NOT cause snapback or reorder above pinned
+  await cdpClient.dragBetween(
+    `[data-testid="board-kanban-card-${todoBefore[2]}"]`,
+    `[data-testid="board-kanban-card-${kbPinnedTopic.id}"]`
+  );
+  await sleep(250);
+  const todoAfterBoundary = await cdpClient.evalJS(
+    `Array.from(document.querySelectorAll('[data-testid="board-kanban-column-todo"] [data-testid^="board-kanban-card-"]')).map(el => el.getAttribute("data-topic-id"))`
+  );
+  const d1TodoAfterBoundary = (await apiJson(hubUrl, adminToken, "/api/v1/board/topics?channel=proj/demo&status=todo&sort=order")).topics;
+  if (todoAfterBoundary[0] !== kbPinnedTopic.id || d1TodoAfterBoundary[0]?.id !== kbPinnedTopic.id) {
+    throw new Error(`Slice 1b Kanban pinned boundary violation: UI=${JSON.stringify(todoAfterBoundary)} D1=${JSON.stringify(d1TodoAfterBoundary.map(t => t.id))}`);
+  }
+
+  const firstTodoId = todoBefore[1];
+  const secondTodoId = todoBefore[2];
+  await cdpClient.dragBetween(
+    `[data-testid="board-kanban-card-${secondTodoId}"]`,
+    `[data-testid="board-kanban-card-${firstTodoId}"]`
+  );
+  for (let i = 0; i < 25; i++) {
+    const todoAfter = await cdpClient.evalJS(
+      `Array.from(document.querySelectorAll('[data-testid="board-kanban-column-todo"] [data-testid^="board-kanban-card-"]')).map(el => el.getAttribute("data-topic-id"))`
+    );
+    if (todoAfter[0] === kbPinnedTopic.id && todoAfter[1] === secondTodoId && todoAfter[2] === firstTodoId) break;
+    if (i === 24) throw new Error(`Slice 1b Kanban intra-column DnD reorder failed: expected [${kbPinnedTopic.id}, ${secondTodoId}, ${firstTodoId}], got ${JSON.stringify(todoAfter)}`);
+    await sleep(150);
+  }
+  const d1TodoOrder = (await apiJson(hubUrl, adminToken, "/api/v1/board/topics?channel=proj/demo&status=todo&sort=order")).topics;
+  if (d1TodoOrder[0]?.id !== kbPinnedTopic.id || d1TodoOrder[1]?.id !== secondTodoId || d1TodoOrder[2]?.id !== firstTodoId) {
+    throw new Error(`Slice 1b Kanban intra-column reorder D1 mismatch: expected [${kbPinnedTopic.id}, ${secondTodoId}, ${firstTodoId}], got ${JSON.stringify(d1TodoOrder.map(t => ({ id: t.id, pinned: t.pinned, sort_order: t.sort_order })))}`);
+  }
+
+  // Cross-column drag: kbTopicA (todo) -> in_progress column
+  await cdpClient.dragBetween(
+    `[data-testid="board-kanban-card-${kbTopicA.id}"]`,
+    `[data-testid="board-kanban-column-in_progress"]`
+  );
+  for (let i = 0; i < 25; i++) {
+    const inProgIds = await cdpClient.evalJS(
+      `Array.from(document.querySelectorAll('[data-testid="board-kanban-column-in_progress"] [data-testid^="board-kanban-card-"]')).map(el => el.getAttribute("data-topic-id"))`
+    );
+    if (inProgIds.includes(kbTopicA.id)) break;
+    if (i === 24) throw new Error(`Slice 1b Kanban cross-column DnD failed: ${kbTopicA.id} did not move to in_progress`);
+    await sleep(150);
+  }
+  const d1TopicAAfterDrag = (await apiJson(hubUrl, adminToken, `/api/v1/board/topics/${kbTopicA.id}/messages`)).topic;
+  if (d1TopicAAfterDrag.status !== "in_progress") {
+    throw new Error(`Slice 1b Kanban cross-column D1 persistence failed: expected in_progress, got ${d1TopicAAfterDrag.status}`);
+  }
+
+  // 4) < 768px (360x780 & 390x844) Kanban mobile degradation (segmented pills + single list + 0 overflow)
+  for (const [vw, vh] of [[360, 780], [390, 844]]) {
+    await cdpClient.setViewport(vw, vh, true);
+    await sleep(250);
+    await assertViewportContainment(cdpClient, `mobile-${vw}x${vh}-board-kanban`);
+    const mobileKanbanCheck = await cdpClient.evalJS(`
+      (() => {
+        const hasDesktopCols = Boolean(document.querySelector('[data-testid="board-kanban-column-todo"]'));
+        const hasPills = Boolean(document.querySelector('[data-testid="board-kanban-mobile-pills"]'));
+        const hasList = Boolean(document.querySelector('[data-testid="board-kanban-mobile-list"]'));
+        const pills = ["todo", "in_progress", "blocked", "done"].map((st) => {
+          const el = document.querySelector('[data-testid="board-kanban-mobile-pill-' + st + '"]');
+          const r = el ? el.getBoundingClientRect() : null;
+          return { st, w: r?.width ?? 0, h: r?.height ?? 0, text: el?.textContent?.trim() ?? "" };
+        });
+        const viewTabs = ["timeline", "list", "kanban"].map((vm) => {
+          const el = document.querySelector('[data-testid="board-view-tab-' + vm + '"]');
+          const r = el ? el.getBoundingClientRect() : null;
+          return { vm, w: r?.width ?? 0, h: r?.height ?? 0 };
+        });
+        return { hasDesktopCols, hasPills, hasList, pills, viewTabs };
+      })()
+    `);
+    if (
+      mobileKanbanCheck.hasDesktopCols ||
+      !mobileKanbanCheck.hasPills ||
+      !mobileKanbanCheck.hasList ||
+      mobileKanbanCheck.pills.some((p) => p.w < 43.5 || p.h < 43.5) ||
+      mobileKanbanCheck.viewTabs.some((t) => t.w < 43.5 || t.h < 43.5)
+    ) {
+      throw new Error(`Slice 1b Mobile ${vw}x${vh} Kanban degradation failed: ${JSON.stringify(mobileKanbanCheck)}`);
+    }
+
+    await cdpClient.clickSelector('[data-testid="board-kanban-mobile-pill-in_progress"]');
+    await sleep(150);
+    const mobileInProgHasA = await cdpClient.evalJS(
+      `Boolean(document.querySelector('[data-testid="board-kanban-mobile-list"] [data-testid="board-kanban-card-${kbTopicA.id}"]'))`
+    );
+    if (!mobileInProgHasA) {
+      throw new Error(`Slice 1b Mobile ${vw}x${vh} Kanban pill in_progress missing ${kbTopicA.id}`);
+    }
+    await assertViewportContainment(cdpClient, `mobile-${vw}x${vh}-board-kanban-in-progress`);
+    if (vw === 360) {
+      const hasBoardChannelTrigger = await cdpClient.evalJS(`Boolean(document.querySelector('[data-testid="board-mobile-channels-trigger"]'))`);
+      await cdpClient.clickSelector(hasBoardChannelTrigger ? '[data-testid="board-mobile-channels-trigger"]' : '[data-testid="mobile-left-trigger"]');
+      await sleep(250);
+      await cdpClient.clickSelector('[data-testid="board-filter-active"]');
+      await sleep(200);
+      const longBtnClip = await cdpClient.evalJS(`(() => {
+        const btns = Array.from(document.querySelectorAll('[data-testid^="board-kanban-switch-channel-"]'));
+        return btns.map(b => {
+          const r = b.getBoundingClientRect();
+          return { id: b.getAttribute("data-testid"), left: r.left, right: r.right, width: r.width, vw: window.innerWidth };
+        });
+      })()`);
+      if (longBtnClip.length === 0 || longBtnClip.some((b) => b.right > 360 + 1 || b.left < -1)) {
+        throw new Error(`Slice 1b Mobile 360px channel switch button clipped/overflowed: ${JSON.stringify(longBtnClip)}`);
+      }
+      await assertViewportContainment(cdpClient, "mobile-360x780-board-kanban-channel-guard");
+      await cdpClient.clickSelector('[data-testid="board-kanban-switch-channel-proj/demo"]');
+      await sleep(200);
+    }
+  }
+
+  // 5) Single-channel desktop Kanban card Enter & J+Enter regression (must open detail, not trigger @dnd-kit KeyboardSensor drag)
+  await cdpClient.setViewport(1440, 900, false);
+  await sleep(200);
+  const kanbanDesktopCards = await cdpClient.evalJS(`
+    ["todo", "in_progress", "blocked", "done"].flatMap((st) =>
+      Array.from(document.querySelectorAll('[data-testid="board-kanban-column-' + st + '"] [data-testid^="board-kanban-card-"]'))
+        .map((el) => el.getAttribute("data-topic-id"))
+        .filter(Boolean)
+    )
+  `);
+  if (kanbanDesktopCards.length < 2) {
+    throw new Error(`Slice 1b Kanban Enter regression expected >= 2 cards, got ${JSON.stringify(kanbanDesktopCards)}`);
+  }
+  const kanbanCard1 = kanbanDesktopCards[0];
+  const kanbanCard2 = kanbanDesktopCards[1];
+
+  await cdpClient.clickSelector(`[data-testid="board-kanban-card-${kanbanCard1}"]`);
+  await sleep(120);
+  await cdpClient.pressKey("Enter");
+  await sleep(200);
+  const afterKanbanCardEnter = await cdpClient.evalJS(`({
+    viewMode: window.__AHUB_EVAL__.getState().boardViewMode,
+    selectedTopicId: window.__AHUB_EVAL__.getState().selectedBoardTopicId
+  })`);
+  if (afterKanbanCardEnter.viewMode !== "timeline" || afterKanbanCardEnter.selectedTopicId !== kanbanCard1) {
+    throw new Error(`Slice 1b regression: click Kanban card + Enter failed to open detail (expected timeline/${kanbanCard1}, got ${JSON.stringify(afterKanbanCardEnter)})`);
+  }
+
+  await cdpClient.pressKey("Escape");
+  await sleep(150);
+  const backToKanban = await cdpClient.evalJS(`window.__AHUB_EVAL__.getState().boardViewMode`);
+  if (backToKanban !== "kanban") {
+    throw new Error(`Slice 1b regression: Escape from Kanban detail did not return to kanban (got ${backToKanban})`);
+  }
+
+  // Space on focused board-kanban-card-* must also activate the card and enter detail
+  await cdpClient.clickSelector(`[data-testid="board-kanban-card-${kanbanCard1}"]`);
+  await sleep(120);
+  await cdpClient.pressKey(" ");
+  await sleep(200);
+  const afterKanbanCardSpace = await cdpClient.evalJS(`({
+    viewMode: window.__AHUB_EVAL__.getState().boardViewMode,
+    selectedTopicId: window.__AHUB_EVAL__.getState().selectedBoardTopicId
+  })`);
+  if (afterKanbanCardSpace.viewMode !== "timeline" || afterKanbanCardSpace.selectedTopicId !== kanbanCard1) {
+    throw new Error(`Slice 1b regression: Space on focused Kanban card failed to open detail (expected timeline/${kanbanCard1}, got ${JSON.stringify(afterKanbanCardSpace)})`);
+  }
+  await cdpClient.pressKey("Escape");
+  await sleep(150);
+  const backToKanbanAfterSpace = await cdpClient.evalJS(`window.__AHUB_EVAL__.getState().boardViewMode`);
+  if (backToKanbanAfterSpace !== "kanban") {
+    throw new Error(`Slice 1b regression: Escape after Space detail did not return to kanban (got ${backToKanbanAfterSpace})`);
+  }
+
+  // Focus drag handle -> J -> Enter blurs handle, moves focus to next card button, and opens detail
+  await cdpClient.clickSelector(`[data-testid="board-kanban-card-${kanbanCard1}"]`);
+  await sleep(120);
+  const focusedHandle = await cdpClient.evalJS(`(() => {
+    const h = document.querySelector('[data-testid="board-kanban-drag-handle-${kanbanCard1}"]');
+    if (!(h instanceof HTMLElement)) return false;
+    h.focus();
+    return document.activeElement === h;
+  })()`);
+  if (!focusedHandle) {
+    throw new Error(`Slice 1b failed to focus board-kanban-drag-handle-${kanbanCard1}`);
+  }
+  await cdpClient.pressKey("j");
+  await sleep(150);
+  const afterHandleJ = await cdpClient.evalJS(`({
+    focusedTopicId: window.__AHUB_EVAL__.getState().focusedBoardTopicId,
+    activeTestId: document.activeElement?.getAttribute("data-testid") ?? null
+  })`);
+  if (
+    afterHandleJ.focusedTopicId !== kanbanCard2 ||
+    afterHandleJ.activeTestId !== `board-kanban-card-${kanbanCard2}`
+  ) {
+    throw new Error(`Slice 1b regression: J from Kanban drag handle did not move DOM focus to ${kanbanCard2}: ${JSON.stringify(afterHandleJ)}`);
+  }
+  await cdpClient.pressKey("Enter");
+  await sleep(200);
+  const afterHandleJEnter = await cdpClient.evalJS(`({
+    viewMode: window.__AHUB_EVAL__.getState().boardViewMode,
+    selectedTopicId: window.__AHUB_EVAL__.getState().selectedBoardTopicId
+  })`);
+  if (afterHandleJEnter.viewMode !== "timeline" || afterHandleJEnter.selectedTopicId !== kanbanCard2) {
+    throw new Error(`Slice 1b regression: focus drag handle + J + Enter failed to open ${kanbanCard2}: ${JSON.stringify(afterHandleJEnter)}`);
+  }
+  await cdpClient.pressKey("Escape");
+  await sleep(150);
+
+  await cdpClient.clickSelector(`[data-testid="board-kanban-card-${kanbanCard1}"]`);
+  await sleep(120);
+  await cdpClient.pressKey("j");
+  await sleep(150);
+  const afterKanbanCardJ = await cdpClient.evalJS(`({
+    focusedTopicId: window.__AHUB_EVAL__.getState().focusedBoardTopicId,
+    activeTestId: document.activeElement?.getAttribute("data-testid") ?? null
+  })`);
+  if (
+    afterKanbanCardJ.focusedTopicId !== kanbanCard2 ||
+    afterKanbanCardJ.activeTestId !== `board-kanban-card-${kanbanCard2}`
+  ) {
+    throw new Error(`Slice 1b regression: J from Kanban card did not move DOM focus to next card ${kanbanCard2}: ${JSON.stringify(afterKanbanCardJ)}`);
+  }
+  await cdpClient.pressKey("Enter");
+  await sleep(200);
+  const afterKanbanCardJEnter = await cdpClient.evalJS(`({
+    viewMode: window.__AHUB_EVAL__.getState().boardViewMode,
+    selectedTopicId: window.__AHUB_EVAL__.getState().selectedBoardTopicId
+  })`);
+  if (afterKanbanCardJEnter.viewMode !== "timeline" || afterKanbanCardJEnter.selectedTopicId !== kanbanCard2) {
+    throw new Error(`Slice 1b regression: click Kanban card + J + Enter failed to open next topic ${kanbanCard2}: ${JSON.stringify(afterKanbanCardJEnter)}`);
+  }
+
+  // Exit detail back to kanban for Tab+Space / Tab+Enter / rapid synchronous J+Enter checks
+  await cdpClient.pressKey("Escape");
+  await sleep(150);
+
+  // Tab twice from kanbanCard1 onto kanbanCard2 + Space must open kanbanCard2 (not stale kanbanCard1)
+  await cdpClient.clickSelector(`[data-testid="board-kanban-card-${kanbanCard1}"]`);
+  await sleep(120);
+  const preTabKanbanFocus = await cdpClient.evalJS(`window.__AHUB_EVAL__.getState().focusedBoardTopicId`);
+  if (preTabKanbanFocus !== kanbanCard1) {
+    throw new Error(`Slice 1b Tab+Space setup expected focusedBoardTopicId=${kanbanCard1}, got ${preTabKanbanFocus}`);
+  }
+  await cdpClient.pressKey("Tab");
+  await cdpClient.pressKey("Tab");
+  const tabSpaceTargetEl = await cdpClient.evalJS(
+    `document.activeElement?.getAttribute("data-testid") ?? null`
+  );
+  if (tabSpaceTargetEl !== `board-kanban-card-${kanbanCard2}`) {
+    throw new Error(`Slice 1b Tab twice from ${kanbanCard1} expected activeElement board-kanban-card-${kanbanCard2}, got ${tabSpaceTargetEl}`);
+  }
+  await cdpClient.pressKey(" ");
+  await sleep(200);
+  const afterTabSpace = await cdpClient.evalJS(`({
+    viewMode: window.__AHUB_EVAL__.getState().boardViewMode,
+    selectedTopicId: window.__AHUB_EVAL__.getState().selectedBoardTopicId
+  })`);
+  if (afterTabSpace.viewMode !== "timeline" || afterTabSpace.selectedTopicId !== kanbanCard2) {
+    throw new Error(`Slice 1b regression: Tab+Space on board-kanban-card-${kanbanCard2} opened ${JSON.stringify(afterTabSpace)}`);
+  }
+  await cdpClient.pressKey("Escape");
+  await sleep(150);
+
+  // Tab twice from kanbanCard1 onto kanbanCard2 + Enter must also open kanbanCard2
+  await cdpClient.clickSelector(`[data-testid="board-kanban-card-${kanbanCard1}"]`);
+  await sleep(120);
+  await cdpClient.pressKey("Tab");
+  await cdpClient.pressKey("Tab");
+  const tabEnterTargetEl = await cdpClient.evalJS(
+    `document.activeElement?.getAttribute("data-testid") ?? null`
+  );
+  if (tabEnterTargetEl !== `board-kanban-card-${kanbanCard2}`) {
+    throw new Error(`Slice 1b Tab+Enter expected activeElement board-kanban-card-${kanbanCard2}, got ${tabEnterTargetEl}`);
+  }
+  await cdpClient.pressKey("Enter");
+  await sleep(200);
+  const afterTabEnter = await cdpClient.evalJS(`({
+    viewMode: window.__AHUB_EVAL__.getState().boardViewMode,
+    selectedTopicId: window.__AHUB_EVAL__.getState().selectedBoardTopicId
+  })`);
+  if (afterTabEnter.viewMode !== "timeline" || afterTabEnter.selectedTopicId !== kanbanCard2) {
+    throw new Error(`Slice 1b regression: Tab+Enter on board-kanban-card-${kanbanCard2} opened ${JSON.stringify(afterTabEnter)}`);
+  }
+  await cdpClient.pressKey("Escape");
+  await sleep(150);
+
+  // Rapid synchronous J + Enter (before rAF/re-render) must move DOM focus synchronously and open kanbanCard2
+  await cdpClient.clickSelector(`[data-testid="board-kanban-card-${kanbanCard1}"]`);
+  await sleep(120);
+  await cdpClient.evalJS(`(() => {
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "j", bubbles: true, cancelable: true }));
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+  })()`);
+  await sleep(200);
+  const afterSyncJEnter = await cdpClient.evalJS(`({
+    viewMode: window.__AHUB_EVAL__.getState().boardViewMode,
+    selectedTopicId: window.__AHUB_EVAL__.getState().selectedBoardTopicId
+  })`);
+  if (afterSyncJEnter.viewMode !== "timeline" || afterSyncJEnter.selectedTopicId !== kanbanCard2) {
+    throw new Error(`Slice 1b regression: rapid synchronous J+Enter opened ${JSON.stringify(afterSyncJEnter)} instead of ${kanbanCard2}`);
+  }
+  await cdpClient.pressKey("Escape");
+  await sleep(150);
+
+  // List view Tab onto board-list-item-${kanbanCard2} + Enter must open kanbanCard2
+  await cdpClient.clickSelector('[data-testid="board-view-tab-list"]');
+  await sleep(150);
+  const listOrderForTab = await cdpClient.evalJS(
+    `Array.from(document.querySelectorAll('[data-testid^="board-list-item-"]')).map(el => el.getAttribute("data-topic-id")).filter(Boolean)`
+  );
+  const card2ListIdx = listOrderForTab.indexOf(kanbanCard2);
+  if (card2ListIdx < 1) {
+    throw new Error(`Slice 1b list Tab+Enter expected ${kanbanCard2} at index >= 1, got ${JSON.stringify(listOrderForTab)}`);
+  }
+  const listPrevId = listOrderForTab[card2ListIdx - 1];
+  await cdpClient.clickSelector(`[data-testid="board-list-item-${listPrevId}"]`);
+  await sleep(150);
+  await cdpClient.pressKey("Escape");
+  await sleep(150);
+  const focusedListPrev = await cdpClient.evalJS(`(() => {
+    const el = document.querySelector('[data-testid="board-list-item-${listPrevId}"]');
+    if (!(el instanceof HTMLElement)) return false;
+    el.focus();
+    return document.activeElement === el;
+  })()`);
+  if (!focusedListPrev) {
+    throw new Error(`Slice 1b failed to focus board-list-item-${listPrevId}`);
+  }
+  await cdpClient.pressKey("Tab");
+  const listTabTargetEl = await cdpClient.evalJS(
+    `document.activeElement?.getAttribute("data-testid") ?? null`
+  );
+  if (listTabTargetEl !== `board-list-item-${kanbanCard2}`) {
+    throw new Error(`Slice 1b list Tab expected activeElement board-list-item-${kanbanCard2}, got ${listTabTargetEl}`);
+  }
+  await cdpClient.pressKey("Enter");
+  await sleep(200);
+  const afterListTabEnter = await cdpClient.evalJS(`({
+    viewMode: window.__AHUB_EVAL__.getState().boardViewMode,
+    selectedTopicId: window.__AHUB_EVAL__.getState().selectedBoardTopicId
+  })`);
+  if (afterListTabEnter.viewMode !== "timeline" || afterListTabEnter.selectedTopicId !== kanbanCard2) {
+    throw new Error(`Slice 1b regression: list Tab+Enter on board-list-item-${kanbanCard2} opened ${JSON.stringify(afterListTabEnter)}`);
+  }
+  await cdpClient.pressKey("Escape");
+  await sleep(150);
+  await cdpClient.pressKey("Escape");
+  await sleep(150);
+
+  // 6) Cross-channel 近期动态 (Recent Topics)
+  await cdpClient.clickSelector('[data-testid="board-filter-recent"]');
+  await sleep(250);
+  const recentCheck = await cdpClient.evalJS(`(() => {
+    const s = window.__AHUB_EVAL__.getState();
+    const byId = new Map(s.boardTopics.map(t => [t.id, t]));
+    const listIds = Array.from(document.querySelectorAll('[data-testid^="board-list-item-"]')).map(el => el.getAttribute("data-topic-id"));
+    let isUpdatedDesc = true;
+    for (let i = 1; i < listIds.length; i++) {
+      const prev = byId.get(listIds[i - 1]);
+      const cur = byId.get(listIds[i]);
+      if (!prev || !cur || prev.updated_at < cur.updated_at) {
+        isUpdatedDesc = false;
+        break;
+      }
+    }
+    return {
+      topicFilter: s.boardTopicFilter,
+      selectedChannel: s.selectedBoardChannel,
+      listIds,
+      isUpdatedDesc,
+      hasOpsRecent: Boolean(document.querySelector('[data-testid="board-list-item-${kbRecentTopic.id}"]')),
+      hasProjDemoA: Boolean(document.querySelector('[data-testid="board-list-item-${kbTopicA.id}"]'))
+    };
+  })()`);
+  const topicAIdx = recentCheck.listIds.indexOf(kbTopicA.id);
+  const pinnedIdx = recentCheck.listIds.indexOf(kbPinnedTopic.id);
+  if (
+    recentCheck.topicFilter !== "recent" ||
+    recentCheck.selectedChannel !== null ||
+    !recentCheck.hasOpsRecent ||
+    !recentCheck.hasProjDemoA ||
+    !recentCheck.isUpdatedDesc ||
+    topicAIdx < 0 ||
+    pinnedIdx < 0 ||
+    topicAIdx >= pinnedIdx
+  ) {
+    throw new Error(`Slice 1b Recent Topics check failed: ${JSON.stringify(recentCheck)}`);
+  }
+
+  // 6) Input guard + Board & Inbox J/K/1-4/Enter/Esc keyboard shortcut flow
+  await cdpClient.clickSelector('[data-testid="board-search-input"]');
+  await cdpClient.pressKey("j");
+  await cdpClient.pressKey("k");
+  await cdpClient.pressKey("1");
+  const inputGuardCheck = await cdpClient.evalJS(`({
+    inputVal: document.querySelector('[data-testid="board-search-input"]')?.value ?? "",
+    focusedTopicId: window.__AHUB_EVAL__.getState().focusedBoardTopicId
+  })`);
+  if (inputGuardCheck.inputVal !== "jk1" || inputGuardCheck.focusedTopicId !== null) {
+    throw new Error(`Slice 1b input focus guard failed: ${JSON.stringify(inputGuardCheck)}`);
+  }
+  await cdpClient.evalJS(`
+    (() => {
+      const inp = document.querySelector('[data-testid="board-search-input"]');
+      if (inp) {
+        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+        setter?.call(inp, "");
+        inp.dispatchEvent(new Event("input", { bubbles: true }));
+        inp.blur();
+      }
+    })()
+  `);
+  await sleep(150);
+
+  // Board list J / K / Enter / Esc + 1-4 status shortcut
+  await cdpClient.pressKey("j");
+  const firstFocus = await cdpClient.evalJS(`window.__AHUB_EVAL__.getState().focusedBoardTopicId`);
+  await cdpClient.pressKey("j");
+  const secondFocus = await cdpClient.evalJS(`window.__AHUB_EVAL__.getState().focusedBoardTopicId`);
+  await cdpClient.pressKey("k");
+  const backFocus = await cdpClient.evalJS(`window.__AHUB_EVAL__.getState().focusedBoardTopicId`);
+  if (!firstFocus || !secondFocus || firstFocus === secondFocus || backFocus !== firstFocus) {
+    throw new Error(`Slice 1b Board J/K focus check failed: first=${firstFocus}, second=${secondFocus}, back=${backFocus}`);
+  }
+  await cdpClient.pressKey("Enter");
+  await sleep(200);
+  const afterBoardEnter = await cdpClient.evalJS(`({
+    viewMode: window.__AHUB_EVAL__.getState().boardViewMode,
+    selectedTopicId: window.__AHUB_EVAL__.getState().selectedBoardTopicId
+  })`);
+  if (afterBoardEnter.viewMode !== "timeline" || afterBoardEnter.selectedTopicId !== firstFocus) {
+    throw new Error(`Slice 1b Board Enter into topic detail failed: ${JSON.stringify(afterBoardEnter)}`);
+  }
+  await cdpClient.pressKey("Escape");
+  await sleep(150);
+  const afterBoardEsc = await cdpClient.evalJS(`window.__AHUB_EVAL__.getState().boardViewMode`);
+  if (afterBoardEsc !== "list") {
+    throw new Error(`Slice 1b Board Esc return to list failed: expected list, got ${afterBoardEsc}`);
+  }
+
+  // Regression: switching channel via left rail clears returnViewModeRef so Esc does not yank back to list
+  await cdpClient.pressKey("Enter");
+  await sleep(150);
+  await cdpClient.clickSelector('[data-testid="board-channel-item-proj/demo"]');
+  await sleep(150);
+  await cdpClient.pressKey("Escape");
+  await sleep(150);
+  const afterChannelSwitchEsc = await cdpClient.evalJS(`window.__AHUB_EVAL__.getState().boardViewMode`);
+  if (afterChannelSwitchEsc !== "timeline") {
+    throw new Error(`Slice 1b regression: stale returnViewModeRef yanked viewMode to ${afterChannelSwitchEsc} after channel switch`);
+  }
+  await cdpClient.clickSelector('[data-testid="board-filter-recent"]');
+  await sleep(200);
+  await cdpClient.clickSelector('[data-testid="board-view-tab-list"]');
+  await sleep(150);
+
+  // Navigate to kbTopicB in list and press "4" to set status -> done
+  const listOrderNow = await cdpClient.evalJS(
+    `Array.from(document.querySelectorAll('[data-testid^="board-list-item-"]')).map(el => el.getAttribute("data-topic-id"))`
+  );
+  const targetBIdx = listOrderNow.indexOf(kbTopicB.id);
+  if (targetBIdx < 0) throw new Error("kbTopicB missing from board list for keyboard status test");
+  const curFocusIdx = listOrderNow.indexOf(await cdpClient.evalJS(`window.__AHUB_EVAL__.getState().focusedBoardTopicId`));
+  for (let s = curFocusIdx; s < targetBIdx; s++) {
+    await cdpClient.pressKey("j");
+  }
+  for (let s = curFocusIdx; s > targetBIdx; s--) {
+    await cdpClient.pressKey("k");
+  }
+  await cdpClient.pressKey("4");
+  for (let i = 0; i < 20; i++) {
+    const tB = (await apiJson(hubUrl, adminToken, `/api/v1/board/topics/${kbTopicB.id}/messages`)).topic;
+    if (tB.status === "done") break;
+    if (i === 19) throw new Error(`Slice 1b Board shortcut '4' failed to update ${kbTopicB.id} to done in D1 (got ${tB.status})`);
+    await sleep(150);
+  }
+
+  // Board detail 1-4 + Enter open question answering on kbQTopic2 / kbBoardQ2
+  await cdpClient.clickSelector('[data-testid="board-view-tab-timeline"]');
+  await sleep(150);
+  const tlOrderNow = await cdpClient.evalJS(
+    `Array.from(document.querySelectorAll('[data-testid^="board-topic-item-"]')).map(el => el.getAttribute("data-testid")?.replace("board-topic-item-", ""))`
+  );
+  const q2Idx = tlOrderNow.indexOf(kbQTopic2.id);
+  if (q2Idx < 0) throw new Error("kbQTopic2 missing from timeline list for keyboard answer test");
+  await cdpClient.pressKey("Escape");
+  await sleep(100);
+  // Reset focus from start with J
+  const curTlFocus = await cdpClient.evalJS(`window.__AHUB_EVAL__.getState().focusedBoardTopicId`);
+  if (!curTlFocus) {
+    await cdpClient.pressKey("j");
+  }
+  const curTlIdx = tlOrderNow.indexOf(await cdpClient.evalJS(`window.__AHUB_EVAL__.getState().focusedBoardTopicId`));
+  for (let s = curTlIdx; s < q2Idx; s++) await cdpClient.pressKey("j");
+  for (let s = curTlIdx; s > q2Idx; s--) await cdpClient.pressKey("k");
+  await cdpClient.pressKey("Enter");
+  await sleep(250);
+  // Regression: in Board detail with a <4-option open question, pressing '4' must NOT fall through and mutate topic status to done
+  await cdpClient.pressKey("4");
+  await sleep(150);
+  const q2AfterKey4 = await cdpClient.evalJS(`({
+    uiStatus: window.__AHUB_EVAL__.getState().boardTopics.find(t => t.id === ${JSON.stringify(kbQTopic2.id)})?.status ?? null,
+    opt0Selected: document.querySelector('[data-testid="board-question-option-${kbBoardQ2.id}-0"]')?.getAttribute("data-selected") ?? null
+  })`);
+  const q2D1AfterKey4 = (await apiJson(hubUrl, adminToken, `/api/v1/board/topics/${kbQTopic2.id}/messages`)).topic;
+  if (
+    q2AfterKey4.uiStatus !== "blocked" ||
+    q2D1AfterKey4.status !== "blocked" ||
+    q2AfterKey4.opt0Selected === "true"
+  ) {
+    throw new Error(`Slice 1b regression: pressing '4' on 2-option open question mutated status or staged invalid option: ui=${JSON.stringify(q2AfterKey4)}, d1Status=${q2D1AfterKey4.status}`);
+  }
+  await cdpClient.pressKey("1");
+  await sleep(100);
+  const boardStagedAttr = await cdpClient.evalJS(
+    `document.querySelector('[data-testid="board-question-option-${kbBoardQ2.id}-0"]')?.getAttribute("data-selected")`
+  );
+  if (boardStagedAttr !== "true") {
+    throw new Error(`Slice 1b Board detail '1' did not stage option 0: data-selected=${boardStagedAttr}`);
+  }
+  await cdpClient.pressKey("Enter");
+  for (let i = 0; i < 25; i++) {
+    const q2D1 = (await apiJson(hubUrl, adminToken, `/api/v1/board/topics/${kbQTopic2.id}/messages`)).messages.find(m => m.id === kbBoardQ2.id);
+    if (q2D1?.question_state === "answered") break;
+    if (i === 24) throw new Error(`Slice 1b Board detail Enter failed to submit answer for ${kbBoardQ2.id}`);
+    await sleep(150);
+  }
+
+  // Inbox J / K / 1-4 / Enter / Esc keyboard flow
+  await cdpClient.clickSelector('[data-testid="workspace-tab-inbox"]');
+  await sleep(250);
+
+  // Regression: focusing inbox-filter-board + Enter switches filter natively without hijacking/resolving items
+  const focusedInboxFilter = await cdpClient.evalJS(`(() => {
+    const btn = document.querySelector('[data-testid="inbox-filter-board"]');
+    if (!(btn instanceof HTMLElement)) return false;
+    btn.focus();
+    return document.activeElement === btn;
+  })()`);
+  if (!focusedInboxFilter) {
+    throw new Error("Slice 1b failed to focus inbox-filter-board");
+  }
+  await cdpClient.pressKey("Enter");
+  await sleep(150);
+  const inboxFilterBoardPressed = await cdpClient.evalJS(
+    `document.querySelector('[data-testid="inbox-filter-board"]')?.getAttribute("aria-pressed")`
+  );
+  if (inboxFilterBoardPressed !== "true") {
+    throw new Error(`Slice 1b regression: Enter on focused inbox-filter-board did not activate filter (aria-pressed=${inboxFilterBoardPressed})`);
+  }
+  await cdpClient.clickSelector('[data-testid="inbox-filter-all"]');
+  await sleep(150);
+  const inboxOrderBefore = await cdpClient.evalJS(
+    `Array.from(document.querySelectorAll('[data-testid^="inbox-item-"]')).map(el => el.getAttribute("data-testid")?.replace("inbox-item-", ""))`
+  );
+  const targetInboxKey = `board:${kbInboxQ1.id}`;
+  const targetInboxIdx = inboxOrderBefore.indexOf(targetInboxKey);
+  if (targetInboxIdx < 0 || inboxOrderBefore.length < 2) {
+    throw new Error(`Slice 1b Inbox expected >= 2 items including ${targetInboxKey}, got ${JSON.stringify(inboxOrderBefore)}`);
+  }
+  // Tab from inbox item 0 to item 1 + Enter must select item 1 (not execute action on stale item 0)
+  await cdpClient.clickSelector(`[data-testid="inbox-item-${inboxOrderBefore[0]}"]`);
+  await sleep(120);
+  await cdpClient.pressKey("Tab");
+  const inboxTabActive = await cdpClient.evalJS(
+    `document.activeElement?.getAttribute("data-testid") ?? null`
+  );
+  if (inboxTabActive !== `inbox-item-${inboxOrderBefore[1]}`) {
+    throw new Error(`Slice 1b Inbox Tab expected activeElement inbox-item-${inboxOrderBefore[1]}, got ${inboxTabActive}`);
+  }
+  await cdpClient.pressKey("Enter");
+  await sleep(150);
+  const inboxAfterTabEnter = await cdpClient.evalJS(`({
+    focusedKey: document.querySelector('[data-testid^="inbox-item-"][data-focused="true"]')?.getAttribute("data-testid")?.replace("inbox-item-", "") ?? null,
+    item0Present: Boolean(document.querySelector('[data-testid="inbox-item-${inboxOrderBefore[0]}"]'))
+  })`);
+  if (inboxAfterTabEnter.focusedKey !== inboxOrderBefore[1] || !inboxAfterTabEnter.item0Present) {
+    throw new Error(`Slice 1b regression: Inbox Tab+Enter acted on stale item 0 or failed to select item 1: ${JSON.stringify(inboxAfterTabEnter)}`);
+  }
+  await cdpClient.clickSelector(`[data-testid="inbox-item-${inboxOrderBefore[0]}"]`);
+  await sleep(120);
+  await cdpClient.pressKey("j");
+  const afterInboxJ = await cdpClient.evalJS(`
+    document.querySelector('[data-testid^="inbox-item-"][data-focused="true"]')?.getAttribute("data-testid")?.replace("inbox-item-", "") ?? null
+  `);
+  await cdpClient.pressKey("k");
+  const afterInboxK = await cdpClient.evalJS(`
+    document.querySelector('[data-testid^="inbox-item-"][data-focused="true"]')?.getAttribute("data-testid")?.replace("inbox-item-", "") ?? null
+  `);
+  if (afterInboxJ !== inboxOrderBefore[1] || afterInboxK !== inboxOrderBefore[0]) {
+    throw new Error(`Slice 1b Inbox J/K navigation failed: order=${JSON.stringify(inboxOrderBefore)} j=${afterInboxJ} k=${afterInboxK}`);
+  }
+  for (let s = 0; s < targetInboxIdx; s++) {
+    await cdpClient.pressKey("j");
+  }
+  await cdpClient.pressKey("1");
+  const inboxStaged1 = await cdpClient.evalJS(
+    `document.querySelector('[data-testid="inbox-question-option-0"]')?.getAttribute("data-selected")`
+  );
+  if (inboxStaged1 !== "true") {
+    throw new Error(`Slice 1b Inbox '1' did not stage option 0: data-selected=${inboxStaged1}`);
+  }
+  await cdpClient.pressKey("Escape");
+  const inboxCleared = await cdpClient.evalJS(
+    `document.querySelector('[data-testid="inbox-question-option-0"]')?.getAttribute("data-selected")`
+  );
+  if (inboxCleared === "true") {
+    throw new Error("Slice 1b Inbox Esc did not clear staged option");
+  }
+  await cdpClient.pressKey("2");
+  const inboxStaged2 = await cdpClient.evalJS(
+    `document.querySelector('[data-testid="inbox-question-option-1"]')?.getAttribute("data-selected")`
+  );
+  if (inboxStaged2 !== "true") {
+    throw new Error(`Slice 1b Inbox '2' did not stage option 1: data-selected=${inboxStaged2}`);
+  }
+  await cdpClient.pressKey("Enter");
+  for (let i = 0; i < 25; i++) {
+    const q1D1 = (await apiJson(hubUrl, adminToken, `/api/v1/board/topics/${kbQTopic1.id}/messages`)).messages.find(m => m.id === kbInboxQ1.id);
+    if (q1D1?.question_state === "answered") break;
+    if (i === 24) throw new Error(`Slice 1b Inbox Enter failed to submit staged answer for ${kbInboxQ1.id}`);
+    await sleep(150);
+  }
+  // Esc in Inbox detail returns cleanly to list view (clears active detail)
+  await cdpClient.pressKey("Escape");
+  await sleep(150);
+  const inboxAfterEsc = await cdpClient.evalJS(`Boolean(document.querySelector('[data-testid="inbox-question-option-0"]'))`);
+  if (inboxAfterEsc) {
+    throw new Error("Slice 1b Inbox Esc did not dismiss detail view on desktop");
+  }
+
   // Phase 5: Verify client-scope Board + Runs isolation (prefix-scoped AND empty-prefix) with zero 403/console errors
   const forbiddenResponses = [];
   await cdpClient.send("Network.enable");
@@ -3106,6 +4031,10 @@ try {
   ) {
     throw new Error(`Expected client scope Inbox question to render read-only without enabled answer controls, got ${JSON.stringify(clientInboxReadOnly)}`);
   }
+  // Pressing 1 + Enter in client-scope Inbox must never emit 403 /answer requests
+  await cdpClient.pressKey("1");
+  await cdpClient.pressKey("Enter");
+  await sleep(150);
 
   await cdpClient.clickSelector('[data-testid="workspace-tab-runs"]');
   let runsState = null;

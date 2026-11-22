@@ -2,19 +2,78 @@ import { create } from "zustand";
 import type {
   BoardChannelSummary,
   BoardMessage,
-  BoardTopic
+  BoardTopic,
+  BoardTopicStatus
 } from "@/types";
 
-export type BoardTopicFilter = "active" | "open_questions";
+export type BoardTopicFilter = "active" | "open_questions" | "recent";
+export type BoardViewMode = "timeline" | "list" | "kanban";
+export type BoardKanbanColumnStatus = "todo" | "in_progress" | "blocked" | "done";
 
-function compareTopics(a: BoardTopic, b: BoardTopic): number {
+function compareCodepointAsc(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+export function compareTopics(a: BoardTopic, b: BoardTopic): number {
   if (a.pinned !== b.pinned) {
     return a.pinned ? -1 : 1;
   }
   if (a.updated_at !== b.updated_at) {
-    return b.updated_at.localeCompare(a.updated_at);
+    return compareCodepointAsc(b.updated_at, a.updated_at);
   }
-  return a.id.localeCompare(b.id);
+  return compareCodepointAsc(a.id, b.id);
+}
+
+export function compareTopicsKanban(a: BoardTopic, b: BoardTopic): number {
+  if (a.pinned !== b.pinned) {
+    return a.pinned ? -1 : 1;
+  }
+  if (a.sort_order !== b.sort_order) {
+    return a.sort_order - b.sort_order;
+  }
+  if (a.updated_at !== b.updated_at) {
+    return compareCodepointAsc(b.updated_at, a.updated_at);
+  }
+  return compareCodepointAsc(a.id, b.id);
+}
+
+export function compareTopicsRecent(a: BoardTopic, b: BoardTopic): number {
+  if (a.updated_at !== b.updated_at) {
+    return compareCodepointAsc(b.updated_at, a.updated_at);
+  }
+  return compareCodepointAsc(b.id, a.id);
+}
+
+export function filterAndSortBoardTopics(params: {
+  topics: BoardTopic[];
+  selectedChannel: string | null;
+  topicFilter: BoardTopicFilter;
+  statusFilter: "all" | BoardTopicStatus;
+  searchQuery: string;
+}): BoardTopic[] {
+  const { topics, selectedChannel, topicFilter, statusFilter, searchQuery } = params;
+  const q = searchQuery.trim().toLowerCase();
+  const filtered = topics.filter((t) => {
+    if (selectedChannel && t.channel !== selectedChannel) return false;
+    if (topicFilter === "open_questions" && (t.open_question_count ?? 0) <= 0) return false;
+    if (statusFilter === "all") {
+      if ((topicFilter === "active" || topicFilter === "recent" || topicFilter === "open_questions") && t.status === "archived") {
+        return false;
+      }
+    } else if (t.status !== statusFilter) {
+      return false;
+    }
+    if (q) {
+      const hay = `${t.title}\n${t.channel}\n${t.external_ref}\n${t.id}`.toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+
+  if (topicFilter === "recent") {
+    return filtered.sort(compareTopicsRecent);
+  }
+  return filtered.sort(compareTopics);
 }
 
 function sortAndDedupTopics(topics: BoardTopic[]): BoardTopic[] {
@@ -43,7 +102,7 @@ function sortAndDedupMessages(messages: BoardMessage[]): BoardMessage[] {
     const existing = byId.get(m.id);
     byId.set(m.id, existing ? { ...existing, ...m } : m);
   }
-  return Array.from(byId.values()).sort((a, b) => a.seq - b.seq || a.id.localeCompare(b.id));
+  return Array.from(byId.values()).sort((a, b) => a.seq - b.seq || compareCodepointAsc(a.id, b.id));
 }
 
 function deriveOpenQuestionCount(topics: BoardTopic[]): number {
@@ -100,7 +159,7 @@ function recomputeChannelsFromTopics(
       updated_at: latestUpdatedAt
     });
   }
-  return Array.from(byChannel.values()).sort((a, b) => a.channel.localeCompare(b.channel));
+  return Array.from(byChannel.values()).sort((a, b) => compareCodepointAsc(a.channel, b.channel));
 }
 
 export interface AppendBoardMessageOptions {
@@ -116,7 +175,10 @@ export interface BoardState {
   openBoardQuestionCount: number;
   selectedChannel: string | null;
   selectedTopicId: string | null;
+  focusedTopicId: string | null;
   topicFilter: BoardTopicFilter;
+  viewMode: BoardViewMode;
+  kanbanMobileStatus: BoardKanbanColumnStatus;
   searchQuery: string;
   boardPermissionDenied: boolean;
   hydrateBoard: (payload: {
@@ -127,6 +189,7 @@ export interface BoardState {
   }) => void;
   setOpenBoardQuestionCount: (count: number) => void;
   upsertTopic: (topic: BoardTopic) => void;
+  upsertTopics: (topics: BoardTopic[]) => void;
   setTopicMessages: (topicId: string, messages: BoardMessage[], cursor?: number) => void;
   appendMessage: (
     topicId: string,
@@ -143,7 +206,10 @@ export interface BoardState {
   }) => void;
   selectChannel: (channel: string | null) => void;
   selectTopic: (topicId: string | null) => void;
+  setFocusedTopicId: (topicId: string | null) => void;
   setTopicFilter: (filter: BoardTopicFilter) => void;
+  setViewMode: (mode: BoardViewMode) => void;
+  setKanbanMobileStatus: (status: BoardKanbanColumnStatus) => void;
   setSearchQuery: (q: string) => void;
   setBoardPermissionDenied: (denied: boolean) => void;
   reset: () => void;
@@ -157,14 +223,17 @@ export const useBoardStore = create<BoardState>((set) => ({
   openBoardQuestionCount: 0,
   selectedChannel: null,
   selectedTopicId: null,
+  focusedTopicId: null,
   topicFilter: "active",
+  viewMode: "timeline",
+  kanbanMobileStatus: "todo",
   searchQuery: "",
   boardPermissionDenied: false,
 
   hydrateBoard: ({ channels, topics, eventsCursor, openQuestionCount }) =>
     set((state) => {
       const sortedTopics = sortAndDedupTopics(topics);
-      const nextChannels = [...channels].sort((a, b) => a.channel.localeCompare(b.channel));
+      const nextChannels = [...channels].sort((a, b) => compareCodepointAsc(a.channel, b.channel));
       const maxTopicCursor = sortedTopics.reduce(
         (max, t) => Math.max(max, t.last_event_cursor ?? 0),
         0
@@ -217,6 +286,30 @@ export const useBoardStore = create<BoardState>((set) => ({
         eventsCursor: nextCursor,
         openBoardQuestionCount: Math.max(0, state.openBoardQuestionCount + openDelta),
         selectedTopicId: state.selectedTopicId ?? merged.id
+      };
+    }),
+
+  upsertTopics: (incomingTopics) =>
+    set((state) => {
+      if (incomingTopics.length === 0) return state;
+      const existingById = new Map(state.topics.map((t) => [t.id, t]));
+      let openDelta = 0;
+      let nextCursor = state.eventsCursor;
+      for (const topic of incomingTopics) {
+        const prev = existingById.get(topic.id);
+        const merged = prev ? mergeTopicFields(prev, topic) : topic;
+        openDelta += (merged.open_question_count ?? 0) - (prev?.open_question_count ?? 0);
+        existingById.set(topic.id, merged);
+        nextCursor = Math.max(nextCursor, topic.last_event_cursor ?? 0);
+      }
+      const nextTopics = sortAndDedupTopics(Array.from(existingById.values()));
+      const nextChannels = recomputeChannelsFromTopics(state.channels, nextTopics);
+      return {
+        topics: nextTopics,
+        channels: nextChannels,
+        eventsCursor: nextCursor,
+        openBoardQuestionCount: Math.max(0, state.openBoardQuestionCount + openDelta),
+        selectedTopicId: state.selectedTopicId ?? nextTopics[0]?.id ?? null
       };
     }),
 
@@ -350,7 +443,10 @@ export const useBoardStore = create<BoardState>((set) => ({
 
   selectChannel: (selectedChannel) => set({ selectedChannel }),
   selectTopic: (selectedTopicId) => set({ selectedTopicId }),
+  setFocusedTopicId: (focusedTopicId) => set({ focusedTopicId }),
   setTopicFilter: (topicFilter) => set({ topicFilter }),
+  setViewMode: (viewMode) => set({ viewMode }),
+  setKanbanMobileStatus: (kanbanMobileStatus) => set({ kanbanMobileStatus }),
   setSearchQuery: (searchQuery) => set({ searchQuery }),
   setBoardPermissionDenied: (boardPermissionDenied) => set({ boardPermissionDenied }),
 
@@ -363,7 +459,10 @@ export const useBoardStore = create<BoardState>((set) => ({
       openBoardQuestionCount: 0,
       selectedChannel: null,
       selectedTopicId: null,
+      focusedTopicId: null,
       topicFilter: "active",
+      viewMode: "timeline",
+      kanbanMobileStatus: "todo",
       searchQuery: "",
       boardPermissionDenied: false
     })
