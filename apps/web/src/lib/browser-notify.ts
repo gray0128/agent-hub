@@ -10,7 +10,18 @@ import type {
 export const DEFAULT_PUSH_EVENT_FILTER: PushEventFilterKey[] = [
   "run_needs_approval",
   "run_failed",
-  "native_interaction_needed"
+  "native_interaction_needed",
+  "board_question_opened"
+];
+
+export const DEFAULT_NODE_NOTIFY_EVENTS: PushEventFilterKey[] = [
+  "run_needs_approval",
+  "run_failed",
+  "run_done",
+  "run_cancelled",
+  "native_interaction_needed",
+  "native_turn_summary",
+  "native_progress"
 ];
 
 export const PUSH_EVENT_FILTER_OPTIONS: Array<{
@@ -22,6 +33,11 @@ export const PUSH_EVENT_FILTER_OPTIONS: Array<{
     key: "native_interaction_needed",
     label: "原生待互动确认",
     description: "本机终端触发 interaction_needed 时推送"
+  },
+  {
+    key: "board_question_opened",
+    label: "协同板阻塞提问",
+    description: "协同板发布 question 阻塞提问时高优推送"
   },
   {
     key: "run_needs_approval",

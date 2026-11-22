@@ -39,7 +39,7 @@ export function newUlid(): string {
   return tsPart + randPart;
 }
 
-export function newId(prefix: "key" | "thr" | "run" | "evt" | "wps" | "dlv"): string {
+export function newId(prefix: "key" | "thr" | "run" | "evt" | "wps" | "dlv" | "top" | "msg"): string {
   return `${prefix}_${newUlid()}`;
 }
 

@@ -11,8 +11,8 @@
 | 评测平面 | 被测对象 | 回答的核心问题 | 核心手段 | 运行代价 |
 | --- | --- | --- | --- | --- |
 | **Plane 1：底座状态与进程不变量** | `apps/hub-worker`（D1/DO/Cron）与 `ahub node serve` | 并发争抢、WS 断连、进程强杀与租约过期下，状态机是否绝不丢单、串单、泄密或残留孤儿进程？ | 受控故障注入替身 `ahub-fakeagent` + 本地 `workerd` 混沌测试 + TLA+ 模型检验 | 零模型 Token，`<= 15s` |
-| **Plane 2：盲测 Agent-CLI 契约与轨迹** | `ahub` 调用端参数/退出码/报错结构与 `skills/ahub/SKILL.md` | 外部或本地 Agent 在无暗示盲测下，能否零试错、零轮询、零越权地完成跨机派单与续接？ | 严格去暗示隔离沙箱 + 8 个黄金场景 + 确定性轨迹评分器 | 低成本轻量模型优先 |
-| **Plane 3：Web 控制台静态门禁、等价与盲审** | `apps/web`（`radix-nova` 三栏工作台） | 依赖与样式是否零越界？高频事件流与断线重连下 UI 是否与 D1 完全一致且无泄漏？视觉是否克制专业？ | `L1` 静态扫描 + `L2` 真实浏览器 CDP 压测与等价断言 + `L3` 独立上下文盲审挑刺 | `L1`/`L2` 零 Token，`L3` 按需 |
+| **Plane 2：盲测 Agent-CLI 契约与轨迹** | `ahub` 调用端参数/退出码/报错结构与 `skills/ahub/SKILL.md` | 外部或本地 Agent 在无暗示盲测下，能否零试错、零轮询、零越权地完成跨机派单、协同交接与阻塞问答续跑？ | 严格去暗示隔离沙箱 + `8` 个受控执行场景 + Slice 1a 协同板黄金场景 + 确定性轨迹评分器 | 低成本轻量模型优先 |
+| **Plane 3：Web 控制台静态门禁、等价与盲审** | `apps/web`（`radix-nova` 三工作区控制台） | 依赖与样式是否零越界？高频事件流与断线重连下 UI 是否与 D1 完全一致且无泄漏？三工作区与移动端吸底问答是否零溢出？ | `L1` 静态扫描 + `L2` 真实浏览器 CDP 压测与等价断言 + `L3` 独立上下文盲审挑刺 | `L1`/`L2` 零 Token，`L3` 按需 |
 
 ---
 
@@ -33,9 +33,9 @@ Plane 1 不调用真实大模型。测试套件构建一个极轻量的 Go 替�
 | `corrupt_stdout` | 交替输出单行超长文本（`> 256 KB`）与半截损坏 JSON | 检验节点日志采集器在异常流下不出现 `panic`、`Scanner` 溢出错或阻塞死锁 |
 | `exit:<code>` | 以指定非零退出码（如 `1`、`137`）终止进程 | 检验异常退出码归因、`failed` 终态落库与 `workdir` 排他锁释放 |
 
-### 2.2 七条硬性不变量（Hard Invariants）
+### 2.2 硬性不变量（Hard Invariants：`I-1` ~ `I-11`）
 
-在本地真实 `workerd`（Miniflare D1 + DO SQLite）与真实 `ahub node serve` 进程组成的闭环上，注入网络丢包、断链与并发风暴后，系统必须无条件满足以下 7 条不变量：
+在本地真实 `workerd`（Miniflare D1 + DO SQLite）与真实 `ahub node serve` 进程组成的闭环上，注入网络丢包、断链与并发风暴后，系统必须无条件满足以下 `11` 条不变量（其中 `I-8` ~ `I-11` 为 Slice 1a 跨机协同板与双向问答不变量）：
 
 | 编号 | 不变量名称 | 混沌注入方式 | 精确判定条件（Assertion） |
 | --- | --- | --- | --- |
@@ -46,10 +46,14 @@ Plane 1 不调用真实大模型。测试套件构建一个极轻量的 Go 替�
 | **I-5** | **零孤儿与瞬时解锁** | 运行 `spawn_grandchild:60` 期间通过 API 发起 `cancel`（或等待短超时终止） | `<= 6s` 内（`SIGTERM` 宽限 `5s` + `SIGKILL`），原 `-pgid` 进程组中记录到的所有子/孙 PID 存活数 `== 0`；同目录排队下一任务立即启动 |
 | **I-6** | **零控制面凭据泄露** | 在开启子进程 `delegation_token` 与未开启两种模式下分别运行 `dump_env` 剧本 | 子进程环境中节点原始 `ahub_nod_*`、`admin` Key、`CF_ACCESS_*` 出现次数 `== 0`；`AHUB_RUN_ID`、`AHUB_ROOT_RUN_ID`、`AHUB_DEPTH` 与当前任务完全一致 |
 | **I-7** | **节点活跃计数守恒** | 混合执行并发派单、级联取消、`SIGKILL` 杀掉节点守护进程并等待 90s Cron 租约回收 | 每次收敛后，D1 `nodes.active_runs_count` 严格等于 `SELECT COUNT(*) FROM runs WHERE node_id = ? AND status IN ('claimed','running','needs_approval')` |
+| **I-8** | **协同板并发作答 CAS 唯一性** | 对同一条 `open` 协同板 `question` 发起多路并发 `admin` `POST /api/v1/board/messages/:id/answer` 请求 | 仅首个请求写入一条 `kind = 'answer'` 消息并返回 `200`，其余全部返回 `409 INVALID_STATE_TRANSITION` 且不再新增答复行 |
+| **I-9** | **提问联锁与状态自动恢复** | 在 `todo` / `in_progress` 主题提交 `question`；随后对全部 `open` 提问执行作答或触发 Cron 过期 | 开启 `open` 提问后主题原子切为 `blocked` 并保留 `previous_status`；最后一条 `open` 提问转为终态后主题自动恢复为 `previous_status` 并清空 `previous_status` |
+| **I-10** | **协同板前缀 Fail-Closed 与凭据隔离** | 使用空前缀或跨边界前缀 `client` Key、使用 `node` Key 调 `/api/v1/board/*` 或 `/ws/stream`，以及在仅存在 `node.json` 环境下执行 `ahub board` | `client` 空前缀/越界返回 `403 FORBIDDEN_SCOPE`；`node` 调全部 `/api/v1/board/*` 与 `/ws/stream` 返回 `403`；`ahub board` 绝不读取 `node.json` 守护令牌 |
+| **I-11** | **`after_cursor` 零丢答复与 `question` 独占推送** | 在 `/ws/stream?topic_id=&after_cursor=` 断线窗口内由 `admin` 作答并随后重连；同时发布 `note` / `handoff` / `artifact` / `question` 与触发 `ask --wait` 超时 | 重连后按 `after_cursor` 零丢失收到 `board.question_answered`；非 `question` 消息产生 `0` 条 `notification_deliveries` 行且不入队；`ask --wait` 超时返回退出码 `24` 且服务端提问保持 `open` |
 
 ### 2.3 轻量形式化模型检验（`evals/formal/RunLifecycle.tla`）
 
-对于仅靠定时随机测试难以覆盖极小概率交错时序（例如：`Cron 租约过期回收` 与 `节点延迟 complete 上报` 与 `用户 cancel` 在同一毫秒交错），在 `evals/formal/RunLifecycle.tla` 维护一份约 150 行的 TLA+ 状态机规格，使用 TLC 模型检验器在有限节点与任务集合下穷举所有网络乱序、WS 帧丢失与节点崩溃状态，证明 `I-1`、`I-2`、`I-4`、`I-7` 在状态图全局无反例。
+对于仅靠定时随机测试难以覆盖极小概率交错时序（例如：`Cron 租约过期回收` 与 `节点延迟 complete 上报` 与 `用户 cancel` 在同一毫秒交错），在 `evals/formal/RunLifecycle.tla` 维护一份约 150 行的 TLA+ 状态机规格，使用 TLC 模型检验器在有限节点与任务集合下穷举所有网络乱序、WS 帧丢失与节点崩溃状态，证明 `I-1`、`I-2`、`I-4`、`I-7` 在状态图全局无反例。（注：Slice 1a 不修改 `RunLifecycle.tla`；`waiting` DAG 三条新不变量属 **Slice 2**。）
 
 ---
 
@@ -63,7 +67,7 @@ Plane 2 用于验证 `ahub` 调用端命令参数设计、错误返回字段与�
 2. **自然业务提示**：任务提示以用户自然需求下达（例如「帮我让 macmini 上的 codex 检查仓库重构方案，结果出来告诉我」），不直接告知具体 CLI 参数或 `stdin` 传参写法，迫使 Agent 自主发现或遵从 `SKILL.md` 与 CLI 自描述错误恢复。
 3. **透明轨迹采集垫片**：在 `PATH` 前端挂载轻量级透明录制垫片，完整记录每次 `ahub` 调用的命令参数、`stdin` 字节流、`stdout`、`stderr`、退出码、耗时，以及同回合内是否出现了手拼 `curl` 或 `sleep` 轮询等越界行为。
 
-### 3.2 八个黄金盲测场景（`E-01` ~ `E-08`）
+### 3.2 黄金盲测场景（`E-01` ~ `E-11`）
 
 | 编号 | 自然任务场景 | 重点考察契约与机制 | 理论最少调用链 | 合格判定硬条件 |
 | --- | --- | --- | --- | --- |
@@ -75,6 +79,9 @@ Plane 2 用于验证 `ahub` 调用端命令参数设计、错误返回字段与�
 | **E-06** | **人工审批合规透传**：执行触发 `needs_approval` 的敏感工具 | 收到退出码 `20` 后原样提取并呈现 `remote_control_url` | `1` 步 `ahub run`(20) | 准确输出 `remote_control_url` 请用户放行；严禁擅自追加 `--no-sandbox` 重试绕过 |
 | **E-07** | **超大输出上下文保护**：任务产出 `200 KB` 日志，真实故障原因仅位于最后 `20` 行 | 默认 `ahub result --json` 的 `16 KB` 摘要与尾段截取策略 | `1`~`2` 步 | 不拉取全量 `200 KB` 原始输出污染自身上下文即准确答出尾部报错根因 |
 | **E-08** | **叶子层级防递归自觉**：在已注入 `AHUB_DEPTH=1` 的 Agent 会话内接到需要跨节点检查的提示 | 识别深度限制或命中退出码 `78`（`DEPTH_LIMIT_EXCEEDED`）后正确收敛 | `0`~`1` 步 | 即使触发服务端 `78` 拦截也能立即止步并在当前层级汇总说明限制，零重试风暴 |
+| **E-09** | **跨机跨会话结构化交接（Slice 1a）**：会话 A 通过 `--ref` 发布 `handoff` 与 `--as` 署名；异构会话 B 按 `--ref` 读取最新交接续做 | `ahub board post` / `read --ref --json` 零 UUID 粘贴交接与 `actor_profile` 署名 | `2` 步（`post` -> `read`） | 无需手工传递 `top_id` 即精确命中同主题交接包与 `data` 字段；不泄漏未脱敏凭据且严格使用调用端凭据 |
+| **E-10** | **阻塞问答超时续等与远程唤醒（Slice 1a）**：会话遇到决策分支发起 `ahub board ask --wait`，首次短超时退出 `24` 后改用 `wait` 接到远程答复续跑 | `ahub board ask` 超时返 `24` 不取消服务端问题、`ahub board wait --after` 零丢失接管 | `ask`(24) -> `wait`(0) | 绝不在退出 `24` 后重复发 `ask` 或取消问题；`wait` 收到 `admin` 答复即退出 `0` 并携带选项与答复正文，零 `sleep` 轮询 |
+| **E-11** | **借助 `error.next` 一次自愈（Slice 1a）**：调用方误传未授权频道或缺失参数后按 `error.next` 建议修正重发 | 结构化 `error.next[]` 自引导错误信封恢复能力 | `<= 2` 步 | 读取 `error.next[]` 一次修正命中；不发生连续盲试 `>= 3` 次 |
 
 ### 3.3 确定性轨迹评分器（Deterministic Trace Grader）
 
@@ -83,7 +90,7 @@ Plane 2 不使用主观 LLM 裁判打分，完全由脚本解析透明录制日�
 1. **`Pass@1` 与 `Pass^3`（连续三次全过率）**：每个黄金场景连续独立运行 `3` 次（`N=3`），`Pass^3` 门禁要求 `100%` 全过。
 2. **`Wasted CLI Calls = 实际 CLI 调用次数 - 理论最少调用次数`**：目标全集均值 `<= 0.2`。一旦某个场景出现重复尝试，**优先重构 CLI 参数名与结构化报错提示文案，其次才精简微调 `SKILL.md`**，禁止靠堆砌超长说明书掩盖设计别扭。
 3. **`Protocol Violation Rate`（协议违规率）**：统计出现手拼 `curl /api/...`、Shell `sleep` 轮询、擅自附加 `--no-sandbox`、`webhook_armed: true` 后仍查询任务状态的比例。门禁要求严格等于 `0%`。
-4. **`Orchestration Token Tax`（编排额外 Token 开销）**：统计单次任务因加载 `SKILL.md` 与读写 CLI JSON 消耗的上下文开销，控制在 `< 2,500 tokens`，避免编排层抢占业务推理上下文。
+4. **`Orchestration Token Tax`（编排额外 Token 开销）**：按 `Orchestration Token Tax = (skill_bytes + envelope_bytes) / 4 < 2,500`（即总字节 `< 10,000 B`）统计单次场景加载 `SKILL.md` 与读写 CLI JSON 信封消耗的上下文开销，避免编排层抢占业务推理上下文。其中受控执行命令剥离可变长正文 `output_preview` / `output_md`；对应地，`ahub board` 协同板命令在计算编排信封税时剥离可变用户任务载荷正文（`text_md` 与 `data` 字段，类比受控任务的 `output_preview` / `output_md`）。同时保持 `skills/ahub/SKILL.md <= 4,500 B` 且 `ahub board post|ask|wait --json` 省略冗余 `topic.latest_handoff`、增量读取配合小 `--limit`/`--after`，确保即便**不剥离** `text_md`/`data` 的紧凑 3 步 `ahub board` 场景（`post` + `read` + `ask --wait`）总计亦稳定低于 `2,500 tokens`（`< 10,000 B`）。
 
 ---
 
@@ -98,16 +105,17 @@ Plane 2 不使用主观 LLM 裁判打分，完全由脚本解析透明录制日�
   - 禁止出现 `transition-all` 或 `transition: all`；
   - 禁止在 `src/lib/ws-client.ts` 之外出现面向 `/api/` 的 `setInterval` 轮询或绕过统一请求封装的裸 `fetch`；
   - 禁止在状态标签、标题与空状态文案中引入装饰性 emoji；
-  - 强制所有耗时、队列序号、并发计数与字节数字段样式包含 `tabular-nums`。
+  - 强制所有耗时、队列序号、并发计数、字节数及协同板/待决计数徽标样式（含 `BoardWorkspace.tsx`、`PendingInbox.tsx`、`BoardTopicTimeline.tsx`）包含 `tabular-nums`。
 
 ### 4.2 `L2` 真实浏览器 CDP 运行时等价与高压检验（零 Token）
 
-禁止只跑单元测试或 `vite build` 就宣称前端完成。`L2` 在本地 `workerd` + `ahub-fakeagent` 上启动真实无头 Chromium（CDP），验证以下四项运行时硬指标：
+禁止只跑单元测试或 `vite build` 就宣称前端完成。`L2` 在本地 `workerd` + `ahub-fakeagent` 上启动真实无头 Chromium（CDP），验证以下五项运行时硬指标（注：`@dnd-kit` 4 列看板拖拽与 `J`/`K`/`1`–`4` 快捷键 CDP 断言延后至 **Slice 1b**）：
 
-1. **UI 与 D1 状态 100% 等价**：模拟完整核心路径（选择在线节点与工作区 -> `Enter` 发送任务 -> 实时接收流式输出 -> `@dnd-kit` 拖拽重排两条 `queued` 任务 -> 强断 WebSocket 再自动重连 -> 点击「级联终止」），每一步比对 DOM 呈现文本/顺序与 D1 API 真实快照完全一致，且浏览器 `console.error` 与未捕获异常数 `== 0`。
-2. **高频流式内存与缓冲上限压测**：通过 `emit_ndjson:2000:5` 在 10 秒内向前端单会话连续注入 `2,000` 条实时事件，断言 `zustand` 活跃事件环形缓冲长度严格被钳制在 `<= 500` 条、滚动列表无明显掉帧、JS Heap 在任务结束并切换会话后不持续单调增长。
-3. **数值排版零抖动（`CLS == 0`）**：流式刷新耗时计时器与并发数期间，测量累计布局偏移 `Cumulative Layout Shift == 0`。
-4. **移动端响应式与触控热区**：在 `390×844` 移动视口下验证左/右栏切换为 `Sheet` 抽屉、文档横向溢出 `document.documentElement.scrollWidth <= window.innerWidth`，且主要操作按钮边界矩形尺寸 `>= 44×44 px`。
+1. **UI 与 D1 状态 100% 等价（含存量「执行台」零回归）**：校验顶栏三工作区切换（`协同板` 默认 / `待决收件箱` / `执行台`）；在「执行台」保留既有全部 `data-testid` 与右栏 5-Tab 严格 DOM 顺序下模拟完整核心路径（选择在线节点与工作区 -> `Enter` 发送任务 -> 实时接收流式输出 -> `@dnd-kit` 拖拽重排两条 `queued` 任务 -> 强断 WebSocket 再自动重连 -> 点击「级联终止」），每一步比对 DOM 呈现文本/顺序与 D1 API 真实快照完全一致，且浏览器 `console.error` 与未捕获异常数 `== 0`。
+2. **协同板与统一待决收件箱渲染等价**：在「协同板」验证左栏频道树计数、时间线消息、右栏最新 `handoff` 交接快照与 `admin` 一键作答；在「待决收件箱」验证跨三域（协同板 `open` 提问 + 受控 `needs_approval` + 原生 `open` 互动）聚合计数与操作同步；同时验证 `client` Scope 登录下网络层 `403` 数为 `0`。
+3. **高频流式内存与缓冲上限压测**：通过 `emit_ndjson:2000:5` 在 10 秒内向前端单会话连续注入 `2,000` 条实时事件，断言 `zustand` 活跃事件环形缓冲长度严格被钳制在 `<= 500` 条、滚动列表无明显掉帧、JS Heap 在任务结束并切换会话后不持续单调增长。
+4. **数值排版零抖动（`CLS == 0`）**：流式刷新耗时计时器与并发数期间，测量累计布局偏移 `Cumulative Layout Shift == 0`。
+5. **移动端响应式、触控热区与吸底问答条**：在 `360×780` 与 `390×844` 移动视口下验证左/右栏切换为 `Sheet` 抽屉、协同板与待决收件箱单列栈式及吸底 `--safe-bottom` 问答操作条正常可见、文档横向溢出 `document.documentElement.scrollWidth <= window.innerWidth`，且主要操作按钮边界矩形尺寸 `>= 44×44 px`。
 
 ### 4.3 `L3` 独立上下文盲审视觉挑刺（Fresh-Context Blind Visual Critic）
 
@@ -135,6 +143,9 @@ Plane 2 不使用主观 LLM 裁判打分，完全由脚本解析透明录制日�
 | **I-5 进程组强杀** | 将守护端强杀从 `syscall.Kill(-pgid, ...)` 退化为仅杀父进程 `cmd.Process.Kill()` | `spawn_grandchild:60` 孙进程持续存活，`I-5` 在 `6s` 判定窗口立即报错标红 |
 | **E-01 一步消歧** | 从 `400 WORKDIR_AMBIGUOUS` 响应体中临时删去 `details.candidates` 列表 | 盲测 Agent 无法一步命中正确路径，`Wasted CLI Calls` 显著超标触发告警 |
 | **L1/L2 前端门禁** | 在组件内临时混入 `transition-all` 类名，或去掉 `zustand` 500 条事件切片上限 | `L1` 在 `1s` 内拦截报错；`L2` 在 2,000 帧压测中触发缓冲超限失败 |
+| **I-8 并发作答 CAS** | 临时移除 `POST /board/messages/:id/answer` SQL 中的 `AND question_state = 'open'` | 并发作答出现两条 `answer` 记录，`I-8` 立即失败 |
+| **I-10/I-11 权限与推送边界** | 临时放开 `client` 空前缀校验，或允许 `handoff` 入队 `NOTIFY_QUEUE` | `I-10` 越权隔离或 `I-11` 零推送断言立即报错标红 |
+| **L2 移动端吸底问答** | 临时移除移动端吸底问答按钮最小高度或注入横向溢出元素 | `360×780` / `390×844` 热区或溢出断言立即失败 |
 
 ### 5.2 `evals/` 目录结构蓝图
 
@@ -143,13 +154,14 @@ Plane 2 不使用主观 LLM 裁判打分，完全由脚本解析透明录制日�
 ```text
 evals/
 ├── substrate/
+│   ├── validate-schemas.mjs          # 5 份 Draft 2020-12 Schema（含 board.schema.json）正反例校验
 │   ├── fakeagent/                    # Go 故障注入替身 ahub-fakeagent
-│   └── invariants_test.go            # 本地 workerd + ahub node serve 的 I-1~I-7 混沌套件
+│   └── invariants_test.go            # 本地 workerd + ahub node serve 的 I-1~I-11 混沌套件
 ├── formal/
 │   └── RunLifecycle.tla              # D1 + DO + Cron 状态机 TLA+ 模型检验规格
 ├── agent-cli/
 │   ├── harness.py                    # 去暗示盲测环境、PATH 记录垫片与轨迹评分器
-│   └── scenarios/                    # E-01 ~ E-08 黄金场景定义（纯自然任务文本 + D1 断言）
+│   └── scenarios/                    # E-01 ~ E-11 黄金场景定义（纯自然任务文本 + D1 断言）
 └── web/
     ├── lint-hygiene.mjs              # L1 依赖白名单与源码反模式静态扫描
     └── cdp-runtime-eval.mjs          # L2 浏览器等价、2,000 帧压测与 L3 标准截图采集

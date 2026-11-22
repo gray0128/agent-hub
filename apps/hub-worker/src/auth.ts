@@ -119,6 +119,7 @@ async function verifyAccessJwt(token: string, env: Env): Promise<AuthPrincipal> 
     scope: "admin",
     boundNodeId: null,
     allowedNodes: [],
+    allowedBoardPrefixes: ["*"],
     allowUnsandboxed: true,
     maxDepthLimit: 3
   };
@@ -221,13 +222,14 @@ export async function authenticateRequest(
       scope: "admin",
       boundNodeId: null,
       allowedNodes: [],
+      allowedBoardPrefixes: ["*"],
       allowUnsandboxed: true,
       maxDepthLimit: 3
     };
   }
 
   const row = await env.DB.prepare(
-    `SELECT id, scope, bound_node_id, allowed_nodes_json, allow_unsandboxed, max_depth_limit, revoked_at
+    `SELECT id, scope, bound_node_id, allowed_nodes_json, allowed_board_prefixes_json, allow_unsandboxed, max_depth_limit, revoked_at
      FROM api_keys
      WHERE key_sha256 = ?1
      LIMIT 1`
@@ -238,6 +240,7 @@ export async function authenticateRequest(
       scope: ApiScope;
       bound_node_id: string | null;
       allowed_nodes_json: string;
+      allowed_board_prefixes_json: string;
       allow_unsandboxed: number;
       max_depth_limit: number;
       revoked_at: string | null;
@@ -257,6 +260,20 @@ export async function authenticateRequest(
     allowedNodes = [];
   }
 
+  let allowedBoardPrefixes: string[] = [];
+  if (row.scope === "admin") {
+    allowedBoardPrefixes = ["*"];
+  } else if (row.scope === "client") {
+    try {
+      const parsed = JSON.parse(row.allowed_board_prefixes_json ?? "[]");
+      if (Array.isArray(parsed)) {
+        allowedBoardPrefixes = parsed.filter((x): x is string => typeof x === "string");
+      }
+    } catch {
+      allowedBoardPrefixes = [];
+    }
+  }
+
   const updateTouch = env.DB.prepare(`UPDATE api_keys SET last_used_at = ?1 WHERE id = ?2`)
     .bind(nowIso(), row.id)
     .run()
@@ -271,6 +288,7 @@ export async function authenticateRequest(
     scope: row.scope,
     boundNodeId: row.bound_node_id,
     allowedNodes,
+    allowedBoardPrefixes,
     allowUnsandboxed: row.allow_unsandboxed === 1,
     maxDepthLimit: row.max_depth_limit
   };
@@ -324,5 +342,66 @@ export function ensureRunAccessible(
   ensureNodeAllowedForClient(principal, run.node_id);
   if (run.created_by_key_id !== principal.keyId) {
     throw new HubError(403, "FORBIDDEN_SCOPE", "Client key cannot access runs created by another key.");
+  }
+}
+
+const SAFE_BOARD_CHANNEL_RE = /^[a-z0-9][a-z0-9_-]*(?:\/[a-z0-9][a-z0-9_-]*)*$/;
+
+export function sanitizeNextHints(hints: readonly string[]): string[] {
+  const out: string[] = [];
+  for (const h of hints) {
+    if (typeof h === "string" && h.length >= 1 && h.length <= 512 && !/[\r\n]/.test(h)) {
+      out.push(h);
+      if (out.length >= 8) break;
+    }
+  }
+  return out;
+}
+
+export function buildBoardPrefixNextHints(principal: AuthPrincipal): string[] {
+  const hints: string[] = [];
+  for (const p of principal.allowedBoardPrefixes ?? []) {
+    if (p === "*") {
+      hints.push("ahub board read --json");
+      break;
+    }
+    if (p.length <= 64 && SAFE_BOARD_CHANNEL_RE.test(p)) {
+      hints.push(`ahub board read ${p} --json`);
+    }
+    if (hints.length >= 4) break;
+  }
+  return sanitizeNextHints(hints);
+}
+
+export function isBoardChannelAllowed(principal: AuthPrincipal, channel: string): boolean {
+  if (principal.scope === "admin") return true;
+  if (principal.scope !== "client") return false;
+  const prefixes = principal.allowedBoardPrefixes ?? [];
+  if (prefixes.length === 0) return false;
+  return prefixes.some((p) => p === "*" || channel === p || channel.startsWith(`${p}/`));
+}
+
+export function ensureBoardReadAllowed(principal: AuthPrincipal): void {
+  requireScope(principal, ["admin", "client"]);
+  if (principal.scope === "client" && (principal.allowedBoardPrefixes ?? []).length === 0) {
+    throw new HubError(
+      403,
+      "FORBIDDEN_SCOPE",
+      "Client key has no allowed_board_prefixes configured for coordination board access."
+    );
+  }
+}
+
+export function ensureBoardChannelAllowed(principal: AuthPrincipal, channel: string): void {
+  ensureBoardReadAllowed(principal);
+  if (!isBoardChannelAllowed(principal, channel)) {
+    const hints = buildBoardPrefixNextHints(principal);
+    throw new HubError(
+      403,
+      "FORBIDDEN_SCOPE",
+      `Client key is not permitted to access board channel '${channel}'.`,
+      undefined,
+      hints.length > 0 ? hints : undefined
+    );
   }
 }

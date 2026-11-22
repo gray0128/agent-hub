@@ -1,6 +1,8 @@
 import {
   type AgentName,
   type ApiScope,
+  type BoardMessageKind,
+  type BoardTopicStatus,
   type EffortLevel,
   HubError,
   type NativeEventAgentName,
@@ -52,12 +54,14 @@ const PUSH_EVENT_FILTER_KEYS = new Set<PushEventFilterKey>([
   "run_cancelled",
   "native_interaction_needed",
   "native_turn_summary",
-  "native_progress"
+  "native_progress",
+  "board_question_opened"
 ]);
 export const DEFAULT_PUSH_EVENT_FILTER: readonly PushEventFilterKey[] = [
   "run_needs_approval",
   "run_failed",
-  "native_interaction_needed"
+  "native_interaction_needed",
+  "board_question_opened"
 ];
 export const DEFAULT_NODE_NOTIFY_EVENTS: readonly PushEventFilterKey[] = [
   "run_needs_approval",
@@ -69,13 +73,40 @@ export const DEFAULT_NODE_NOTIFY_EVENTS: readonly PushEventFilterKey[] = [
   "native_progress"
 ];
 export const VALID_PUSH_EVENT_FILTER_KEYS: ReadonlySet<PushEventFilterKey> = PUSH_EVENT_FILTER_KEYS;
-const NODE_ID_RE = /^[a-z0-9][a-z0-9_-]*$/;
+export const NODE_ID_RE = /^[a-z0-9][a-z0-9_-]*$/;
 const THREAD_ID_RE = /^thr_[A-Za-z0-9]+$/;
 const RUN_ID_RE = /^run_[A-Za-z0-9]+$/;
 const KEY_ID_RE = /^key_[A-Za-z0-9]{8,64}$/;
 const NATIVE_EVENT_ID_RE = /^[A-Za-z0-9_.:-]{8,128}$/;
 const NATIVE_EVENT_ROW_ID_RE = /^evt_[A-Za-z0-9]+$/;
 const DELIVERY_ID_RE = /^dlv_[A-Za-z0-9]+$/;
+export const BOARD_CHANNEL_RE = /^[a-z0-9][a-z0-9_-]*(?:\/[a-z0-9][a-z0-9_-]*)*$/;
+export const BOARD_PREFIX_RE = /^(\*|[a-z0-9][a-z0-9_-]*(?:\/[a-z0-9][a-z0-9_-]*)*)$/;
+export const ACTOR_PROFILE_RE = /^[a-z0-9][a-z0-9._@-]{0,39}$/;
+export const BOARD_TOPIC_ID_RE = /^top_[A-Za-z0-9]+$/;
+export const BOARD_MESSAGE_ID_RE = /^msg_[A-Za-z0-9]+$/;
+const BOARD_TOPIC_STATUSES = new Set<BoardTopicStatus>([
+  "todo",
+  "in_progress",
+  "blocked",
+  "done",
+  "archived"
+]);
+const BOARD_POSTABLE_KINDS = new Set<Exclude<BoardMessageKind, "answer">>([
+  "note",
+  "handoff",
+  "question",
+  "artifact"
+]);
+const utf8Encoder = new TextEncoder();
+
+export function codePointLength(value: string): number {
+  return Array.from(value).length;
+}
+
+export function utf8ByteLength(value: string): number {
+  return utf8Encoder.encode(value).length;
+}
 
 function asRecord(raw: unknown, context: string): Record<string, unknown> {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
@@ -670,11 +701,38 @@ export function parseCancelRunRequest(raw: unknown): {
   };
 }
 
+function parseAllowedBoardPrefixes(raw: unknown): string[] {
+  if (!Array.isArray(raw)) {
+    throw new HubError(400, "BAD_REQUEST", "allowed_board_prefixes must be an array.");
+  }
+  if (raw.length > 100) {
+    throw new HubError(400, "BAD_REQUEST", "allowed_board_prefixes exceeds max length 100.");
+  }
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    if (
+      typeof item !== "string" ||
+      item.length === 0 ||
+      codePointLength(item) > 64 ||
+      !BOARD_PREFIX_RE.test(item)
+    ) {
+      throw new HubError(400, "BAD_REQUEST", "Invalid channel prefix in allowed_board_prefixes.");
+    }
+    if (!seen.has(item)) {
+      seen.add(item);
+      out.push(item);
+    }
+  }
+  return out;
+}
+
 export function parseCreateKeyRequest(raw: unknown): {
   name: string;
   scope: ApiScope;
   boundNodeId?: string;
   allowedNodes: string[];
+  allowedBoardPrefixes: string[];
   allowUnsandboxed: boolean;
   maxDepthLimit: number;
   webhookUrl?: string;
@@ -688,6 +746,7 @@ export function parseCreateKeyRequest(raw: unknown): {
       "scope",
       "bound_node_id",
       "allowed_nodes",
+      "allowed_board_prefixes",
       "allow_unsandboxed",
       "max_depth_limit",
       "webhook_url",
@@ -724,6 +783,17 @@ export function parseCreateKeyRequest(raw: unknown): {
       }
     }
   }
+  const allowedBoardPrefixes =
+    obj["allowed_board_prefixes"] !== undefined
+      ? parseAllowedBoardPrefixes(obj["allowed_board_prefixes"])
+      : [];
+  if (allowedBoardPrefixes.length > 0 && scope !== "client") {
+    throw new HubError(
+      400,
+      "BAD_REQUEST",
+      "allowed_board_prefixes is only supported for client scope keys."
+    );
+  }
   const allowUnsandboxed = asOptionalBoolean(obj, "allow_unsandboxed") ?? false;
   const maxDepthLimit = asOptionalInt(obj, "max_depth_limit", 0, 3) ?? 1;
 
@@ -749,6 +819,7 @@ export function parseCreateKeyRequest(raw: unknown): {
     scope,
     boundNodeId,
     allowedNodes,
+    allowedBoardPrefixes,
     allowUnsandboxed,
     maxDepthLimit,
     webhookUrl,
@@ -759,6 +830,7 @@ export function parseCreateKeyRequest(raw: unknown): {
 export interface PatchKeyInput {
   boundNodeId?: string | null;
   allowedNodes?: string[];
+  allowedBoardPrefixes?: string[];
   allowUnsandboxed?: boolean;
   maxDepthLimit?: number;
   webhookUrl?: string;
@@ -773,6 +845,7 @@ export function parsePatchKeyRequest(raw: unknown): PatchKeyInput {
     [
       "bound_node_id",
       "allowed_nodes",
+      "allowed_board_prefixes",
       "allow_unsandboxed",
       "max_depth_limit",
       "webhook_url",
@@ -813,6 +886,10 @@ export function parsePatchKeyRequest(raw: unknown): PatchKeyInput {
       }
     }
     out.allowedNodes = allowed;
+  }
+
+  if (obj["allowed_board_prefixes"] !== undefined) {
+    out.allowedBoardPrefixes = parseAllowedBoardPrefixes(obj["allowed_board_prefixes"]);
   }
 
   const allowUnsandboxed = asOptionalBoolean(obj, "allow_unsandboxed");
@@ -1331,4 +1408,482 @@ export function parsePatchPushSubscriptionRequest(raw: unknown): ParsedPatchPush
     out.eventFilter = parseEventFilter(obj["event_filter"]);
   }
   return out;
+}
+
+function assertBoardChannelFormat(channel: string, fieldName = "channel"): string {
+  if (codePointLength(channel) < 1 || codePointLength(channel) > 64 || !BOARD_CHANNEL_RE.test(channel)) {
+    throw new HubError(
+      400,
+      "BAD_REQUEST",
+      `Invalid ${fieldName} '${channel}': must match ^[a-z0-9][a-z0-9_-]*(/[a-z0-9][a-z0-9_-]*)*$ (1..64 chars).`
+    );
+  }
+  return channel;
+}
+
+function parseBoardLabels(raw: unknown, fieldName = "labels"): Record<string, string> {
+  const obj = asRecord(raw, fieldName);
+  const entries = Object.entries(obj);
+  if (entries.length > 16) {
+    throw new HubError(400, "BAD_REQUEST", `Field '${fieldName}' exceeds maxProperties 16.`);
+  }
+  const out: Record<string, string> = {};
+  for (const [k, v] of entries) {
+    const kLen = codePointLength(k);
+    if (kLen < 1 || kLen > 64) {
+      throw new HubError(400, "BAD_REQUEST", `Label key '${k}' must have 1..64 characters.`);
+    }
+    if (typeof v !== "string") {
+      throw new HubError(400, "BAD_REQUEST", `Label '${k}' value must be a string.`);
+    }
+    if (codePointLength(v) > 128) {
+      throw new HubError(400, "BAD_REQUEST", `Label '${k}' value exceeds max length 128.`);
+    }
+    out[k] = v;
+  }
+  return out;
+}
+
+function parseBoardTopicStatusValue(raw: string, fieldName = "status"): BoardTopicStatus {
+  if (!BOARD_TOPIC_STATUSES.has(raw as BoardTopicStatus)) {
+    throw new HubError(400, "BAD_REQUEST", `Invalid ${fieldName} '${raw}'.`);
+  }
+  return raw as BoardTopicStatus;
+}
+
+export interface ParsedCreateBoardTopic {
+  channel: string;
+  title: string;
+  externalRef: string;
+  status: BoardTopicStatus;
+  pinned: boolean;
+  labels: Record<string, string>;
+  upsert: boolean;
+}
+
+export function parseCreateBoardTopicRequest(raw: unknown): ParsedCreateBoardTopic {
+  const obj = asRecord(raw, "CreateBoardTopicRequest");
+  rejectUnknownKeys(
+    obj,
+    ["channel", "title", "external_ref", "status", "pinned", "labels", "upsert"],
+    "CreateBoardTopicRequest"
+  );
+  const channel = assertBoardChannelFormat(asRequiredString(obj, "channel", 1));
+  const title = asRequiredString(obj, "title", 1);
+  if (codePointLength(title) < 1 || codePointLength(title) > 200) {
+    throw new HubError(400, "BAD_REQUEST", "Field 'title' must have 1..200 characters.");
+  }
+  const externalRef = asOptionalString(obj, "external_ref") ?? "";
+  if (codePointLength(externalRef) > 200) {
+    throw new HubError(400, "BAD_REQUEST", "Field 'external_ref' exceeds max length 200.");
+  }
+  const statusRaw = asOptionalString(obj, "status");
+  const status = statusRaw !== undefined ? parseBoardTopicStatusValue(statusRaw, "status") : "todo";
+  const pinned = asOptionalBoolean(obj, "pinned") ?? false;
+  const labels = obj["labels"] !== undefined ? parseBoardLabels(obj["labels"]) : {};
+  const upsert = asOptionalBoolean(obj, "upsert") ?? false;
+  return {
+    channel,
+    title,
+    externalRef,
+    status,
+    pinned,
+    labels,
+    upsert
+  };
+}
+
+export interface ParsedPatchBoardTopic {
+  title?: string;
+  status?: BoardTopicStatus;
+  pinned?: boolean;
+  sortOrder?: number;
+  labels?: Record<string, string>;
+}
+
+export function parsePatchBoardTopicRequest(raw: unknown): ParsedPatchBoardTopic {
+  const obj = asRecord(raw, "PatchBoardTopicRequest");
+  rejectUnknownKeys(
+    obj,
+    ["title", "status", "pinned", "sort_order", "labels"],
+    "PatchBoardTopicRequest"
+  );
+  if (Object.keys(obj).length === 0) {
+    throw new HubError(400, "BAD_REQUEST", "PatchBoardTopicRequest must specify at least one field.");
+  }
+  const out: ParsedPatchBoardTopic = {};
+  if (obj["title"] !== undefined) {
+    const title = asRequiredString(obj, "title", 1);
+    if (codePointLength(title) < 1 || codePointLength(title) > 200) {
+      throw new HubError(400, "BAD_REQUEST", "Field 'title' must have 1..200 characters.");
+    }
+    out.title = title;
+  }
+  const statusRaw = asOptionalString(obj, "status");
+  if (statusRaw !== undefined) {
+    out.status = parseBoardTopicStatusValue(statusRaw, "status");
+  }
+  const pinned = asOptionalBoolean(obj, "pinned");
+  if (pinned !== undefined) {
+    out.pinned = pinned;
+  }
+  const sortOrder = asOptionalNumber(obj, "sort_order");
+  if (sortOrder !== undefined) {
+    out.sortOrder = sortOrder;
+  }
+  if (obj["labels"] !== undefined) {
+    out.labels = parseBoardLabels(obj["labels"]);
+  }
+  return out;
+}
+
+export interface ParsedReorderBoardTopics {
+  channel: string;
+  status: BoardTopicStatus;
+  orderedTopicIds: string[];
+}
+
+export function parseReorderBoardTopicsRequest(raw: unknown): ParsedReorderBoardTopics {
+  const obj = asRecord(raw, "ReorderBoardTopicsRequest");
+  rejectUnknownKeys(
+    obj,
+    ["channel", "status", "ordered_topic_ids"],
+    "ReorderBoardTopicsRequest"
+  );
+  const channel = assertBoardChannelFormat(asRequiredString(obj, "channel", 1));
+  const status = parseBoardTopicStatusValue(asRequiredString(obj, "status", 1), "status");
+  const rawIds = obj["ordered_topic_ids"];
+  if (!Array.isArray(rawIds) || rawIds.length < 1 || rawIds.length > 500) {
+    throw new HubError(400, "BAD_REQUEST", "ordered_topic_ids must be an array of 1..500 topic IDs.");
+  }
+  const seen = new Set<string>();
+  const orderedTopicIds: string[] = [];
+  for (const item of rawIds) {
+    if (typeof item !== "string" || !BOARD_TOPIC_ID_RE.test(item)) {
+      throw new HubError(400, "BAD_REQUEST", "ordered_topic_ids must contain valid topic IDs.");
+    }
+    if (seen.has(item)) {
+      throw new HubError(400, "BAD_REQUEST", `Duplicate topic_id '${item}' in ordered_topic_ids.`);
+    }
+    seen.add(item);
+    orderedTopicIds.push(item);
+  }
+  return { channel, status, orderedTopicIds };
+}
+
+export interface ParsedCreateBoardMessage {
+  kind: Exclude<BoardMessageKind, "answer">;
+  textMd: string;
+  data: Record<string, unknown>;
+  actorProfile: string;
+  sourceNode: string;
+  topicStatus?: BoardTopicStatus;
+  questionOptions: string[];
+  questionExpiresSec: number;
+  idempotencyKey?: string;
+}
+
+export function parseCreateBoardMessageRequest(raw: unknown): ParsedCreateBoardMessage {
+  const obj = asRecord(raw, "CreateBoardMessageRequest");
+  rejectUnknownKeys(
+    obj,
+    [
+      "kind",
+      "text_md",
+      "data",
+      "actor_profile",
+      "source_node",
+      "topic_status",
+      "question_options",
+      "question_expires_sec",
+      "idempotency_key"
+    ],
+    "CreateBoardMessageRequest"
+  );
+  const kindRaw = asRequiredString(obj, "kind", 1);
+  if (!BOARD_POSTABLE_KINDS.has(kindRaw as Exclude<BoardMessageKind, "answer">)) {
+    throw new HubError(
+      400,
+      "BAD_REQUEST",
+      `Invalid message kind '${kindRaw}' (expected note, handoff, question, or artifact).`
+    );
+  }
+  const kind = kindRaw as Exclude<BoardMessageKind, "answer">;
+  const textMd = asRequiredString(obj, "text_md", 1);
+  if (codePointLength(textMd) > 8192) {
+    throw new HubError(400, "BAD_REQUEST", "Field 'text_md' exceeds max length 8192 characters.");
+  }
+
+  let data: Record<string, unknown> = {};
+  if (obj["data"] !== undefined) {
+    data = asRecord(obj["data"], "data");
+    if (utf8ByteLength(JSON.stringify(data)) > 32768) {
+      throw new HubError(400, "BAD_REQUEST", "Field 'data' exceeds max size 32768 UTF-8 bytes.");
+    }
+  }
+
+  const actorProfileRaw = asOptionalString(obj, "actor_profile");
+  if (
+    actorProfileRaw !== undefined &&
+    (codePointLength(actorProfileRaw) < 1 ||
+      codePointLength(actorProfileRaw) > 40 ||
+      !ACTOR_PROFILE_RE.test(actorProfileRaw))
+  ) {
+    throw new HubError(400, "BAD_REQUEST", "Invalid actor_profile format.");
+  }
+  const actorProfile = actorProfileRaw ?? "";
+
+  const sourceNodeRaw = asOptionalString(obj, "source_node");
+  if (
+    sourceNodeRaw !== undefined &&
+    (codePointLength(sourceNodeRaw) < 1 ||
+      codePointLength(sourceNodeRaw) > 64 ||
+      !NODE_ID_RE.test(sourceNodeRaw))
+  ) {
+    throw new HubError(400, "BAD_REQUEST", "Invalid source_node format.");
+  }
+  const sourceNode = sourceNodeRaw ?? "";
+
+  const topicStatusRaw = asOptionalString(obj, "topic_status");
+  const topicStatus =
+    topicStatusRaw !== undefined ? parseBoardTopicStatusValue(topicStatusRaw, "topic_status") : undefined;
+
+  const questionOptions: string[] = [];
+  if (obj["question_options"] !== undefined) {
+    if (!Array.isArray(obj["question_options"])) {
+      throw new HubError(400, "BAD_REQUEST", "question_options must be an array.");
+    }
+    if (obj["question_options"].length > 8) {
+      throw new HubError(400, "BAD_REQUEST", "question_options exceeds maxItems 8.");
+    }
+    for (const item of obj["question_options"]) {
+      if (typeof item !== "string") {
+        throw new HubError(400, "BAD_REQUEST", "question_options items must be strings.");
+      }
+      const len = codePointLength(item);
+      if (len < 1 || len > 200) {
+        throw new HubError(400, "BAD_REQUEST", "Each question_options item must have 1..200 characters.");
+      }
+      questionOptions.push(item);
+    }
+  }
+
+  const questionExpiresSec = asOptionalInt(obj, "question_expires_sec", 600, 259200) ?? 86400;
+
+  const idempotencyKey = asOptionalString(obj, "idempotency_key");
+  if (
+    idempotencyKey !== undefined &&
+    (codePointLength(idempotencyKey) < 8 || codePointLength(idempotencyKey) > 128)
+  ) {
+    throw new HubError(400, "BAD_REQUEST", "idempotency_key must have length 8..128.");
+  }
+
+  return {
+    kind,
+    textMd,
+    data,
+    actorProfile,
+    sourceNode,
+    topicStatus,
+    questionOptions,
+    questionExpiresSec,
+    idempotencyKey
+  };
+}
+
+export interface ParsedAnswerBoardQuestion {
+  selectedOption?: string;
+  answerText?: string;
+  actorProfile: string;
+}
+
+export function parseAnswerBoardQuestionRequest(raw: unknown): ParsedAnswerBoardQuestion {
+  const obj = asRecord(raw, "AnswerBoardQuestionRequest");
+  rejectUnknownKeys(
+    obj,
+    ["selected_option", "answer_text", "actor_profile"],
+    "AnswerBoardQuestionRequest"
+  );
+  const selectedOption = asOptionalString(obj, "selected_option");
+  if (selectedOption !== undefined) {
+    const len = codePointLength(selectedOption);
+    if (len < 1 || len > 200) {
+      throw new HubError(400, "BAD_REQUEST", "Field 'selected_option' must have 1..200 characters.");
+    }
+  }
+  const answerText = asOptionalString(obj, "answer_text");
+  if (answerText !== undefined) {
+    const len = codePointLength(answerText);
+    if (len < 1 || len > 8192) {
+      throw new HubError(400, "BAD_REQUEST", "Field 'answer_text' must have 1..8192 characters.");
+    }
+  }
+  if (selectedOption === undefined && answerText === undefined) {
+    throw new HubError(
+      400,
+      "BAD_REQUEST",
+      "AnswerBoardQuestionRequest requires 'selected_option' or 'answer_text'."
+    );
+  }
+  const actorProfileRaw = asOptionalString(obj, "actor_profile");
+  if (
+    actorProfileRaw !== undefined &&
+    (codePointLength(actorProfileRaw) < 1 ||
+      codePointLength(actorProfileRaw) > 40 ||
+      !ACTOR_PROFILE_RE.test(actorProfileRaw))
+  ) {
+    throw new HubError(400, "BAD_REQUEST", "Invalid actor_profile format.");
+  }
+  const actorProfile = actorProfileRaw ?? "";
+  return {
+    selectedOption,
+    answerText,
+    actorProfile
+  };
+}
+
+export interface ParsedListBoardTopicsQuery {
+  channel?: string;
+  externalRef?: string;
+  status?: BoardTopicStatus;
+  hasOpenQuestion?: boolean;
+  q?: string;
+  sort: "recent" | "order";
+  limit: number;
+}
+
+export function parseListBoardTopicsQuery(searchParams: URLSearchParams): ParsedListBoardTopicsQuery {
+  const channelRaw = searchParams.get("channel")?.trim();
+  const channel = channelRaw ? assertBoardChannelFormat(channelRaw, "channel") : undefined;
+
+  const externalRefRaw = searchParams.get("external_ref")?.trim();
+  if (externalRefRaw && codePointLength(externalRefRaw) > 200) {
+    throw new HubError(400, "BAD_REQUEST", "Query 'external_ref' exceeds max length 200.");
+  }
+  const externalRef = externalRefRaw || undefined;
+
+  const statusRaw = searchParams.get("status")?.trim();
+  const status = statusRaw ? parseBoardTopicStatusValue(statusRaw, "status") : undefined;
+
+  const hasOpenRaw = searchParams.get("has_open_question")?.trim();
+  let hasOpenQuestion: boolean | undefined;
+  if (hasOpenRaw !== undefined && hasOpenRaw !== "") {
+    if (hasOpenRaw === "true") hasOpenQuestion = true;
+    else if (hasOpenRaw === "false") hasOpenQuestion = false;
+    else throw new HubError(400, "BAD_REQUEST", "Query 'has_open_question' must be 'true' or 'false'.");
+  }
+
+  const qRaw = searchParams.get("q")?.trim();
+  if (qRaw && qRaw.length > 256) {
+    throw new HubError(400, "BAD_REQUEST", "Query 'q' exceeds max length 256.");
+  }
+  const q = qRaw || undefined;
+
+  const sortRaw = searchParams.get("sort")?.trim() || "recent";
+  if (sortRaw !== "recent" && sortRaw !== "order") {
+    throw new HubError(400, "BAD_REQUEST", "Query 'sort' must be 'recent' or 'order'.");
+  }
+
+  const limitRaw = searchParams.get("limit")?.trim();
+  let limit = 50;
+  if (limitRaw !== undefined && limitRaw !== "") {
+    if (!/^-?\d+$/.test(limitRaw)) {
+      throw new HubError(400, "BAD_REQUEST", "Query 'limit' must be an integer.");
+    }
+    const parsed = Number.parseInt(limitRaw, 10);
+    if (!Number.isSafeInteger(parsed)) {
+      throw new HubError(400, "BAD_REQUEST", "Query 'limit' must be a finite integer.");
+    }
+    limit = Math.min(Math.max(parsed, 1), 200);
+  }
+
+  return {
+    channel,
+    externalRef,
+    status,
+    hasOpenQuestion,
+    q,
+    sort: sortRaw,
+    limit
+  };
+}
+
+export function parseListBoardMessagesQuery(searchParams: URLSearchParams): {
+  afterSeq: number;
+  limit: number;
+} {
+  const afterSeqRaw = searchParams.get("after_seq")?.trim();
+  let afterSeq = 0;
+  if (afterSeqRaw !== undefined && afterSeqRaw !== "") {
+    if (!/^\d+$/.test(afterSeqRaw)) {
+      throw new HubError(400, "BAD_REQUEST", "Query 'after_seq' must be a non-negative integer.");
+    }
+    const parsed = Number.parseInt(afterSeqRaw, 10);
+    if (!Number.isSafeInteger(parsed)) {
+      throw new HubError(400, "BAD_REQUEST", "Query 'after_seq' must be a finite integer.");
+    }
+    afterSeq = parsed;
+  }
+
+  const limitRaw = searchParams.get("limit")?.trim();
+  let limit = 50;
+  if (limitRaw !== undefined && limitRaw !== "") {
+    if (!/^-?\d+$/.test(limitRaw)) {
+      throw new HubError(400, "BAD_REQUEST", "Query 'limit' must be an integer.");
+    }
+    const parsed = Number.parseInt(limitRaw, 10);
+    if (!Number.isSafeInteger(parsed)) {
+      throw new HubError(400, "BAD_REQUEST", "Query 'limit' must be a finite integer.");
+    }
+    limit = Math.min(Math.max(parsed, 1), 200);
+  }
+
+  return { afterSeq, limit };
+}
+
+export function parseListBoardEventsQuery(searchParams: URLSearchParams): {
+  channel?: string;
+  topicId?: string;
+  afterCursor: number;
+  limit: number;
+} {
+  const channelRaw = searchParams.get("channel")?.trim();
+  const channel = channelRaw ? assertBoardChannelFormat(channelRaw, "channel") : undefined;
+
+  const topicIdRaw = searchParams.get("topic_id")?.trim();
+  let topicId: string | undefined;
+  if (topicIdRaw) {
+    if (!BOARD_TOPIC_ID_RE.test(topicIdRaw)) {
+      throw new HubError(400, "BAD_REQUEST", "Invalid topic_id format.");
+    }
+    topicId = topicIdRaw;
+  }
+
+  const afterCursorRaw = searchParams.get("after_cursor")?.trim();
+  let afterCursor = 0;
+  if (afterCursorRaw !== undefined && afterCursorRaw !== "") {
+    if (!/^\d+$/.test(afterCursorRaw)) {
+      throw new HubError(400, "BAD_REQUEST", "Query 'after_cursor' must be a non-negative integer.");
+    }
+    const parsed = Number.parseInt(afterCursorRaw, 10);
+    if (!Number.isSafeInteger(parsed)) {
+      throw new HubError(400, "BAD_REQUEST", "Query 'after_cursor' must be a finite integer.");
+    }
+    afterCursor = parsed;
+  }
+
+  const limitRaw = searchParams.get("limit")?.trim();
+  let limit = 100;
+  if (limitRaw !== undefined && limitRaw !== "") {
+    if (!/^-?\d+$/.test(limitRaw)) {
+      throw new HubError(400, "BAD_REQUEST", "Query 'limit' must be an integer.");
+    }
+    const parsed = Number.parseInt(limitRaw, 10);
+    if (!Number.isSafeInteger(parsed)) {
+      throw new HubError(400, "BAD_REQUEST", "Query 'limit' must be a finite integer.");
+    }
+    limit = Math.min(Math.max(parsed, 1), 200);
+  }
+
+  return { channel, topicId, afterCursor, limit };
 }

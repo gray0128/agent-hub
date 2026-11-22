@@ -25,7 +25,7 @@ export interface WebPushSubscriptionTarget {
 
 export interface WebPushNotificationPayload {
   v: 1;
-  kind: "native_event" | "run" | "test";
+  kind: "native_event" | "run" | "board_message" | "test";
   id: string;
   tag: string;
   urgent: boolean;

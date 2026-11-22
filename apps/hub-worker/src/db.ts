@@ -201,6 +201,7 @@ interface ApiKeyRow {
   bound_node_id: string | null;
   key_prefix: string;
   allowed_nodes_json: string;
+  allowed_board_prefixes_json?: string;
   allow_unsandboxed: number;
   max_depth_limit: number;
   notify_webhook_ciphertext: string;
@@ -210,7 +211,7 @@ interface ApiKeyRow {
   created_at: string;
 }
 
-function parseJsonObject(raw: string): Record<string, unknown> {
+export function parseJsonObject(raw: string): Record<string, unknown> {
   try {
     const parsed = JSON.parse(raw);
     if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
@@ -234,7 +235,7 @@ function parseWorkspaces(raw: string): WorkspaceEntry[] {
   return [];
 }
 
-function parseStringArray(raw: string): string[] {
+export function parseStringArray(raw: string): string[] {
   try {
     const parsed = JSON.parse(raw);
     if (Array.isArray(parsed)) {
@@ -700,6 +701,7 @@ export function mapApiKeyRow(row: ApiKeyRow): ApiKeyRecord {
     bound_node_id: row.bound_node_id,
     key_prefix: row.key_prefix,
     allowed_nodes: parseStringArray(row.allowed_nodes_json),
+    allowed_board_prefixes: parseStringArray(row.allowed_board_prefixes_json ?? "[]"),
     allow_unsandboxed: row.allow_unsandboxed === 1,
     max_depth_limit: row.max_depth_limit,
     notify_webhook_host: row.notify_webhook_host ?? "",
@@ -1514,7 +1516,7 @@ function resolveLegacyWebhookHost(env: Env, target: NotifyTarget): string {
 
 export async function listMatchingWebPushSubscriptions(
   db: D1Database,
-  nodeId: string,
+  nodeId: string | null,
   filterKey: PushEventFilterKey
 ): Promise<WebPushSubscriptionMatch[]> {
   const res = await db
@@ -1536,7 +1538,7 @@ export async function listMatchingWebPushSubscriptions(
   for (const row of res.results ?? []) {
     const nodeFilter = parseStringArray(row.node_filter_json);
     const eventFilter = parseStringArray(row.event_filter_json);
-    const nodeMatch = nodeFilter.length === 0 || nodeFilter.includes(nodeId);
+    const nodeMatch = nodeFilter.length === 0 || (nodeId !== null && nodeId !== "" && nodeFilter.includes(nodeId));
     const eventMatch = eventFilter.includes(filterKey);
     if (nodeMatch && eventMatch) {
       matches.push({
@@ -1670,6 +1672,13 @@ export async function recomputeSourceNotifyStatus(
       )
       .bind(agg.notifyStatus, agg.notifyError, now, sourceId)
       .run();
+    return agg;
+  }
+
+  if (sourceKind === "board_message") {
+    const agg = computeAggregateNotifyStatus("run", deliveries, {
+      currentNotifyStatus: "none"
+    });
     return agg;
   }
 
@@ -3215,7 +3224,7 @@ export async function listApiKeys(
   if (!filters.includeRevoked) {
     where.push(`revoked_at IS NULL`);
   }
-  const sql = `SELECT id, name, scope, bound_node_id, key_prefix, allowed_nodes_json, allow_unsandboxed, max_depth_limit, notify_webhook_ciphertext, notify_webhook_host, revoked_at, last_used_at, created_at
+  const sql = `SELECT id, name, scope, bound_node_id, key_prefix, allowed_nodes_json, allowed_board_prefixes_json, allow_unsandboxed, max_depth_limit, notify_webhook_ciphertext, notify_webhook_host, revoked_at, last_used_at, created_at
                FROM api_keys
                ${where.length ? "WHERE " + where.join(" AND ") : ""}
                ORDER BY created_at DESC`;
@@ -3226,7 +3235,7 @@ export async function listApiKeys(
 export async function getApiKeyRawById(db: D1Database, keyId: string): Promise<ApiKeyRow | null> {
   return db
     .prepare(
-      `SELECT id, name, scope, bound_node_id, key_prefix, allowed_nodes_json, allow_unsandboxed, max_depth_limit, notify_webhook_ciphertext, notify_webhook_host, revoked_at, last_used_at, created_at
+      `SELECT id, name, scope, bound_node_id, key_prefix, allowed_nodes_json, allowed_board_prefixes_json, allow_unsandboxed, max_depth_limit, notify_webhook_ciphertext, notify_webhook_host, revoked_at, last_used_at, created_at
        FROM api_keys
        WHERE id = ?1
        LIMIT 1`
@@ -3254,6 +3263,7 @@ export async function createApiKey(
     scope: ApiScope;
     boundNodeId?: string;
     allowedNodes: string[];
+    allowedBoardPrefixes: string[];
     allowUnsandboxed: boolean;
     maxDepthLimit: number;
     notifyWebhookCiphertext?: string;
@@ -3272,8 +3282,8 @@ export async function createApiKey(
 
   await db
     .prepare(
-      `INSERT INTO api_keys (id, name, scope, bound_node_id, key_prefix, key_sha256, allowed_nodes_json, allow_unsandboxed, max_depth_limit, notify_webhook_ciphertext, notify_webhook_host, created_at)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)`
+      `INSERT INTO api_keys (id, name, scope, bound_node_id, key_prefix, key_sha256, allowed_nodes_json, allowed_board_prefixes_json, allow_unsandboxed, max_depth_limit, notify_webhook_ciphertext, notify_webhook_host, created_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)`
     )
     .bind(
       keyId,
@@ -3283,6 +3293,7 @@ export async function createApiKey(
       keyPrefix,
       input.tokenSha256,
       JSON.stringify(input.allowedNodes),
+      JSON.stringify(input.allowedBoardPrefixes),
       input.allowUnsandboxed ? 1 : 0,
       input.maxDepthLimit,
       input.notifyWebhookCiphertext ?? "",
@@ -3301,6 +3312,7 @@ export async function patchApiKey(
   patch: {
     boundNodeId?: string | null;
     allowedNodes?: string[];
+    allowedBoardPrefixes?: string[];
     allowUnsandboxed?: boolean;
     maxDepthLimit?: number;
     notifyWebhookCiphertext?: string;
@@ -3321,6 +3333,10 @@ export async function patchApiKey(
   if (patch.allowedNodes !== undefined) {
     binds.push(JSON.stringify(patch.allowedNodes));
     sets.push(`allowed_nodes_json = ?${binds.length}`);
+  }
+  if (patch.allowedBoardPrefixes !== undefined) {
+    binds.push(JSON.stringify(patch.allowedBoardPrefixes));
+    sets.push(`allowed_board_prefixes_json = ?${binds.length}`);
   }
   if (patch.allowUnsandboxed !== undefined) {
     binds.push(patch.allowUnsandboxed ? 1 : 0);
@@ -3574,7 +3590,7 @@ export async function redeliverSourceDeliveries(
     if (!evRow) {
       throw new HubError(404, "NOT_FOUND", `Native event '${sourceId}' not found.`);
     }
-  } else {
+  } else if (sourceKind === "run") {
     const runRow = await db
       .prepare(`SELECT id FROM runs WHERE id = ?1 LIMIT 1`)
       .bind(sourceId)
@@ -3582,6 +3598,8 @@ export async function redeliverSourceDeliveries(
     if (!runRow) {
       throw new HubError(404, "NOT_FOUND", `Run '${sourceId}' not found.`);
     }
+  } else {
+    throw new HubError(400, "BAD_REQUEST", `Unsupported redeliver source_kind '${sourceKind}'.`);
   }
 
   let targets: DeliveryRow[];

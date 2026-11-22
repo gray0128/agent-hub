@@ -16,12 +16,15 @@ import {
   AlertCircle,
   Bell,
   Ellipsis,
+  Inbox,
   KeyRound,
+  LayoutGrid,
   Moon,
   PanelLeft,
   PanelRight,
   Plus,
   Sun,
+  Terminal,
   X
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -33,6 +36,7 @@ import {
   DropdownMenuTrigger
 } from "@/components/ui/dropdown-menu";
 import { Sheet, SheetContent } from "@/components/ui/sheet";
+import { BoardWorkspace } from "@/components/workbench/BoardWorkspace";
 import { BrowserNotifyDialog } from "@/components/workbench/BrowserNotifyDialog";
 import { BrandMark } from "@/components/workbench/BrandMark";
 import { ConversationPane } from "@/components/workbench/ConversationPane";
@@ -43,6 +47,7 @@ import {
   KeysDialog,
   OnboardingDialog
 } from "@/components/workbench/OnboardingKeysDialogs";
+import { PendingInbox } from "@/components/workbench/PendingInbox";
 import { apiClient, ApiClientError } from "@/lib/api-client";
 import {
   getCurrentDevicePushInfo,
@@ -56,6 +61,7 @@ import {
 import { getAvailableAgents, resolveInitialComposerModelAndEffort } from "@/lib/capabilities";
 import { AUTO_FULL_OUTPUT_MAX_BYTES, cn } from "@/lib/utils";
 import { HubStreamClient } from "@/lib/ws-client";
+import { useBoardStore } from "@/stores/board-store";
 import { useFleetStore } from "@/stores/fleet-store";
 import {
   getDeliverySourceKey,
@@ -67,13 +73,21 @@ import {
   type CenterPaneMode,
   type InspectorTab,
   type LeftRailTab,
+  type WorkspaceMode,
   useWorkbenchStore
 } from "@/stores/workbench-store";
 import type {
+  AnswerBoardQuestionPayload,
+  AuthPrincipal,
+  BoardTopic,
+  BoardTopicStatus,
+  CreateBoardMessagePayload,
+  CreateBoardTopicPayload,
   DeliverySourceKind,
   NativeEventView,
   NodeRecord,
   PushEventFilterKey,
+  RunRecord,
   ThreadRecord
 } from "@/types";
 
@@ -93,6 +107,7 @@ declare global {
         authStatus: string;
         authKind: string | null;
         authScope: string | null;
+        workspaceMode: WorkspaceMode;
         leftTab: LeftRailTab;
         centerMode: CenterPaneMode;
         activeTab: InspectorTab;
@@ -105,6 +120,14 @@ declare global {
         >["deliveriesBySourceKey"];
         pushConfig: ReturnType<typeof useNativeActivityStore.getState>["pushConfig"];
         pushSubscriptions: ReturnType<typeof useNativeActivityStore.getState>["subscriptions"];
+        boardChannels: ReturnType<typeof useBoardStore.getState>["channels"];
+        boardTopics: ReturnType<typeof useBoardStore.getState>["topics"];
+        boardMessagesByTopicId: ReturnType<typeof useBoardStore.getState>["messagesByTopicId"];
+        boardEventsCursor: number;
+        openBoardQuestionCount: number;
+        selectedBoardChannel: string | null;
+        selectedBoardTopicId: string | null;
+        boardPermissionDenied: boolean;
       };
     };
   }
@@ -160,6 +183,8 @@ export function App() {
   const authKind = useWorkbenchStore((s) => s.authKind);
   const authScope = useWorkbenchStore((s) => s.authScope);
   const streamStatus = useWorkbenchStore((s) => s.streamStatus);
+  const workspaceMode = useWorkbenchStore((s) => s.workspaceMode);
+  const selectedInboxItemKey = useWorkbenchStore((s) => s.selectedInboxItemKey);
   const leftTab = useWorkbenchStore((s) => s.leftTab);
   const centerMode = useWorkbenchStore((s) => s.centerMode);
   const activeTab = useWorkbenchStore((s) => s.activeTab);
@@ -169,6 +194,9 @@ export function App() {
   const browserNotifyOpen = useWorkbenchStore((s) => s.browserNotifyOpen);
   const mobileLeftOpen = useWorkbenchStore((s) => s.mobileLeftOpen);
   const mobileRightOpen = useWorkbenchStore((s) => s.mobileRightOpen);
+  const boardMobileLeftOpen = useWorkbenchStore((s) => s.boardMobileLeftOpen);
+  const boardMobileRightOpen = useWorkbenchStore((s) => s.boardMobileRightOpen);
+  const boardMobileShowDetail = useWorkbenchStore((s) => s.boardMobileShowDetail);
   const errorBanner = useWorkbenchStore((s) => s.errorBanner);
   const composerNotice = useWorkbenchStore((s) => s.composerNotice);
   const composer = useWorkbenchStore((s) => s.composer);
@@ -177,6 +205,8 @@ export function App() {
   const setToken = useWorkbenchStore((s) => s.setToken);
   const setAuthState = useWorkbenchStore((s) => s.setAuthState);
   const setStreamStatus = useWorkbenchStore((s) => s.setStreamStatus);
+  const setWorkspaceMode = useWorkbenchStore((s) => s.setWorkspaceMode);
+  const setSelectedInboxItemKey = useWorkbenchStore((s) => s.setSelectedInboxItemKey);
   const setLeftTab = useWorkbenchStore((s) => s.setLeftTab);
   const setCenterMode = useWorkbenchStore((s) => s.setCenterMode);
   const setActiveTab = useWorkbenchStore((s) => s.setActiveTab);
@@ -186,9 +216,35 @@ export function App() {
   const setBrowserNotifyOpen = useWorkbenchStore((s) => s.setBrowserNotifyOpen);
   const setMobileLeftOpen = useWorkbenchStore((s) => s.setMobileLeftOpen);
   const setMobileRightOpen = useWorkbenchStore((s) => s.setMobileRightOpen);
+  const setBoardMobileLeftOpen = useWorkbenchStore((s) => s.setBoardMobileLeftOpen);
+  const setBoardMobileRightOpen = useWorkbenchStore((s) => s.setBoardMobileRightOpen);
+  const setBoardMobileShowDetail = useWorkbenchStore((s) => s.setBoardMobileShowDetail);
   const setErrorBanner = useWorkbenchStore((s) => s.setErrorBanner);
   const setComposerNotice = useWorkbenchStore((s) => s.setComposerNotice);
   const patchComposer = useWorkbenchStore((s) => s.patchComposer);
+
+  const boardChannels = useBoardStore((s) => s.channels);
+  const boardTopics = useBoardStore((s) => s.topics);
+  const boardMessagesByTopicId = useBoardStore((s) => s.messagesByTopicId);
+  const openBoardQuestionCount = useBoardStore((s) => s.openBoardQuestionCount);
+  const selectedBoardChannel = useBoardStore((s) => s.selectedChannel);
+  const selectedBoardTopicId = useBoardStore((s) => s.selectedTopicId);
+  const boardTopicFilter = useBoardStore((s) => s.topicFilter);
+  const boardSearchQuery = useBoardStore((s) => s.searchQuery);
+  const boardPermissionDenied = useBoardStore((s) => s.boardPermissionDenied);
+
+  const hydrateBoard = useBoardStore((s) => s.hydrateBoard);
+  const setOpenBoardQuestionCount = useBoardStore((s) => s.setOpenBoardQuestionCount);
+  const upsertBoardTopic = useBoardStore((s) => s.upsertTopic);
+  const setBoardTopicMessages = useBoardStore((s) => s.setTopicMessages);
+  const appendBoardMessage = useBoardStore((s) => s.appendMessage);
+  const applyBoardQuestionAnswered = useBoardStore((s) => s.applyQuestionAnswered);
+  const selectBoardChannel = useBoardStore((s) => s.selectChannel);
+  const selectBoardTopic = useBoardStore((s) => s.selectTopic);
+  const setBoardTopicFilter = useBoardStore((s) => s.setTopicFilter);
+  const setBoardSearchQuery = useBoardStore((s) => s.setSearchQuery);
+  const setBoardPermissionDenied = useBoardStore((s) => s.setBoardPermissionDenied);
+  const resetBoard = useBoardStore((s) => s.reset);
 
   const nativeEvents = useNativeActivityStore((s) => s.events);
   const openInteractionCount = useNativeActivityStore((s) => s.openInteractionCount);
@@ -227,7 +283,14 @@ export function App() {
   const [acknowledgingIds, setAcknowledgingIds] = useState<Record<string, boolean>>({});
   const [deliveriesLoading, setDeliveriesLoading] = useState(false);
   const [redeliveringIds, setRedeliveringIds] = useState<Record<string, boolean>>({});
+  const [boardMessagesLoading, setBoardMessagesLoading] = useState(false);
+  const [submittingBoardMessage, setSubmittingBoardMessage] = useState(false);
+  const [updatingBoardTopic, setUpdatingBoardTopic] = useState(false);
+  const [answeringQuestionIds, setAnsweringQuestionIds] = useState<Record<string, boolean>>({});
   const wsClientRef = useRef<HubStreamClient | null>(null);
+  const hasConnectedOnceRef = useRef<boolean>(false);
+  const boardInFlightTopicMsgRef = useRef<Set<string>>(new Set());
+  const boardHydratedOpenKeyRef = useRef<Map<string, string>>(new Map());
   const hydrationGenRef = useRef<number>(0);
   const inFlightHydrationRef = useRef<Set<string>>(new Set());
   const completedHydrationRef = useRef<Set<string>>(new Set());
@@ -257,6 +320,7 @@ export function App() {
         const task = useTaskStore.getState();
         const wb = useWorkbenchStore.getState();
         const native = useNativeActivityStore.getState();
+        const board = useBoardStore.getState();
         return {
           nodes: fleet.nodes,
           threads: task.threads,
@@ -270,6 +334,7 @@ export function App() {
           authStatus: wb.authStatus,
           authKind: wb.authKind,
           authScope: wb.authScope,
+          workspaceMode: wb.workspaceMode,
           leftTab: wb.leftTab,
           centerMode: wb.centerMode,
           activeTab: wb.activeTab,
@@ -279,7 +344,15 @@ export function App() {
           selectedNativeEventId: native.selectedEventId,
           deliveriesBySourceKey: native.deliveriesBySourceKey,
           pushConfig: native.pushConfig,
-          pushSubscriptions: native.subscriptions
+          pushSubscriptions: native.subscriptions,
+          boardChannels: board.channels,
+          boardTopics: board.topics,
+          boardMessagesByTopicId: board.messagesByTopicId,
+          boardEventsCursor: board.eventsCursor,
+          openBoardQuestionCount: board.openBoardQuestionCount,
+          selectedBoardChannel: board.selectedChannel,
+          selectedBoardTopicId: board.selectedTopicId,
+          boardPermissionDenied: board.boardPermissionDenied
         };
       }
     };
@@ -324,10 +397,50 @@ export function App() {
     }
   }, [patchComposer, selectNode, selectRun, selectThread]);
 
+  const hydrateBoardSafe = useCallback(
+    async (principal: Pick<AuthPrincipal, "scope" | "allowed_board_prefixes">) => {
+      if (principal.scope === "node") {
+        resetBoard();
+        setBoardPermissionDenied(true);
+        return;
+      }
+      if (
+        principal.scope === "client" &&
+        Array.isArray(principal.allowed_board_prefixes) &&
+        principal.allowed_board_prefixes.length === 0
+      ) {
+        resetBoard();
+        setBoardPermissionDenied(true);
+        return;
+      }
+      try {
+        const [chRes, topicsRes] = await Promise.all([
+          apiClient.fetchBoardChannels(token),
+          apiClient.fetchBoardTopics(token, { limit: 100 })
+        ]);
+        hydrateBoard({
+          channels: chRes.channels,
+          topics: topicsRes.topics
+        });
+      } catch (err) {
+        if (err instanceof ApiClientError && err.status === 403) {
+          resetBoard();
+          setBoardPermissionDenied(true);
+        }
+      }
+    },
+    [hydrateBoard, resetBoard, setBoardPermissionDenied, token]
+  );
+
   const applyTargetUrlNavigation = useCallback(
     (targetUrl: string) => {
       try {
         const url = new URL(targetUrl, window.location.origin);
+        const workspace = url.searchParams.get("workspace");
+        const source = url.searchParams.get("source");
+        const id = url.searchParams.get("id");
+        const channel = url.searchParams.get("channel");
+        const topic = url.searchParams.get("topic");
         const pane = url.searchParams.get("pane");
         const session = url.searchParams.get("session");
         const eventId = url.searchParams.get("event");
@@ -335,7 +448,62 @@ export function App() {
         const threadId = url.searchParams.get("thread");
         const scope = useWorkbenchStore.getState().authScope;
 
+        if (workspace === "inbox" || (source === "board" && id)) {
+          setWorkspaceMode("inbox");
+          if (source === "board" && id) {
+            setSelectedInboxItemKey(`board:${id}`);
+            const currentMessages = useBoardStore.getState().messagesByTopicId;
+            const foundTopicEntry = Object.entries(currentMessages).find(([, list]) =>
+              list.some((m) => m.id === id)
+            );
+            if (!foundTopicEntry && !useBoardStore.getState().boardPermissionDenied) {
+              void apiClient
+                .fetchBoardTopics(token, { has_open_question: true, limit: 50 })
+                .then(async (res) => {
+                  for (const t of res.topics) {
+                    upsertBoardTopic(t);
+                    try {
+                      const msgRes = await apiClient.fetchBoardTopicMessages(token, t.id, {
+                        limit: 100
+                      });
+                      setBoardTopicMessages(msgRes.topic.id, msgRes.messages, msgRes.cursor);
+                    } catch {
+                      // ignore individual topic failures
+                    }
+                  }
+                })
+                .catch(() => {});
+            }
+          }
+          setMobileLeftOpen(false);
+          setBoardMobileLeftOpen(false);
+          return;
+        }
+
+        if (workspace === "board") {
+          setWorkspaceMode("board");
+          if (channel) {
+            selectBoardChannel(channel);
+          }
+          if (topic) {
+            selectBoardTopic(topic);
+            setBoardMobileShowDetail(true);
+          }
+          setMobileLeftOpen(false);
+          setBoardMobileLeftOpen(false);
+          return;
+        }
+
+        if (workspace === "runs") {
+          setWorkspaceMode("runs");
+          if (!pane && !runId && !threadId) {
+            setMobileLeftOpen(false);
+            return;
+          }
+        }
+
         if (pane === "native" && scope === "admin") {
+          setWorkspaceMode("runs");
           setLeftTab("native");
           setCenterMode("native");
           if (session) selectNativeSession(session);
@@ -367,6 +535,7 @@ export function App() {
         }
 
         if (runId || threadId) {
+          setWorkspaceMode("runs");
           setLeftTab("threads");
           setCenterMode("controlled");
           const curRuns = useTaskStore.getState().runs;
@@ -385,15 +554,23 @@ export function App() {
       }
     },
     [
+      selectBoardChannel,
+      selectBoardTopic,
       selectNativeEvent,
       selectNativeSession,
       selectRun,
       selectThread,
+      setBoardMobileLeftOpen,
+      setBoardMobileShowDetail,
+      setBoardTopicMessages,
       setCenterMode,
       setDeliveries,
       setLeftTab,
       setMobileLeftOpen,
+      setSelectedInboxItemKey,
+      setWorkspaceMode,
       token,
+      upsertBoardTopic,
       upsertNativeEvent
     ]
   );
@@ -418,6 +595,9 @@ export function App() {
   useEffect(() => {
     let cancelled = false;
     let client: HubStreamClient | null = null;
+    hasConnectedOnceRef.current = false;
+    boardInFlightTopicMsgRef.current.clear();
+    boardHydratedOpenKeyRef.current.clear();
     hydrationGenRef.current += 1;
     inFlightHydrationRef.current.clear();
     completedHydrationRef.current.clear();
@@ -450,7 +630,8 @@ export function App() {
           void Promise.allSettled([
             apiClient.fetchNativeEvents(token, { limit: 100 }),
             apiClient.fetchPushConfig(token),
-            apiClient.fetchPushSubscriptions(token, false)
+            apiClient.fetchPushSubscriptions(token, false),
+            hydrateBoardSafe(meRes.principal)
           ]).then(([nativeRes, cfgRes, subsRes]) => {
             if (cancelled) return;
             if (nativeRes.status === "fulfilled") {
@@ -478,13 +659,53 @@ export function App() {
             onFrame: (frame) => {
               if (cancelled) return;
               switch (frame.type) {
-                case "snapshot":
+                case "snapshot": {
                   setNodes(frame.nodes ?? []);
                   if (frame.threads) setThreads(frame.threads);
                   setRuns(frame.runs ?? []);
                   hydrateNativeEvents(frame.native_events ?? [], frame.open_interaction_count);
+                  if (frame.topic) {
+                    upsertBoardTopic(frame.topic);
+                  }
+                  if (typeof frame.open_board_question_count === "number") {
+                    setOpenBoardQuestionCount(frame.open_board_question_count);
+                  }
                   syncDefaultSelection();
+                  if (hasConnectedOnceRef.current) {
+                    void Promise.allSettled([
+                      apiClient.fetchNodes(token),
+                      apiClient.fetchThreads(token),
+                      apiClient.fetchRuns(token, { limit: 200 }),
+                      apiClient.fetchNativeEvents(token, { limit: 100 }),
+                      hydrateBoardSafe(meRes.principal)
+                    ]).then(([nRes, tRes, rRes, evRes]) => {
+                      if (cancelled) return;
+                      if (nRes.status === "fulfilled") setNodes(nRes.value.nodes);
+                      if (tRes.status === "fulfilled") setThreads(tRes.value.threads);
+                      if (rRes.status === "fulfilled") setRuns(rRes.value.runs);
+                      if (evRes.status === "fulfilled") {
+                        hydrateNativeEvents(
+                          evRes.value.events,
+                          evRes.value.open_interaction_count
+                        );
+                      }
+                      const activeTopicId = useBoardStore.getState().selectedTopicId;
+                      if (activeTopicId) {
+                        void apiClient
+                          .fetchBoardTopicMessages(token, activeTopicId, { limit: 100 })
+                          .then((mRes) => {
+                            if (!cancelled) {
+                              upsertBoardTopic(mRes.topic);
+                              setBoardTopicMessages(mRes.topic.id, mRes.messages, mRes.cursor);
+                            }
+                          })
+                          .catch(() => {});
+                      }
+                    });
+                  }
+                  hasConnectedOnceRef.current = true;
                   break;
+                }
                 case "node.status":
                   upsertNode(frame.node);
                   break;
@@ -567,6 +788,57 @@ export function App() {
                 case "delivery.updated":
                   upsertDelivery(frame.delivery);
                   break;
+                case "board.topic_updated":
+                  upsertBoardTopic(frame.topic);
+                  if (typeof frame.open_board_question_count === "number") {
+                    setOpenBoardQuestionCount(frame.open_board_question_count);
+                  }
+                  break;
+                case "board.message_created": {
+                  const prevMsgs =
+                    useBoardStore.getState().messagesByTopicId[frame.message.topic_id] ?? [];
+                  const alreadySeen = prevMsgs.some((m) => m.id === frame.message.id);
+                  if (frame.topic) {
+                    upsertBoardTopic(frame.topic);
+                  }
+                  appendBoardMessage(frame.message.topic_id, frame.message, frame.cursor, {
+                    topicUpdated: Boolean(frame.topic),
+                    openQuestionCount: frame.open_board_question_count
+                  });
+                  if (
+                    !alreadySeen &&
+                    frame.message.kind === "question" &&
+                    frame.message.question_state === "open"
+                  ) {
+                    const nativeState = useNativeActivityStore.getState();
+                    const actorLabel = `${frame.message.actor_profile || frame.message.actor_scope}${
+                      frame.message.source_node ? `@${frame.message.source_node}` : ""
+                    }`;
+                    void notifyInPageWithDedup({
+                      eventKey: `ahub-board-${frame.message.id}`,
+                      title: `[${frame.message.channel}] ${actorLabel} 请求确认`,
+                      body: frame.message.text_md.slice(0, 200),
+                      targetUrl: `/?workspace=inbox&source=board&id=${encodeURIComponent(frame.message.id)}`,
+                      nodeId: frame.message.source_node || "board",
+                      filterKey: "board_question_opened",
+                      pushConfig: nativeState.pushConfig,
+                      subscriptions: nativeState.subscriptions,
+                      localEndpointSha256Prefix: localEndpointShaRef.current,
+                      inPageEnabled: inPageFallbackRef.current,
+                      onNavigate: applyTargetUrlNavigation
+                    });
+                  }
+                  break;
+                }
+                case "board.question_answered":
+                  applyBoardQuestionAnswered({
+                    question: frame.question,
+                    answer: frame.answer,
+                    topic: frame.topic,
+                    cursor: frame.cursor,
+                    openQuestionCount: frame.open_board_question_count
+                  });
+                  break;
               }
             }
           });
@@ -580,6 +852,11 @@ export function App() {
             setActiveTab("events");
           }
           setStreamStatus("disconnected");
+          void hydrateBoardSafe(meRes.principal).then(() => {
+            if (!cancelled && window.location.search) {
+              applyTargetUrlNavigation(window.location.href);
+            }
+          });
         }
       } catch (err) {
         if (cancelled) return;
@@ -606,6 +883,8 @@ export function App() {
       hydrationGenRef.current += 1;
       inFlightHydrationRef.current.clear();
       completedHydrationRef.current.clear();
+      boardInFlightTopicMsgRef.current.clear();
+      boardHydratedOpenKeyRef.current.clear();
       if (client) {
         client.stop();
       }
@@ -613,26 +892,190 @@ export function App() {
     };
   }, [
     token,
+    appendBoardMessage,
     appendEvents,
+    applyBoardQuestionAnswered,
     applyTargetUrlNavigation,
+    hydrateBoardSafe,
     hydrateNativeEvents,
     resetNativeActivity,
     setActiveTab,
     setAuthState,
+    setBoardTopicMessages,
     setCenterMode,
     setErrorBanner,
     setLeftTab,
     setNodes,
+    setOpenBoardQuestionCount,
     setPushConfig,
     setPushSubscriptions,
     setRuns,
     setStreamStatus,
     setThreads,
     syncDefaultSelection,
+    upsertBoardTopic,
     upsertDelivery,
     upsertNativeEvent,
     upsertNode,
     upsertRun
+  ]);
+
+  // Fetch board messages for active selected topic
+  useEffect(() => {
+    if (!hasSession || authStatus !== "authenticated" || boardPermissionDenied || !selectedBoardTopicId) {
+      return;
+    }
+    let cancelled = false;
+    setBoardMessagesLoading(true);
+    void apiClient
+      .fetchBoardTopicMessages(token, selectedBoardTopicId, { limit: 100 })
+      .then((res) => {
+        if (cancelled) return;
+        upsertBoardTopic(res.topic);
+        setBoardTopicMessages(res.topic.id, res.messages, res.cursor);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        if (err instanceof ApiClientError && err.status === 403) {
+          setBoardPermissionDenied(true);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setBoardMessagesLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    authStatus,
+    boardPermissionDenied,
+    hasSession,
+    selectedBoardTopicId,
+    setBoardPermissionDenied,
+    setBoardTopicMessages,
+    token,
+    upsertBoardTopic
+  ]);
+
+  // Hydrate messages for topics with open questions so Unified Pending Inbox has full payloads
+  useEffect(() => {
+    if (!hasSession || authStatus !== "authenticated" || boardPermissionDenied) return;
+    const topicsNeedingMessages = boardTopics.filter((t) => {
+      const serverOpenCount = t.open_question_count ?? 0;
+      if (boardInFlightTopicMsgRef.current.has(t.id)) return false;
+      const cached = boardMessagesByTopicId[t.id];
+      const cachedOpenCount =
+        cached?.filter((m) => m.kind === "question" && m.question_state === "open").length ?? 0;
+      const missingLatest =
+        serverOpenCount > 0 &&
+        Boolean(cached && t.last_message_id && !cached.some((m) => m.id === t.last_message_id));
+      if (cachedOpenCount === serverOpenCount && !missingLatest) return false;
+      if (serverOpenCount <= 0 && cachedOpenCount === 0) return false;
+      const stateKey = `${t.id}:${t.last_message_id}:${serverOpenCount}`;
+      return boardHydratedOpenKeyRef.current.get(t.id) !== stateKey;
+    });
+    if (topicsNeedingMessages.length === 0) return;
+
+    const gen = hydrationGenRef.current;
+    for (const t of topicsNeedingMessages.slice(0, 10)) {
+      const stateKey = `${t.id}:${t.last_message_id}:${t.open_question_count ?? 0}`;
+      boardHydratedOpenKeyRef.current.set(t.id, stateKey);
+      boardInFlightTopicMsgRef.current.add(t.id);
+      void apiClient
+        .fetchBoardTopicMessages(token, t.id, { limit: 100 })
+        .then((res) => {
+          if (hydrationGenRef.current !== gen) return;
+          upsertBoardTopic(res.topic);
+          setBoardTopicMessages(res.topic.id, res.messages, res.cursor);
+        })
+        .catch(() => {
+          // non-fatal background sync
+        })
+        .finally(() => {
+          boardInFlightTopicMsgRef.current.delete(t.id);
+        });
+    }
+  }, [
+    authStatus,
+    boardMessagesByTopicId,
+    boardPermissionDenied,
+    boardTopics,
+    hasSession,
+    setBoardTopicMessages,
+    token,
+    upsertBoardTopic
+  ]);
+
+  // Client scope: optional topic-scoped WS subscription (NEVER global /ws/stream)
+  useEffect(() => {
+    if (
+      !hasSession ||
+      authStatus !== "authenticated" ||
+      authScope !== "client" ||
+      boardPermissionDenied ||
+      !selectedBoardTopicId ||
+      workspaceMode === "runs"
+    ) {
+      if (authScope === "client") {
+        setStreamStatus("disconnected");
+      }
+      return;
+    }
+
+    let cancelled = false;
+    const topicId = selectedBoardTopicId;
+    const topicClient = new HubStreamClient(token, {
+      getPath: () =>
+        `/ws/stream?topic_id=${encodeURIComponent(topicId)}&after_cursor=${useBoardStore.getState().eventsCursor}`,
+      onStatusChange: (status) => {
+        if (!cancelled) setStreamStatus(status);
+      },
+      onFrame: (frame) => {
+        if (cancelled) return;
+        switch (frame.type) {
+          case "snapshot":
+            if (frame.topic) {
+              upsertBoardTopic(frame.topic);
+            }
+            break;
+          case "board.topic_updated":
+            upsertBoardTopic(frame.topic);
+            break;
+          case "board.message_created":
+            if (frame.topic) upsertBoardTopic(frame.topic);
+            appendBoardMessage(frame.message.topic_id, frame.message, frame.cursor, {
+              topicUpdated: Boolean(frame.topic)
+            });
+            break;
+          case "board.question_answered":
+            applyBoardQuestionAnswered({
+              question: frame.question,
+              answer: frame.answer,
+              topic: frame.topic,
+              cursor: frame.cursor
+            });
+            break;
+        }
+      }
+    });
+    topicClient.start();
+
+    return () => {
+      cancelled = true;
+      topicClient.stop();
+    };
+  }, [
+    appendBoardMessage,
+    applyBoardQuestionAnswered,
+    authScope,
+    authStatus,
+    boardPermissionDenied,
+    hasSession,
+    selectedBoardTopicId,
+    setStreamStatus,
+    token,
+    upsertBoardTopic,
+    workspaceMode
   ]);
 
   // Fetch events for selected run when switched
@@ -1041,14 +1484,26 @@ export function App() {
     const busyKey = deliveryId || sourceId;
     setRedeliveringIds((prev) => ({ ...prev, [busyKey]: true }));
     try {
-      if (sourceKind === "native_event") {
-        const res = await apiClient.redeliverNativeEvent(token, sourceId, deliveryId);
-        upsertNativeEvent(res.event);
-        setDeliveries(getDeliverySourceKey("native_event", sourceId), res.deliveries);
-      } else {
-        const res = await apiClient.redeliverRun(token, sourceId, deliveryId);
-        upsertRun(res.run);
-        setDeliveries(getDeliverySourceKey("run", sourceId), res.deliveries);
+      switch (sourceKind) {
+        case "native_event": {
+          const res = await apiClient.redeliverNativeEvent(token, sourceId, deliveryId);
+          upsertNativeEvent(res.event);
+          setDeliveries(getDeliverySourceKey("native_event", sourceId), res.deliveries);
+          break;
+        }
+        case "run": {
+          const res = await apiClient.redeliverRun(token, sourceId, deliveryId);
+          upsertRun(res.run);
+          setDeliveries(getDeliverySourceKey("run", sourceId), res.deliveries);
+          break;
+        }
+        case "board_message":
+          break;
+        default: {
+          const _exhaustive: never = sourceKind;
+          void _exhaustive;
+          break;
+        }
       }
     } catch (err) {
       setErrorBanner(err instanceof ApiClientError ? err.message : "重推通知失败");
@@ -1256,6 +1711,119 @@ export function App() {
     } catch (err) {
       setErrorBanner(err instanceof ApiClientError ? err.message : "更新并发上限失败");
     }
+  }
+
+  async function handleCreateBoardTopic(
+    payload: CreateBoardTopicPayload
+  ): Promise<BoardTopic | null> {
+    if (!hasSession) return null;
+    try {
+      const res = await apiClient.createBoardTopic(token, payload);
+      upsertBoardTopic(res.topic);
+      selectBoardChannel(res.topic.channel);
+      selectBoardTopic(res.topic.id);
+      return res.topic;
+    } catch (err) {
+      setErrorBanner(err instanceof ApiClientError ? err.message : "创建协同主题失败");
+      return null;
+    }
+  }
+
+  async function handleUpdateBoardTopicStatus(topicId: string, status: BoardTopicStatus) {
+    if (!hasSession) return;
+    setUpdatingBoardTopic(true);
+    try {
+      const res = await apiClient.patchBoardTopic(token, topicId, { status });
+      upsertBoardTopic(res.topic);
+    } catch (err) {
+      setErrorBanner(err instanceof ApiClientError ? err.message : "更新主题状态失败");
+    } finally {
+      setUpdatingBoardTopic(false);
+    }
+  }
+
+  async function handleToggleBoardTopicPin(topic: BoardTopic) {
+    if (!hasSession) return;
+    setUpdatingBoardTopic(true);
+    try {
+      const res = await apiClient.patchBoardTopic(token, topic.id, { pinned: !topic.pinned });
+      upsertBoardTopic(res.topic);
+    } catch (err) {
+      setErrorBanner(err instanceof ApiClientError ? err.message : "切换置顶失败");
+    } finally {
+      setUpdatingBoardTopic(false);
+    }
+  }
+
+  async function handlePostBoardMessage(
+    topicId: string,
+    payload: CreateBoardMessagePayload
+  ): Promise<boolean> {
+    if (!hasSession) return false;
+    setSubmittingBoardMessage(true);
+    try {
+      const res = await apiClient.postBoardMessage(token, topicId, payload);
+      upsertBoardTopic(res.topic);
+      appendBoardMessage(res.topic.id, res.message, res.cursor, { topicUpdated: true });
+      return true;
+    } catch (err) {
+      setErrorBanner(err instanceof ApiClientError ? err.message : "发布协同板消息失败");
+      return false;
+    } finally {
+      setSubmittingBoardMessage(false);
+    }
+  }
+
+  async function handleAnswerBoardQuestion(
+    messageId: string,
+    payload: AnswerBoardQuestionPayload
+  ): Promise<boolean> {
+    if (!hasSession || authScope !== "admin") return false;
+    setAnsweringQuestionIds((prev) => ({ ...prev, [messageId]: true }));
+    try {
+      const res = await apiClient.answerBoardQuestion(token, messageId, payload);
+      applyBoardQuestionAnswered({
+        question: res.question,
+        answer: res.answer,
+        topic: res.topic,
+        cursor: res.cursor
+      });
+      return true;
+    } catch (err) {
+      setErrorBanner(err instanceof ApiClientError ? err.message : "提交答复失败");
+      return false;
+    } finally {
+      setAnsweringQuestionIds((prev) => {
+        const next = { ...prev };
+        delete next[messageId];
+        return next;
+      });
+    }
+  }
+
+  function handleOpenBoardTopicFromInbox(topicId: string) {
+    selectBoardTopic(topicId);
+    setWorkspaceMode("board");
+    if (!isDesktop) {
+      setBoardMobileShowDetail(true);
+    }
+  }
+
+  function handleOpenRunFromInbox(run: RunRecord) {
+    selectThread(run.thread_id);
+    selectRun(run.id);
+    setLeftTab("threads");
+    setCenterMode("controlled");
+    setWorkspaceMode("runs");
+  }
+
+  function handleOpenNativeFromInbox(event: NativeEventView) {
+    if (authScope !== "admin") return;
+    selectNativeSession(getNativeSessionKey(event));
+    selectNativeEvent(event.id);
+    setLeftTab("native");
+    setCenterMode("native");
+    setWorkspaceMode("runs");
   }
 
   async function handleSubmitPrompt() {
@@ -1505,6 +2073,82 @@ export function App() {
       />
     );
 
+  const openInboxCount =
+    openBoardQuestionCount +
+    fleetTelemetry.approval +
+    (authScope === "admin" ? openInteractionCount : 0);
+
+  const renderWorkspaceSwitcher = (mobile: boolean) => (
+    <nav
+      aria-label="主工作区切换"
+      data-testid="workspace-switcher"
+      className={cn(
+        mobile
+          ? "grid grid-cols-3 gap-1 border-t border-border py-1"
+          : "inline-flex items-center rounded-[6px] border border-border bg-background p-0.5 gap-0.5"
+      )}
+    >
+      <button
+        type="button"
+        data-testid="workspace-tab-board"
+        aria-current={workspaceMode === "board" ? "page" : undefined}
+        onClick={() => setWorkspaceMode("board")}
+        className={cn(
+          "inline-flex items-center justify-center gap-1.5 rounded-[4px] font-medium transition-colors cursor-pointer",
+          mobile ? "min-h-11 px-2 text-xs" : "h-7 px-2.5 text-xs",
+          workspaceMode === "board"
+            ? "bg-accent text-accent-foreground"
+            : "text-muted-foreground hover:text-foreground"
+        )}
+      >
+        <LayoutGrid className="h-3.5 w-3.5 shrink-0" strokeWidth={1.75} aria-hidden="true" />
+        <span>协同板</span>
+      </button>
+
+      <button
+        type="button"
+        data-testid="workspace-tab-inbox"
+        aria-current={workspaceMode === "inbox" ? "page" : undefined}
+        onClick={() => setWorkspaceMode("inbox")}
+        className={cn(
+          "inline-flex items-center justify-center gap-1.5 rounded-[4px] font-medium transition-colors cursor-pointer",
+          mobile ? "min-h-11 px-2 text-xs" : "h-7 px-2.5 text-xs",
+          workspaceMode === "inbox"
+            ? "bg-accent text-accent-foreground"
+            : "text-muted-foreground hover:text-foreground"
+        )}
+      >
+        <Inbox className="h-3.5 w-3.5 shrink-0" strokeWidth={1.75} aria-hidden="true" />
+        <span>{mobile ? "待决" : "待决收件箱"}</span>
+        {openInboxCount > 0 ? (
+          <span
+            data-testid="inbox-open-badge"
+            className="inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-[var(--status-approval)] px-1 font-mono text-[10px] font-semibold text-black tabular-nums"
+          >
+            {openInboxCount}
+          </span>
+        ) : null}
+      </button>
+
+      <button
+        type="button"
+        data-testid="workspace-tab-runs"
+        aria-current={workspaceMode === "runs" ? "page" : undefined}
+        onClick={() => setWorkspaceMode("runs")}
+        className={cn(
+          "inline-flex items-center justify-center gap-1.5 rounded-[4px] font-medium transition-colors cursor-pointer",
+          mobile ? "min-h-11 px-2 text-xs" : "h-7 px-2.5 text-xs",
+          workspaceMode === "runs"
+            ? "bg-accent text-accent-foreground"
+            : "text-muted-foreground hover:text-foreground"
+        )}
+      >
+        <Terminal className="h-3.5 w-3.5 shrink-0" strokeWidth={1.75} aria-hidden="true" />
+        <span>执行台</span>
+      </button>
+    </nav>
+  );
+
   return (
     <DndContext
       sensors={sensors}
@@ -1517,25 +2161,33 @@ export function App() {
         <header className="shrink-0 border-b border-border bg-card pt-[var(--safe-top)] pl-[max(0.375rem,var(--safe-left))] pr-[max(0.375rem,var(--safe-right))] sm:pl-[max(0.75rem,var(--safe-left))] sm:pr-[max(0.75rem,var(--safe-right))]">
           <div className="flex h-12 w-full items-center justify-between gap-1 sm:gap-2">
             <div className="flex min-w-0 items-center gap-1 sm:gap-2">
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                onClick={() => setMobileLeftOpen(true)}
-                className="relative h-11 w-11 shrink-0 md:hidden"
-                aria-label="打开节点与会话列表"
-                data-testid="mobile-left-trigger"
-              >
-                <PanelLeft className="h-4 w-4" strokeWidth={1.75} aria-hidden="true" />
-                {authScope === "admin" && openInteractionCount > 0 ? (
-                  <span
-                    aria-hidden="true"
-                    className="absolute right-1 top-1 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-[var(--status-approval)] px-1 text-[10px] font-semibold text-black tabular-nums"
-                  >
-                    {openInteractionCount}
-                  </span>
-                ) : null}
-              </Button>
+              {workspaceMode !== "inbox" ? (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  onClick={() => {
+                    if (workspaceMode === "board") {
+                      setBoardMobileLeftOpen(true);
+                    } else {
+                      setMobileLeftOpen(true);
+                    }
+                  }}
+                  className="relative h-11 w-11 shrink-0 md:hidden"
+                  aria-label={workspaceMode === "board" ? "打开协同板频道树" : "打开节点与会话列表"}
+                  data-testid="mobile-left-trigger"
+                >
+                  <PanelLeft className="h-4 w-4" strokeWidth={1.75} aria-hidden="true" />
+                  {workspaceMode === "runs" && authScope === "admin" && openInteractionCount > 0 ? (
+                    <span
+                      aria-hidden="true"
+                      className="absolute right-1 top-1 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-[var(--status-approval)] px-1 text-[10px] font-semibold text-black tabular-nums"
+                    >
+                      {openInteractionCount}
+                    </span>
+                  ) : null}
+                </Button>
+              ) : null}
 
               <div className="flex min-w-0 items-center gap-1.5 px-0.5 sm:px-1">
                 <BrandMark
@@ -1549,6 +2201,8 @@ export function App() {
                   在线 {fleetTelemetry.online}/{fleetTelemetry.total}
                 </span>
               </div>
+
+              {isDesktop ? renderWorkspaceSwitcher(false) : null}
 
               <span
                 data-testid="stream-status-pill"
@@ -1573,14 +2227,20 @@ export function App() {
               <div className="hidden items-center gap-1.5 font-mono text-[11px] text-muted-foreground tabular-nums lg:inline-flex">
                 <button
                   type="button"
-                  onClick={() => setActiveTab("control")}
+                  onClick={() => {
+                    setWorkspaceMode("runs");
+                    setActiveTab("control");
+                  }}
                   className="inline-flex items-center gap-1 rounded-[5px] border border-border bg-background/60 px-2 py-0.5 hover:text-foreground cursor-pointer"
                 >
                   在线 {fleetTelemetry.online}/{fleetTelemetry.total}
                 </button>
                 <button
                   type="button"
-                  onClick={() => setActiveTab("queue")}
+                  onClick={() => {
+                    setWorkspaceMode("runs");
+                    setActiveTab("queue");
+                  }}
                   className="inline-flex items-center gap-2 rounded-[5px] border border-border bg-background/60 px-2 py-0.5 hover:text-foreground cursor-pointer"
                 >
                   <span>运行 {fleetTelemetry.running}</span>
@@ -1603,6 +2263,7 @@ export function App() {
                     type="button"
                     variant="outline"
                     onClick={() => {
+                      setWorkspaceMode("runs");
                       setLeftTab("native");
                       setNativeFilterMode("unacked");
                       setCenterMode("native");
@@ -1626,7 +2287,7 @@ export function App() {
                     data-testid="open-browser-notify-btn"
                   >
                     <Bell className="h-3.5 w-3.5" strokeWidth={1.75} aria-hidden="true" />
-                    <span className="hidden md:inline">通知渠道</span>
+                    <span className="hidden lg:inline">通知渠道</span>
                     {localPushActive ? (
                       <span
                         aria-hidden="true"
@@ -1720,36 +2381,46 @@ export function App() {
                 </DropdownMenuContent>
               </DropdownMenu>
 
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                onClick={() => setMobileRightOpen(true)}
-                className="relative h-11 w-11 shrink-0 md:hidden"
-                aria-label="打开检视面板"
-                data-testid="mobile-right-trigger"
-              >
-                <PanelRight className="h-4 w-4" strokeWidth={1.75} aria-hidden="true" />
-                {fleetTelemetry.approval > 0 ? (
-                  <span
-                    data-testid="mobile-right-badge"
-                    aria-hidden="true"
-                    className="absolute right-1 top-1 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-[var(--status-approval)] px-1 text-[10px] font-semibold text-black tabular-nums"
-                  >
-                    {fleetTelemetry.approval}
-                  </span>
-                ) : fleetTelemetry.running + fleetTelemetry.queued > 0 ? (
-                  <span
-                    data-testid="mobile-right-badge"
-                    aria-hidden="true"
-                    className="absolute right-1 top-1 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-[var(--status-running)] px-1 text-[10px] font-semibold text-white tabular-nums"
-                  >
-                    {fleetTelemetry.running + fleetTelemetry.queued}
-                  </span>
-                ) : null}
-              </Button>
+              {workspaceMode !== "inbox" ? (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  onClick={() => {
+                    if (workspaceMode === "board") {
+                      setBoardMobileRightOpen(true);
+                    } else {
+                      setMobileRightOpen(true);
+                    }
+                  }}
+                  className="relative h-11 w-11 shrink-0 md:hidden"
+                  aria-label={workspaceMode === "board" ? "打开主题上下文" : "打开检视面板"}
+                  data-testid="mobile-right-trigger"
+                >
+                  <PanelRight className="h-4 w-4" strokeWidth={1.75} aria-hidden="true" />
+                  {workspaceMode === "runs" && fleetTelemetry.approval > 0 ? (
+                    <span
+                      data-testid="mobile-right-badge"
+                      aria-hidden="true"
+                      className="absolute right-1 top-1 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-[var(--status-approval)] px-1 text-[10px] font-semibold text-black tabular-nums"
+                    >
+                      {fleetTelemetry.approval}
+                    </span>
+                  ) : workspaceMode === "runs" && fleetTelemetry.running + fleetTelemetry.queued > 0 ? (
+                    <span
+                      data-testid="mobile-right-badge"
+                      aria-hidden="true"
+                      className="absolute right-1 top-1 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-[var(--status-running)] px-1 text-[10px] font-semibold text-white tabular-nums"
+                    >
+                      {fleetTelemetry.running + fleetTelemetry.queued}
+                    </span>
+                  ) : null}
+                </Button>
+              ) : null}
             </div>
           </div>
+
+          {!isDesktop ? renderWorkspaceSwitcher(true) : null}
         </header>
 
         {errorBanner && (
@@ -1772,9 +2443,63 @@ export function App() {
           </div>
         )}
 
-        {/* Single <main> landmark: 3-pane resizable on desktop, focused timeline on mobile */}
+        {/* Single <main> landmark: Board / Pending Inbox / Runs */}
         <main className="relative min-h-0 flex-1 overflow-hidden">
-          {isDesktop ? (
+          {workspaceMode === "board" ? (
+            <BoardWorkspace
+              channels={boardChannels}
+              topics={boardTopics}
+              messagesByTopicId={boardMessagesByTopicId}
+              openBoardQuestionCount={openBoardQuestionCount}
+              selectedChannel={selectedBoardChannel}
+              selectedTopicId={selectedBoardTopicId}
+              topicFilter={boardTopicFilter}
+              searchQuery={boardSearchQuery}
+              boardPermissionDenied={boardPermissionDenied}
+              authScope={authScope}
+              isDesktop={isDesktop}
+              mobileLeftOpen={boardMobileLeftOpen}
+              mobileRightOpen={boardMobileRightOpen}
+              mobileShowDetail={boardMobileShowDetail}
+              messagesLoading={boardMessagesLoading}
+              submittingMessage={submittingBoardMessage}
+              updatingTopic={updatingBoardTopic}
+              answeringIds={answeringQuestionIds}
+              onMobileLeftOpenChange={setBoardMobileLeftOpen}
+              onMobileRightOpenChange={setBoardMobileRightOpen}
+              onMobileShowDetailChange={setBoardMobileShowDetail}
+              onSelectView={(ch, filter) => {
+                selectBoardChannel(ch);
+                setBoardTopicFilter(filter);
+              }}
+              onSelectTopic={selectBoardTopic}
+              onSearchQueryChange={setBoardSearchQuery}
+              onCreateTopic={handleCreateBoardTopic}
+              onUpdateTopicStatus={handleUpdateBoardTopicStatus}
+              onToggleTopicPin={handleToggleBoardTopicPin}
+              onPostMessage={handlePostBoardMessage}
+              onAnswerQuestion={handleAnswerBoardQuestion}
+            />
+          ) : workspaceMode === "inbox" ? (
+            <PendingInbox
+              topics={boardTopics}
+              messagesByTopicId={boardMessagesByTopicId}
+              runs={runs}
+              nativeEvents={nativeEvents}
+              authScope={authScope}
+              selectedItemKey={selectedInboxItemKey}
+              isDesktop={isDesktop}
+              answeringIds={answeringQuestionIds}
+              acknowledgingIds={acknowledgingIds}
+              onSelectItemKey={setSelectedInboxItemKey}
+              onAnswerBoardQuestion={handleAnswerBoardQuestion}
+              onResolveRun={handleResolveRun}
+              onAckNativeEvent={handleAckNativeEvent}
+              onOpenBoardTopic={handleOpenBoardTopicFromInbox}
+              onOpenRunInWorkbench={handleOpenRunFromInbox}
+              onOpenNativeInWorkbench={handleOpenNativeFromInbox}
+            />
+          ) : isDesktop ? (
             <Group orientation="horizontal" className="h-full w-full">
               <Panel id="fleet" defaultSize="22%" minSize="16%" maxSize="34%" className="h-full overflow-hidden">
                 <FleetThreadsPane {...fleetProps} />
@@ -1811,6 +2536,7 @@ export function App() {
           token={token}
           authenticated={authStatus === "authenticated"}
           authKind={authKind}
+          authScope={authScope}
           onApplyToken={(next) => {
             setToken(next);
             wsClientRef.current?.updateToken(next);
@@ -1831,6 +2557,7 @@ export function App() {
           token={token}
           authenticated={authStatus === "authenticated"}
           authKind={authKind}
+          authScope={authScope}
         />
 
         {authScope === "admin" ? (

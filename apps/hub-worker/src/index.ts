@@ -1,4 +1,19 @@
-import { authenticateRequest, ensureNodeAllowedForClient, requireScope } from "./auth";
+import { authenticateRequest, ensureNodeAllowedForClient, requireScope, sanitizeNextHints } from "./auth";
+import {
+  answerBoardQuestion,
+  countOpenBoardQuestions,
+  createOrUpsertBoardTopic,
+  expireOpenBoardQuestions,
+  getBoardTopicById,
+  listBoardChannels,
+  listBoardEvents,
+  listBoardTopicMessages,
+  listBoardTopics,
+  patchBoardTopic,
+  postBoardMessage,
+  pruneExpiredBoardEvents,
+  reorderBoardTopics
+} from "./board";
 import {
   ackNativeEvent,
   cancelRun,
@@ -52,6 +67,8 @@ import { NodeHub } from "./node-hub";
 import { processNotifyBatch } from "./notify-queue";
 import {
   type ApiScope,
+  type BoardMessage,
+  type BoardTopic,
   type Env,
   HubError,
   type NativeEventRecord,
@@ -66,24 +83,32 @@ import {
 import { randomToken, sha256Hex } from "./ulid";
 import {
   parseAckNativeEventRequest,
+  parseAnswerBoardQuestionRequest,
   parseApprovalCheckpointRequest,
   parseCancelRunRequest,
   parseClaimRequest,
   parseCompleteRequest,
+  parseCreateBoardMessageRequest,
+  parseCreateBoardTopicRequest,
   parseCreateKeyRequest,
   parseCreatePushSubscriptionRequest,
   parseCreateRunRequest,
   parseForkThreadRequest,
   parseHeartbeatRequest,
   parseIncludeRevokedQuery,
+  parseListBoardEventsQuery,
+  parseListBoardMessagesQuery,
+  parseListBoardTopicsQuery,
   parseListNativeEventsQuery,
   parseNativeEventCreateRequest,
+  parsePatchBoardTopicRequest,
   parsePatchKeyRequest,
   parsePatchNodeRequest,
   parsePatchPushSubscriptionRequest,
   parsePatchRunRequest,
   parsePatchThreadRequest,
   parseRedeliverRequest,
+  parseReorderBoardTopicsRequest,
   parseReorderRunsRequest,
   parseResolveRunRequest,
   readJsonBody
@@ -113,13 +138,15 @@ function requireWebhookEncryptionKey(env: Env): string {
 
 function jsonError(err: unknown): Response {
   if (err instanceof HubError) {
+    const next = err.next ? sanitizeNextHints(err.next) : [];
     return Response.json(
       {
         ok: false,
         error: {
           code: err.code,
           message: err.message,
-          ...(err.details ? { details: err.details } : {})
+          ...(err.details ? { details: err.details } : {}),
+          ...(next.length > 0 ? { next } : {})
         }
       },
       { status: err.status }
@@ -136,6 +163,14 @@ function jsonError(err: unknown): Response {
     },
     { status: 500 }
   );
+}
+
+function decodePathSegment(raw: string): string {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    throw new HubError(400, "BAD_REQUEST", "Invalid URL path encoding.");
+  }
 }
 
 async function readOptionalJsonBody(request: Request, label: string): Promise<unknown> {
@@ -186,6 +221,57 @@ async function broadcastDelivery(env: Env, delivery: NotificationDeliveryRecord)
   await doPost(env, "/internal/broadcast-delivery", { delivery }).catch(() => undefined);
 }
 
+async function broadcastBoardTopic(
+  env: Env,
+  topic: BoardTopic,
+  cursor?: number,
+  openBoardQuestionCount?: number
+): Promise<void> {
+  await doPost(env, "/internal/broadcast-board-topic", {
+    topic,
+    ...(cursor !== undefined ? { cursor } : {}),
+    ...(openBoardQuestionCount !== undefined
+      ? { open_board_question_count: openBoardQuestionCount }
+      : {})
+  }).catch(() => undefined);
+}
+
+async function broadcastBoardMessage(
+  env: Env,
+  message: BoardMessage,
+  topic: BoardTopic | undefined,
+  cursor: number,
+  openBoardQuestionCount?: number
+): Promise<void> {
+  await doPost(env, "/internal/broadcast-board-message", {
+    message,
+    ...(topic ? { topic } : {}),
+    cursor,
+    ...(openBoardQuestionCount !== undefined
+      ? { open_board_question_count: openBoardQuestionCount }
+      : {})
+  }).catch(() => undefined);
+}
+
+async function broadcastBoardAnswer(
+  env: Env,
+  question: BoardMessage,
+  answer: BoardMessage,
+  topic: BoardTopic | undefined,
+  cursor: number,
+  openBoardQuestionCount?: number
+): Promise<void> {
+  await doPost(env, "/internal/broadcast-board-answer", {
+    question,
+    answer,
+    ...(topic ? { topic } : {}),
+    cursor,
+    ...(openBoardQuestionCount !== undefined
+      ? { open_board_question_count: openBoardQuestionCount }
+      : {})
+  }).catch(() => undefined);
+}
+
 function getNativeEventsRetentionDays(env: Env): number {
   const raw = env.NATIVE_EVENTS_RETENTION_DAYS?.trim() ?? "";
   if (!/^\d+$/.test(raw)) {
@@ -194,6 +280,18 @@ function getNativeEventsRetentionDays(env: Env): number {
   const parsed = Number.parseInt(raw, 10);
   if (!Number.isSafeInteger(parsed) || parsed < 1) {
     return 30;
+  }
+  return Math.min(parsed, 3650);
+}
+
+function getBoardEventsRetentionDays(env: Env): number {
+  const raw = env.BOARD_EVENTS_RETENTION_DAYS?.trim() ?? "";
+  if (!/^\d+$/.test(raw)) {
+    return 90;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
+    return 90;
   }
   return Math.min(parsed, 3650);
 }
@@ -252,16 +350,30 @@ export default {
         const principal = await authenticateRequest(request, env, ctx, true);
         requireScope(principal, ["admin", "client"]);
         const runIdParam = url.searchParams.get("run_id");
-        if (principal.scope === "client" && !runIdParam) {
+        const topicIdParam = url.searchParams.get("topic_id");
+        const afterCursorParam = url.searchParams.get("after_cursor");
+
+        if (runIdParam && topicIdParam) {
+          throw new HubError(400, "BAD_REQUEST", "Cannot combine run_id and topic_id on /ws/stream.");
+        }
+        if (principal.scope === "client" && !runIdParam && !topicIdParam) {
           throw new HubError(
             403,
             "FORBIDDEN_SCOPE",
-            "Client key must pass ?run_id=<id> when subscribing to /ws/stream."
+            "Client key must pass ?run_id=<id> or ?topic_id=<id> when subscribing to /ws/stream."
           );
         }
         if (runIdParam) {
           // Verify permission to read target run before opening socket
           await getRunById(env.DB, principal, runIdParam, "summary", 1024);
+        }
+        if (topicIdParam) {
+          await getBoardTopicById(env.DB, principal, topicIdParam);
+        }
+        if (afterCursorParam !== null && afterCursorParam !== "") {
+          if (!/^\d+$/.test(afterCursorParam) || !Number.isSafeInteger(Number.parseInt(afterCursorParam, 10))) {
+            throw new HubError(400, "BAD_REQUEST", "Query 'after_cursor' must be a non-negative integer.");
+          }
         }
 
         const stub = getNodeHubStub(env);
@@ -270,8 +382,13 @@ export default {
         if (principal.keyId) headers.set("x-ahub-key-id", principal.keyId);
         if (principal.boundNodeId) headers.set("x-ahub-bound-node-id", principal.boundNodeId);
         headers.set("x-ahub-allowed-nodes", JSON.stringify(principal.allowedNodes));
+        headers.set("x-ahub-allowed-board-prefixes", JSON.stringify(principal.allowedBoardPrefixes));
         const forwardUrl = new URL("https://node-hub/internal/ws/stream");
         if (runIdParam) forwardUrl.searchParams.set("run_id", runIdParam);
+        if (topicIdParam) forwardUrl.searchParams.set("topic_id", topicIdParam);
+        if (topicIdParam && afterCursorParam !== null && afterCursorParam !== "") {
+          forwardUrl.searchParams.set("after_cursor", afterCursorParam);
+        }
         return stub.fetch(forwardUrl.toString(), {
           headers,
           method: request.method
@@ -290,6 +407,7 @@ export default {
               scope: principal.scope,
               bound_node_id: principal.boundNodeId,
               allowed_nodes: principal.allowedNodes,
+              allowed_board_prefixes: principal.allowedBoardPrefixes,
               allow_unsandboxed: principal.allowUnsandboxed,
               max_depth_limit: principal.maxDepthLimit
             }
@@ -306,7 +424,7 @@ export default {
         const patchNodeMatch = /^\/api\/v1\/nodes\/([^/]+)$/.exec(pathname);
         if (request.method === "PATCH" && patchNodeMatch) {
           requireScope(principal, ["admin"]);
-          const nodeId = decodeURIComponent(patchNodeMatch[1]!);
+          const nodeId = decodePathSegment(patchNodeMatch[1]!);
           const body = parsePatchNodeRequest(await readJsonBody(request));
           const node = await patchNode(env.DB, nodeId, body);
           ctx.waitUntil(broadcastNode(env, node));
@@ -316,7 +434,7 @@ export default {
         const nativeEventsMatch = /^\/api\/v1\/nodes\/([^/]+)\/native-events$/.exec(pathname);
         if (request.method === "POST" && nativeEventsMatch) {
           requireScope(principal, ["node"]);
-          const nodeId = decodeURIComponent(nativeEventsMatch[1]!);
+          const nodeId = decodePathSegment(nativeEventsMatch[1]!);
           if (principal.boundNodeId !== nodeId) {
             throw new HubError(403, "FORBIDDEN_SCOPE", "Node key cannot emit native events for another node.");
           }
@@ -357,7 +475,7 @@ export default {
         const claimMatch = /^\/api\/v1\/nodes\/([^/]+)\/claim$/.exec(pathname);
         if (request.method === "POST" && claimMatch) {
           requireScope(principal, ["node"]);
-          const nodeId = decodeURIComponent(claimMatch[1]!);
+          const nodeId = decodePathSegment(claimMatch[1]!);
           if (principal.boundNodeId !== nodeId) {
             throw new HubError(403, "FORBIDDEN_SCOPE", "Node key cannot claim runs for another node.");
           }
@@ -382,7 +500,7 @@ export default {
           if (!principal.boundNodeId) {
             throw new HubError(403, "FORBIDDEN_SCOPE", "Missing bound_node_id on node key.");
           }
-          const runId = decodeURIComponent(heartbeatMatch[1]!);
+          const runId = decodePathSegment(heartbeatMatch[1]!);
           const body = parseHeartbeatRequest(await readJsonBody(request));
           const res = await heartbeatRun(
             env.DB,
@@ -405,7 +523,7 @@ export default {
           if (!principal.boundNodeId) {
             throw new HubError(403, "FORBIDDEN_SCOPE", "Missing bound_node_id on node key.");
           }
-          const runId = decodeURIComponent(approvalMatch[1]!);
+          const runId = decodePathSegment(approvalMatch[1]!);
           const body = parseApprovalCheckpointRequest(await readJsonBody(request));
           const updatedRow = await checkpointRunApproval(
             env.DB,
@@ -426,7 +544,7 @@ export default {
           if (!principal.boundNodeId) {
             throw new HubError(403, "FORBIDDEN_SCOPE", "Missing bound_node_id on node key.");
           }
-          const runId = decodeURIComponent(completeMatch[1]!);
+          const runId = decodePathSegment(completeMatch[1]!);
           const body = parseCompleteRequest(await readJsonBody(request));
           const updatedRow = await completeRun(env.DB, env, runId, principal.boundNodeId, body);
           const runRecord = mapRunRow(updatedRow, { view: "summary", tailBytes: 16384 });
@@ -449,7 +567,7 @@ export default {
         const patchThreadMatch = /^\/api\/v1\/threads\/([^/]+)$/.exec(pathname);
         if (request.method === "PATCH" && patchThreadMatch) {
           requireScope(principal, ["admin", "client"]);
-          const threadId = decodeURIComponent(patchThreadMatch[1]!);
+          const threadId = decodePathSegment(patchThreadMatch[1]!);
           const body = parsePatchThreadRequest(await readJsonBody(request));
           const thread = await patchThread(env.DB, principal, threadId, body);
           return Response.json({ ok: true, thread });
@@ -458,7 +576,7 @@ export default {
         const forkThreadMatch = /^\/api\/v1\/threads\/([^/]+)\/fork$/.exec(pathname);
         if (request.method === "POST" && forkThreadMatch) {
           requireScope(principal, ["admin", "client"]);
-          const threadId = decodeURIComponent(forkThreadMatch[1]!);
+          const threadId = decodePathSegment(forkThreadMatch[1]!);
           const body = parseForkThreadRequest(await readJsonBody(request));
           ensureNodeAllowedForClient(principal, body.nodeId);
           const { thread, seedRun } = await forkThread(env.DB, env, principal, threadId, body);
@@ -549,7 +667,7 @@ export default {
         const runDetailMatch = /^\/api\/v1\/runs\/([^/]+)$/.exec(pathname);
         if (request.method === "GET" && runDetailMatch) {
           requireScope(principal, ["admin", "client"]);
-          const runId = decodeURIComponent(runDetailMatch[1]!);
+          const runId = decodePathSegment(runDetailMatch[1]!);
           const view = url.searchParams.get("view") === "full" ? "full" : "summary";
           const tailBytes = Math.min(Math.max(Number(url.searchParams.get("tail_bytes") || "16384"), 256), 900 * 1024);
           const run = await getRunById(env.DB, principal, runId, view, tailBytes);
@@ -558,7 +676,7 @@ export default {
 
         if (request.method === "PATCH" && runDetailMatch) {
           requireScope(principal, ["admin", "client"]);
-          const runId = decodeURIComponent(runDetailMatch[1]!);
+          const runId = decodePathSegment(runDetailMatch[1]!);
           const body = parsePatchRunRequest(await readJsonBody(request));
           const updated = await patchQueuedRun(env.DB, principal, runId, body);
           const runRecord = mapRunRow(updated, { view: "summary" });
@@ -574,7 +692,7 @@ export default {
         const runEventsMatch = /^\/api\/v1\/runs\/([^/]+)\/events$/.exec(pathname);
         if (request.method === "GET" && runEventsMatch) {
           requireScope(principal, ["admin", "client"]);
-          const runId = decodeURIComponent(runEventsMatch[1]!);
+          const runId = decodePathSegment(runEventsMatch[1]!);
           const afterSeq = Math.max(Number(url.searchParams.get("after_seq") || "0"), 0);
           const limit = Math.min(Math.max(Number(url.searchParams.get("limit") || "200"), 1), 500);
           const res = await listRunEvents(env.DB, principal, runId, afterSeq, limit);
@@ -584,7 +702,7 @@ export default {
         const runResolveMatch = /^\/api\/v1\/runs\/([^/]+)\/resolve$/.exec(pathname);
         if (request.method === "POST" && runResolveMatch) {
           requireScope(principal, ["admin", "client"]);
-          const runId = decodeURIComponent(runResolveMatch[1]!);
+          const runId = decodePathSegment(runResolveMatch[1]!);
           const rawBody = await readOptionalJsonBody(request, "Resolve");
           const body = parseResolveRunRequest(rawBody);
           const { run, alreadyTerminal } = await resolveRunApproval(env.DB, env, principal, runId, body);
@@ -602,7 +720,7 @@ export default {
         const runCancelMatch = /^\/api\/v1\/runs\/([^/]+)\/cancel$/.exec(pathname);
         if (request.method === "POST" && runCancelMatch) {
           requireScope(principal, ["admin", "client"]);
-          const runId = decodeURIComponent(runCancelMatch[1]!);
+          const runId = decodePathSegment(runCancelMatch[1]!);
           const rawBody = await readOptionalJsonBody(request, "Cancel");
           const body = parseCancelRunRequest(rawBody);
           const { cancelledRuns, abortTargets } = await cancelRun(env.DB, env, principal, runId, body);
@@ -662,7 +780,7 @@ export default {
         const keyMatch = /^\/api\/v1\/keys\/([^/]+)$/.exec(pathname);
         if (request.method === "PATCH" && keyMatch) {
           requireScope(principal, ["admin"]);
-          const keyId = decodeURIComponent(keyMatch[1]!);
+          const keyId = decodePathSegment(keyMatch[1]!);
           const body = parsePatchKeyRequest(await readJsonBody(request));
           const existing = await getApiKeyRawById(env.DB, keyId);
           if (!existing) {
@@ -673,6 +791,17 @@ export default {
           }
           if (existing.scope === "node" && body.boundNodeId !== undefined) {
             throw new HubError(400, "BAD_REQUEST", "Cannot change bound_node_id of a node key.");
+          }
+          if (
+            body.allowedBoardPrefixes !== undefined &&
+            body.allowedBoardPrefixes.length > 0 &&
+            existing.scope !== "client"
+          ) {
+            throw new HubError(
+              400,
+              "BAD_REQUEST",
+              "allowed_board_prefixes is only supported on client scope keys."
+            );
           }
           if (
             (body.webhookUrl !== undefined || body.webhookKey !== undefined || body.clearWebhook !== undefined) &&
@@ -719,6 +848,7 @@ export default {
           const key = await patchApiKey(env.DB, keyId, {
             boundNodeId: body.boundNodeId,
             allowedNodes: body.allowedNodes,
+            allowedBoardPrefixes: body.allowedBoardPrefixes,
             allowUnsandboxed: body.allowUnsandboxed,
             maxDepthLimit: body.maxDepthLimit,
             notifyWebhookCiphertext,
@@ -733,7 +863,7 @@ export default {
 
         if (request.method === "DELETE" && keyMatch) {
           requireScope(principal, ["admin"]);
-          const keyId = decodeURIComponent(keyMatch[1]!);
+          const keyId = decodePathSegment(keyMatch[1]!);
           const res = await revokeApiKey(env.DB, keyId);
           await doPost(env, "/internal/revoke-key", {
             key_id: keyId,
@@ -762,7 +892,7 @@ export default {
         const nativeEventDetailMatch = /^\/api\/v1\/native-events\/([^/]+)$/.exec(pathname);
         if (request.method === "GET" && nativeEventDetailMatch) {
           requireScope(principal, ["admin"]);
-          const eventId = decodeURIComponent(nativeEventDetailMatch[1]!);
+          const eventId = decodePathSegment(nativeEventDetailMatch[1]!);
           const event = await getNativeEventById(env.DB, eventId);
           if (!event) {
             throw new HubError(404, "NOT_FOUND", `Native event '${eventId}' not found.`);
@@ -774,7 +904,7 @@ export default {
         const nativeEventAckMatch = /^\/api\/v1\/native-events\/([^/]+)\/ack$/.exec(pathname);
         if (request.method === "POST" && nativeEventAckMatch) {
           requireScope(principal, ["admin"]);
-          const eventId = decodeURIComponent(nativeEventAckMatch[1]!);
+          const eventId = decodePathSegment(nativeEventAckMatch[1]!);
           const body = parseAckNativeEventRequest(await readOptionalJsonBody(request, "AckNativeEvent"));
           const res = await ackNativeEvent(env.DB, eventId, body.scope);
           ctx.waitUntil(broadcastNativeEvent(env, res.event, res.openInteractionCount));
@@ -789,7 +919,7 @@ export default {
         const nativeEventRedeliverMatch = /^\/api\/v1\/native-events\/([^/]+)\/redeliver$/.exec(pathname);
         if (request.method === "POST" && nativeEventRedeliverMatch) {
           requireScope(principal, ["admin"]);
-          const eventId = decodeURIComponent(nativeEventRedeliverMatch[1]!);
+          const eventId = decodePathSegment(nativeEventRedeliverMatch[1]!);
           const body = parseRedeliverRequest(await readOptionalJsonBody(request, "RedeliverNativeEvent"));
           const res = await redeliverSourceDeliveries(env.DB, env, "native_event", eventId, body.deliveryId);
           if (res.requeuedCount > 0) {
@@ -809,7 +939,7 @@ export default {
         const runDeliveriesMatch = /^\/api\/v1\/runs\/([^/]+)\/deliveries$/.exec(pathname);
         if (request.method === "GET" && runDeliveriesMatch) {
           requireScope(principal, ["admin"]);
-          const runId = decodeURIComponent(runDeliveriesMatch[1]!);
+          const runId = decodePathSegment(runDeliveriesMatch[1]!);
           const deliveries = await listDeliveriesForRun(env.DB, runId);
           return Response.json({ ok: true, deliveries });
         }
@@ -817,7 +947,7 @@ export default {
         const runRedeliverMatch = /^\/api\/v1\/runs\/([^/]+)\/redeliver$/.exec(pathname);
         if (request.method === "POST" && runRedeliverMatch) {
           requireScope(principal, ["admin"]);
-          const runId = decodeURIComponent(runRedeliverMatch[1]!);
+          const runId = decodePathSegment(runRedeliverMatch[1]!);
           const body = parseRedeliverRequest(await readOptionalJsonBody(request, "RedeliverRun"));
           const res = await redeliverSourceDeliveries(env.DB, env, "run", runId, body.deliveryId);
           if (res.requeuedCount > 0) {
@@ -885,7 +1015,7 @@ export default {
         const pushSubTestMatch = /^\/api\/v1\/push-subscriptions\/([^/]+)\/test$/.exec(pathname);
         if (request.method === "POST" && pushSubTestMatch) {
           requireScope(principal, ["admin"]);
-          const subId = decodeURIComponent(pushSubTestMatch[1]!);
+          const subId = decodePathSegment(pushSubTestMatch[1]!);
           const found = await getPushSubscriptionByIdWithSecret(env.DB, subId);
           if (!found) {
             throw new HubError(404, "NOT_FOUND", `Push subscription '${subId}' not found.`);
@@ -937,7 +1067,7 @@ export default {
         const pushSubMatch = /^\/api\/v1\/push-subscriptions\/([^/]+)$/.exec(pathname);
         if (request.method === "PATCH" && pushSubMatch) {
           requireScope(principal, ["admin"]);
-          const subId = decodeURIComponent(pushSubMatch[1]!);
+          const subId = decodePathSegment(pushSubMatch[1]!);
           const body = parsePatchPushSubscriptionRequest(await readJsonBody(request));
           const subscription = await patchPushSubscription(env.DB, subId, body);
           return Response.json({ ok: true, subscription });
@@ -945,9 +1075,137 @@ export default {
 
         if (request.method === "DELETE" && pushSubMatch) {
           requireScope(principal, ["admin"]);
-          const subId = decodeURIComponent(pushSubMatch[1]!);
+          const subId = decodePathSegment(pushSubMatch[1]!);
           const res = await revokePushSubscription(env.DB, subId);
           return Response.json({ ok: true, revoked_at: res.revokedAt });
+        }
+
+        // 2.7 Cross-Machine Coordination Board & Bidirectional Q&A
+        if (request.method === "GET" && pathname === "/api/v1/board/channels") {
+          requireScope(principal, ["admin", "client"]);
+          const channels = await listBoardChannels(env.DB, principal);
+          return Response.json({ ok: true, channels });
+        }
+
+        if (request.method === "GET" && pathname === "/api/v1/board/topics") {
+          requireScope(principal, ["admin", "client"]);
+          const query = parseListBoardTopicsQuery(url.searchParams);
+          const topics = await listBoardTopics(env.DB, principal, query);
+          return Response.json({ ok: true, topics });
+        }
+
+        if (request.method === "POST" && pathname === "/api/v1/board/topics") {
+          requireScope(principal, ["admin", "client"]);
+          const body = parseCreateBoardTopicRequest(await readJsonBody(request));
+          const { topic, created } = await createOrUpsertBoardTopic(env.DB, principal, body);
+          if (created) {
+            ctx.waitUntil(broadcastBoardTopic(env, topic, topic.last_event_cursor));
+          }
+          return Response.json({ ok: true, topic, created }, { status: created ? 201 : 200 });
+        }
+
+        if (request.method === "POST" && pathname === "/api/v1/board/topics/reorder") {
+          requireScope(principal, ["admin", "client"]);
+          const body = parseReorderBoardTopicsRequest(await readJsonBody(request));
+          const topics = await reorderBoardTopics(env.DB, principal, body);
+          for (const t of topics) {
+            ctx.waitUntil(broadcastBoardTopic(env, t, t.last_event_cursor));
+          }
+          return Response.json({ ok: true, topics });
+        }
+
+        const boardTopicMatch = /^\/api\/v1\/board\/topics\/([^/]+)$/.exec(pathname);
+        if (request.method === "PATCH" && boardTopicMatch) {
+          requireScope(principal, ["admin", "client"]);
+          const topicId = decodePathSegment(boardTopicMatch[1]!);
+          const body = parsePatchBoardTopicRequest(await readJsonBody(request));
+          const topic = await patchBoardTopic(env.DB, principal, topicId, body);
+          ctx.waitUntil(broadcastBoardTopic(env, topic, topic.last_event_cursor));
+          return Response.json({ ok: true, topic });
+        }
+
+        const boardTopicMessagesMatch = /^\/api\/v1\/board\/topics\/([^/]+)\/messages$/.exec(pathname);
+        if (request.method === "GET" && boardTopicMessagesMatch) {
+          requireScope(principal, ["admin", "client"]);
+          const topicId = decodePathSegment(boardTopicMessagesMatch[1]!);
+          const query = parseListBoardMessagesQuery(url.searchParams);
+          const res = await listBoardTopicMessages(env.DB, principal, topicId, query);
+          return Response.json({
+            ok: true,
+            topic: res.topic,
+            messages: res.messages,
+            cursor: res.cursor
+          });
+        }
+
+        if (request.method === "POST" && boardTopicMessagesMatch) {
+          requireScope(principal, ["admin", "client"]);
+          const topicId = decodePathSegment(boardTopicMessagesMatch[1]!);
+          const body = parseCreateBoardMessageRequest(await readJsonBody(request));
+          const headerIdem = request.headers.get("Idempotency-Key") || undefined;
+          const res = await postBoardMessage(env.DB, env, principal, topicId, body, headerIdem);
+          if (!res.deduplicated) {
+            ctx.waitUntil(
+              broadcastBoardMessage(
+                env,
+                res.message,
+                res.topic,
+                res.cursor,
+                res.openBoardQuestionCount
+              )
+            );
+            if (res.statusChanged) {
+              ctx.waitUntil(
+                broadcastBoardTopic(env, res.topic, res.cursor, res.openBoardQuestionCount)
+              );
+            }
+          }
+          return Response.json(
+            {
+              ok: true,
+              topic: res.topic,
+              message: res.message,
+              cursor: res.cursor,
+              deduplicated: res.deduplicated
+            },
+            { status: res.deduplicated ? 200 : 201 }
+          );
+        }
+
+        const boardAnswerMatch = /^\/api\/v1\/board\/messages\/([^/]+)\/answer$/.exec(pathname);
+        if (request.method === "POST" && boardAnswerMatch) {
+          requireScope(principal, ["admin"]);
+          const messageId = decodePathSegment(boardAnswerMatch[1]!);
+          const body = parseAnswerBoardQuestionRequest(await readJsonBody(request));
+          const res = await answerBoardQuestion(env.DB, principal, messageId, body);
+          ctx.waitUntil(
+            broadcastBoardAnswer(
+              env,
+              res.question,
+              res.answer,
+              res.topic,
+              res.cursor,
+              res.openBoardQuestionCount
+            )
+          );
+          return Response.json({
+            ok: true,
+            topic: res.topic,
+            question: res.question,
+            answer: res.answer,
+            cursor: res.cursor
+          });
+        }
+
+        if (request.method === "GET" && pathname === "/api/v1/board/events") {
+          requireScope(principal, ["admin", "client"]);
+          const query = parseListBoardEventsQuery(url.searchParams);
+          const res = await listBoardEvents(env.DB, principal, query);
+          return Response.json({
+            ok: true,
+            events: res.events,
+            next_cursor: res.nextCursor
+          });
         }
 
         // Deterministic admin helper to trigger lease reaping on demand
@@ -981,6 +1239,25 @@ export default {
       await pruneExpiredNativeActivity(env.DB, getNativeEventsRetentionDays(env), 500);
     } catch (err) {
       console.error("[cron] pruneExpiredNativeActivity failed:", err);
+    }
+    try {
+      const expiredQuestions = await expireOpenBoardQuestions(env.DB);
+      if (expiredQuestions.length > 0) {
+        const openCount = await countOpenBoardQuestions(env.DB);
+        for (const item of expiredQuestions) {
+          ctx.waitUntil(broadcastBoardTopic(env, item.topic, item.cursor, openCount));
+          ctx.waitUntil(
+            broadcastBoardMessage(env, item.message, item.topic, item.cursor, openCount)
+          );
+        }
+      }
+    } catch (err) {
+      console.error("[cron] expireOpenBoardQuestions failed:", err);
+    }
+    try {
+      await pruneExpiredBoardEvents(env.DB, getBoardEventsRetentionDays(env), 500);
+    } catch (err) {
+      console.error("[cron] pruneExpiredBoardEvents failed:", err);
     }
   },
 

@@ -12,10 +12,10 @@ flowchart TB
 
     subgraph CF["Cloudflare Edge (ahub.bobocai.win)"]
         Worker["Hub Worker\nREST API + 静态资源托管 + 自举模板"]
-        D1[("Cloudflare D1\n事实源: nodes / threads / runs / run_events / native_events / web_push_subscriptions / notification_deliveries / api_keys")]
+        D1[("Cloudflare D1\n事实源: nodes / threads / runs / run_events / native_events / board_topics / board_messages / board_events / web_push_subscriptions / notification_deliveries / api_keys")]
         DO["Durable Object: NodeHub\nWebSocket Hibernation 实时信道"]
         Queue[["Cloudflare Queue\nahub-outbound-notify"]]
-        Cron["Cron Trigger\n租约超时巡检 + 原生事件留存清理"]
+        Cron["Cron Trigger\n租约超时巡检 + 原生/协同事件清理 + 提问过期"]
     end
 
     subgraph Nodes["工作节点机群 (纯出站 wss:// 与 HTTPS)"]
@@ -30,11 +30,11 @@ flowchart TB
     SW["Web Service Worker (sw.js)\n零回源解密弹窗 + 点击深链"]
 
     WebUI -- "HTTPS + wss://.../ws/stream" --> Worker
-    Bot -- "HTTPS + ahub run --wait 45s" --> Worker
-    LocalCaller -- "HTTPS + wss://.../ws/stream" --> Worker
+    Bot -- "HTTPS + ahub run / ahub board" --> Worker
+    LocalCaller -- "HTTPS + wss://.../ws/stream (run_id / topic_id)" --> Worker
 
     Worker --> D1
-    Worker -- "broadcast run.updated / native_event.upserted / delivery.updated" --> DO
+    Worker -- "broadcast run.updated / native_event.upserted / delivery.updated / board.*" --> DO
     Worker --> Queue
     Cron --> Worker
     Queue -- "按 delivery_id 独立异步投递" --> BotHook
@@ -55,8 +55,8 @@ flowchart TB
 
 ### 2.1 为什么用 D1 作为唯一事实源
 
-- **跨设备持久状态**：`nodes`（含节点默认外部通知通道外键 `default_notify_key_id`）、`threads`、`runs`、`run_events`、`native_events`（本地原生会话幂等事件与人工确认账本）、`web_push_subscriptions`（AES-256-GCM 密文保存浏览器推送订阅、节点与事件过滤规则）、`notification_deliveries`（受控 `Run` 与原生 `NativeEvent` 共用的多通道投递明细账本）与 `api_keys` 全部持久化在 D1 SQLite 中，用户在手机、笔记本或任意桌面浏览器打开 Web 任务中心都能读取完整历史。
-- **双域物理隔离与会话级聚合**：`native_events` 与 `threads` / `runs` 在 D1 中物理隔离，绝不创建 `Thread`、绝不申请 `(node_id, workdir)` 调度锁或进程租约；查询层与前端按 `(node_id, agent, native_session_id || workdir)` 进行逻辑聚合。
+- **跨设备持久状态**：`nodes`（含节点默认外部通知通道外键 `default_notify_key_id`）、`threads`、`runs`、`run_events`、`native_events`（本地原生会话幂等事件与人工确认账本）、`board_topics` / `board_messages` / `board_events`（跨机共享协同主题、结构化交接与双向阻塞问答）、`web_push_subscriptions`（AES-256-GCM 密文保存浏览器推送订阅、节点与事件过滤规则）、`notification_deliveries`（受控 `Run`、原生 `NativeEvent` 与协同板提问 `board_message` 共用的多通道投递明细账本）与 `api_keys`（含协同板频道前缀白名单 `allowed_board_prefixes_json`）全部持久化在 D1 SQLite 中，用户在手机、笔记本或任意桌面浏览器打开 Web 任务中心都能读取完整历史。
+- **三域正交隔离与协同解耦**：受控执行域（`threads` / `runs` / `run_events`）、原生旁路域（`native_events`）与跨机协同域（`board_topics` / `board_messages` / `board_events`）在 D1 中物理隔离、互不混流：`native_events` 按 `(node_id, agent, native_session_id || workdir)` 逻辑聚合；协同板**不绑定单一 `node_id`、`workdir` 或 `agent`**，也不申请调度锁或进程租约。本次 Slice 1a 对现行受控 `Run` 7 态状态机保持零侵入（`waiting` DAG 8 态与任务终态自动回写协同主题属 Slice 2）。
 - **确定性并发控制**：支持基于 `Compare-And-Swap (CAS)` 条件的状态迁移、幂等键去重与同机按工作区目录（`workdir`）的并发排队控制。
 - **不直接用 Cloudflare Queues 存任务**：Queues 单条消息上限为 `128 KB`、免费方案消息保留期仅 `24 小时`，且不支持按节点、工作区、状态进行条件检索或由前端直接取消已入队任务。
 
@@ -73,9 +73,10 @@ flowchart TB
 
 1. **受控 `Run` 多目标扇出（`ahub_run_completed` 与 Web Push）**：当受控 `Run` 到达终态（`done` / `failed` / `cancelled`）或首次进入 `needs_approval` 审批检查点时，沿用 `--notify` / `node_default` Bot 路由隔离边界（禁止 `client` 静默任务及 `depth >= 1` 子任务落入 `node_default`）；同时匹配激活的 `admin` Web Push 订阅（其中 `client` Key 创建的 `depth = 0` 任务仅在 `needs_approval` 与 `failed` 时向管理员推送 Web Push，不在 `done` / `cancelled` 弹窗；`depth >= 1` 子任务静默）。
 2. **本地原生会话多目标扇出（`native_events`）**：支持 `interaction_needed`、`turn_summary` 与 `progress`；Bot Webhook 仍严格按 `nodes.default_notify_key_id` Fail-Closed（节点未绑定时仅跳过 Bot 通道，**不再阻断浏览器 Web Push 通道**）；Web Push 按 `node_filter_json` 与 `event_filter_json`（`native_<event_kind>`）独立扇出，Bot 载荷继续固定携带 `action_required: "notify_user_only"` 只读转达契约。
-3. **独立投递账本与每渠道隔离入队**：入库期将每个匹配目标写入 `notification_deliveries`（`status = 'queued'`），并向 `NOTIFY_QUEUE` 投递独立的 `{ kind: "delivery", delivery_id }` 消息，使单条 Web Push `5xx` / `429` 重试绝不重复触发已成功的 Bot Webhook 或其他设备。
-4. **零外部依赖边缘 Web Push 引擎（`apps/hub-worker/src/web-push.ts`）**：纯基于 Workers 原生 `crypto.subtle` 实现 RFC 8292 VAPID `ES256` 签名与 RFC 8291 / RFC 8188 `aes128gcm` 载荷加密（维持 `apps/hub-worker/package.json` 零运行时 npm 依赖），明文 JSON 控制在 `<= 3072` UTF-8 字节内供 `sw.js` 在 Cloudflare Access Cookie 过期时仍可离线零回源解密；严格校验 Push 端点域名 SSRF 白名单（`fcm.googleapis.com`、`*.push.apple.com`、`*.push.services.mozilla.com`、`*.notify.windows.com`，仅在显式测试环境变量 `ALLOW_LOOPBACK_PUSH_FOR_TEST === "true"` 时放行本地回环测试网关）。
-5. **投递期 Fail-Closed 与 DO 实时回推**：Bot 消费端在发送 HTTP POST 前实时联表复核目标 `client` Key 未吊销、节点权限未移除且通道未中途换绑；Web Push 在 `404` / `410` 时自动吊销失效订阅（`revoked_at`），`400` / `401` / `403` / `413` 不重试，`429` / `5xx` / 超时按指数退避最多重试至第 5 次。`notify-queue.ts` 更新 `notification_deliveries` 及外层 `runs.notify_status` / `native_events.notify_status` 后，统一调用 `NodeHub` DO 内部接口向全局 `admin` `/ws/stream` 广播 `delivery.updated` 与 `run.updated` / `native_event.upserted`（同步修复原有受控任务通知状态滞留 `queued` 的缺陷）。
+3. **跨机协同板阻塞提问直发（`board_message`，仅限 `kind = 'question'`）**：仅当发布 `kind = 'question'` 时写入 `notification_deliveries`（`source_kind = 'board_message'`、`trigger_event = 'question_opened'`、`node_id = source_node || 'board'`）并向 `NOTIFY_QUEUE` 入队高优 Web Push（`Urgency: high`，事件过滤键 `board_question_opened` 默认开启，当 `node_filter_json` 为空数组 `[]` 或 `source_node` 非空且命中过滤集合时投递，深链 `/?workspace=inbox&source=board&id=<msg_id>`）；`note` / `handoff` / `artifact` 在 Slice 1a 不开放 `--notify`，绝不写入 `notification_deliveries` 或触发打扰式推送。
+4. **独立投递账本与每渠道隔离入队**：入库期将每个匹配目标写入 `notification_deliveries`（`status = 'queued'`），并向 `NOTIFY_QUEUE` 投递独立的 `{ kind: "delivery", delivery_id }` 消息，使单条 Web Push `5xx` / `429` 重试绝不重复触发已成功的 Bot Webhook 或其他设备。
+5. **零外部依赖边缘 Web Push 引擎（`apps/hub-worker/src/web-push.ts`）**：纯基于 Workers 原生 `crypto.subtle` 实现 RFC 8292 VAPID `ES256` 签名与 RFC 8291 / RFC 8188 `aes128gcm` 载荷加密（维持 `apps/hub-worker/package.json` 零运行时 npm 依赖），明文 JSON 控制在 `<= 3072` UTF-8 字节内供 `sw.js` 在 Cloudflare Access Cookie 过期时仍可离线零回源解密；严格校验 Push 端点域名 SSRF 白名单（`fcm.googleapis.com`、`*.push.apple.com`、`*.push.services.mozilla.com`、`*.notify.windows.com`，仅在显式测试环境变量 `ALLOW_LOOPBACK_PUSH_FOR_TEST === "true"` 时放行本地回环测试网关）。
+6. **投递期 Fail-Closed 与 DO 实时回推**：Bot 消费端在发送 HTTP POST 前实时联表复核目标 `client` Key 未吊销、节点权限未移除且通道未中途换绑；Web Push 在 `404` / `410` 时自动吊销失效订阅（`revoked_at`），`400` / `401` / `403` / `413` 不重试，`429` / `5xx` / 超时按指数退避最多重试至第 5 次。`notify-queue.ts` 更新 `notification_deliveries` 及外层 `runs.notify_status` / `native_events.notify_status`（或广播 `board_message` 投递更新）后，统一调用 `NodeHub` DO 内部接口向全局 `admin` `/ws/stream` 广播 `delivery.updated` 与对应的业务帧。
 
 ## 3. 物理会话亲和性模型：`Thread` 与 `Run` 分离
 
@@ -96,7 +97,7 @@ WebSocket 连接在跨公网环境下可能因机器休眠、网络切换或代�
 1. **落库先行**：客户端调用 `POST /api/v1/runs` 后，Worker 首先将记录写入 D1（`status = 'queued'`），随即向调用方返回 `202`（或进入短等待）。
 2. **即时唤醒**：Worker 通知 DO `NodeHub`，若目标 `node_id` 当前存在活跃 WebSocket，立刻下发 `hub.wake` 信令，节点收到后主动发起认领（`POST /api/v1/nodes/:id/claim`）。
 3. **重连必扫**：无论节点因休眠唤醒还是网络闪断重新连上 `/ws/node`，在 `node.hello` 握手完成后，节点守护进程**必须立即执行一次 `claim`**，拉取离线期间积压在 D1 中的待执行任务。
-4. **租约与超时巡检及留存清理**：节点认领任务后获得有效期为 `90 秒` 的租约（`lease_expires_at`），执行期间每 `30 秒` 续期一次。Worker 每分钟通过 Cron Trigger（`scheduled`）巡检租约过期但仍处于 `claimed`、`running` 或 `needs_approval` 的任务（配合 `POST /api/v1/runs/:id/approval` 在总超时预算内的有界驻留与 `POST /api/v1/runs/:id/resolve` 人工放行收口，防止审批节点断联造成工作区互斥锁永久残留）：由于本地代码修改操作通常不具备天然幂等性，超时失联任务默认标记为 `failed`（`error_code = 'NODE_LEASE_EXPIRED'`）并通知发起方，避免节点意外重启后盲目重放造成工作区冲突；同时 Cron 依据 `NATIVE_EVENTS_RETENTION_DAYS`（默认 `30` 天）分批滚动清理过期的 `native_events` 与 `notification_deliveries`，保持 `threads` / `runs` 既有留存策略不变。
+4. **租约与超时巡检及留存清理**：节点认领任务后获得有效期为 `90 秒` 的租约（`lease_expires_at`），执行期间每 `30 秒` 续期一次。Worker 每分钟通过 Cron Trigger（`scheduled`）巡检租约过期但仍处于 `claimed`、`running` 或 `needs_approval` 的任务（配合 `POST /api/v1/runs/:id/approval` 在总超时预算内的有界驻留与 `POST /api/v1/runs/:id/resolve` 人工放行收口，防止审批节点断联造成工作区互斥锁永久残留）：由于本地代码修改操作通常不具备天然幂等性，超时失联任务默认标记为 `failed`（`error_code = 'NODE_LEASE_EXPIRED'`）并通知发起方，避免节点意外重启后盲目重放造成工作区冲突；同时 Cron 依据 `NATIVE_EVENTS_RETENTION_DAYS`（默认 `30` 天）与 `BOARD_EVENTS_RETENTION_DAYS`（默认 `90` 天）分批滚动清理过期的 `native_events`、`board_events`（保留 `board_topics` 与 `board_messages` 实体）与 `notification_deliveries`，并扫描 `question_expires_at < now` 的 `open` 协同板提问执行 CAS 转 `expired`（无剩余 `open` 提问时自动恢复主题 `previous_status`），保持 `threads` / `runs` 既有留存策略不变。
 
 ## 5. 跨机 Agent 互调防递归死循环门禁
 
@@ -127,9 +128,9 @@ WebSocket 连接在跨公网环境下可能因机器休眠、网络切换或代�
 
 | 主体类型 | 认证方式 | 权限边界与约束 |
 | --- | --- | --- |
-| **Web 任务中心用户** | Cloudflare Access（Zero Trust）签发的 `Cf-Access-Jwt-Assertion` 请求头（RS256 JWKS 验签）或同源 `CF_Authorization` Cookie（强校验 `Origin` 与 `Sec-Fetch-Site` 防 CSRF）；本地开发模式可回退 `admin` Bearer Token | 拥有控制台完整读写能力，包括查看所有节点与任务、创建/取消任务、绑定节点默认通知通道、查阅/确认/重推原生活动与投递账本、管理浏览器 Web Push 订阅以及签发与吊销 API Key |
-| **`admin` API Key** | `Authorization: Bearer ahub_adm_<secret>` | 仅供管理员自动化脚本或初始化部署使用，可管理节点、默认通知绑定、原生活动（含 `ahub activity`）、Web Push 订阅与全部凭证 |
-| **`client` API Key** | `Authorization: Bearer ahub_cli_<secret>`（参考 `/dl/client-bootstrap.md` 与 `AHUB_CONFIG_DIR` 多 Bot 隔离） | 分发给 Grok Bot 或允许对外派单的本地 Agent。统一强制校验 `bound_node_id` 与 `allowed_nodes_json` 交集、`allow_unsandboxed` 与 `max_depth_limit`；`/ws/stream` 强制要求 `?run_id=<id>` 且校验创建者归属，绝不推送 `native_events` 或 `delivery.updated` 帧；调用 `/api/v1/native-events*`、`/api/v1/runs/:id/deliveries`、`/api/v1/runs/:id/redeliver`、`/api/v1/push/*` 与 `/api/v1/push-subscriptions*` 一律返回 `403 FORBIDDEN_SCOPE`；支持每 Key 独立 `AES-256-GCM` 加密 Webhook；非 `admin` 视图自动剥离节点 `default_notify_*` 元数据，控制面全链路返回脱敏 `prompt`（仅节点 `POST /api/v1/nodes/:id/claim` 返回明文指令） |
-| **`node:<node_id>` API Key** | `Authorization: Bearer ahub_nod_<secret>` | 每台工作节点独享一枚。仅允许以该 `node_id` 建立 `/ws/node` 连接、认领并回写本机任务事件与结果，以及上报本节点的 `POST /api/v1/nodes/:id/native-events`（拒绝 `admin` / `client` 或跨节点代报）；对全部 `admin` 原生活动读取/确认/投递与 Web Push 管理接口一律返回 `403 FORBIDDEN_SCOPE`；`ahub native-emit` 绕过客户端 `credentials` 仅读取 `node.json` 中的节点令牌。单机泄露或退役时可在 Web 面板一键吊销，不影响其他机器 |
+| **Web 任务中心用户** | Cloudflare Access（Zero Trust）签发的 `Cf-Access-Jwt-Assertion` 请求头（RS256 JWKS 验签）或同源 `CF_Authorization` Cookie（强校验 `Origin` 与 `Sec-Fetch-Site` 防 CSRF）；本地开发模式可回退 `admin` Bearer Token | 拥有控制台完整读写能力，包括查看所有节点与任务、创建/取消任务、读写全部协同板频道并**独占答复**协同板提问、绑定节点默认通知通道、查阅/确认/重推原生活动与投递账本、管理浏览器 Web Push 订阅以及签发与吊销 API Key |
+| **`admin` API Key** | `Authorization: Bearer ahub_adm_<secret>` | 仅供管理员自动化脚本或初始化部署使用，可管理节点、全部协同板频道及提问答复、默认通知绑定、原生活动（含 `ahub activity`）、Web Push 订阅与全部凭证 |
+| **`client` API Key** | `Authorization: Bearer ahub_cli_<secret>`（参考 `/dl/client-bootstrap.md` 与 `AHUB_CONFIG_DIR` 多 Bot 隔离） | 分发给 Grok Bot 或允许对外派单/协同的本地 Agent。受控执行侧强制校验 `bound_node_id` 与 `allowed_nodes_json` 交集、创建者归属（`created_by_key_id`）、`allow_unsandboxed` 与 `max_depth_limit`；协同板侧按 `allowed_board_prefixes_json` 执行**段边界前缀 Fail-Closed 授权**（默认 `[]` 拒绝所有协同板读写返回 `403 FORBIDDEN_SCOPE`），且严禁代答提问（`POST /api/v1/board/messages/:id/answer` 返回 `403 FORBIDDEN_SCOPE`）；`/ws/stream` 强制要求 `?run_id=<id>` 或拥有频道前缀权限的 `?topic_id=<tid>&after_cursor=<c>`，绝不推送 `native_events`、`delivery.updated` 或其他主题/任务帧；调用 `/api/v1/native-events*`、`/api/v1/runs/:id/deliveries`、`/api/v1/runs/:id/redeliver`、`/api/v1/push/*` 与 `/api/v1/push-subscriptions*` 一律返回 `403 FORBIDDEN_SCOPE`；支持每 Key 独立 `AES-256-GCM` 加密 Webhook；非 `admin` 视图自动剥离节点 `default_notify_*` 元数据，控制面全链路返回脱敏 `prompt`（仅节点 `POST /api/v1/nodes/:id/claim` 返回明文指令） |
+| **`node:<node_id>` API Key** | `Authorization: Bearer ahub_nod_<secret>` | 每台工作节点独享一枚。仅允许以该 `node_id` 建立 `/ws/node` 连接、认领并回写本机任务事件与结果，以及上报本节点的 `POST /api/v1/nodes/:id/native-events`（拒绝 `admin` / `client` 或跨节点代报）；对全部 `admin` 原生活动、Web Push 管理接口、`/ws/stream` 及全部 `/api/v1/board/*` 协同板接口一律返回 `403 FORBIDDEN_SCOPE`；`ahub native-emit` 仅读取 `node.json` 节点令牌，而 `ahub board` 严禁读取 `node.json` 守护令牌。单机泄露或退役时可在 Web 面板一键吊销，不影响其他机器 |
 
 所有 API Key 在 D1 中仅保存 `SHA-256` 哈希摘要与短前缀 `key_prefix`，明文仅在签发响应中返回一次。

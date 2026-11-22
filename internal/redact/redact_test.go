@@ -1,6 +1,8 @@
 package redact
 
 import (
+	"bytes"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -110,5 +112,82 @@ func TestTruncateUTF8RespectsRuneBoundaries(t *testing.T) {
 	}
 	if !strings.Contains(trimmed, "--full") {
 		t.Fatalf("expected --full hint in truncated suffix: %q", trimmed)
+	}
+}
+
+func TestMapAndValueRedactsNestedSecretsAndPreservesTypes(t *testing.T) {
+	rawJSON := `{
+		"api_key": "raw_unprefixed_secret_123",
+		"webhook_key": "wh_raw_999",
+		"access_token": "ahub_cli_leaksecret99",
+		"placeholder_token": "$MY_SECRET_VAR",
+		"template_secret": "<WEBHOOK_SECRET>",
+		"has_token": "true",
+		"token_source": "env",
+		"count": 9007199254740993,
+		"ok": true,
+		"nested": {
+			"password": "db_password_xyz",
+			"note": "Authorization: Bearer my_bearer_999"
+		},
+		"items": [
+			"token=inline_val_abc",
+			{"secret": "nested_arr_secret"}
+		]
+	}`
+	dec := json.NewDecoder(bytes.NewBufferString(rawJSON))
+	dec.UseNumber()
+	var decoded map[string]interface{}
+	if err := dec.Decode(&decoded); err != nil {
+		t.Fatalf("decode failed: %v", err)
+	}
+
+	got := Map(decoded)
+	encodedBytes, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+	encoded := string(encodedBytes)
+
+	for _, forbidden := range []string{
+		"raw_unprefixed_secret_123",
+		"wh_raw_999",
+		"leaksecret99",
+		"db_password_xyz",
+		"my_bearer_999",
+		"inline_val_abc",
+		"nested_arr_secret",
+	} {
+		if strings.Contains(encoded, forbidden) {
+			t.Fatalf("expected %q redacted in Map output: %s", forbidden, encoded)
+		}
+	}
+
+	if got["api_key"] != "[REDACTED]" {
+		t.Fatalf("expected api_key=[REDACTED], got %v", got["api_key"])
+	}
+	if got["webhook_key"] != "[REDACTED]" {
+		t.Fatalf("expected webhook_key=[REDACTED], got %v", got["webhook_key"])
+	}
+	if got["access_token"] != "ahub_cli_[REDACTED]" {
+		t.Fatalf("expected access_token=ahub_cli_[REDACTED], got %v", got["access_token"])
+	}
+	if got["placeholder_token"] != "$MY_SECRET_VAR" {
+		t.Fatalf("expected $MY_SECRET_VAR preserved, got %v", got["placeholder_token"])
+	}
+	if got["template_secret"] != "<WEBHOOK_SECRET>" {
+		t.Fatalf("expected <WEBHOOK_SECRET> preserved, got %v", got["template_secret"])
+	}
+	if got["has_token"] != "true" || got["token_source"] != "env" {
+		t.Fatalf("expected has_token and token_source preserved, got %v / %v", got["has_token"], got["token_source"])
+	}
+	if num, ok := got["count"].(json.Number); !ok || num.String() != "9007199254740993" {
+		t.Fatalf("expected json.Number preserved, got %#v", got["count"])
+	}
+	if got["ok"] != true {
+		t.Fatalf("expected bool preserved, got %#v", got["ok"])
+	}
+	if Map(nil) != nil || Value(nil) != nil {
+		t.Fatalf("expected nil Map/Value to stay nil")
 	}
 }

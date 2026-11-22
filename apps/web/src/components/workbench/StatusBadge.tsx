@@ -1,5 +1,5 @@
 import { Badge } from "@/components/ui/badge";
-import type { NodeStatus, RunStatus } from "@/types";
+import type { BoardTopicStatus, NodeStatus, RunStatus } from "@/types";
 
 export function NodeStatusDot({ status }: { status: NodeStatus }) {
   const colorClass =
@@ -38,6 +38,26 @@ export function RunStatusBadge({ status }: { status: RunStatus }) {
       {status === "running" || status === "claimed" ? (
         <span className="h-1.5 w-1.5 rounded-full bg-current animate-pulse" aria-hidden="true" />
       ) : null}
+      {meta.label}
+    </Badge>
+  );
+}
+
+const BOARD_STATUS_META: Record<
+  BoardTopicStatus,
+  { label: string; variant: "outline" | "done" | "running" | "approval" | "secondary" }
+> = {
+  todo: { label: "待办", variant: "outline" },
+  in_progress: { label: "进行中", variant: "running" },
+  blocked: { label: "阻塞中", variant: "approval" },
+  done: { label: "已完成", variant: "done" },
+  archived: { label: "已归档", variant: "secondary" }
+};
+
+export function BoardTopicStatusBadge({ status }: { status: BoardTopicStatus }) {
+  const meta = BOARD_STATUS_META[status];
+  return (
+    <Badge variant={meta.variant} data-board-status={status}>
       {meta.label}
     </Badge>
   );

@@ -83,8 +83,8 @@
       ],
       "properties": {
         "id": { "type": "string", "pattern": "^dlv_[A-Za-z0-9]+$" },
-        "source_kind": { "type": "string", "enum": ["run", "native_event"] },
-        "source_id": { "type": "string", "pattern": "^(run|evt)_[A-Za-z0-9]+$" },
+        "source_kind": { "type": "string", "enum": ["run", "native_event", "board_message"] },
+        "source_id": { "type": "string", "pattern": "^(run|evt|msg)_[A-Za-z0-9]+$" },
         "trigger_event": {
           "type": "string",
           "enum": [
@@ -94,7 +94,8 @@
             "cancelled",
             "interaction_needed",
             "turn_summary",
-            "progress"
+            "progress",
+            "question_opened"
           ]
         },
         "node_id": { "type": "string", "minLength": 1 },
@@ -111,6 +112,119 @@
         "sent_at": { "type": ["string", "null"], "format": "date-time" },
         "created_at": { "type": "string", "format": "date-time" },
         "updated_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "BoardHandoffSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "actor_profile", "source_node", "text_md", "data", "created_at"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^msg_[A-Za-z0-9]+$" },
+        "actor_profile": { "type": "string", "maxLength": 40, "pattern": "^(|[a-z0-9][a-z0-9._@-]{0,39})$" },
+        "source_node": { "type": "string", "maxLength": 64, "pattern": "^(|[a-z0-9][a-z0-9_-]*)$" },
+        "text_md": { "type": "string", "maxLength": 8192 },
+        "data": { "type": "object" },
+        "created_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "BoardTopic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "channel",
+        "title",
+        "external_ref",
+        "status",
+        "previous_status",
+        "pinned",
+        "sort_order",
+        "labels",
+        "created_by_key_id",
+        "last_message_id",
+        "last_handoff_message_id",
+        "last_event_cursor",
+        "created_at",
+        "updated_at"
+      ],
+      "properties": {
+        "id": { "type": "string", "pattern": "^top_[A-Za-z0-9]+$" },
+        "channel": { "type": "string", "maxLength": 64, "pattern": "^[a-z0-9][a-z0-9_-]*(/[a-z0-9][a-z0-9_-]*)*$" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "external_ref": { "type": "string", "maxLength": 200 },
+        "status": { "type": "string", "enum": ["todo", "in_progress", "blocked", "done", "archived"] },
+        "previous_status": { "type": "string", "enum": ["", "todo", "in_progress"] },
+        "pinned": { "type": "boolean" },
+        "sort_order": { "type": "number" },
+        "labels": {
+          "type": "object",
+          "maxProperties": 16,
+          "propertyNames": { "type": "string", "minLength": 1, "maxLength": 64 },
+          "additionalProperties": { "type": "string", "maxLength": 128 }
+        },
+        "created_by_key_id": { "type": ["string", "null"], "pattern": "^key_[A-Za-z0-9]+$" },
+        "last_message_id": { "type": "string", "pattern": "^(|msg_[A-Za-z0-9]+)$" },
+        "last_handoff_message_id": { "type": "string", "pattern": "^(|msg_[A-Za-z0-9]+)$" },
+        "last_event_cursor": { "type": "integer", "minimum": 0 },
+        "open_question_count": { "type": "integer", "minimum": 0 },
+        "message_count": { "type": "integer", "minimum": 0 },
+        "latest_handoff": {
+          "oneOf": [
+            { "$ref": "#/$defs/BoardHandoffSnapshot" },
+            { "type": "null" }
+          ]
+        },
+        "created_at": { "type": "string", "format": "date-time" },
+        "updated_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "BoardMessage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "topic_id",
+        "channel",
+        "seq",
+        "kind",
+        "reply_to_id",
+        "actor_scope",
+        "actor_key_id",
+        "actor_profile",
+        "source_node",
+        "text_md",
+        "data",
+        "question_state",
+        "question_options",
+        "question_expires_at",
+        "answered_message_id",
+        "answered_at",
+        "created_at"
+      ],
+      "properties": {
+        "id": { "type": "string", "pattern": "^msg_[A-Za-z0-9]+$" },
+        "topic_id": { "type": "string", "pattern": "^top_[A-Za-z0-9]+$" },
+        "channel": { "type": "string", "maxLength": 64, "pattern": "^[a-z0-9][a-z0-9_-]*(/[a-z0-9][a-z0-9_-]*)*$" },
+        "seq": { "type": "integer", "minimum": 1 },
+        "kind": { "type": "string", "enum": ["note", "handoff", "question", "answer", "artifact"] },
+        "reply_to_id": { "type": ["string", "null"], "pattern": "^msg_[A-Za-z0-9]+$" },
+        "actor_scope": { "type": "string", "enum": ["admin", "client"] },
+        "actor_key_id": { "type": ["string", "null"], "pattern": "^key_[A-Za-z0-9]+$" },
+        "actor_profile": { "type": "string", "maxLength": 40, "pattern": "^(|[a-z0-9][a-z0-9._@-]{0,39})$" },
+        "source_node": { "type": "string", "maxLength": 64, "pattern": "^(|[a-z0-9][a-z0-9_-]*)$" },
+        "text_md": { "type": "string", "maxLength": 8192 },
+        "data": { "type": "object" },
+        "question_state": { "type": "string", "enum": ["", "open", "answered", "expired", "cancelled"] },
+        "question_options": {
+          "type": "array",
+          "maxItems": 8,
+          "items": { "type": "string", "minLength": 1, "maxLength": 200 }
+        },
+        "question_expires_at": { "type": ["string", "null"], "format": "date-time" },
+        "answered_message_id": { "type": ["string", "null"], "pattern": "^msg_[A-Za-z0-9]+$" },
+        "answered_at": { "type": ["string", "null"], "format": "date-time" },
+        "deliveries_summary": { "$ref": "#/$defs/DeliveriesSummary" },
+        "created_at": { "type": "string", "format": "date-time" }
       }
     }
   },
@@ -312,6 +426,8 @@
           "items": { "$ref": "#/$defs/NativeEventView" }
         },
         "open_interaction_count": { "type": "integer", "minimum": 0 },
+        "open_board_question_count": { "type": "integer", "minimum": 0 },
+        "topic": { "$ref": "#/$defs/BoardTopic" },
         "ts": { "type": "string", "format": "date-time" }
       }
     },
@@ -360,6 +476,42 @@
       "properties": {
         "type": { "const": "delivery.updated" },
         "delivery": { "$ref": "#/$defs/NotificationDeliveryRecord" }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "topic"],
+      "properties": {
+        "type": { "const": "board.topic_updated" },
+        "topic": { "$ref": "#/$defs/BoardTopic" },
+        "cursor": { "type": "integer", "minimum": 1 },
+        "open_board_question_count": { "type": "integer", "minimum": 0 }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "message", "cursor"],
+      "properties": {
+        "type": { "const": "board.message_created" },
+        "message": { "$ref": "#/$defs/BoardMessage" },
+        "topic": { "$ref": "#/$defs/BoardTopic" },
+        "cursor": { "type": "integer", "minimum": 1 },
+        "open_board_question_count": { "type": "integer", "minimum": 0 }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "question", "answer", "cursor"],
+      "properties": {
+        "type": { "const": "board.question_answered" },
+        "question": { "$ref": "#/$defs/BoardMessage" },
+        "answer": { "$ref": "#/$defs/BoardMessage" },
+        "topic": { "$ref": "#/$defs/BoardTopic" },
+        "cursor": { "type": "integer", "minimum": 1 },
+        "open_board_question_count": { "type": "integer", "minimum": 0 }
       }
     }
   ]

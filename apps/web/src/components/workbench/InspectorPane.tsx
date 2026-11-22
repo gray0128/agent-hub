@@ -22,7 +22,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { PUSH_EVENT_FILTER_OPTIONS } from "@/lib/browser-notify";
+import { DEFAULT_NODE_NOTIFY_EVENTS, PUSH_EVENT_FILTER_OPTIONS } from "@/lib/browser-notify";
 import {
   cn,
   type EventTone,
@@ -646,7 +646,7 @@ export function InspectorPane({
                           {
                             (
                               selectedNode.default_notify_events ??
-                              PUSH_EVENT_FILTER_OPTIONS.map((o) => o.key)
+                              DEFAULT_NODE_NOTIFY_EVENTS
                             ).length
                           }
                           /{PUSH_EVENT_FILTER_OPTIONS.length}
@@ -656,7 +656,7 @@ export function InspectorPane({
                         {PUSH_EVENT_FILTER_OPTIONS.map((opt) => {
                           const currentEvents =
                             selectedNode.default_notify_events ??
-                            PUSH_EVENT_FILTER_OPTIONS.map((o) => o.key);
+                            DEFAULT_NODE_NOTIFY_EVENTS;
                           const active = currentEvents.includes(opt.key);
                           return (
                             <button

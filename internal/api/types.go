@@ -266,7 +266,10 @@ type ErrorBody struct {
 	Code    string                 `json:"code"`
 	Message string                 `json:"message"`
 	Details map[string]interface{} `json:"details,omitempty"`
+	Next    []string               `json:"next,omitempty"`
 }
+
+type ErrorDetail = ErrorBody
 
 type APIError struct {
 	HTTPStatus int
@@ -290,4 +293,190 @@ type RunEventItem struct {
 	Kind    string                 `json:"kind"`
 	Payload map[string]interface{} `json:"payload"`
 	TS      string                 `json:"ts"`
+}
+
+type BoardHandoffSnapshot struct {
+	ID           string                 `json:"id"`
+	ActorProfile string                 `json:"actor_profile"`
+	SourceNode   string                 `json:"source_node"`
+	TextMD       string                 `json:"text_md"`
+	Data         map[string]interface{} `json:"data"`
+	CreatedAt    string                 `json:"created_at"`
+}
+
+type BoardChannelSummary struct {
+	Channel           string  `json:"channel"`
+	ActiveTopicCount  int     `json:"active_topic_count"`
+	OpenQuestionCount int     `json:"open_question_count"`
+	TotalTopicCount   *int    `json:"total_topic_count,omitempty"`
+	UpdatedAt         *string `json:"updated_at,omitempty"`
+}
+
+type BoardTopic struct {
+	ID                   string                `json:"id"`
+	Channel              string                `json:"channel"`
+	Title                string                `json:"title"`
+	ExternalRef          string                `json:"external_ref"`
+	Status               string                `json:"status"`
+	PreviousStatus       string                `json:"previous_status"`
+	Pinned               bool                  `json:"pinned"`
+	SortOrder            float64               `json:"sort_order"`
+	Labels               map[string]string     `json:"labels"`
+	CreatedByKeyID       *string               `json:"created_by_key_id"`
+	LastMessageID        string                `json:"last_message_id"`
+	LastHandoffMessageID string                `json:"last_handoff_message_id"`
+	LastEventCursor      int64                 `json:"last_event_cursor"`
+	OpenQuestionCount    *int                  `json:"open_question_count,omitempty"`
+	MessageCount         *int                  `json:"message_count,omitempty"`
+	LatestHandoff        *BoardHandoffSnapshot `json:"latest_handoff,omitempty"`
+	CreatedAt            string                `json:"created_at"`
+	UpdatedAt            string                `json:"updated_at"`
+}
+
+type BoardMessage struct {
+	ID                string                 `json:"id"`
+	TopicID           string                 `json:"topic_id"`
+	Channel           string                 `json:"channel"`
+	Seq               int                    `json:"seq"`
+	Kind              string                 `json:"kind"`
+	ReplyToID         *string                `json:"reply_to_id"`
+	ActorScope        string                 `json:"actor_scope"`
+	ActorKeyID        *string                `json:"actor_key_id"`
+	ActorProfile      string                 `json:"actor_profile"`
+	SourceNode        string                 `json:"source_node"`
+	TextMD            string                 `json:"text_md"`
+	Data              map[string]interface{} `json:"data"`
+	QuestionState     string                 `json:"question_state"`
+	QuestionOptions   []string               `json:"question_options"`
+	QuestionExpiresAt *string                `json:"question_expires_at"`
+	AnsweredMessageID *string                `json:"answered_message_id"`
+	AnsweredAt        *string                `json:"answered_at"`
+	DeliveriesSummary *DeliveriesSummary     `json:"deliveries_summary,omitempty"`
+	CreatedAt         string                 `json:"created_at"`
+}
+
+type BoardEvent struct {
+	Cursor       int64   `json:"cursor"`
+	Channel      string  `json:"channel"`
+	TopicID      string  `json:"topic_id"`
+	MessageID    *string `json:"message_id"`
+	EventType    string  `json:"event_type"`
+	ActorProfile string  `json:"actor_profile"`
+	CreatedAt    string  `json:"created_at"`
+}
+
+type CreateBoardTopicRequest struct {
+	Channel     string            `json:"channel"`
+	Title       string            `json:"title"`
+	ExternalRef string            `json:"external_ref,omitempty"`
+	Status      string            `json:"status,omitempty"`
+	Pinned      *bool             `json:"pinned,omitempty"`
+	Labels      map[string]string `json:"labels,omitempty"`
+	Upsert      bool              `json:"upsert,omitempty"`
+}
+
+type PatchBoardTopicRequest struct {
+	Title     string            `json:"title,omitempty"`
+	Status    string            `json:"status,omitempty"`
+	Pinned    *bool             `json:"pinned,omitempty"`
+	SortOrder *float64          `json:"sort_order,omitempty"`
+	Labels    map[string]string `json:"labels,omitempty"`
+}
+
+type ReorderBoardTopicsRequest struct {
+	Channel         string   `json:"channel"`
+	Status          string   `json:"status"`
+	OrderedTopicIDs []string `json:"ordered_topic_ids"`
+}
+
+type CreateBoardMessageRequest struct {
+	Kind               string                 `json:"kind"`
+	TextMD             string                 `json:"text_md"`
+	Data               map[string]interface{} `json:"data,omitempty"`
+	ActorProfile       string                 `json:"actor_profile,omitempty"`
+	SourceNode         string                 `json:"source_node,omitempty"`
+	TopicStatus        string                 `json:"topic_status,omitempty"`
+	QuestionOptions    []string               `json:"question_options,omitempty"`
+	QuestionExpiresSec int                    `json:"question_expires_sec,omitempty"`
+	IdempotencyKey     string                 `json:"idempotency_key,omitempty"`
+}
+
+type AnswerBoardQuestionRequest struct {
+	SelectedOption string `json:"selected_option,omitempty"`
+	AnswerText     string `json:"answer_text,omitempty"`
+	ActorProfile   string `json:"actor_profile,omitempty"`
+}
+
+type ListBoardTopicsOptions struct {
+	Channel         string
+	ExternalRef     string
+	Status          string
+	HasOpenQuestion *bool
+	Query           string
+	Sort            string
+	Limit           int
+}
+
+type ListBoardEventsOptions struct {
+	Channel     string
+	TopicID     string
+	AfterCursor int64
+	Limit       int
+}
+
+type BoardChannelsResponse struct {
+	OK       bool                  `json:"ok"`
+	Channels []BoardChannelSummary `json:"channels"`
+}
+
+type BoardTopicsResponse struct {
+	OK     bool         `json:"ok"`
+	Topics []BoardTopic `json:"topics"`
+}
+
+type BoardTopicResponse struct {
+	OK      bool       `json:"ok"`
+	Topic   BoardTopic `json:"topic"`
+	Created *bool      `json:"created,omitempty"`
+}
+
+type BoardMessagesResponse struct {
+	OK       bool           `json:"ok"`
+	Topic    BoardTopic     `json:"topic"`
+	Messages []BoardMessage `json:"messages"`
+	Cursor   int64          `json:"cursor"`
+}
+
+type BoardMessagePostResponse struct {
+	OK           bool         `json:"ok"`
+	Topic        BoardTopic   `json:"topic"`
+	Message      BoardMessage `json:"message"`
+	Cursor       int64        `json:"cursor"`
+	Deduplicated *bool        `json:"deduplicated,omitempty"`
+}
+
+type AnswerBoardQuestionResponse struct {
+	OK       bool         `json:"ok"`
+	Topic    BoardTopic   `json:"topic"`
+	Question BoardMessage `json:"question"`
+	Answer   BoardMessage `json:"answer"`
+	Cursor   int64        `json:"cursor"`
+}
+
+type BoardEventsResponse struct {
+	OK         bool         `json:"ok"`
+	Events     []BoardEvent `json:"events"`
+	NextCursor int64        `json:"next_cursor"`
+}
+
+type BoardWaitTimeoutResult struct {
+	OK            bool        `json:"ok"`
+	TimedOut      bool        `json:"timed_out"`
+	Channel       string      `json:"channel,omitempty"`
+	TopicID       string      `json:"topic_id"`
+	MessageID     string      `json:"message_id,omitempty"`
+	Cursor        int64       `json:"cursor"`
+	QuestionState string      `json:"question_state"`
+	Topic         *BoardTopic `json:"topic,omitempty"`
+	Next          []string    `json:"next,omitempty"`
 }

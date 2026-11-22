@@ -16,6 +16,8 @@ const CLI_FLAG_SECRET_RE =
   /(^|[\s;|&(])(--(?:[a-z0-9-]+-)?(?:token|password|passwd|secret|api-key|apikey|webhook-key))(\s*=\s*|[ \t]+)(\\"(?:[^"\\\r\n]|\\[^"\r\n])*\\"|"(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*'|[^\s'"`;|&)]+)/gi;
 const JSON_SECRET_RE =
   /("(?:[a-z0-9_]*_)?(?:password|passwd|token|secret|api_?key|webhook_?key|access_?token|auth_?token|private_?key|encryption_?key)"\s*:\s*")((?:[^"\\\r\n]|\\.)*)(")/gi;
+const SECRET_JSON_KEY_RE =
+  /^(?:[a-z0-9_]*_)?(?:password|passwd|token|secret|api_?key|webhook_?key|access_?token|auth_?token|private_?key|encryption_?key)$/i;
 const KV_SECRET_RE =
   /\b([A-Za-z0-9_]*(?:PASSWORD|PASSWD|TOKEN|SECRET|API_?KEY|WEBHOOK_?KEY|PRIVATE_?KEY|ENCRYPTION_?KEY))\s*([:=])\s*(\\"(?:[^"\\\r\n]|\\[^"\r\n])*\\"|"(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*'|[^\s'"`;|&]+)/gi;
 
@@ -204,4 +206,123 @@ export function buildPromptPreview(
     promptPreview: `${chars.slice(0, maxChars).join("")}\n...[truncated]`,
     promptTruncated: true
   };
+}
+
+function redactNamedString(key: string, val: string): string {
+  const redacted = redactSecrets(val);
+  if (
+    key.toLowerCase() !== "has_token" &&
+    SECRET_JSON_KEY_RE.test(key) &&
+    redacted !== "" &&
+    !isPlaceholderValue(redacted)
+  ) {
+    return "[REDACTED]";
+  }
+  return redacted;
+}
+
+export function redactJsonValue(value: unknown): unknown {
+  if (typeof value === "string") {
+    return redactSecrets(value);
+  }
+  if (value === null || typeof value !== "object") {
+    return value;
+  }
+
+  const ancestors = new WeakSet<object>();
+  const cloned = new WeakMap<object, unknown>();
+  const holder: { root: unknown } = { root: undefined };
+
+  type StackTask =
+    | { kind: "exit"; source: object }
+    | {
+        kind: "visit";
+        val: unknown;
+        keyName: string | null;
+        assign: (redacted: unknown) => void;
+      };
+
+  const stack: StackTask[] = [
+    {
+      kind: "visit",
+      val: value,
+      keyName: null,
+      assign: (redacted) => {
+        holder.root = redacted;
+      }
+    }
+  ];
+
+  while (stack.length > 0) {
+    const task = stack.pop()!;
+    if (task.kind === "exit") {
+      ancestors.delete(task.source);
+      continue;
+    }
+
+    const { val, keyName, assign } = task;
+    if (typeof val === "string") {
+      assign(keyName !== null ? redactNamedString(keyName, val) : redactSecrets(val));
+      continue;
+    }
+    if (val === null || typeof val !== "object") {
+      assign(val);
+      continue;
+    }
+    if (ancestors.has(val)) {
+      assign("[Circular]");
+      continue;
+    }
+    if (cloned.has(val)) {
+      assign(cloned.get(val));
+      continue;
+    }
+
+    ancestors.add(val);
+    if (Array.isArray(val)) {
+      const outArr = new Array<unknown>(val.length);
+      cloned.set(val, outArr);
+      assign(outArr);
+      stack.push({ kind: "exit", source: val });
+      for (let i = val.length - 1; i >= 0; i--) {
+        const idx = i;
+        stack.push({
+          kind: "visit",
+          val: val[idx],
+          keyName: null,
+          assign: (redacted) => {
+            outArr[idx] = redacted;
+          }
+        });
+      }
+    } else {
+      const outObj: Record<string, unknown> = {};
+      cloned.set(val, outObj);
+      assign(outObj);
+      stack.push({ kind: "exit", source: val });
+      const entries = Object.entries(val);
+      for (let i = entries.length - 1; i >= 0; i--) {
+        const [k, childVal] = entries[i]!;
+        stack.push({
+          kind: "visit",
+          val: childVal,
+          keyName: k,
+          assign: (redacted) => {
+            Object.defineProperty(outObj, k, {
+              value: redacted,
+              enumerable: true,
+              writable: true,
+              configurable: true
+            });
+          }
+        });
+      }
+    }
+  }
+
+  return holder.root;
+}
+
+export function redactBoardData(data: Record<string, unknown>): Record<string, unknown> {
+  return redactJsonValue(data) as Record<string, unknown>;
 }

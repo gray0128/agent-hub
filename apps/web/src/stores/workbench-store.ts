@@ -4,6 +4,7 @@ import type { AgentName, EffortLevel } from "@/types";
 export type ThemeMode = "dark" | "light";
 export type AuthStatus = "checking" | "authenticated" | "unauthenticated";
 export type AuthScope = "admin" | "client" | "node";
+export type WorkspaceMode = "board" | "inbox" | "runs";
 export type LeftRailTab = "threads" | "native" | "nodes";
 export type CenterPaneMode = "controlled" | "native";
 export type InspectorTab = "events" | "queue" | "lineage" | "control" | "deliveries";
@@ -28,6 +29,8 @@ interface WorkbenchState {
   authKind: string | null;
   authScope: AuthScope | null;
   streamStatus: StreamStatus;
+  workspaceMode: WorkspaceMode;
+  selectedInboxItemKey: string | null;
   leftTab: LeftRailTab;
   centerMode: CenterPaneMode;
   activeTab: InspectorTab;
@@ -37,6 +40,9 @@ interface WorkbenchState {
   browserNotifyOpen: boolean;
   mobileLeftOpen: boolean;
   mobileRightOpen: boolean;
+  boardMobileLeftOpen: boolean;
+  boardMobileRightOpen: boolean;
+  boardMobileShowDetail: boolean;
   errorBanner: string | null;
   composerNotice: string | null;
   composer: ComposerDraft;
@@ -45,6 +51,8 @@ interface WorkbenchState {
   setToken: (token: string) => void;
   setAuthState: (authStatus: AuthStatus, authKind?: string | null, authScope?: AuthScope | null) => void;
   setStreamStatus: (status: StreamStatus) => void;
+  setWorkspaceMode: (mode: WorkspaceMode) => void;
+  setSelectedInboxItemKey: (key: string | null) => void;
   setLeftTab: (tab: LeftRailTab) => void;
   setCenterMode: (mode: CenterPaneMode) => void;
   setActiveTab: (tab: InspectorTab) => void;
@@ -54,6 +62,9 @@ interface WorkbenchState {
   setBrowserNotifyOpen: (open: boolean) => void;
   setMobileLeftOpen: (open: boolean) => void;
   setMobileRightOpen: (open: boolean) => void;
+  setBoardMobileLeftOpen: (open: boolean) => void;
+  setBoardMobileRightOpen: (open: boolean) => void;
+  setBoardMobileShowDetail: (show: boolean) => void;
   setErrorBanner: (msg: string | null) => void;
   setComposerNotice: (msg: string | null) => void;
   patchComposer: (patch: Partial<ComposerDraft>) => void;
@@ -102,6 +113,8 @@ export const useWorkbenchStore = create<WorkbenchState>((set) => ({
   authKind: null,
   authScope: null,
   streamStatus: "connecting",
+  workspaceMode: "board",
+  selectedInboxItemKey: null,
   leftTab: "threads",
   centerMode: "controlled",
   activeTab: "events",
@@ -111,6 +124,9 @@ export const useWorkbenchStore = create<WorkbenchState>((set) => ({
   browserNotifyOpen: false,
   mobileLeftOpen: false,
   mobileRightOpen: false,
+  boardMobileLeftOpen: false,
+  boardMobileRightOpen: false,
+  boardMobileShowDetail: false,
   errorBanner: null,
   composerNotice: null,
   composer: {
@@ -146,6 +162,8 @@ export const useWorkbenchStore = create<WorkbenchState>((set) => ({
   setAuthState: (authStatus, authKind = null, authScope = null) =>
     set({ authStatus, authKind, authScope }),
   setStreamStatus: (streamStatus) => set({ streamStatus }),
+  setWorkspaceMode: (workspaceMode) => set({ workspaceMode }),
+  setSelectedInboxItemKey: (selectedInboxItemKey) => set({ selectedInboxItemKey }),
   setLeftTab: (leftTab) => set({ leftTab }),
   setCenterMode: (centerMode) => set({ centerMode }),
   setActiveTab: (activeTab) => set({ activeTab }),
@@ -155,6 +173,9 @@ export const useWorkbenchStore = create<WorkbenchState>((set) => ({
   setBrowserNotifyOpen: (browserNotifyOpen) => set({ browserNotifyOpen }),
   setMobileLeftOpen: (mobileLeftOpen) => set({ mobileLeftOpen }),
   setMobileRightOpen: (mobileRightOpen) => set({ mobileRightOpen }),
+  setBoardMobileLeftOpen: (boardMobileLeftOpen) => set({ boardMobileLeftOpen }),
+  setBoardMobileRightOpen: (boardMobileRightOpen) => set({ boardMobileRightOpen }),
+  setBoardMobileShowDetail: (boardMobileShowDetail) => set({ boardMobileShowDetail }),
   setErrorBanner: (errorBanner) => set({ errorBanner }),
   setComposerNotice: (composerNotice) => set({ composerNotice }),
   patchComposer: (patch) =>

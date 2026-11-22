@@ -382,11 +382,34 @@ func (c *Client) DialWebSocket(ctx context.Context, path string) (*websocket.Con
 	if c.HTTPClient != nil && c.HTTPClient.Transport != nil {
 		dialClient.Transport = c.HTTPClient.Transport
 	}
-	conn, _, err := websocket.Dial(ctx, wsEndpoint, &websocket.DialOptions{
+	conn, resp, err := websocket.Dial(ctx, wsEndpoint, &websocket.DialOptions{
 		HTTPClient: dialClient,
 		HTTPHeader: headers,
 	})
 	if err != nil {
+		if resp != nil && resp.Body != nil {
+			raw, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+			_ = resp.Body.Close()
+			if resp.StatusCode >= 400 {
+				if readErr == nil {
+					var env ErrorEnvelope
+					if json.Unmarshal(raw, &env) == nil && env.Error.Code != "" {
+						return nil, &APIError{HTTPStatus: resp.StatusCode, Body: env.Error}
+					}
+				}
+				msg := strings.TrimSpace(string(raw))
+				if msg == "" {
+					msg = resp.Status
+				}
+				return nil, &APIError{
+					HTTPStatus: resp.StatusCode,
+					Body: ErrorBody{
+						Code:    fmt.Sprintf("HTTP_%d", resp.StatusCode),
+						Message: msg,
+					},
+				}
+			}
+		}
 		return nil, err
 	}
 	conn.SetReadLimit(4 << 20)

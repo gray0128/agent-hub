@@ -1,0 +1,14 @@
+{
+  "id": "E-09",
+  "name": "跨机跨会话结构化交接",
+  "task_prompt": "在 proj/demo 频道针对工单 cnb:org/demo#123，以 mbp 上 codex-reviewer 身份提交一条包含分支与提交哈希的结构化交接记录，然后模拟另一台机器上的新会话不依赖内部主题 ID 直接读取该交接并核对关键字段。",
+  "theoretical_min_calls": 2,
+  "max_wasted_calls": 0,
+  "assertions": {
+    "must_omit_latest_handoff_on_post": true,
+    "must_redact_secret": true,
+    "must_read_by_ref_without_topic_id": true,
+    "must_preserve_actor_profile": "codex-reviewer",
+    "must_preserve_source_node": "mbp"
+  }
+}

@@ -1,5 +1,14 @@
 import type {
+  AnswerBoardQuestionPayload,
   ApiKeyRecord,
+  AuthPrincipal,
+  BoardChannelSummary,
+  BoardEvent,
+  BoardMessage,
+  BoardTopic,
+  BoardTopicStatus,
+  CreateBoardMessagePayload,
+  CreateBoardTopicPayload,
   CreateRunPayload,
   NativeEventAgentName,
   NativeEventKind,
@@ -8,9 +17,11 @@ import type {
   NodeRecord,
   NodeStatus,
   NotificationDeliveryRecord,
+  PatchBoardTopicPayload,
   PushConfigRecord,
   PushEventFilterKey,
   PushSubscriptionTestResponse,
+  ReorderBoardTopicsPayload,
   RunEventItem,
   RunRecord,
   ThreadRecord,
@@ -21,11 +32,13 @@ import type {
 export class ApiClientError extends Error {
   readonly code: string;
   readonly status: number;
+  readonly next?: string[];
 
-  constructor(status: number, code: string, message: string) {
+  constructor(status: number, code: string, message: string, next?: string[]) {
     super(message);
     this.status = status;
     this.code = code;
+    this.next = next;
   }
 }
 
@@ -48,14 +61,18 @@ async function requestJson<T>(path: string, token: string, init: RequestInit = {
   });
 
   const data = (await res.json().catch(() => null)) as
-    | ({ ok?: boolean; error?: { code?: string; message?: string } } & T)
+    | ({ ok?: boolean; error?: { code?: string; message?: string; next?: string[] } } & T)
     | null;
 
   if (!res.ok) {
+    const next = Array.isArray(data?.error?.next)
+      ? data.error.next.filter((item): item is string => typeof item === "string")
+      : undefined;
     throw new ApiClientError(
       res.status,
       data?.error?.code ?? "HTTP_ERROR",
-      data?.error?.message ?? `请求失败 (${res.status})`
+      data?.error?.message ?? `请求失败 (${res.status})`,
+      next
     );
   }
   return (data ?? {}) as T;
@@ -63,7 +80,7 @@ async function requestJson<T>(path: string, token: string, init: RequestInit = {
 
 export const apiClient = {
   fetchMe(token: string) {
-    return requestJson<{ ok: true; principal: { kind: string; scope: "admin" | "client" | "node" } }>(
+    return requestJson<{ ok: true; principal: AuthPrincipal }>(
       "/api/v1/auth/me",
       token
     );
@@ -195,6 +212,7 @@ export const apiClient = {
       scope: "admin" | "client" | "node";
       bound_node_id?: string;
       allowed_nodes?: string[];
+      allowed_board_prefixes?: string[];
       allow_unsandboxed?: boolean;
       max_depth_limit?: number;
       webhook_url?: string;
@@ -213,6 +231,7 @@ export const apiClient = {
     body: {
       bound_node_id?: string | null;
       allowed_nodes?: string[];
+      allowed_board_prefixes?: string[];
       allow_unsandboxed?: boolean;
       max_depth_limit?: number;
       webhook_url?: string;
@@ -409,5 +428,139 @@ export const apiClient = {
         body: JSON.stringify({})
       }
     );
+  },
+
+  fetchBoardChannels(token: string) {
+    return requestJson<{ ok: true; channels: BoardChannelSummary[] }>(
+      "/api/v1/board/channels",
+      token
+    );
+  },
+
+  fetchBoardTopics(
+    token: string,
+    params: {
+      channel?: string;
+      external_ref?: string;
+      status?: BoardTopicStatus;
+      has_open_question?: boolean;
+      q?: string;
+      sort?: "recent" | "order";
+      limit?: number;
+    } = {}
+  ) {
+    const sp = new URLSearchParams();
+    if (params.channel) sp.set("channel", params.channel);
+    if (params.external_ref) sp.set("external_ref", params.external_ref);
+    if (params.status) sp.set("status", params.status);
+    if (params.has_open_question !== undefined) {
+      sp.set("has_open_question", params.has_open_question ? "true" : "false");
+    }
+    if (params.q) sp.set("q", params.q);
+    if (params.sort) sp.set("sort", params.sort);
+    if (params.limit !== undefined) sp.set("limit", String(params.limit));
+    const qs = sp.toString();
+    return requestJson<{ ok: true; topics: BoardTopic[] }>(
+      `/api/v1/board/topics${qs ? `?${qs}` : ""}`,
+      token
+    );
+  },
+
+  createBoardTopic(token: string, body: CreateBoardTopicPayload) {
+    return requestJson<{ ok: true; topic: BoardTopic; created?: boolean }>(
+      "/api/v1/board/topics",
+      token,
+      {
+        method: "POST",
+        body: JSON.stringify(body)
+      }
+    );
+  },
+
+  patchBoardTopic(token: string, topicId: string, patch: PatchBoardTopicPayload) {
+    return requestJson<{ ok: true; topic: BoardTopic }>(
+      `/api/v1/board/topics/${encodeURIComponent(topicId)}`,
+      token,
+      {
+        method: "PATCH",
+        body: JSON.stringify(patch)
+      }
+    );
+  },
+
+  reorderBoardTopics(token: string, body: ReorderBoardTopicsPayload) {
+    return requestJson<{ ok: true; topics: BoardTopic[] }>(
+      "/api/v1/board/topics/reorder",
+      token,
+      {
+        method: "POST",
+        body: JSON.stringify(body)
+      }
+    );
+  },
+
+  fetchBoardTopicMessages(
+    token: string,
+    topicId: string,
+    params: { after_seq?: number; limit?: number } = {}
+  ) {
+    const sp = new URLSearchParams();
+    if (params.after_seq !== undefined) sp.set("after_seq", String(params.after_seq));
+    if (params.limit !== undefined) sp.set("limit", String(params.limit));
+    const qs = sp.toString();
+    return requestJson<{
+      ok: true;
+      topic: BoardTopic;
+      messages: BoardMessage[];
+      cursor: number;
+    }>(`/api/v1/board/topics/${encodeURIComponent(topicId)}/messages${qs ? `?${qs}` : ""}`, token);
+  },
+
+  postBoardMessage(token: string, topicId: string, body: CreateBoardMessagePayload) {
+    return requestJson<{
+      ok: true;
+      topic: BoardTopic;
+      message: BoardMessage;
+      cursor: number;
+      deduplicated?: boolean;
+    }>(`/api/v1/board/topics/${encodeURIComponent(topicId)}/messages`, token, {
+      method: "POST",
+      body: JSON.stringify(body)
+    });
+  },
+
+  answerBoardQuestion(token: string, messageId: string, body: AnswerBoardQuestionPayload) {
+    return requestJson<{
+      ok: true;
+      topic: BoardTopic;
+      question: BoardMessage;
+      answer: BoardMessage;
+      cursor: number;
+    }>(`/api/v1/board/messages/${encodeURIComponent(messageId)}/answer`, token, {
+      method: "POST",
+      body: JSON.stringify(body)
+    });
+  },
+
+  fetchBoardEvents(
+    token: string,
+    params: {
+      channel?: string;
+      topic_id?: string;
+      after_cursor?: number;
+      limit?: number;
+    } = {}
+  ) {
+    const sp = new URLSearchParams();
+    if (params.channel) sp.set("channel", params.channel);
+    if (params.topic_id) sp.set("topic_id", params.topic_id);
+    if (params.after_cursor !== undefined) sp.set("after_cursor", String(params.after_cursor));
+    if (params.limit !== undefined) sp.set("limit", String(params.limit));
+    const qs = sp.toString();
+    return requestJson<{
+      ok: true;
+      events: BoardEvent[];
+      next_cursor: number;
+    }>(`/api/v1/board/events${qs ? `?${qs}` : ""}`, token);
   }
 };

@@ -9,6 +9,7 @@ import hashlib
 import http.server
 import json
 import os
+import shlex
 import shutil
 import signal
 import socket
@@ -19,6 +20,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -156,6 +158,7 @@ class LocalSubstrate:
                 "name": "blind-assistant",
                 "scope": "client",
                 "allowed_nodes": ["macmini", "mbp"],
+                "allowed_board_prefixes": ["proj/demo"],
                 "max_depth_limit": 1,
             },
         )["token"]
@@ -330,10 +333,45 @@ def seed_completed_run(
     raise RuntimeError(f"Seeded run {run['id']} failed to finish")
 
 
+def extract_subcommand(argv: list[str]) -> str:
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--":
+            return argv[i + 1] if i + 1 < len(argv) else ""
+        if a == "--json" or a.startswith("--url=") or a.startswith("--token="):
+            i += 1
+            continue
+        if a in ("--url", "--token"):
+            i += 2
+            continue
+        if a.startswith("-"):
+            i += 1
+            continue
+        return a
+    return ""
+
+
+def strip_variable_payload(obj: object, is_board: bool) -> object:
+    if isinstance(obj, list):
+        return [strip_variable_payload(item, is_board) for item in obj]
+    if not isinstance(obj, dict):
+        return obj
+    out = {}
+    for k, v in obj.items():
+        if not is_board and k in ("output_preview", "output_md"):
+            continue
+        if is_board and k in ("text_md", "data"):
+            continue
+        out[k] = strip_variable_payload(v, is_board)
+    return out
+
+
 def execute_contract_scenario(substrate: LocalSubstrate, scenario: dict) -> tuple[bool, dict]:
     sid = scenario["id"]
     sandbox = BlindedEnv(substrate, sid)
     to_cancel: list[str] = []
+    trial_nonce = uuid.uuid4().hex[:8]
     try:
         if sid == "E-01":
             # Step 1: ambiguous -d demo (expect 64 + WORKDIR_AMBIGUOUS + error.details.candidates)
@@ -441,6 +479,148 @@ def execute_contract_scenario(substrate: LocalSubstrate, scenario: dict) -> tupl
             assert rc == 78, f"E-08 expected exit 78, got rc={rc} {out}"
             assert out.get("error", {}).get("code") == "DEPTH_LIMIT_EXCEEDED", f"Expected DEPTH_LIMIT_EXCEEDED: {out}"
 
+        elif sid == "E-09":
+            ext_ref = f"cnb:org/demo#e09-{trial_nonce}"
+            handoff_data = json.dumps({
+                "repo": "org/demo",
+                "branch": "feat/123",
+                "commit_sha": "a1b2c3d",
+                "next_action": "verify on linux-dev",
+            })
+            rc1, out1, _ = sandbox.call_ahub(
+                [
+                    "--json", "board", "post", "proj/demo",
+                    "--ref", ext_ref,
+                    "--title", "Issue 123 handoff",
+                    "--kind", "handoff",
+                    "--status", "in_progress",
+                    "--as", "codex-reviewer",
+                    "--node", "mbp",
+                    "--data", handoff_data,
+                    "-",
+                ],
+                "Handoff ready. token=secret_e09_must_redact",
+            )
+            assert rc1 == 0 and out1.get("ok") is True, f"E-09 post failed: rc={rc1} {out1}"
+            msg1 = out1.get("message", {})
+            top1 = out1.get("topic", {})
+            assert msg1.get("kind") == "handoff", f"E-09 expected kind=handoff: {msg1}"
+            assert msg1.get("actor_profile") == "codex-reviewer", f"E-09 actor_profile mismatch: {msg1}"
+            assert msg1.get("source_node") == "mbp", f"E-09 source_node mismatch: {msg1}"
+            assert top1.get("status") == "in_progress", f"E-09 expected status=in_progress: {top1}"
+            assert "latest_handoff" not in top1, f"E-09 post must omit redundant topic.latest_handoff: {top1}"
+            assert "secret_e09_must_redact" not in json.dumps(out1), f"E-09 secret leaked in post output: {out1}"
+            assert "[REDACTED]" in msg1.get("text_md", ""), f"E-09 expected [REDACTED] marker: {msg1}"
+
+            # Step 2: fresh cross-machine read strictly via --ref (NO --topic)
+            rc2, out2, _ = sandbox.call_ahub(
+                ["--json", "board", "read", "proj/demo", "--ref", ext_ref, "--limit", "20"]
+            )
+            assert rc2 == 0 and out2.get("ok") is True, f"E-09 read --ref failed: rc={rc2} {out2}"
+            assert out2.get("topic", {}).get("external_ref") == ext_ref, f"E-09 topic external_ref mismatch: {out2}"
+            assert "secret_e09_must_redact" not in json.dumps(out2), f"E-09 secret leaked in read output: {out2}"
+            msgs2 = out2.get("messages", [])
+            handoff_msg = next((m for m in msgs2 if m.get("kind") == "handoff"), None)
+            assert handoff_msg is not None, f"E-09 missing handoff message in read output: {out2}"
+            assert handoff_msg.get("actor_scope") == "client", f"E-09 expected actor_scope=client: {handoff_msg}"
+            assert handoff_msg.get("actor_profile") == "codex-reviewer", f"E-09 actor_profile mismatch: {handoff_msg}"
+            assert handoff_msg.get("source_node") == "mbp", f"E-09 source_node mismatch: {handoff_msg}"
+            assert handoff_msg.get("data", {}).get("branch") == "feat/123", f"E-09 branch mismatch: {handoff_msg}"
+            assert handoff_msg.get("data", {}).get("commit_sha") == "a1b2c3d", f"E-09 commit_sha mismatch: {handoff_msg}"
+
+        elif sid == "E-10":
+            ext_ref = f"cnb:org/demo#e10-{trial_nonce}"
+            rc1, out1, _ = sandbox.call_ahub(
+                [
+                    "--json", "board", "ask", "proj/demo",
+                    "--ref", ext_ref,
+                    "--title", "Decision 456",
+                    "--as", "agy-worker",
+                    "--node", "linux-dev",
+                    "--option", "Option A",
+                    "--option", "Option B",
+                    "--wait", "600ms",
+                    "-",
+                ],
+                "Select migration path?",
+            )
+            assert rc1 == 24, f"E-10 expected initial exit 24, got rc={rc1} {out1}"
+            tid = out1.get("topic_id") or (out1.get("topic") or {}).get("id")
+            qid = out1.get("message_id") or (out1.get("question") or {}).get("id")
+            cursor = out1.get("cursor")
+            assert tid and qid and isinstance(cursor, int) and cursor >= 1, f"E-10 ask timeout missing ids/cursor: {out1}"
+
+            server_tl = api_json(substrate.hub_url, substrate.admin_token, f"/api/v1/board/topics/{tid}/messages")
+            assert server_tl["topic"]["status"] == "blocked", f"E-10 server topic must stay blocked: {server_tl}"
+            server_q = next((m for m in server_tl["messages"] if m["id"] == qid), None)
+            assert server_q and server_q["question_state"] == "open", f"E-10 question must stay open after exit 24: {server_tl}"
+
+            ans_err: list[Exception] = []
+
+            def _answer_later() -> None:
+                try:
+                    time.sleep(0.35)
+                    api_json(
+                        substrate.hub_url,
+                        substrate.admin_token,
+                        f"/api/v1/board/messages/{qid}/answer",
+                        "POST",
+                        {
+                            "selected_option": "Option A",
+                            "answer_text": "Option A",
+                            "actor_profile": "admin-web",
+                        },
+                    )
+                except Exception as exc:
+                    ans_err.append(exc)
+
+            bg = threading.Thread(target=_answer_later, daemon=True)
+            bg.start()
+            rc2, out2, _ = sandbox.call_ahub(
+                ["--json", "board", "wait", "proj/demo", "--topic", tid, "--after", str(cursor), "--timeout", "10s"]
+            )
+            bg.join(timeout=5)
+            assert not ans_err, f"E-10 background admin answer failed: {ans_err[0]}"
+            assert rc2 == 0 and out2.get("ok") is True, f"E-10 wait failed: rc={rc2} {out2}"
+            assert out2.get("question", {}).get("question_state") == "answered", f"E-10 expected answered question: {out2}"
+            assert out2.get("answer", {}).get("kind") == "answer", f"E-10 expected answer payload: {out2}"
+            assert out2.get("answer", {}).get("text_md") == "Option A", f"E-10 answer text mismatch: {out2}"
+            assert out2.get("topic", {}).get("status") == "todo", f"E-10 expected restored todo status: {out2}"
+            assert "latest_handoff" not in out2.get("topic", {}), f"E-10 wait must omit latest_handoff: {out2}"
+            ask_calls = [
+                t
+                for t in sandbox.traces()
+                if extract_subcommand(t["argv"]) == "board" and "ask" in t["argv"]
+            ]
+            assert len(ask_calls) == 1, f"E-10 must not re-ask after exit 24: {ask_calls}"
+
+        elif sid == "E-11":
+            api_json(
+                substrate.hub_url,
+                substrate.admin_token,
+                "/api/v1/board/topics",
+                "POST",
+                {"channel": "proj/demo", "title": f"E-11 active topic {trial_nonce}", "status": "todo"},
+            )
+            rc1, out1, _ = sandbox.call_ahub(["--json", "board", "read", "ops/prod"])
+            assert rc1 == 78, f"E-11 expected exit 78, got rc={rc1} {out1}"
+            assert out1.get("ok") is False, f"E-11 expected ok=false: {out1}"
+            err1 = out1.get("error", {})
+            assert err1.get("code") == "FORBIDDEN_SCOPE", f"E-11 expected FORBIDDEN_SCOPE: {out1}"
+            next_list = err1.get("next", [])
+            assert isinstance(next_list, list) and len(next_list) >= 1, f"E-11 missing error.next: {out1}"
+            cmd_hint = next_list[0]
+            assert isinstance(cmd_hint, str) and cmd_hint.startswith("ahub board ") and "proj/demo" in cmd_hint, (
+                f"E-11 unexpected error.next[0]: {next_list}"
+            )
+            next_args = shlex.split(cmd_hint)
+            if next_args and next_args[0] == "ahub":
+                next_args = next_args[1:]
+            if "--json" not in next_args:
+                next_args = ["--json", *next_args]
+            rc2, out2, _ = sandbox.call_ahub(next_args)
+            assert rc2 == 0 and out2.get("ok") is True, f"E-11 recovery command {next_args} failed: rc={rc2} {out2}"
+
         else:
             raise ValueError(f"Unknown scenario {sid}")
 
@@ -461,19 +641,23 @@ def execute_contract_scenario(substrate: LocalSubstrate, scenario: dict) -> tupl
         min_calls = int(scenario["theoretical_min_calls"])
         wasted = max(0, calls - min_calls)
         env_bytes = 0
+        raw_env_bytes = 0
         for t in traces:
+            is_board = extract_subcommand(t["argv"]) == "board"
+            raw_bytes = len(t["stdout"].encode("utf-8"))
+            raw_env_bytes += raw_bytes
             try:
                 obj = json.loads(t["stdout"])
                 if isinstance(obj, dict):
-                    obj = dict(obj)
-                    obj.pop("output_preview", None)
-                    obj.pop("output_md", None)
-                    env_bytes += len(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+                    stripped = strip_variable_payload(obj, is_board)
+                    env_bytes += len(json.dumps(stripped, ensure_ascii=False).encode("utf-8"))
                     continue
             except Exception:
                 pass
-            env_bytes += len(t["stdout"].encode("utf-8"))
-        token_tax = int((len(sandbox.skill_text.encode("utf-8")) + env_bytes) / 4)
+            env_bytes += raw_bytes
+        skill_bytes = len(sandbox.skill_text.encode("utf-8"))
+        token_tax = int((skill_bytes + env_bytes) / 4)
+        raw_token_tax = int((skill_bytes + raw_env_bytes) / 4)
 
         passed = (
             len(violations) == 0
@@ -486,6 +670,7 @@ def execute_contract_scenario(substrate: LocalSubstrate, scenario: dict) -> tupl
             "wasted": wasted,
             "violations": violations,
             "token_tax": token_tax,
+            "raw_token_tax": raw_token_tax,
         }
     except Exception as exc:
         return False, {"error": str(exc), "calls": len(sandbox.traces()), "wasted": 1, "violations": sandbox.violations(), "token_tax": 0}

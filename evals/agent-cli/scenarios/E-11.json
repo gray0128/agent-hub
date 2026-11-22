@@ -1,0 +1,13 @@
+{
+  "id": "E-11",
+  "name": "借助 error.next 一次自愈",
+  "task_prompt": "尝试读取 ops/prod 频道的协同板内容；若受权限限制失败，依据返回结果中的下一步修复建议一次修正并读取已授权频道。",
+  "theoretical_min_calls": 2,
+  "max_wasted_calls": 0,
+  "assertions": {
+    "first_exit_code": 78,
+    "first_error_code": "FORBIDDEN_SCOPE",
+    "requires_error_next": true,
+    "final_exit_code": 0
+  }
+}

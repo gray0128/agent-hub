@@ -290,6 +290,159 @@ CREATE INDEX IF NOT EXISTS idx_deliveries_channel_sent
   WHERE status = 'sent';
 ```
 
+### 1.3 跨机协同板与双向问答迁移（`migrations/0008_board_coordination_and_questions.sql`）
+
+为在不修改 `threads` / `runs` 既有受控执行域的前提下引入跨机协同主题板、结构化交接、双向阻塞问答与增量事件游标（RFC-0001 Slice 1a），`0008` 迁移按如下 DDL 演进：
+
+```sql
+PRAGMA foreign_keys = ON;
+
+-- 1. 扩展 api_keys：支持 client Key 按频道前缀做 Fail-Closed 协同板授权（默认空数组表示拒绝访问协同板）
+ALTER TABLE api_keys
+  ADD COLUMN allowed_board_prefixes_json TEXT NOT NULL DEFAULT '[]';
+
+-- 2. 跨机共享协同主题表（5 态生命周期 + 排序键）
+CREATE TABLE IF NOT EXISTS board_topics (
+  id TEXT PRIMARY KEY,                              -- top_<ulid>
+  channel TEXT NOT NULL,                            -- 路径式频道，如 proj/demo、ops/fleet（^[a-z0-9][a-z0-9_-]*(/[a-z0-9][a-z0-9_-]*)*$，1..64 字符）
+  title TEXT NOT NULL,
+  external_ref TEXT NOT NULL DEFAULT '',            -- 可选外部工单锚点，如 cnb:org/demo#123
+  status TEXT NOT NULL DEFAULT 'todo'
+    CHECK (status IN ('todo', 'in_progress', 'blocked', 'done', 'archived')),
+  previous_status TEXT NOT NULL DEFAULT ''
+    CHECK (previous_status IN ('', 'todo', 'in_progress')),
+  pinned INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
+  sort_order REAL NOT NULL DEFAULT 0,               -- 供 Slice 1a /reorder 与 Slice 1b 看板拖拽排序（IEEE 754 中点插值）
+  labels_json TEXT NOT NULL DEFAULT '{}',
+  created_by_key_id TEXT REFERENCES api_keys(id) ON DELETE SET NULL,
+  last_message_id TEXT NOT NULL DEFAULT '',
+  last_handoff_message_id TEXT NOT NULL DEFAULT '', -- 指向最新一条 handoff 消息，供右栏交接快照零扫描读取
+  last_event_cursor INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_board_topics_channel_ref
+  ON board_topics (channel, external_ref)
+  WHERE external_ref != '';
+
+CREATE INDEX IF NOT EXISTS idx_board_topics_channel_status_order
+  ON board_topics (channel, status, pinned DESC, sort_order ASC, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_board_topics_recent
+  ON board_topics (updated_at DESC)
+  WHERE status != 'archived';
+
+-- 3. 协同消息与双向问答表
+CREATE TABLE IF NOT EXISTS board_messages (
+  id TEXT PRIMARY KEY,                              -- msg_<ulid>
+  topic_id TEXT NOT NULL REFERENCES board_topics(id) ON DELETE CASCADE,
+  channel TEXT NOT NULL,
+  seq INTEGER NOT NULL CHECK (seq >= 1),
+  kind TEXT NOT NULL CHECK (kind IN ('note', 'handoff', 'question', 'answer', 'artifact')),
+  reply_to_id TEXT REFERENCES board_messages(id) ON DELETE SET NULL,
+  actor_scope TEXT NOT NULL CHECK (actor_scope IN ('admin', 'client')),
+  actor_key_id TEXT REFERENCES api_keys(id) ON DELETE SET NULL,
+  actor_profile TEXT NOT NULL DEFAULT '',           -- 如 codex-reviewer、agy-worker（^[a-z0-9][a-z0-9._@-]{0,39}$）
+  source_node TEXT NOT NULL DEFAULT '',             -- 可选来源节点短名，如 macmini / mbp / linux-dev
+  text_md TEXT NOT NULL DEFAULT '',                 -- 经双端对称脱敏，<= 8192 字符
+  data_json TEXT NOT NULL DEFAULT '{}',             -- 结构化交接或选项元数据，经脱敏，<= 32768 UTF-8 字节
+  idempotency_key TEXT UNIQUE,
+  question_state TEXT NOT NULL DEFAULT ''
+    CHECK (question_state IN ('', 'open', 'answered', 'expired', 'cancelled')),
+  question_options_json TEXT NOT NULL DEFAULT '[]', -- 建议选项字符串数组，<= 8 项
+  question_expires_at TEXT,                         -- 默认创建后 24h（允许 10m..72h），由 Cron 巡检过期
+  answered_message_id TEXT REFERENCES board_messages(id) ON DELETE SET NULL,
+  answered_at TEXT,
+  created_at TEXT NOT NULL,
+  UNIQUE (topic_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_board_messages_topic_seq
+  ON board_messages (topic_id, seq ASC);
+
+CREATE INDEX IF NOT EXISTS idx_board_messages_open_questions
+  ON board_messages (question_state, question_expires_at)
+  WHERE kind = 'question' AND question_state = 'open';
+
+-- 4. 单调有序协同事件日志（提供 cursor 续读与 WS 断线防漏回放）
+CREATE TABLE IF NOT EXISTS board_events (
+  cursor INTEGER PRIMARY KEY AUTOINCREMENT,
+  channel TEXT NOT NULL,
+  topic_id TEXT NOT NULL REFERENCES board_topics(id) ON DELETE CASCADE,
+  message_id TEXT REFERENCES board_messages(id) ON DELETE CASCADE,
+  event_type TEXT NOT NULL CHECK (event_type IN (
+    'topic.created', 'topic.updated', 'message.posted',
+    'question.opened', 'question.answered', 'question.expired', 'question.cancelled'
+  )),
+  actor_profile TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_board_events_channel_cursor
+  ON board_events (channel, cursor ASC);
+
+CREATE INDEX IF NOT EXISTS idx_board_events_topic_cursor
+  ON board_events (topic_id, cursor ASC);
+
+-- 5. 重建 notification_deliveries：扩展 source_kind 支持 'board_message'，并显式重建 0006 + 0007 全部 3 个索引
+CREATE TABLE notification_deliveries_v2 (
+  id TEXT PRIMARY KEY,
+  source_kind TEXT NOT NULL CHECK (source_kind IN ('run', 'native_event', 'board_message')),
+  source_id TEXT NOT NULL,                          -- run_<ulid> / evt_<ulid> / msg_<ulid>
+  trigger_event TEXT NOT NULL,                      -- 新增 'question_opened'
+  node_id TEXT NOT NULL,                            -- board_message 无节点时写入 'board'（source_node || 'board'）
+  channel_kind TEXT NOT NULL CHECK (channel_kind IN ('bot_webhook', 'web_push', 'legacy_webhook')),
+  channel_id TEXT NOT NULL,
+  channel_label TEXT NOT NULL,
+  target_host TEXT NOT NULL,
+  route_mode TEXT NOT NULL DEFAULT 'node_default'
+    CHECK (route_mode IN ('key', 'node_default', 'web_push', 'global_legacy')),
+  status TEXT NOT NULL DEFAULT 'queued'
+    CHECK (status IN ('queued', 'sent', 'failed', 'skipped')),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  http_status INTEGER,
+  error_code TEXT NOT NULL DEFAULT '',
+  error_message TEXT NOT NULL DEFAULT '',
+  sent_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (source_kind, source_id, trigger_event, channel_kind, channel_id)
+);
+
+INSERT INTO notification_deliveries_v2 (
+  id, source_kind, source_id, trigger_event, node_id, channel_kind, channel_id,
+  channel_label, target_host, route_mode, status, attempts, http_status,
+  error_code, error_message, sent_at, created_at, updated_at
+)
+SELECT
+  id, source_kind, source_id, trigger_event, node_id, channel_kind, channel_id,
+  channel_label, target_host, route_mode, status, attempts, http_status,
+  error_code, error_message, sent_at, created_at, updated_at
+FROM notification_deliveries;
+
+DROP TABLE notification_deliveries;
+ALTER TABLE notification_deliveries_v2 RENAME TO notification_deliveries;
+
+CREATE INDEX IF NOT EXISTS idx_deliveries_source
+  ON notification_deliveries (source_kind, source_id, created_at ASC);
+
+CREATE INDEX IF NOT EXISTS idx_deliveries_status_updated
+  ON notification_deliveries (status, updated_at DESC)
+  WHERE status IN ('queued', 'failed');
+
+CREATE INDEX IF NOT EXISTS idx_deliveries_channel_sent
+  ON notification_deliveries (source_kind, channel_kind, channel_id, sent_at DESC)
+  WHERE status = 'sent';
+
+-- 6. 升级存量默认 Web Push 订阅过滤规则：仅对仍持有 0006 精确默认值的行追加 "board_question_opened"，保留用户自定义配置
+UPDATE web_push_subscriptions
+SET event_filter_json = '["run_needs_approval","run_failed","native_interaction_needed","board_question_opened"]'
+WHERE event_filter_json = '["run_needs_approval","run_failed","native_interaction_needed"]';
+```
+
+> 注：SQLite 不支持通过 `ALTER TABLE` 原地修改既有列 `DEFAULT`；新注册浏览器订阅由应用层 `DEFAULT_PUSH_EVENT_FILTER` 统一注入上述 4 项默认值。全系统 `PushEventFilterKey` 共 `8` 项（含第 8 项 `board_question_opened`）；`nodes.default_notify_events_json` 继续保留 `0007` 对受控/原生事件的 `7` 项默认开启集合，并将 `board_question_opened` 作为第 `8` 项按需勾选开关暴露于控制台「节点控制」面板。
+
 ### 字段语义与容量边界
 
 - 所有时间字段统一使用 RFC 3339 UTC 字符串（精度至毫秒，例如 `2026-11-13T04:15:30.123Z`），确保按字典序比较与索引扫描结果一致。
@@ -297,9 +450,13 @@ CREATE INDEX IF NOT EXISTS idx_deliveries_channel_sent
 - `runs.notify_status` D1 列继续保持 `('none', 'queued', 'sent', 'failed')` 枚举以向后兼容调用端 CLI 与 Schema；对外 REST / WebSocket 返回的 `RunRecord` 额外附带可选 `deliveries_summary: { total, sent, queued, failed }` 精确暴露多通道投递计数。
 - `native_events.title` 与 `native_events.summary` 在节点端预脱敏与云端二次脱敏后，分别截断至 `<= 200` 字符与 `<= 4000` 字符。
 - `web_push_subscriptions.subscription_ciphertext` 采用与 `api_keys.notify_webhook_ciphertext` 相同的 `AES-256-GCM` 格式（`v1:<iv_b64url>:<ct_b64url>`，以 `WEBHOOK_ENCRYPTION_KEY` 加密），明文为 `{ endpoint, keys: { p256dh, auth } }`。
-- `threads.sort_order` 与 `runs.priority_order` 使用 IEEE 754 `REAL`（如中点插值法或批量整数重编号），以支持前端 `@dnd-kit` 单次拖拽调整顺序而不必重写全表。
+- `threads.sort_order`、`runs.priority_order` 与 `board_topics.sort_order` 使用 IEEE 754 `REAL`（如中点插值法或批量整数重编号），以支持前端 `@dnd-kit` 单次拖拽调整顺序而不必重写全表（其中协同板 4 列看板拖拽 UI 延后至 Slice 1b，Slice 1a 仅提供 `sort_order` 字段与 `/reorder` 端点）。
+- 协同板标识与容量边界：`board_topics.channel` 匹配正则 `^[a-z0-9][a-z0-9_-]*(/[a-z0-9][a-z0-9_-]*)*$`（`maxLength: 64`，`1..64` 字符，禁止空段 `//`、前导 `/` 与尾随 `/`）；`actor_profile` 匹配 `^[a-z0-9][a-z0-9._@-]{0,39}$`（未署名时存 `''`）；`board_messages.text_md <= 8192` 字符、`data_json <= 32768` UTF-8 字节（`32 KB`）、`question_options_json <= 8` 项（单选项 `1..200` 字符）、`question_expires_at` 默认创建后 `24h`（请求允许 `600..259200` 秒，即 `10m..72h`）；`text_md`、`data_json` 与 `question_options_json` 在入库前统一执行对称 `redactSecrets`。
+- 协同板投递记录的 `node_id` 兼容契约：`notification_deliveries.node_id` 为非空列（`minLength: 1`）。当 `source_kind = 'board_message'` 时，写入 `source_node || 'board'`，在保留既有非空约束的同时准确标示来源节点或无节点协同板来源。
 
 ## 2. 状态机定义与合法迁移
+
+> **Slice 1a 边界声明**：Slice 1a 对以下现行受控 `Run` 7 态状态机与形式化模型 `evals/formal/RunLifecycle.tla` **保持零侵入**；`waiting` DAG 8 态、`0009_waiting_dag_and_schedule.sql`、`runs.actor_profile` 及 `runs.board_topic_id` 持久化延后至 **Slice 2**，`runs.labels_json` 与 `result_schema_json` / `result_json` 延后至 **Slice 3（`0010`）**。
 
 ```mermaid
 stateDiagram-v2
@@ -406,12 +563,14 @@ D1 查询层与 Web Store 共享同一纯函数逻辑推导每条 `native_events
 | `native_interaction_needed` | `interaction_needed` | `native_event` | 是 |
 | `native_turn_summary` | `turn_summary` | `native_event` | 否 |
 | `native_progress` | `progress` | `native_event` | 否 |
+| `board_question_opened` | `question_opened` | `board_message` | 是 |
 
-新注册订阅的默认 `event_filter_json` 为 `["run_needs_approval", "run_failed", "native_interaction_needed"]`。Bot Webhook 与 Web Push 双通道路由边界如下：
+全系统共有 `8` 项 `PushEventFilterKey`（`7` 项受控/原生事件键 + 第 `8` 项 `board_question_opened`）：新注册浏览器 Web Push 订阅默认启用 `["run_needs_approval", "run_failed", "native_interaction_needed", "board_question_opened"]`（`0008` 迁移同步升级仍持有 `0006` 默认 3 项的存量订阅，保留用户自定义过滤不变）；而 `nodes.default_notify_events_json` 保留 `0007` 的 `7` 项受控/原生事件默认开启集合，并将 `board_question_opened` 作为第 `8` 项按需勾选开关暴露于控制台。Bot Webhook 与 Web Push 双通道路由边界如下：
 
 | 事件来源 | Bot Webhook 路由规则 | 浏览器 Web Push 路由规则 |
 | --- | --- | --- |
-| `native_events` | 按 `nodes.default_notify_key_id` Fail-Closed，并过滤 `nodes.default_notify_events`（非 `admin` 作用域剥离，默认启用全部 7 项 `PushEventFilterKey`）；未绑定或未命中事件时仅跳过 Bot 通道，**不阻断 Web Push 通道** | 匹配 `enabled = 1 AND revoked_at IS NULL`、`node_filter_json`（空数组为全部节点）及 `native_<event_kind>` |
+| `native_events` | 按 `nodes.default_notify_key_id` Fail-Closed，并过滤 `nodes.default_notify_events`（非 `admin` 作用域剥离，全集为 `8` 项 `PushEventFilterKey`，其中 `7` 项受控/原生默认启用 + 第 `8` 项 `board_question_opened` 按需开启）；未绑定或未命中事件时仅跳过 Bot 通道，**不阻断 Web Push 通道** | 匹配 `enabled = 1 AND revoked_at IS NULL`、`node_filter_json`（空数组为全部节点）及 `native_<event_kind>` |
+| `board_message`（**仅限 `kind = 'question'`**） | 若 `source_node` 非空且该节点已绑定有效 `default_notify_key_id` 且管理员已在 `nodes.default_notify_events` 中勾选开启第 `8` 项 `board_question_opened`（默认不勾选），可路由至 `node_default` Bot 通道；`note` / `handoff` / `artifact` 在 Slice 1a 不开放 `--notify`，绝不写入 `notification_deliveries` | 仅 `kind = 'question'` 匹配 `enabled = 1 AND revoked_at IS NULL`、`event_filter_json` 包含 `board_question_opened`（新订阅及 `0008` 升级默认开启），且 `node_filter_json` 为空 `[]` 或（`source_node` 非空且命中 `node_filter_json`）；`note` / `handoff` / `artifact` 零投递行 |
 | 人工 / `admin` 发起的 `runs`（`depth = 0`） | 按 `--notify` 或 `nodes.default_notify_key_id`（走 `node_default` 时同步受 `nodes.default_notify_events` 过滤，否则回退 `global_legacy`）路由 | 匹配 `node_filter_json` 与 `run_<status>` |
 | `client` Key 发起的 `runs`（`depth = 0`） | 仅当显式传 `--notify` 时锁定发起方 `client` Key 自身 Webhook（`target = 'none'` 时不发 Bot 回调） | 仅向匹配 `node_filter_json` 的管理员订阅推送 `needs_approval` 与 `failed`（`done` / `cancelled` 绝不触发） |
 | 衍生子任务 `runs`（`depth >= 1`） | 禁止落入 `node_default` | 静默（不向管理员推送 Web Push，防止子任务通知风暴） |
@@ -428,6 +587,33 @@ D1 查询层与 Web Store 共享同一纯函数逻辑推导每条 `native_events
    - 当 `native_session_id != ''` 且同一 `(node_id, agent, native_session_id, channel_kind, channel_id)` 在 `[now - cooldownSec, now]` 内已存在 `status = 'sent'` 的非紧急（`turn_summary` / `progress`）投递时，入库期直接落盘 `status = 'skipped'`（`SESSION_COOLDOWN_ACTIVE`）且不再入队，消费端在发送前亦二次复核。
    - 若所有候选通道均被跳过，外层 `native_events.notify_status` 按规则收敛为 `'skipped'` 并写入对应诊断码（`NO_MATCHING_CHANNELS` / `SUPERSEDED_BY_NEWER_TURN` / `SESSION_COOLDOWN_ACTIVE`）。
 
-### 5.4 原生活动与投递账本留存清理契约（Cron）
+### 5.4 原生活动、协同事件留存清理与提问过期巡检契约（Cron）
 
-每分钟执行的 Cron Trigger（`scheduled`）除调用 `reapExpiredLeases` 外，按环境变量 `NATIVE_EVENTS_RETENTION_DAYS`（默认 `30` 天）分批（如单次上限 `500` 条）滚动删除 `created_at < now - retentionDays` 的过期 `native_events` 与 `notification_deliveries` 记录；受控 `threads` / `runs` 保持现有留存策略不变，且清理失败仅记录日志而绝不阻塞租约巡检。
+每分钟执行的 Cron Trigger（`scheduled`）除调用 `reapExpiredLeases` 外，执行以下两项周期治理（失败仅记录日志而绝不阻塞租约巡检）：
+
+1. **留存清理**：按 `NATIVE_EVENTS_RETENTION_DAYS`（默认 `30` 天）分批（单次上限 `500` 条）滚动删除 `created_at < now - retentionDays` 的过期 `native_events` 与对应 `notification_deliveries`；按 `BOARD_EVENTS_RETENTION_DAYS`（默认 `90` 天）分批清理过期的 `board_events` 事件游标与关联已过期 `board_message` 投递行，**永久保留 `board_topics` 与 `board_messages` 实体**（`threads` / `runs` 保持现有留存策略不变）。
+2. **提问过期与状态自动恢复**：扫描 `board_messages` 中满足 `kind = 'question' AND question_state = 'open' AND question_expires_at IS NOT NULL AND question_expires_at < now` 的记录，CAS 置为 `question_state = 'expired'`、写入 `board_events`（`event_type = 'question.expired'`），并在该主题已无其余 `open` 提问且当前 `status = 'blocked'`、`previous_status != ''` 时恢复 `status = previous_status`（清空 `previous_status = ''`）并经 DO 广播 `board.topic_updated`。
+
+## 6. 跨机协同板状态机、提问联锁与频道权限契约
+
+### 6.1 协同主题 5 态与提问 4 态联锁规则
+
+- **`board_topics.status`（5 态）**：`todo`（待开始）、`in_progress`（进行中）、`blocked`（阻塞/待确认）、`done`（已完成）、`archived`（已归档）。其中 `previous_status` 仅允许 `'' | 'todo' | 'in_progress'`。
+- **`board_messages.question_state`（仅 `kind = 'question'`）**：`open` -> `answered` | `expired` | `cancelled`。其余消息类型（`note`、`handoff`、`answer`、`artifact`）固定为 `''`。
+- **提问开启联锁**：当向主题提交 `kind = 'question'`（初始 `question_state = 'open'`）时，若主题当前 `status IN ('todo', 'in_progress')`，同一事务内记录 `previous_status = status` 并将 `status` 原子推进为 `'blocked'`（若已在 `'blocked'`，保留原 `previous_status` 不覆盖）。
+- **单语句 CAS 作答与状态恢复**：仅 `admin` 作用域可调用 `POST /api/v1/board/messages/:id/answer`，执行如下单语句 CAS：
+  ```sql
+  UPDATE board_messages
+  SET question_state = 'answered', answered_message_id = ?, answered_at = ?
+  WHERE id = ? AND kind = 'question' AND question_state = 'open';
+  ```
+  若 `changes === 0`（问题不存在或已非 `open`），控制面直接拒绝并返回 `409 INVALID_STATE_TRANSITION`（不存在返回 `404 NOT_FOUND`）。当该问题转为 `answered`、`expired` 或 `cancelled` 后，若同一主题内已无其他 `question_state = 'open'` 的消息，且主题仍处于 `status = 'blocked'` 且 `previous_status != ''`，控制面自动恢复 `status = previous_status` 并清空 `previous_status = ''`。
+
+### 6.2 `client` 频道前缀 Fail-Closed 授权规则
+
+- `admin`（及 Cloudflare Access Web 会话）拥有全频道读写与独家答复提问权限。
+- `node` Scope 对全部 `/api/v1/board/*` 接口返回 `403 FORBIDDEN_SCOPE`。
+- `client` Scope 按 `api_keys.allowed_board_prefixes_json` 执行段边界前缀校验（默认 `'[]'` 拒绝全部读写，返回 `403 FORBIDDEN_SCOPE`）：
+  - 若数组包含 `"*"`：允许读写全部频道（仍禁止调用 `/answer`）。
+  - 否则，目标频道 `channel` 必须至少匹配数组中的一项前缀 `p`：`channel === p || channel.startsWith(p + "/")`（严格按 `/` 分段匹配，防止 `"proj/a"` 误放行 `"proj/ab"`）。
+- `POST /api/v1/board/topics/reorder` 在 Slice 1a 完整落地并按 `channel` 校验前缀权限；前端 `@dnd-kit` 4 列看板拖拽 UI 与快捷键流延后至 **Slice 1b**。

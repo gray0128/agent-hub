@@ -351,7 +351,8 @@ test("All 12 admin native-activity & web-push routes enforce strict 403 FORBIDDE
   assert.deepEqual(subRes.json.subscription.event_filter, [
     "run_needs_approval",
     "run_failed",
-    "native_interaction_needed"
+    "native_interaction_needed",
+    "board_question_opened"
   ]);
 
   const listSubs = await harness.callApi("GET", "/api/v1/push-subscriptions", adminTok);

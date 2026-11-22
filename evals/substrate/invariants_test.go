@@ -3,12 +3,16 @@ package substrate
 import (
 	"bytes"
 	"context"
+	"crypto/ecdh"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -30,20 +34,31 @@ import (
 	"github.com/gray0128/agent-hub/internal/selfupdate"
 )
 
+type boardPushHit struct {
+	Method     string
+	Path       string
+	AuthHeader string
+	Urgency    string
+}
+
 type testHarness struct {
-	t            *testing.T
-	rootDir      string
-	tmpDir       string
-	ahubBin      string
-	fakeAgentBin string
-	fakeLogPath  string
-	hubURL       string
-	adminToken   string
-	configDir    string
-	wranglerCmd  *exec.Cmd
-	webhookCh    chan map[string]interface{}
-	releaseSrv   *httptest.Server
-	webhookSrv   *httptest.Server
+	t              *testing.T
+	rootDir        string
+	tmpDir         string
+	d1Dir          string
+	ahubBin        string
+	fakeAgentBin   string
+	fakeLogPath    string
+	hubURL         string
+	adminToken     string
+	configDir      string
+	wranglerCmd    *exec.Cmd
+	webhookCh      chan map[string]interface{}
+	pushCh         chan boardPushHit
+	vapidPublicKey string
+	releaseSrv     *httptest.Server
+	webhookSrv     *httptest.Server
+	pushSrv        *httptest.Server
 
 	mu      sync.Mutex
 	daemons []*exec.Cmd
@@ -98,6 +113,40 @@ func newTestHarness(t *testing.T) *testHarness {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
+
+	pushCh := make(chan boardPushHit, 32)
+	pushSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		select {
+		case pushCh <- boardPushHit{
+			Method:     r.Method,
+			Path:       r.URL.Path,
+			AuthHeader: r.Header.Get("Authorization"),
+			Urgency:    r.Header.Get("Urgency"),
+		}:
+		default:
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte("mock-push-201"))
+	}))
+
+	vapidPriv, err := ecdh.P256().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate VAPID P-256 key: %v", err)
+	}
+	vapidPubRaw := vapidPriv.PublicKey().Bytes()
+	if len(vapidPubRaw) != 65 || vapidPubRaw[0] != 0x04 {
+		t.Fatalf("unexpected VAPID public key bytes length %d", len(vapidPubRaw))
+	}
+	vapidPublicKey := base64.RawURLEncoding.EncodeToString(vapidPubRaw)
+	vapidPrivJWKBytes, _ := json.Marshal(map[string]string{
+		"kty": "EC",
+		"crv": "P-256",
+		"x":   base64.RawURLEncoding.EncodeToString(vapidPubRaw[1:33]),
+		"y":   base64.RawURLEncoding.EncodeToString(vapidPubRaw[33:65]),
+		"d":   base64.RawURLEncoding.EncodeToString(vapidPriv.Bytes()),
+	})
+	vapidPrivateJWK := string(vapidPrivJWKBytes)
 
 	// Mock release server for /dl/version.json & /dl/ahub-<os>-<arch>
 	binBytes, err := os.ReadFile(ahubBin)
@@ -164,6 +213,10 @@ func newTestHarness(t *testing.T) *testHarness {
 		"--var", "GROK_WEBHOOK_URL:"+webhookSrv.URL,
 		"--var", "WEBHOOK_ENCRYPTION_KEY:eval-test-master-secret-32bytes!!",
 		"--var", "RELEASE_BASE_URL:"+releaseSrv.URL,
+		"--var", "VAPID_PUBLIC_KEY:"+vapidPublicKey,
+		"--var", "VAPID_PRIVATE_JWK:"+vapidPrivateJWK,
+		"--var", "VAPID_SUBJECT:mailto:ops@bobocai.win",
+		"--var", "ALLOW_LOOPBACK_PUSH_FOR_TEST:true",
 	)
 	wranglerCmd.Dir = workerDir
 	wranglerCmd.Env = append(os.Environ(), "CI=1")
@@ -175,19 +228,23 @@ func newTestHarness(t *testing.T) *testHarness {
 	}
 
 	h := &testHarness{
-		t:            t,
-		rootDir:      root,
-		tmpDir:       tmpDir,
-		ahubBin:      ahubBin,
-		fakeAgentBin: fakeBin,
-		fakeLogPath:  filepath.Join(tmpDir, "fakeagent.jsonl"),
-		hubURL:       hubURL,
-		adminToken:   adminToken,
-		configDir:    cfgDir,
-		wranglerCmd:  wranglerCmd,
-		webhookCh:    webhookCh,
-		releaseSrv:   releaseSrv,
-		webhookSrv:   webhookSrv,
+		t:              t,
+		rootDir:        root,
+		tmpDir:         tmpDir,
+		d1Dir:          d1Dir,
+		ahubBin:        ahubBin,
+		fakeAgentBin:   fakeBin,
+		fakeLogPath:    filepath.Join(tmpDir, "fakeagent.jsonl"),
+		hubURL:         hubURL,
+		adminToken:     adminToken,
+		configDir:      cfgDir,
+		wranglerCmd:    wranglerCmd,
+		webhookCh:      webhookCh,
+		pushCh:         pushCh,
+		vapidPublicKey: vapidPublicKey,
+		releaseSrv:     releaseSrv,
+		webhookSrv:     webhookSrv,
+		pushSrv:        pushSrv,
 	}
 
 	t.Cleanup(func() {
@@ -198,6 +255,7 @@ func newTestHarness(t *testing.T) *testHarness {
 		}
 		h.releaseSrv.Close()
 		h.webhookSrv.Close()
+		h.pushSrv.Close()
 	})
 
 	// Wait until HTTP server accepts /api/v1/auth/me
@@ -264,6 +322,138 @@ func (h *testHarness) createKeyWithWebhook(name, scope, boundNodeID string, allo
 		h.t.Fatal(err)
 	}
 	return out.Key.ID, out.Token
+}
+
+func (h *testHarness) doJSON(method, reqPath, tok string, payload interface{}) (int, []byte) {
+	h.t.Helper()
+	var bodyReader io.Reader
+	if payload != nil {
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			h.t.Fatalf("marshal %s %s: %v", method, reqPath, err)
+		}
+		bodyReader = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequest(method, h.hubURL+reqPath, bodyReader)
+	if err != nil {
+		h.t.Fatalf("new request %s %s: %v", method, reqPath, err)
+	}
+	if tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		h.t.Fatalf("do request %s %s: %v", method, reqPath, err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		h.t.Fatalf("read response %s %s: %v", method, reqPath, err)
+	}
+	return resp.StatusCode, raw
+}
+
+func (h *testHarness) mustCreateKeyWithPrefixes(name, scope string, allowedNodes, allowedBoardPrefixes []string, includePrefixesField bool) (string, string) {
+	h.t.Helper()
+	payload := map[string]interface{}{
+		"name":            name,
+		"scope":           scope,
+		"allowed_nodes":   allowedNodes,
+		"max_depth_limit": 1,
+	}
+	if includePrefixesField {
+		if allowedBoardPrefixes == nil {
+			allowedBoardPrefixes = []string{}
+		}
+		payload["allowed_board_prefixes"] = allowedBoardPrefixes
+	}
+	st, raw := h.doJSON(http.MethodPost, "/api/v1/keys", h.adminToken, payload)
+	if st != http.StatusCreated {
+		h.t.Fatalf("mustCreateKeyWithPrefixes(%s) failed (%d): %s", name, st, string(raw))
+	}
+	var out struct {
+		Key struct {
+			ID string `json:"id"`
+		} `json:"key"`
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		h.t.Fatalf("decode key response: %v (%s)", err, string(raw))
+	}
+	return out.Key.ID, out.Token
+}
+
+func (h *testHarness) d1SQLiteFile() string {
+	h.t.Helper()
+	var found string
+	_ = filepath.WalkDir(h.d1Dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d == nil || d.IsDir() {
+			return nil
+		}
+		if strings.HasSuffix(d.Name(), ".sqlite") {
+			found = p
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	if found == "" {
+		h.t.Fatalf("no .sqlite file found under d1Dir %s", h.d1Dir)
+	}
+	return found
+}
+
+func (h *testHarness) execD1SQL(sqlStmt string) string {
+	h.t.Helper()
+	dbFile := h.d1SQLiteFile()
+	if sqliteBin, err := exec.LookPath("sqlite3"); err == nil {
+		cmd := exec.Command(sqliteBin, "-cmd", ".timeout 5000", dbFile, sqlStmt)
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			return strings.TrimSpace(string(out))
+		}
+	}
+	cmd := exec.Command(
+		"pnpm", "exec", "wrangler", "d1", "execute", "DB",
+		"--local", "--persist-to", h.d1Dir, "--json", "--command", sqlStmt,
+	)
+	cmd.Dir = filepath.Join(h.rootDir, "apps", "hub-worker")
+	cmd.Env = append(os.Environ(), "CI=1")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		h.t.Fatalf("execD1SQL failed (%v): %s\nsql: %s", err, string(out), sqlStmt)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func (h *testHarness) queryD1Count(sqlStmt string) int {
+	h.t.Helper()
+	dbFile := h.d1SQLiteFile()
+	if sqliteBin, err := exec.LookPath("sqlite3"); err == nil {
+		cmd := exec.Command(sqliteBin, "-cmd", ".timeout 5000", dbFile, sqlStmt)
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			n, convErr := strconv.Atoi(strings.TrimSpace(string(out)))
+			if convErr == nil {
+				return n
+			}
+		}
+	}
+	out := h.execD1SQL(sqlStmt)
+	var rows []struct {
+		Results []map[string]interface{} `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(out), &rows); err == nil && len(rows) > 0 && len(rows[0].Results) > 0 {
+		for _, v := range rows[0].Results[0] {
+			if f, ok := v.(float64); ok {
+				return int(f)
+			}
+		}
+	}
+	h.t.Fatalf("failed to parse D1 count from %q (sql=%s)", out, sqlStmt)
+	return -1
 }
 
 func (h *testHarness) makeWorkspaceDir(name string) string {
@@ -1935,4 +2125,907 @@ func TestInvariant_NodeDefaultNotifyAndNativeEventsIsolation(t *testing.T) {
 			t.Fatalf("expected acked/superseded event %s excluded from --unacked, got %+v", ev.ID, ev)
 		}
 	}
+}
+
+type evalDeliveriesSummary struct {
+	Total  int `json:"total"`
+	Sent   int `json:"sent"`
+	Queued int `json:"queued"`
+	Failed int `json:"failed"`
+}
+
+type evalBoardTopic struct {
+	ID                   string            `json:"id"`
+	Channel              string            `json:"channel"`
+	Title                string            `json:"title"`
+	ExternalRef          string            `json:"external_ref"`
+	Status               string            `json:"status"`
+	PreviousStatus       string            `json:"previous_status"`
+	Pinned               bool              `json:"pinned"`
+	SortOrder            float64           `json:"sort_order"`
+	Labels               map[string]string `json:"labels"`
+	LastMessageID        string            `json:"last_message_id"`
+	LastHandoffMessageID string            `json:"last_handoff_message_id"`
+	LastEventCursor      int64             `json:"last_event_cursor"`
+	OpenQuestionCount    int               `json:"open_question_count"`
+	MessageCount         int               `json:"message_count"`
+}
+
+type evalBoardMessage struct {
+	ID                string                 `json:"id"`
+	TopicID           string                 `json:"topic_id"`
+	Channel           string                 `json:"channel"`
+	Seq               int                    `json:"seq"`
+	Kind              string                 `json:"kind"`
+	ReplyToID         *string                `json:"reply_to_id"`
+	ActorScope        string                 `json:"actor_scope"`
+	ActorProfile      string                 `json:"actor_profile"`
+	SourceNode        string                 `json:"source_node"`
+	TextMD            string                 `json:"text_md"`
+	Data              map[string]interface{} `json:"data"`
+	QuestionState     string                 `json:"question_state"`
+	QuestionOptions   []string               `json:"question_options"`
+	QuestionExpiresAt *string                `json:"question_expires_at"`
+	AnsweredMessageID *string                `json:"answered_message_id"`
+	DeliveriesSummary *evalDeliveriesSummary `json:"deliveries_summary,omitempty"`
+}
+
+type evalBoardTopicResp struct {
+	OK      bool           `json:"ok"`
+	Topic   evalBoardTopic `json:"topic"`
+	Created bool           `json:"created"`
+}
+
+type evalBoardPostMsgResp struct {
+	OK      bool             `json:"ok"`
+	Topic   evalBoardTopic   `json:"topic"`
+	Message evalBoardMessage `json:"message"`
+	Cursor  int64            `json:"cursor"`
+}
+
+type evalBoardMessagesResp struct {
+	OK       bool               `json:"ok"`
+	Topic    evalBoardTopic     `json:"topic"`
+	Messages []evalBoardMessage `json:"messages"`
+	Cursor   int64              `json:"cursor"`
+}
+
+type evalBoardAnswerResp struct {
+	OK       bool             `json:"ok"`
+	Topic    evalBoardTopic   `json:"topic"`
+	Question evalBoardMessage `json:"question"`
+	Answer   evalBoardMessage `json:"answer"`
+	Cursor   int64            `json:"cursor"`
+}
+
+type evalBoardEventsResp struct {
+	OK         bool `json:"ok"`
+	NextCursor int64 `json:"next_cursor"`
+	Events     []struct {
+		Cursor    int64   `json:"cursor"`
+		Channel   string  `json:"channel"`
+		TopicID   string  `json:"topic_id"`
+		MessageID *string `json:"message_id"`
+		EventType string  `json:"event_type"`
+	} `json:"events"`
+}
+
+type evalBoardErrorEnv struct {
+	OK    bool `json:"ok"`
+	Error struct {
+		Code    string   `json:"code"`
+		Message string   `json:"message"`
+		Next    []string `json:"next,omitempty"`
+	} `json:"error"`
+}
+
+func TestInvariant_BoardCoordinationAndQuestions(t *testing.T) {
+	h := newTestHarness(t)
+
+	mustCreateTopic := func(tb testing.TB, tok, channel, title, extRef, status string) evalBoardTopic {
+		tb.Helper()
+		body := map[string]interface{}{
+			"channel": channel,
+			"title":   title,
+		}
+		if extRef != "" {
+			body["external_ref"] = extRef
+		}
+		if status != "" {
+			body["status"] = status
+		}
+		st, raw := h.doJSON(http.MethodPost, "/api/v1/board/topics", tok, body)
+		if st != http.StatusCreated && st != http.StatusOK {
+			tb.Fatalf("create topic (%s/%s) failed (%d): %s", channel, title, st, string(raw))
+		}
+		var out evalBoardTopicResp
+		if err := json.Unmarshal(raw, &out); err != nil {
+			tb.Fatalf("decode topic resp: %v (%s)", err, string(raw))
+		}
+		return out.Topic
+	}
+
+	mustPostMsg := func(tb testing.TB, tok, topicID string, payload map[string]interface{}) evalBoardPostMsgResp {
+		tb.Helper()
+		st, raw := h.doJSON(http.MethodPost, "/api/v1/board/topics/"+topicID+"/messages", tok, payload)
+		if st != http.StatusCreated && st != http.StatusOK {
+			tb.Fatalf("post board msg on %s failed (%d): %s", topicID, st, string(raw))
+		}
+		var out evalBoardPostMsgResp
+		if err := json.Unmarshal(raw, &out); err != nil {
+			tb.Fatalf("decode post msg resp: %v (%s)", err, string(raw))
+		}
+		return out
+	}
+
+	mustGetMessages := func(tb testing.TB, tok, topicID string) evalBoardMessagesResp {
+		tb.Helper()
+		st, raw := h.doJSON(http.MethodGet, "/api/v1/board/topics/"+topicID+"/messages", tok, nil)
+		if st != http.StatusOK {
+			tb.Fatalf("get board messages %s failed (%d): %s", topicID, st, string(raw))
+		}
+		var out evalBoardMessagesResp
+		if err := json.Unmarshal(raw, &out); err != nil {
+			tb.Fatalf("decode board messages: %v (%s)", err, string(raw))
+		}
+		return out
+	}
+
+	mustAnswerQuestion := func(tb testing.TB, tok, qid, option, text string) evalBoardAnswerResp {
+		tb.Helper()
+		payload := map[string]interface{}{
+			"actor_profile": "admin-ops",
+		}
+		if option != "" {
+			payload["selected_option"] = option
+		}
+		if text != "" {
+			payload["answer_text"] = text
+		}
+		st, raw := h.doJSON(http.MethodPost, "/api/v1/board/messages/"+qid+"/answer", tok, payload)
+		if st != http.StatusOK {
+			tb.Fatalf("answer question %s failed (%d): %s", qid, st, string(raw))
+		}
+		var out evalBoardAnswerResp
+		if err := json.Unmarshal(raw, &out); err != nil {
+			tb.Fatalf("decode answer resp: %v (%s)", err, string(raw))
+		}
+		return out
+	}
+
+	assertForbiddenScope := func(tb testing.TB, method, reqPath, tok string, payload interface{}) {
+		tb.Helper()
+		st, raw := h.doJSON(method, reqPath, tok, payload)
+		if st != http.StatusForbidden {
+			tb.Fatalf("expected 403 FORBIDDEN_SCOPE for %s %s, got (%d): %s", method, reqPath, st, string(raw))
+		}
+		var errEnv evalBoardErrorEnv
+		if err := json.Unmarshal(raw, &errEnv); err != nil || errEnv.OK || errEnv.Error.Code != "FORBIDDEN_SCOPE" {
+			tb.Fatalf("expected error.code=FORBIDDEN_SCOPE for %s %s, got: %s", method, reqPath, string(raw))
+		}
+	}
+
+	// I-8: Concurrent admin CAS answer uniqueness (1x 200, 7x 409 INVALID_STATE_TRANSITION, 1 answer row)
+	t.Run("I8_BoardQuestionAnswerCASUniqueness", func(t *testing.T) {
+		top := mustCreateTopic(t, h.adminToken, "proj/demo", "CAS Concurrent Answer", "", "todo")
+		qPost := mustPostMsg(t, h.adminToken, top.ID, map[string]interface{}{
+			"kind":             "question",
+			"text_md":          "Choose rollout path?",
+			"actor_profile":    "agy-worker",
+			"question_options": []string{"Approve", "Reject"},
+		})
+
+		const workers = 8
+		startCh := make(chan struct{})
+		type casRes struct {
+			status int
+			raw    []byte
+		}
+		resCh := make(chan casRes, workers)
+		var wg sync.WaitGroup
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				<-startCh
+				st, raw := h.doJSON(
+					http.MethodPost,
+					"/api/v1/board/messages/"+qPost.Message.ID+"/answer",
+					h.adminToken,
+					map[string]interface{}{
+						"selected_option": "Approve",
+						"answer_text":     fmt.Sprintf("goroutine-%d", idx),
+						"actor_profile":   "admin-ops",
+					},
+				)
+				resCh <- casRes{status: st, raw: raw}
+			}(i)
+		}
+		close(startCh)
+		wg.Wait()
+		close(resCh)
+
+		count200 := 0
+		count409 := 0
+		for r := range resCh {
+			switch r.status {
+			case http.StatusOK:
+				count200++
+			case http.StatusConflict:
+				count409++
+				var errEnv evalBoardErrorEnv
+				if err := json.Unmarshal(r.raw, &errEnv); err != nil || errEnv.Error.Code != "INVALID_STATE_TRANSITION" {
+					t.Fatalf("expected 409 INVALID_STATE_TRANSITION, got: %s", string(r.raw))
+				}
+			default:
+				t.Fatalf("unexpected CAS answer status %d: %s", r.status, string(r.raw))
+			}
+		}
+		if count200 != 1 || count409 != workers-1 {
+			t.Fatalf("expected 1x 200 and %dx 409, got 200=%d 409=%d", workers-1, count200, count409)
+		}
+
+		tl := mustGetMessages(t, h.adminToken, top.ID)
+		answerRows := 0
+		var answeredMsg evalBoardMessage
+		var questionMsg evalBoardMessage
+		for _, m := range tl.Messages {
+			if m.ID == qPost.Message.ID {
+				questionMsg = m
+			}
+			if m.Kind == "answer" && m.ReplyToID != nil && *m.ReplyToID == qPost.Message.ID {
+				answerRows++
+				answeredMsg = m
+			}
+		}
+		if answerRows != 1 {
+			t.Fatalf("expected strictly 1 answer row in D1, got %d", answerRows)
+		}
+		if questionMsg.QuestionState != "answered" || questionMsg.AnsweredMessageID == nil || *questionMsg.AnsweredMessageID != answeredMsg.ID {
+			t.Fatalf("question row not linked cleanly to sole answer: q=%+v ans=%+v", questionMsg, answeredMsg)
+		}
+	})
+
+	// I-9: Question interlock (todo|in_progress -> blocked), non-overwrite previous_status, & Cron expiry restore
+	t.Run("I9_QuestionInterlockAndStatusRestoration", func(t *testing.T) {
+		top := mustCreateTopic(t, h.adminToken, "proj/demo", "Interlock Status Restore", "", "todo")
+		q1 := mustPostMsg(t, h.adminToken, top.ID, map[string]interface{}{
+			"kind":             "question",
+			"text_md":          "First blocking question",
+			"question_options": []string{"Proceed"},
+		})
+		if q1.Topic.Status != "blocked" || q1.Topic.PreviousStatus != "todo" || q1.Topic.OpenQuestionCount != 1 {
+			t.Fatalf("expected todo->blocked with previous_status=todo, open=1; got %+v", q1.Topic)
+		}
+
+		q2 := mustPostMsg(t, h.adminToken, top.ID, map[string]interface{}{
+			"kind":             "question",
+			"text_md":          "Second blocking question",
+			"question_options": []string{"Confirm"},
+		})
+		if q2.Topic.Status != "blocked" || q2.Topic.PreviousStatus != "todo" || q2.Topic.OpenQuestionCount != 2 {
+			t.Fatalf("second question overwrote previous_status or miscounted open questions: %+v", q2.Topic)
+		}
+
+		ans1 := mustAnswerQuestion(t, h.adminToken, q1.Message.ID, "Proceed", "Proceed")
+		if ans1.Topic.Status != "blocked" || ans1.Topic.PreviousStatus != "todo" || ans1.Topic.OpenQuestionCount != 1 {
+			t.Fatalf("answering 1st of 2 open questions must keep blocked/todo, got %+v", ans1.Topic)
+		}
+
+		ans2 := mustAnswerQuestion(t, h.adminToken, q2.Message.ID, "Confirm", "Confirm")
+		if ans2.Topic.Status != "todo" || ans2.Topic.PreviousStatus != "" || ans2.Topic.OpenQuestionCount != 0 {
+			t.Fatalf("answering last open question must restore todo & clear previous_status, got %+v", ans2.Topic)
+		}
+
+		stPatch, rawPatch := h.doJSON(http.MethodPatch, "/api/v1/board/topics/"+top.ID, h.adminToken, map[string]interface{}{
+			"status": "in_progress",
+		})
+		if stPatch != http.StatusOK {
+			t.Fatalf("PATCH status=in_progress failed (%d): %s", stPatch, string(rawPatch))
+		}
+
+		q3 := mustPostMsg(t, h.adminToken, top.ID, map[string]interface{}{
+			"kind":    "question",
+			"text_md": "Blocking in_progress topic",
+		})
+		if q3.Topic.Status != "blocked" || q3.Topic.PreviousStatus != "in_progress" {
+			t.Fatalf("expected in_progress->blocked with previous_status=in_progress, got %+v", q3.Topic)
+		}
+		ans3 := mustAnswerQuestion(t, h.adminToken, q3.Message.ID, "", "Unblocked")
+		if ans3.Topic.Status != "in_progress" || ans3.Topic.PreviousStatus != "" {
+			t.Fatalf("expected restore to in_progress & cleared previous_status, got %+v", ans3.Topic)
+		}
+
+		// Cron expiry: backdate question_expires_at in local D1 SQLite, then hit /cdn-cgi/handler/scheduled
+		q4 := mustPostMsg(t, h.adminToken, top.ID, map[string]interface{}{
+			"kind":    "question",
+			"text_md": "Will expire via Cron",
+		})
+		if q4.Topic.Status != "blocked" || q4.Topic.PreviousStatus != "in_progress" {
+			t.Fatalf("expected blocked/in_progress before cron expiry, got %+v", q4.Topic)
+		}
+		h.execD1SQL(fmt.Sprintf(
+			"UPDATE board_messages SET question_expires_at = '2020-01-01T00:00:00.000Z' WHERE id = '%s';",
+			q4.Message.ID,
+		))
+		schedResp, err := http.Get(h.hubURL + "/cdn-cgi/handler/scheduled")
+		if err != nil {
+			t.Fatalf("trigger /cdn-cgi/handler/scheduled failed: %v", err)
+		}
+		_ = schedResp.Body.Close()
+		if schedResp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 from /cdn-cgi/handler/scheduled, got %d", schedResp.StatusCode)
+		}
+
+		expiredOK := false
+		var lastTL evalBoardMessagesResp
+		for i := 0; i < 20; i++ {
+			lastTL = mustGetMessages(t, h.adminToken, top.ID)
+			for _, m := range lastTL.Messages {
+				if m.ID == q4.Message.ID && m.QuestionState == "expired" && lastTL.Topic.Status == "in_progress" && lastTL.Topic.PreviousStatus == "" && lastTL.Topic.OpenQuestionCount == 0 {
+					expiredOK = true
+					break
+				}
+			}
+			if expiredOK {
+				break
+			}
+			time.Sleep(150 * time.Millisecond)
+		}
+		if !expiredOK {
+			t.Fatalf("Cron expiry did not transition Q4 to expired and restore topic status=in_progress (open_question_count=0): %+v", lastTL)
+		}
+
+		stExpiredAns, rawExpiredAns := h.doJSON(http.MethodPost, "/api/v1/board/messages/"+q4.Message.ID+"/answer", h.adminToken, map[string]interface{}{
+			"answer_text": "too late after expiry",
+		})
+		if stExpiredAns != http.StatusConflict {
+			t.Fatalf("expected 409 INVALID_STATE_TRANSITION answering expired question %s, got (%d): %s", q4.Message.ID, stExpiredAns, string(rawExpiredAns))
+		}
+		var expiredErr evalBoardErrorEnv
+		if err := json.Unmarshal(rawExpiredAns, &expiredErr); err != nil || expiredErr.Error.Code != "INVALID_STATE_TRANSITION" {
+			t.Fatalf("expected error.code=INVALID_STATE_TRANSITION answering expired question %s, got: %s", q4.Message.ID, string(rawExpiredAns))
+		}
+
+		stEv, rawEv := h.doJSON(http.MethodGet, "/api/v1/board/events?topic_id="+top.ID, h.adminToken, nil)
+		if stEv != http.StatusOK {
+			t.Fatalf("GET board events failed (%d): %s", stEv, string(rawEv))
+		}
+		var evResp evalBoardEventsResp
+		_ = json.Unmarshal(rawEv, &evResp)
+		sawExpiredEv := false
+		for _, ev := range evResp.Events {
+			if ev.EventType == "question.expired" && ev.MessageID != nil && *ev.MessageID == q4.Message.ID {
+				sawExpiredEv = true
+				break
+			}
+		}
+		if !sawExpiredEv {
+			t.Fatalf("expected question.expired board_event for %s, got %s", q4.Message.ID, string(rawEv))
+		}
+	})
+
+	// Shared client/node keys for I-10 and I-11
+	_, clientDemoTok := h.mustCreateKeyWithPrefixes("board-client-demo", "client", []string{"macmini"}, []string{"proj/demo"}, true)
+
+	// I-10: Client Fail-Closed prefix isolation, node scope 403 across all 9 routes + WS, CLI node.json isolation
+	t.Run("I10_PrefixFailClosed_NodeForbidden_And_CredentialIsolation", func(t *testing.T) {
+		_, clientEmptyTok := h.mustCreateKeyWithPrefixes("board-client-empty", "client", []string{"macmini"}, []string{}, true)
+		_, clientOmittedTok := h.mustCreateKeyWithPrefixes("board-client-omitted", "client", []string{"macmini"}, nil, false)
+
+		for _, tok := range []string{clientEmptyTok, clientOmittedTok} {
+			assertForbiddenScope(t, http.MethodGet, "/api/v1/board/channels", tok, nil)
+			assertForbiddenScope(t, http.MethodGet, "/api/v1/board/topics", tok, nil)
+			assertForbiddenScope(t, http.MethodPost, "/api/v1/board/topics", tok, map[string]interface{}{"channel": "proj/demo", "title": "denied"})
+			assertForbiddenScope(t, http.MethodGet, "/api/v1/board/events", tok, nil)
+		}
+
+		demoTop := mustCreateTopic(t, h.adminToken, "proj/demo", "Demo Root Topic", "", "todo")
+		demoSubTop := mustCreateTopic(t, h.adminToken, "proj/demo/sub", "Demo Sub Topic", "", "todo")
+		demo2Top := mustCreateTopic(t, h.adminToken, "proj/demo2", "Boundary Sibling Topic", "", "todo")
+		opsTop := mustCreateTopic(t, h.adminToken, "ops/fleet", "Ops Fleet Topic", "", "todo")
+		demoQ := mustPostMsg(t, h.adminToken, demoTop.ID, map[string]interface{}{
+			"kind":             "question",
+			"text_md":          "Client cannot answer even own channel",
+			"question_options": []string{"Yes"},
+		})
+
+		// Authorized prefix access ("proj/demo" and "proj/demo/sub")
+		_ = mustCreateTopic(t, clientDemoTok, "proj/demo", "Client Allowed Root", "", "todo")
+		_ = mustCreateTopic(t, clientDemoTok, "proj/demo/sub", "Client Allowed Sub", "", "todo")
+		_ = mustPostMsg(t, clientDemoTok, demoSubTop.ID, map[string]interface{}{
+			"kind":          "note",
+			"text_md":       "Authorized sub-channel note",
+			"actor_profile": "client-bot",
+		})
+		stDemoList, _ := h.doJSON(http.MethodGet, "/api/v1/board/topics?channel=proj/demo", clientDemoTok, nil)
+		stSubList, _ := h.doJSON(http.MethodGet, "/api/v1/board/topics?channel=proj/demo/sub", clientDemoTok, nil)
+		if stDemoList != http.StatusOK || stSubList != http.StatusOK {
+			t.Fatalf("expected 200 for proj/demo (%d) & proj/demo/sub (%d)", stDemoList, stSubList)
+		}
+
+		// Segment-boundary & cross-prefix rejections + client answer rejection
+		assertForbiddenScope(t, http.MethodPost, "/api/v1/board/topics", clientDemoTok, map[string]interface{}{"channel": "proj/demo2", "title": "denied"})
+		assertForbiddenScope(t, http.MethodPost, "/api/v1/board/topics", clientDemoTok, map[string]interface{}{"channel": "ops/fleet", "title": "denied"})
+		assertForbiddenScope(t, http.MethodGet, "/api/v1/board/topics?channel=proj/demo2", clientDemoTok, nil)
+		assertForbiddenScope(t, http.MethodGet, "/api/v1/board/topics?channel=ops/fleet", clientDemoTok, nil)
+		assertForbiddenScope(t, http.MethodGet, "/api/v1/board/events?channel=proj/demo2", clientDemoTok, nil)
+		assertForbiddenScope(t, http.MethodGet, "/api/v1/board/events?channel=ops/fleet", clientDemoTok, nil)
+		assertForbiddenScope(t, http.MethodPost, "/api/v1/board/topics/reorder", clientDemoTok, map[string]interface{}{
+			"channel":           "proj/demo2",
+			"status":            "todo",
+			"ordered_topic_ids": []string{demo2Top.ID},
+		})
+		assertForbiddenScope(t, http.MethodGet, "/api/v1/board/topics/"+demo2Top.ID+"/messages", clientDemoTok, nil)
+		assertForbiddenScope(t, http.MethodPost, "/api/v1/board/topics/"+demo2Top.ID+"/messages", clientDemoTok, map[string]interface{}{
+			"kind":    "note",
+			"text_md": "boundary sibling write",
+		})
+		assertForbiddenScope(t, http.MethodPatch, "/api/v1/board/topics/"+demo2Top.ID, clientDemoTok, map[string]interface{}{"status": "done"})
+		assertForbiddenScope(t, http.MethodGet, "/api/v1/board/topics/"+opsTop.ID+"/messages", clientDemoTok, nil)
+		assertForbiddenScope(t, http.MethodPost, "/api/v1/board/topics/"+opsTop.ID+"/messages", clientDemoTok, map[string]interface{}{
+			"kind":    "note",
+			"text_md": "cross-prefix write",
+		})
+		assertForbiddenScope(t, http.MethodPatch, "/api/v1/board/topics/"+opsTop.ID, clientDemoTok, map[string]interface{}{"status": "done"})
+		assertForbiddenScope(t, http.MethodPost, "/api/v1/board/messages/"+demoQ.Message.ID+"/answer", clientDemoTok, map[string]interface{}{
+			"selected_option": "Yes",
+			"answer_text":     "client hijack",
+		})
+
+		// Unfiltered list endpoints must exclude proj/demo2 and ops/fleet
+		stCh, rawCh := h.doJSON(http.MethodGet, "/api/v1/board/channels", clientDemoTok, nil)
+		if stCh != http.StatusOK {
+			t.Fatalf("client GET /board/channels failed (%d): %s", stCh, string(rawCh))
+		}
+		if strings.Contains(string(rawCh), "proj/demo2") || strings.Contains(string(rawCh), "ops/fleet") {
+			t.Fatalf("unfiltered /board/channels leaked unauthorized channel: %s", string(rawCh))
+		}
+		stTop, rawTop := h.doJSON(http.MethodGet, "/api/v1/board/topics", clientDemoTok, nil)
+		if stTop != http.StatusOK {
+			t.Fatalf("client GET /board/topics failed (%d): %s", stTop, string(rawTop))
+		}
+		if strings.Contains(string(rawTop), demo2Top.ID) || strings.Contains(string(rawTop), opsTop.ID) {
+			t.Fatalf("unfiltered /board/topics leaked unauthorized topics: %s", string(rawTop))
+		}
+		stEv, rawEv := h.doJSON(http.MethodGet, "/api/v1/board/events", clientDemoTok, nil)
+		if stEv != http.StatusOK {
+			t.Fatalf("client GET /board/events failed (%d): %s", stEv, string(rawEv))
+		}
+		if strings.Contains(string(rawEv), demo2Top.ID) || strings.Contains(string(rawEv), opsTop.ID) {
+			t.Fatalf("unfiltered /board/events leaked unauthorized events: %s", string(rawEv))
+		}
+
+		// node scope 403 across all 9 /api/v1/board/* endpoints + /ws/stream
+		nodeTok := h.createKey("board-probe-node", "node", "board-probe-node", []string{"board-probe-node"}, 0)
+		nodeProbes := []struct {
+			method string
+			path   string
+			body   interface{}
+		}{
+			{http.MethodGet, "/api/v1/board/channels", nil},
+			{http.MethodGet, "/api/v1/board/topics", nil},
+			{http.MethodPost, "/api/v1/board/topics", map[string]interface{}{"channel": "proj/demo", "title": "node denied"}},
+			{http.MethodPatch, "/api/v1/board/topics/" + demoTop.ID, map[string]interface{}{"status": "done"}},
+			{http.MethodPost, "/api/v1/board/topics/reorder", map[string]interface{}{"channel": "proj/demo", "status": "todo", "ordered_topic_ids": []string{demoTop.ID}}},
+			{http.MethodGet, "/api/v1/board/topics/" + demoTop.ID + "/messages", nil},
+			{http.MethodPost, "/api/v1/board/topics/" + demoTop.ID + "/messages", map[string]interface{}{"kind": "note", "text_md": "node denied"}},
+			{http.MethodPost, "/api/v1/board/messages/" + demoQ.Message.ID + "/answer", map[string]interface{}{"answer_text": "node denied"}},
+			{http.MethodGet, "/api/v1/board/events", nil},
+		}
+		for _, p := range nodeProbes {
+			assertForbiddenScope(t, p.method, p.path, nodeTok, p.body)
+		}
+
+		wsCtx, wsCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer wsCancel()
+		for _, wsCheck := range []struct {
+			tok  string
+			path string
+		}{
+			{nodeTok, "/ws/stream"},
+			{nodeTok, "/ws/stream?topic_id=" + demoTop.ID},
+			{clientDemoTok, "/ws/stream"},
+			{clientDemoTok, "/ws/stream?topic_id=" + demo2Top.ID},
+			{clientDemoTok, "/ws/stream?topic_id=" + opsTop.ID},
+		} {
+			c, err := api.NewClient(h.hubURL, wsCheck.tok).DialWebSocket(wsCtx, wsCheck.path)
+			if err == nil {
+				_ = c.Close(websocket.StatusNormalClosure, "unexpected")
+				t.Fatalf("expected WS 403 FORBIDDEN_SCOPE for %s, dial succeeded", wsCheck.path)
+			}
+			var apiErr *api.APIError
+			if !errors.As(err, &apiErr) || apiErr.HTTPStatus != http.StatusForbidden || apiErr.Body.Code != "FORBIDDEN_SCOPE" {
+				t.Fatalf("expected WS 403 FORBIDDEN_SCOPE for %s, got %v", wsCheck.path, err)
+			}
+		}
+
+		// CLI credential isolation: ahub board MUST NEVER read node.json (0 requests to probeSrv)
+		var probeMu sync.Mutex
+		var probeAuths []string
+		probeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			probeMu.Lock()
+			probeAuths = append(probeAuths, r.Method+" "+r.URL.Path+" auth="+r.Header.Get("Authorization"))
+			probeMu.Unlock()
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"ok":false,"error":{"code":"FORBIDDEN_SCOPE","message":"node token must not reach server"}}`))
+		}))
+		defer probeSrv.Close()
+
+		isoDir := t.TempDir()
+		nodeJSONBytes, _ := json.Marshal(map[string]interface{}{
+			"node_id":  "board-probe-node",
+			"hub_url":  probeSrv.URL,
+			"token":    nodeTok,
+			"skip_dirs": []string{".git"},
+		})
+		if err := os.WriteFile(filepath.Join(isoDir, "node.json"), nodeJSONBytes, 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		isolatedCmds := [][]string{
+			{"--json", "board", "read", "proj/demo"},
+			{"--json", "board", "post", "proj/demo", "--kind", "note", "isolated check"},
+			{"--json", "board", "ask", "proj/demo", "--wait", "500ms", "isolated q"},
+			{"--json", "board", "wait", "proj/demo", "--topic", demoTop.ID, "--timeout", "500ms"},
+		}
+		for _, urlEnv := range []string{probeSrv.URL, ""} {
+			for _, args := range isolatedCmds {
+				cmd := exec.Command(h.ahubBin, args...)
+				cmd.Env = []string{
+					"PATH=" + os.Getenv("PATH"),
+					"HOME=" + isoDir,
+					"AHUB_CONFIG_DIR=" + isoDir,
+					"AHUB_URL=" + urlEnv,
+					"AHUB_TOKEN=",
+				}
+				out, runErr := cmd.CombinedOutput()
+				if runErr == nil {
+					t.Fatalf("expected non-zero exit when only node.json exists for %v, got 0 (%s)", args, string(out))
+				}
+			}
+		}
+		probeMu.Lock()
+		leaked := append([]string(nil), probeAuths...)
+		probeMu.Unlock()
+		if len(leaked) != 0 {
+			t.Fatalf("ahub board leaked node.json credential over HTTP: %v", leaked)
+		}
+	})
+
+	// I-11: /ws/stream?topic_id=&after_cursor= zero-loss replay, question-only push, ask --wait timeout 24 + wait recovery
+	t.Run("I11_TopicStreamAfterCursorReplay_QuestionOnlyPush_And_AskWaitTimeout", func(t *testing.T) {
+		uaPriv, err := ecdh.P256().GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		uaAuth := make([]byte, 16)
+		if _, err := rand.Read(uaAuth); err != nil {
+			t.Fatal(err)
+		}
+		stSub, rawSub := h.doJSON(http.MethodPost, "/api/v1/push-subscriptions", h.adminToken, map[string]interface{}{
+			"label": "i11-board-push",
+			"subscription": map[string]interface{}{
+				"endpoint": h.pushSrv.URL + "/push/board-i11",
+				"keys": map[string]string{
+					"p256dh": base64.RawURLEncoding.EncodeToString(uaPriv.PublicKey().Bytes()),
+					"auth":   base64.RawURLEncoding.EncodeToString(uaAuth),
+				},
+			},
+			"node_filter": []string{},
+		})
+		if stSub != http.StatusCreated && stSub != http.StatusOK {
+			t.Fatalf("create push subscription failed (%d): %s", stSub, string(rawSub))
+		}
+		// Drain any prior hits
+		for len(h.pushCh) > 0 {
+			<-h.pushCh
+		}
+
+		wsTop := mustCreateTopic(t, clientDemoTok, "proj/demo", "WS Replay & Push Topic", "", "todo")
+		otherTop := mustCreateTopic(t, h.adminToken, "ops/fleet", "Unrelated Other Topic", "", "todo")
+
+		qWS := mustPostMsg(t, clientDemoTok, wsTop.ID, map[string]interface{}{
+			"kind":             "question",
+			"text_md":          "Need WS replay check?",
+			"actor_profile":    "agy-worker",
+			"source_node":      "macmini",
+			"question_options": []string{"Yes", "No"},
+		})
+		cursor0 := qWS.Cursor
+
+		select {
+		case hit := <-h.pushCh:
+			if hit.Urgency != "high" {
+				t.Fatalf("expected high urgency Web Push for board question, got %+v", hit)
+			}
+		case <-time.After(8 * time.Second):
+			t.Fatalf("expected Web Push hit for board question %s within 8s", qWS.Message.ID)
+		}
+
+		wsCtx, wsCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer wsCancel()
+		wsClient := api.NewClient(h.hubURL, clientDemoTok)
+		conn1, err := wsClient.DialWebSocket(wsCtx, fmt.Sprintf("/ws/stream?topic_id=%s&after_cursor=%d", wsTop.ID, cursor0))
+		if err != nil {
+			t.Fatalf("dial topic stream failed: %v", err)
+		}
+		_, snapRaw1, err := conn1.Read(wsCtx)
+		if err != nil {
+			t.Fatalf("read snapshot1 failed: %v", err)
+		}
+		var snap1 map[string]interface{}
+		if err := json.Unmarshal(snapRaw1, &snap1); err != nil {
+			t.Fatalf("decode snapshot1: %v", err)
+		}
+		if snap1["type"] != "snapshot" {
+			t.Fatalf("expected snapshot frame, got %+v", snap1)
+		}
+		topicMap, _ := snap1["topic"].(map[string]interface{})
+		if topicMap["id"] != wsTop.ID {
+			t.Fatalf("expected snapshot topic.id=%s, got %+v", wsTop.ID, snap1["topic"])
+		}
+		for _, forbiddenKey := range []string{"native_events", "open_interaction_count", "open_board_question_count"} {
+			if _, exists := snap1[forbiddenKey]; exists {
+				t.Fatalf("topic stream snapshot leaked %q: %s", forbiddenKey, string(snapRaw1))
+			}
+		}
+		_ = conn1.Close(websocket.StatusNormalClosure, "offline window")
+
+		// While disconnected: admin posts note on wsTop, unrelated note on otherTop, and answers qWS
+		offlineNote := mustPostMsg(t, h.adminToken, wsTop.ID, map[string]interface{}{
+			"kind":          "note",
+			"text_md":       "Offline context note",
+			"actor_profile": "admin-web",
+		})
+		_ = mustPostMsg(t, h.adminToken, otherTop.ID, map[string]interface{}{
+			"kind":    "note",
+			"text_md": "Must never leak into wsTop stream",
+		})
+		_ = mustAnswerQuestion(t, h.adminToken, qWS.Message.ID, "Yes", "Yes")
+
+		conn2, err := wsClient.DialWebSocket(wsCtx, fmt.Sprintf("/ws/stream?topic_id=%s&after_cursor=%d", wsTop.ID, cursor0))
+		if err != nil {
+			t.Fatalf("reconnect topic stream failed: %v", err)
+		}
+		defer conn2.Close(websocket.StatusNormalClosure, "done")
+
+		sawNote := false
+		sawAnswer := false
+		var lastCursor float64 = float64(cursor0)
+		replayDeadline := time.Now().Add(8 * time.Second)
+		for time.Now().Before(replayDeadline) && (!sawNote || !sawAnswer) {
+			rCtx, rCancel := context.WithTimeout(wsCtx, 2*time.Second)
+			_, frameRaw, rErr := conn2.Read(rCtx)
+			rCancel()
+			if rErr != nil {
+				break
+			}
+			var frame map[string]interface{}
+			if err := json.Unmarshal(frameRaw, &frame); err != nil {
+				t.Fatalf("decode WS replay frame: %v", err)
+			}
+			if _, leaked := frame["open_board_question_count"]; leaked {
+				t.Fatalf("client topic stream leaked open_board_question_count: %s", string(frameRaw))
+			}
+			if strings.Contains(string(frameRaw), otherTop.ID) || strings.Contains(string(frameRaw), "ops/fleet") {
+				t.Fatalf("client topic stream leaked unrelated topic frame: %s", string(frameRaw))
+			}
+			if cVal, ok := frame["cursor"].(float64); ok && frame["type"] != "snapshot" {
+				if cVal <= float64(cursor0) || cVal <= lastCursor {
+					t.Fatalf("expected strictly ascending replay cursor > %d (prev %.0f), got %.0f in %s", cursor0, lastCursor, cVal, string(frameRaw))
+				}
+				lastCursor = cVal
+			}
+			switch frame["type"] {
+			case "board.message_created":
+				msgMap, _ := frame["message"].(map[string]interface{})
+				if msgMap["id"] == offlineNote.Message.ID {
+					sawNote = true
+				}
+			case "board.question_answered":
+				if !sawNote {
+					t.Fatalf("expected missed note (%s) to arrive before question_answered in replay order, got: %s", offlineNote.Message.ID, string(frameRaw))
+				}
+				qMap, _ := frame["question"].(map[string]interface{})
+				ansMap, _ := frame["answer"].(map[string]interface{})
+				if qMap["id"] == qWS.Message.ID && qMap["question_state"] == "answered" && ansMap["kind"] == "answer" {
+					sawAnswer = true
+				}
+			}
+		}
+		if !sawNote || !sawAnswer {
+			t.Fatalf("after_cursor replay missed frames: sawNote=%v sawAnswer=%v", sawNote, sawAnswer)
+		}
+
+		// question-only push boundary: note, handoff, artifact produce 0 push hits and 0 notification_deliveries rows
+		for len(h.pushCh) > 0 {
+			<-h.pushCh
+		}
+		notePost := mustPostMsg(t, clientDemoTok, wsTop.ID, map[string]interface{}{
+			"kind":    "note",
+			"text_md": "Non-push note",
+		})
+		handoffPost := mustPostMsg(t, clientDemoTok, wsTop.ID, map[string]interface{}{
+			"kind":    "handoff",
+			"text_md": "Non-push handoff",
+			"data":    map[string]string{"branch": "feat/ws"},
+		})
+		artifactPost := mustPostMsg(t, clientDemoTok, wsTop.ID, map[string]interface{}{
+			"kind":    "artifact",
+			"text_md": "Non-push artifact",
+			"data":    map[string]string{"path": "dist/out.tar.gz"},
+		})
+
+		select {
+		case stray := <-h.pushCh:
+			t.Fatalf("non-question message triggered Web Push: %+v", stray)
+		case <-time.After(450 * time.Millisecond):
+		}
+
+		tlAfter := mustGetMessages(t, h.adminToken, wsTop.ID)
+		for _, m := range tlAfter.Messages {
+			switch m.ID {
+			case qWS.Message.ID:
+				if m.DeliveriesSummary == nil || m.DeliveriesSummary.Total < 1 || m.DeliveriesSummary.Sent < 1 {
+					t.Fatalf("expected question %s deliveries_summary.sent >= 1, got %+v", m.ID, m.DeliveriesSummary)
+				}
+			case notePost.Message.ID, handoffPost.Message.ID, artifactPost.Message.ID:
+				if m.DeliveriesSummary != nil && m.DeliveriesSummary.Total > 0 {
+					t.Fatalf("non-question %s (%s) must have 0 deliveries, got %+v", m.ID, m.Kind, m.DeliveriesSummary)
+				}
+			}
+		}
+
+		nonQCount := h.queryD1Count(fmt.Sprintf(
+			"SELECT COUNT(*) FROM notification_deliveries WHERE source_id IN ('%s','%s','%s');",
+			notePost.Message.ID, handoffPost.Message.ID, artifactPost.Message.ID,
+		))
+		if nonQCount != 0 {
+			t.Fatalf("expected 0 notification_deliveries rows for note/handoff/artifact, got %d", nonQCount)
+		}
+		qDlvCount := h.queryD1Count(fmt.Sprintf(
+			"SELECT COUNT(*) FROM notification_deliveries WHERE source_kind = 'board_message' AND source_id = '%s' AND trigger_event = 'question_opened';",
+			qWS.Message.ID,
+		))
+		if qDlvCount < 1 {
+			t.Fatalf("expected >= 1 notification_deliveries row for question %s, got %d", qWS.Message.ID, qDlvCount)
+		}
+
+		// ahub board ask --wait timeout exit 24 (without cancelling server question) + ahub board wait recovery
+		cliCfgDir := t.TempDir()
+		runIsolatedBoardCLI := func(args ...string) (int, string, string) {
+			cmd := exec.Command(h.ahubBin, args...)
+			cmd.Env = []string{
+				"PATH=" + os.Getenv("PATH"),
+				"HOME=" + cliCfgDir,
+				"AHUB_CONFIG_DIR=" + cliCfgDir,
+				"AHUB_URL=" + h.hubURL,
+				"AHUB_TOKEN=" + clientDemoTok,
+			}
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout = &stdout
+			cmd.Stderr = &stderr
+			runErr := cmd.Run()
+			code := 0
+			if runErr != nil {
+				var ee *exec.ExitError
+				if errors.As(runErr, &ee) {
+					code = ee.ExitCode()
+				} else {
+					code = 1
+				}
+			}
+			return code, stdout.String(), stderr.String()
+		}
+
+		askCode, askOut, askErr := runIsolatedBoardCLI(
+			"--json", "board", "ask", "proj/demo",
+			"--ref", "cnb:org/demo#i11-wait",
+			"--title", "I11 Wait Recovery",
+			"--as", "agy-worker",
+			"--node", "macmini",
+			"--option", "Opt1",
+			"--option", "Opt2",
+			"--wait", "800ms",
+			"Pick strategy?",
+		)
+		if askCode != api.ExitWaitTimeout {
+			t.Fatalf("expected exit 24 from board ask --wait timeout, got %d\nstdout=%s\nstderr=%s", askCode, askOut, askErr)
+		}
+		var askJSON map[string]interface{}
+		if err := json.Unmarshal(bytes.TrimSpace([]byte(askOut)), &askJSON); err != nil {
+			t.Fatalf("board ask --wait --json must emit 1 valid JSON object: %v (%s)", err, askOut)
+		}
+		extractID := func(m map[string]interface{}, topKey, nestedKey string) string {
+			if s, ok := m[topKey].(string); ok && s != "" {
+				return s
+			}
+			if sub, ok := m[nestedKey].(map[string]interface{}); ok {
+				if s, ok := sub["id"].(string); ok {
+					return s
+				}
+			}
+			return ""
+		}
+		askTopicID := extractID(askJSON, "topic_id", "topic")
+		askMsgID := extractID(askJSON, "message_id", "question")
+		askCursorFloat, _ := askJSON["cursor"].(float64)
+		askCursor := int64(askCursorFloat)
+		if askTopicID == "" || askMsgID == "" || askCursor < 1 {
+			t.Fatalf("board ask timeout JSON missing topic/question/cursor: %s", askOut)
+		}
+
+		tlTimedOut := mustGetMessages(t, h.adminToken, askTopicID)
+		if tlTimedOut.Topic.Status != "blocked" {
+			t.Fatalf("expected topic to stay blocked after ask --wait timeout, got %+v", tlTimedOut.Topic)
+		}
+		foundOpenQ := false
+		for _, m := range tlTimedOut.Messages {
+			if m.ID == askMsgID && m.QuestionState == "open" {
+				foundOpenQ = true
+				break
+			}
+		}
+		if !foundOpenQ {
+			t.Fatalf("expected question %s to remain open on server after exit 24", askMsgID)
+		}
+
+		answerErrCh := make(chan error, 1)
+		go func() {
+			time.Sleep(350 * time.Millisecond)
+			bodyBytes, marshalErr := json.Marshal(map[string]interface{}{
+				"actor_profile":   "admin-ops",
+				"selected_option": "Opt1",
+				"answer_text":     "Opt1",
+			})
+			if marshalErr != nil {
+				answerErrCh <- marshalErr
+				return
+			}
+			req, reqErr := http.NewRequest(http.MethodPost, h.hubURL+"/api/v1/board/messages/"+askMsgID+"/answer", bytes.NewReader(bodyBytes))
+			if reqErr != nil {
+				answerErrCh <- reqErr
+				return
+			}
+			req.Header.Set("Authorization", "Bearer "+h.adminToken)
+			req.Header.Set("Content-Type", "application/json")
+			resp, doErr := http.DefaultClient.Do(req)
+			if doErr != nil {
+				answerErrCh <- doErr
+				return
+			}
+			raw, readErr := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if readErr != nil {
+				answerErrCh <- readErr
+				return
+			}
+			if resp.StatusCode != http.StatusOK {
+				answerErrCh <- fmt.Errorf("answer question %s failed (%d): %s", askMsgID, resp.StatusCode, string(raw))
+				return
+			}
+			answerErrCh <- nil
+		}()
+
+		waitCode, waitOut, waitErr := runIsolatedBoardCLI(
+			"--json", "board", "wait", "proj/demo",
+			"--topic", askTopicID,
+			"--after", strconv.FormatInt(askCursor, 10),
+			"--timeout", "10s",
+		)
+		if ansErr := <-answerErrCh; ansErr != nil {
+			t.Fatalf("background answer question failed: %v", ansErr)
+		}
+		if waitCode != 0 {
+			t.Fatalf("expected exit 0 from board wait after admin answer, got %d\nstdout=%s\nstderr=%s", waitCode, waitOut, waitErr)
+		}
+		var waitResp evalBoardAnswerResp
+		if err := json.Unmarshal(bytes.TrimSpace([]byte(waitOut)), &waitResp); err != nil {
+			t.Fatalf("board wait --json must emit 1 valid JSON object: %v (%s)", err, waitOut)
+		}
+		if !waitResp.OK || waitResp.Question.QuestionState != "answered" || waitResp.Answer.Kind != "answer" || waitResp.Answer.TextMD != "Opt1" {
+			t.Fatalf("unexpected board wait output: %+v", waitResp)
+		}
+	})
 }

@@ -984,6 +984,81 @@ try {
   });
   const h4Done = await waitForSeedRunDone(h4Res.run.id, "Hydration turn 4");
 
+  // Seed client board key + Slice 1a Board topics/messages before opening browser
+  const clientBoardKey = await apiJson(hubUrl, adminToken, "/api/v1/keys", {
+    method: "POST",
+    body: JSON.stringify({
+      name: "cdp-client-board",
+      scope: "client",
+      allowed_nodes: ["macmini"],
+      allowed_board_prefixes: ["proj/demo"]
+    })
+  });
+
+  const boardTop1Res = await apiJson(hubUrl, adminToken, "/api/v1/board/topics", {
+    method: "POST",
+    body: JSON.stringify({
+      channel: "proj/demo",
+      title: "RFC-0001 跨机协同验收",
+      external_ref: "cnb:org/demo#123",
+      status: "todo",
+      upsert: true
+    })
+  });
+  const boardTop1 = boardTop1Res.topic;
+
+  const boardHandoff1Res = await apiJson(hubUrl, adminToken, `/api/v1/board/topics/${boardTop1.id}/messages`, {
+    method: "POST",
+    body: JSON.stringify({
+      kind: "handoff",
+      actor_profile: "codex-reviewer",
+      source_node: "mbp",
+      text_md: "代码评审完成，请执行跨机验收。",
+      data: {
+        repo: "org/demo",
+        branch: "feat/rfc-0001",
+        commit_sha: "a1b2c3d",
+        pr_url: "https://cnb.cool/org/demo/-/pulls/123",
+        next_action: "请在 macmini 执行端到端验证"
+      }
+    })
+  });
+  const boardHandoff1 = boardHandoff1Res.message;
+
+  const boardQ1Res = await apiJson(hubUrl, adminToken, `/api/v1/board/topics/${boardTop1.id}/messages`, {
+    method: "POST",
+    body: JSON.stringify({
+      kind: "question",
+      actor_profile: "agy-worker",
+      source_node: "macmini",
+      text_md: "检测到下游字段差异，是否按方案 A 合入？",
+      question_options: ["按方案 A 推进", "保持兼容分支"]
+    })
+  });
+  const boardQ1 = boardQ1Res.message;
+  if (boardQ1Res.topic.status !== "blocked" || boardQ1Res.topic.previous_status !== "todo") {
+    throw new Error(`Expected boardTop1 interlocked to blocked(todo), got ${JSON.stringify(boardQ1Res.topic)}`);
+  }
+
+  const boardTop2Res = await apiJson(hubUrl, adminToken, "/api/v1/board/topics", {
+    method: "POST",
+    body: JSON.stringify({
+      channel: "ops/fleet",
+      title: "机群基线巡检",
+      status: "in_progress"
+    })
+  });
+  const boardTop2 = boardTop2Res.topic;
+  await apiJson(hubUrl, adminToken, `/api/v1/board/topics/${boardTop2.id}/messages`, {
+    method: "POST",
+    body: JSON.stringify({
+      kind: "note",
+      actor_profile: "ops-bot",
+      source_node: "macmini",
+      text_md: "基线巡检正常。"
+    })
+  });
+
   const chromeProc = spawn(
     chromeBin,
     [
@@ -1037,7 +1112,16 @@ try {
     state = await cdpClient.evalJS(`
       (() => {
         const s = window.__AHUB_EVAL__?.getState();
-        if (!s || s.nodes.length < 2 || s.threads.length < 2 || s.streamStatus !== "connected") return null;
+        if (
+          !s ||
+          s.nodes.length < 2 ||
+          s.threads.length < 2 ||
+          s.streamStatus !== "connected" ||
+          !Array.isArray(s.boardTopics) ||
+          s.boardTopics.length < 2
+        ) {
+          return null;
+        }
         return s;
       })()
     `);
@@ -1045,6 +1129,346 @@ try {
     await sleep(250);
   }
   if (!state) throw new Error("UI did not hydrate and connect WebSocket in time");
+
+  // Phase 1 (1440x900): Default 协同板 (board) landing, channel tree, timeline, handoff snapshot & D1 parity
+  const phase1Check = await cdpClient.evalJS(`
+    (() => {
+      const s = window.__AHUB_EVAL__.getState();
+      const badge = document.querySelector('[data-testid="inbox-open-badge"]');
+      const badgeStyle = badge ? getComputedStyle(badge) : null;
+      return {
+        workspaceMode: s.workspaceMode,
+        hasBoardTab: Boolean(document.querySelector('[data-testid="workspace-tab-board"]')),
+        hasInboxTab: Boolean(document.querySelector('[data-testid="workspace-tab-inbox"]')),
+        hasRunsTab: Boolean(document.querySelector('[data-testid="workspace-tab-runs"]')),
+        hasBoardWorkspace: Boolean(document.querySelector('[data-testid="board-workspace"]')),
+        badgeText: badge?.textContent?.trim() ?? "",
+        badgeTabular: Boolean(
+          badge &&
+          (badge.classList.contains("tabular-nums") || (badgeStyle?.fontVariantNumeric ?? "").includes("tabular-nums"))
+        ),
+        openBoardQuestionCount: s.openBoardQuestionCount,
+        hasProjDemoChannel: Boolean(document.querySelector('[data-testid="board-channel-item-proj/demo"]')),
+        hasOpsFleetChannel: Boolean(document.querySelector('[data-testid="board-channel-item-ops/fleet"]'))
+      };
+    })()
+  `);
+  if (
+    phase1Check.workspaceMode !== "board" ||
+    !phase1Check.hasBoardTab ||
+    !phase1Check.hasInboxTab ||
+    !phase1Check.hasRunsTab ||
+    !phase1Check.hasBoardWorkspace ||
+    phase1Check.badgeText !== "1" ||
+    !phase1Check.badgeTabular ||
+    phase1Check.openBoardQuestionCount !== 1 ||
+    !phase1Check.hasProjDemoChannel ||
+    !phase1Check.hasOpsFleetChannel
+  ) {
+    throw new Error(`Phase 1 default board landing check failed: ${JSON.stringify(phase1Check)}`);
+  }
+
+  await cdpClient.clickSelector('[data-testid="board-channel-item-proj/demo"]');
+  await sleep(200);
+  const channelFilterCheck = await cdpClient.evalJS(`({
+    hasTop1: Boolean(document.querySelector('[data-testid="board-topic-item-${boardTop1.id}"]')),
+    hasTop2: Boolean(document.querySelector('[data-testid="board-topic-item-${boardTop2.id}"]'))
+  })`);
+  if (!channelFilterCheck.hasTop1 || channelFilterCheck.hasTop2) {
+    throw new Error(`Phase 1 channel tree filtering failed: ${JSON.stringify(channelFilterCheck)}`);
+  }
+
+  await cdpClient.clickSelector(`[data-testid="board-topic-item-${boardTop1.id}"]`);
+  for (let i = 0; i < 25; i++) {
+    const tlReady = await cdpClient.evalJS(`
+      Boolean(document.querySelector('[data-testid="board-topic-timeline"]')) &&
+      Boolean(document.querySelector('[data-testid="board-message-row-${boardHandoff1.id}"]')) &&
+      Boolean(document.querySelector('[data-testid="board-open-question-banner-${boardQ1.id}"]'))
+    `);
+    if (tlReady) break;
+    if (i === 24) throw new Error("Phase 1 topic timeline / handoff / pinned question did not render");
+    await sleep(150);
+  }
+  const boardDetailCheck = await cdpClient.evalJS(`
+    (() => {
+      const tlText = document.querySelector('[data-testid="board-topic-timeline"]')?.textContent ?? "";
+      const snapText = document.querySelector('[data-testid="board-latest-handoff"]')?.textContent ?? "";
+      const inspText = document.querySelector('[data-testid="board-topic-inspector"]')?.textContent ?? "";
+      return {
+        hasReviewer: tlText.includes("codex-reviewer") && tlText.includes("mbp"),
+        hasWorker: tlText.includes("agy-worker") && tlText.includes("macmini"),
+        hasBranch: snapText.includes("feat/rfc-0001") && snapText.includes("a1b2c3d"),
+        hasNextAction: snapText.includes("请在 macmini 执行端到端验证"),
+        hasReadCmd: snapText.includes("ahub board read"),
+        hasRef: inspText.includes("cnb:org/demo#123")
+      };
+    })()
+  `);
+  if (
+    !boardDetailCheck.hasReviewer ||
+    !boardDetailCheck.hasWorker ||
+    !boardDetailCheck.hasBranch ||
+    !boardDetailCheck.hasNextAction ||
+    !boardDetailCheck.hasReadCmd ||
+    !boardDetailCheck.hasRef
+  ) {
+    throw new Error(`Phase 1 board timeline / handoff snapshot check failed: ${JSON.stringify(boardDetailCheck)}`);
+  }
+
+  const d1BoardChannels = (await apiJson(hubUrl, adminToken, "/api/v1/board/channels")).channels;
+  const d1BoardTopics = (await apiJson(hubUrl, adminToken, "/api/v1/board/topics")).topics;
+  if (
+    state.boardChannels.length !== d1BoardChannels.length ||
+    state.boardTopics.length !== d1BoardTopics.length
+  ) {
+    throw new Error(
+      `Phase 1 Board UI!=D1 parity mismatch: channels(${state.boardChannels.length}/${d1BoardChannels.length}) topics(${state.boardTopics.length}/${d1BoardTopics.length})`
+    );
+  }
+  await assertViewportContainment(cdpClient, "desktop-1440x900-board");
+
+  // Phase 2 (1440x900): Unified 待决收件箱 (inbox) cross-3-domain aggregation (3 -> 2 -> 1 -> 0)
+  await cdpClient.evalJS(`window.__AHUB_CLS__ = 0; window.__AHUB_CLS_SOURCES__ = [];`);
+  const inboxApprovalRes = await apiJson(hubUrl, adminToken, "/api/v1/runs?wait_ms=0", {
+    method: "POST",
+    body: JSON.stringify({
+      node_id: "macmini",
+      workdir: wsBeta,
+      agent: "agy",
+      title: "收件箱待审批任务",
+      prompt: JSON.stringify({
+        summary: "等待收件箱审批",
+        directives: [
+          {
+            op: "soft_approval",
+            hold_ms: 15000,
+            url: "https://claude.ai/code/session_inbox_approval",
+            then: "resume"
+          }
+        ]
+      })
+    })
+  });
+  const inboxApprovalRunId = inboxApprovalRes.run.id;
+  for (let i = 0; i < 40; i++) {
+    const r = await apiJson(hubUrl, adminToken, `/api/v1/runs/${inboxApprovalRunId}`);
+    if (r.run.status === "needs_approval") break;
+    if (i === 39) throw new Error("inboxApprovalRun did not reach needs_approval in time");
+    await sleep(200);
+  }
+
+  const inboxNativeRes = await apiJson(hubUrl, macKey.token, "/api/v1/nodes/macmini/native-events", {
+    method: "POST",
+    body: JSON.stringify({
+      event_id: "cdp-inbox-native-evt-1",
+      agent: "claude",
+      event_kind: "interaction_needed",
+      native_session_id: "sess_inbox_1",
+      workdir: wsAlpha,
+      title: "收件箱原生确认",
+      summary: "请确认是否继续本地原生操作。",
+      source: "hook:Notification"
+    })
+  });
+  const inboxNativeEvtId = inboxNativeRes.event.id;
+
+  let badge3Ready = false;
+  for (let i = 0; i < 35; i++) {
+    const badgeVal = await cdpClient.evalJS(`document.querySelector('[data-testid="inbox-open-badge"]')?.textContent?.trim() ?? ""`);
+    if (badgeVal === "3") {
+      badge3Ready = true;
+      break;
+    }
+    await sleep(150);
+  }
+  if (!badge3Ready) {
+    throw new Error("Expected [data-testid='inbox-open-badge'] to reach 3 across board+run+native");
+  }
+  const inboxBadgeCls = await cdpClient.evalJS(`window.__AHUB_CLS__ ?? 0`);
+  if (inboxBadgeCls > 0.001) {
+    throw new Error(`Expected CLS <= 0.001 during inbox badge live updates, got ${inboxBadgeCls}`);
+  }
+
+  await cdpClient.clickSelector('[data-testid="workspace-tab-inbox"]');
+  await sleep(250);
+  const inboxPresence = await cdpClient.evalJS(`({
+    mode: window.__AHUB_EVAL__.getState().workspaceMode,
+    hasPane: Boolean(document.querySelector('[data-testid="pending-inbox"]')),
+    hasBoardItem: Boolean(document.querySelector('[data-testid="inbox-item-board:${boardQ1.id}"]')),
+    hasRunItem: Boolean(document.querySelector('[data-testid="inbox-item-run:${inboxApprovalRunId}"]')),
+    hasNativeItem: Boolean(document.querySelector('[data-testid="inbox-item-native:${inboxNativeEvtId}"]'))
+  })`);
+  if (
+    inboxPresence.mode !== "inbox" ||
+    !inboxPresence.hasPane ||
+    !inboxPresence.hasBoardItem ||
+    !inboxPresence.hasRunItem ||
+    !inboxPresence.hasNativeItem
+  ) {
+    throw new Error(`Phase 2 unified inbox failed to aggregate all 3 domains: ${JSON.stringify(inboxPresence)}`);
+  }
+
+  // 0) T6f regression: switching inbox-filter-* on desktop updates both list & inbox-detail-pane cleanly
+  await cdpClient.clickSelector(`[data-testid="inbox-item-board:${boardQ1.id}"]`);
+  await sleep(150);
+  const beforeFilterCheck = await cdpClient.evalJS(`({
+    hasOptionBtn: Boolean(document.querySelector('[data-testid="inbox-question-option-0"]')),
+    detailText: document.querySelector('[data-testid="inbox-detail-pane"]')?.textContent ?? ""
+  })`);
+  if (!beforeFilterCheck.hasOptionBtn || !beforeFilterCheck.detailText.includes("检测到下游字段差异，是否按方案 A 合入？")) {
+    throw new Error(`Phase 2 inbox board selection failed before filter check: ${JSON.stringify(beforeFilterCheck)}`);
+  }
+
+  await cdpClient.clickSelector('[data-testid="inbox-filter-runs"]');
+  await sleep(150);
+  const runsFilterCheck = await cdpClient.evalJS(`({
+    listItems: Array.from(document.querySelectorAll('[data-testid^="inbox-item-"]')).map((el) => el.getAttribute('data-testid')),
+    hasResolveBtn: Boolean(document.querySelector('[data-testid="inbox-resolve-run-btn"]')),
+    hasOptionBtn: Boolean(document.querySelector('[data-testid="inbox-question-option-0"]')),
+    detailText: document.querySelector('[data-testid="inbox-detail-pane"]')?.textContent ?? ""
+  })`);
+  if (
+    runsFilterCheck.listItems.length !== 1 ||
+    runsFilterCheck.listItems[0] !== `inbox-item-run:${inboxApprovalRunId}` ||
+    !runsFilterCheck.hasResolveBtn ||
+    runsFilterCheck.hasOptionBtn ||
+    runsFilterCheck.detailText.includes("检测到下游字段差异，是否按方案 A 合入？") ||
+    !runsFilterCheck.detailText.includes(inboxApprovalRunId)
+  ) {
+    throw new Error(`Phase 2 inbox-filter-runs leaked excluded board item or failed detail sync: ${JSON.stringify(runsFilterCheck)}`);
+  }
+
+  await cdpClient.clickSelector('[data-testid="inbox-filter-native"]');
+  await sleep(150);
+  const nativeFilterCheck = await cdpClient.evalJS(`({
+    listItems: Array.from(document.querySelectorAll('[data-testid^="inbox-item-"]')).map((el) => el.getAttribute('data-testid')),
+    hasAckBtn: Boolean(document.querySelector('[data-testid="inbox-ack-native-btn"]')),
+    hasResolveBtn: Boolean(document.querySelector('[data-testid="inbox-resolve-run-btn"]')),
+    hasOptionBtn: Boolean(document.querySelector('[data-testid="inbox-question-option-0"]')),
+    detailText: document.querySelector('[data-testid="inbox-detail-pane"]')?.textContent ?? ""
+  })`);
+  if (
+    nativeFilterCheck.listItems.length !== 1 ||
+    nativeFilterCheck.listItems[0] !== `inbox-item-native:${inboxNativeEvtId}` ||
+    !nativeFilterCheck.hasAckBtn ||
+    nativeFilterCheck.hasResolveBtn ||
+    nativeFilterCheck.hasOptionBtn ||
+    nativeFilterCheck.detailText.includes(inboxApprovalRunId) ||
+    !nativeFilterCheck.detailText.includes("收件箱原生确认")
+  ) {
+    throw new Error(`Phase 2 inbox-filter-native failed detail sync: ${JSON.stringify(nativeFilterCheck)}`);
+  }
+
+  await cdpClient.clickSelector('[data-testid="inbox-filter-board"]');
+  await sleep(150);
+  const boardFilterCheck = await cdpClient.evalJS(`({
+    listItems: Array.from(document.querySelectorAll('[data-testid^="inbox-item-"]')).map((el) => el.getAttribute('data-testid')),
+    hasOptionBtn: Boolean(document.querySelector('[data-testid="inbox-question-option-0"]')),
+    hasAckBtn: Boolean(document.querySelector('[data-testid="inbox-ack-native-btn"]')),
+    detailText: document.querySelector('[data-testid="inbox-detail-pane"]')?.textContent ?? ""
+  })`);
+  if (
+    boardFilterCheck.listItems.length !== 1 ||
+    boardFilterCheck.listItems[0] !== `inbox-item-board:${boardQ1.id}` ||
+    !boardFilterCheck.hasOptionBtn ||
+    boardFilterCheck.hasAckBtn ||
+    !boardFilterCheck.detailText.includes("检测到下游字段差异，是否按方案 A 合入？")
+  ) {
+    throw new Error(`Phase 2 inbox-filter-board failed detail sync: ${JSON.stringify(boardFilterCheck)}`);
+  }
+
+  await cdpClient.clickSelector('[data-testid="inbox-filter-all"]');
+  await sleep(150);
+
+  // 1) Answer Board question via instant-submit option button inside Inbox -> badge 3 -> 2, Topic 1 restored to todo
+  await cdpClient.clickSelector(`[data-testid="inbox-item-board:${boardQ1.id}"]`);
+  await sleep(200);
+  await cdpClient.clickSelector('[data-testid="inbox-question-option-0"]');
+  for (let i = 0; i < 30; i++) {
+    const b = await cdpClient.evalJS(`document.querySelector('[data-testid="inbox-open-badge"]')?.textContent?.trim() ?? ""`);
+    if (b === "2") break;
+    if (i === 29) throw new Error(`Expected inbox badge 3->2 after answering board question, got ${JSON.stringify(b)}`);
+    await sleep(150);
+  }
+  const top1AfterAnswer = (await apiJson(hubUrl, adminToken, `/api/v1/board/topics/${boardTop1.id}/messages`)).topic;
+  if (top1AfterAnswer.status !== "todo" || top1AfterAnswer.open_question_count !== 0) {
+    throw new Error(`Expected boardTop1 restored to todo after Inbox answer, got ${JSON.stringify(top1AfterAnswer)}`);
+  }
+
+  // Empty-filter check: select run item, switch to inbox-filter-board (now 0 items), verify stale detail is hidden, then restore inbox-filter-all
+  await cdpClient.clickSelector(`[data-testid="inbox-item-run:${inboxApprovalRunId}"]`);
+  await sleep(150);
+  await cdpClient.clickSelector('[data-testid="inbox-filter-board"]');
+  await sleep(150);
+  const emptyBoardFilterCheck = await cdpClient.evalJS(`({
+    hasEmptyList: Boolean(document.querySelector('[data-testid="inbox-empty-state"]')),
+    hasResolveBtn: Boolean(document.querySelector('[data-testid="inbox-resolve-run-btn"]')),
+    detailText: document.querySelector('[data-testid="inbox-detail-pane"]')?.textContent ?? ""
+  })`);
+  if (
+    !emptyBoardFilterCheck.hasEmptyList ||
+    emptyBoardFilterCheck.hasResolveBtn ||
+    emptyBoardFilterCheck.detailText.includes(inboxApprovalRunId) ||
+    !emptyBoardFilterCheck.detailText.includes("当前没有待确认或待审批的阻塞事项。")
+  ) {
+    throw new Error(`Phase 2 empty inbox-filter-board leaked stale run detail: ${JSON.stringify(emptyBoardFilterCheck)}`);
+  }
+  await cdpClient.clickSelector('[data-testid="inbox-filter-all"]');
+  await sleep(150);
+
+  // 2) Resolve needs_approval Run inside Inbox -> badge 2 -> 1, Run -> done
+  await cdpClient.clickSelector(`[data-testid="inbox-item-run:${inboxApprovalRunId}"]`);
+  await sleep(200);
+  await cdpClient.clickSelector('[data-testid="inbox-resolve-run-btn"]');
+  for (let i = 0; i < 30; i++) {
+    const b = await cdpClient.evalJS(`document.querySelector('[data-testid="inbox-open-badge"]')?.textContent?.trim() ?? ""`);
+    if (b === "1") break;
+    if (i === 29) throw new Error(`Expected inbox badge 2->1 after resolving run, got ${JSON.stringify(b)}`);
+    await sleep(150);
+  }
+  const resolvedRunD1 = (await apiJson(hubUrl, adminToken, `/api/v1/runs/${inboxApprovalRunId}`)).run;
+  if (resolvedRunD1.status !== "done") {
+    throw new Error(`Expected inboxApprovalRun D1 status=done after resolve, got ${resolvedRunD1.status}`);
+  }
+
+  // 3) Ack native interaction inside Inbox -> badge 1 -> 0, empty state
+  await cdpClient.clickSelector(`[data-testid="inbox-item-native:${inboxNativeEvtId}"]`);
+  await sleep(200);
+  await cdpClient.clickSelector('[data-testid="inbox-ack-native-btn"]');
+  for (let i = 0; i < 30; i++) {
+    const emptyCheck = await cdpClient.evalJS(`({
+      badge: document.querySelector('[data-testid="inbox-open-badge"]')?.textContent?.trim() ?? "",
+      text: document.querySelector('[data-testid="pending-inbox"]')?.textContent ?? ""
+    })`);
+    if ((emptyCheck.badge === "" || emptyCheck.badge === "0") && emptyCheck.text.includes("当前没有待确认或待审批的阻塞事项。")) {
+      break;
+    }
+    if (i === 29) throw new Error(`Expected inbox badge 1->0 & empty state after ack, got ${JSON.stringify(emptyCheck)}`);
+    await sleep(150);
+  }
+  const ackedNativeD1 = (await apiJson(hubUrl, adminToken, `/api/v1/native-events/${inboxNativeEvtId}`)).event;
+  if (!ackedNativeD1.ack_at) {
+    throw new Error(`Expected inboxNativeEvt ack_at set in D1, got ${JSON.stringify(ackedNativeD1)}`);
+  }
+
+  // Verify answer + restored todo status in Board timeline
+  await cdpClient.clickSelector('[data-testid="workspace-tab-board"]');
+  await sleep(250);
+  const boardAfterAnswerCheck = await cdpClient.evalJS(`({
+    tlText: document.querySelector('[data-testid="board-topic-timeline"]')?.textContent ?? "",
+    topicStatus: window.__AHUB_EVAL__.getState().boardTopics.find(t => t.id === ${JSON.stringify(boardTop1.id)})?.status
+  })`);
+  if (!boardAfterAnswerCheck.tlText.includes("按方案 A 推进") || boardAfterAnswerCheck.topicStatus !== "todo") {
+    throw new Error(`Board timeline did not reflect answer / restored todo status: ${JSON.stringify(boardAfterAnswerCheck)}`);
+  }
+
+  // Phase 3: Switch to 执行台 (runs) and execute 100% of legacy regressions untouched
+  await cdpClient.clickSelector('[data-testid="workspace-tab-runs"]');
+  for (let i = 0; i < 20; i++) {
+    if ((await cdpClient.evalJS(`window.__AHUB_EVAL__.getState().workspaceMode`)) === "runs") break;
+    if (i === 19) throw new Error("Failed to switch workspaceMode to runs");
+    await sleep(100);
+  }
 
   // Verify 4-turn regression thread: multi-turn >16KB full hydration without self-cancellation, long-output fold/expand, and >128KB explicit truncation
   if (state.selectedThreadId !== hydrationThreadId) {
@@ -2386,7 +2810,200 @@ try {
     await waitForSeedRunDone(forkedRunInD1.id, "Mobile forked thread seed run");
   }
 
-  // Verify client-scope UI login omits admin-only default Bot notify, Native Activity, and Push controls with zero console/403 errors
+  // Phase 4: Mobile (360x780 & 390x844) Board & Inbox sticky --safe-bottom Q&A containment + deep link
+  const qMobileRes = await apiJson(hubUrl, adminToken, `/api/v1/board/topics/${boardTop1.id}/messages`, {
+    method: "POST",
+    body: JSON.stringify({
+      kind: "question",
+      actor_profile: "agy-worker",
+      source_node: "macmini",
+      text_md: "移动端吸底问答检查：请选择处理方式？",
+      question_options: ["继续", "暂停"]
+    })
+  });
+  const qMobile = qMobileRes.message;
+
+  for (const [vw, vh] of [[360, 780], [390, 844]]) {
+    await cdpClient.setViewport(vw, vh, true);
+    await sleep(250);
+    await cdpClient.clickSelector('[data-testid="workspace-tab-board"]');
+    await sleep(250);
+
+    const mobileHeaderTabs = await cdpClient.evalJS(`
+      (() => {
+        const els = Array.from(document.querySelectorAll('[data-testid="workspace-tab-board"], [data-testid="workspace-tab-inbox"], [data-testid="workspace-tab-runs"]'));
+        return els.map((el) => {
+          const r = el.getBoundingClientRect();
+          return { testid: el.getAttribute("data-testid"), w: r.width, h: r.height };
+        });
+      })()
+    `);
+    if (mobileHeaderTabs.length !== 3 || mobileHeaderTabs.some((t) => t.w < 43.5 || t.h < 43.5)) {
+      throw new Error(`Mobile ${vw}x${vh} topbar workspace switcher < 44px: ${JSON.stringify(mobileHeaderTabs)}`);
+    }
+
+    const hasBoardChannelTrigger = await cdpClient.evalJS(`Boolean(document.querySelector('[data-testid="board-mobile-channels-trigger"]'))`);
+    await cdpClient.clickSelector(hasBoardChannelTrigger ? '[data-testid="board-mobile-channels-trigger"]' : '[data-testid="mobile-left-trigger"]');
+    await sleep(250);
+    await cdpClient.clickSelector('[data-testid="board-channel-item-proj/demo"]');
+    await sleep(200);
+    await cdpClient.clickSelector(`[data-testid="board-topic-item-${boardTop1.id}"]`);
+    await sleep(250);
+
+    await assertViewportContainment(cdpClient, `mobile-${vw}x${vh}-board-qa`);
+    const mobileBoardQA = await cdpClient.evalJS(`
+      (() => {
+        const bar = document.querySelector('[data-testid="board-mobile-qa-bar"]');
+        const scroller = document.querySelector('[data-testid="board-messages-list"]');
+        if (scroller) scroller.scrollTop = scroller.scrollHeight;
+        const barRect = bar ? bar.getBoundingClientRect() : null;
+        const backBtn = document.querySelector('[data-testid="board-mobile-back-btn"]');
+        const backRect = backBtn ? backBtn.getBoundingClientRect() : null;
+        const inputEl = document.querySelector('[data-testid="board-mobile-answer-input"]');
+        const inputFont = inputEl ? parseFloat(getComputedStyle(inputEl).fontSize) : 0;
+        const btns = bar ? Array.from(bar.querySelectorAll("button")) : [];
+        const undersized = btns
+          .map((b) => {
+            const r = b.getBoundingClientRect();
+            return { text: b.textContent?.trim(), w: r.width, h: r.height };
+          })
+          .filter((b) => b.w > 0 && b.h > 0 && (b.w < 43.5 || b.h < 43.5));
+        return {
+          hasQuestionRow: Boolean(document.querySelector('[data-testid="board-message-row-${qMobile.id}"]')),
+          barRect: barRect ? { top: barRect.top, bottom: barRect.bottom, width: barRect.width, height: barRect.height } : null,
+          backRect: backRect ? { w: backRect.width, h: backRect.height } : null,
+          innerHeight: window.innerHeight,
+          inputFont,
+          undersized
+        };
+      })()
+    `);
+    if (
+      !mobileBoardQA.hasQuestionRow ||
+      !mobileBoardQA.barRect ||
+      mobileBoardQA.barRect.height <= 0 ||
+      mobileBoardQA.barRect.top < 0 ||
+      mobileBoardQA.barRect.bottom > mobileBoardQA.innerHeight + 1 ||
+      mobileBoardQA.barRect.bottom < mobileBoardQA.innerHeight - 24 ||
+      !mobileBoardQA.backRect ||
+      mobileBoardQA.backRect.w < 43.5 ||
+      mobileBoardQA.backRect.h < 43.5 ||
+      !(mobileBoardQA.inputFont >= 16) ||
+      mobileBoardQA.undersized.length > 0
+    ) {
+      throw new Error(`Mobile ${vw}x${vh} Board sticky Q&A check failed: ${JSON.stringify(mobileBoardQA)}`);
+    }
+
+    await cdpClient.clickSelector('[data-testid="board-mobile-back-btn"]');
+    await sleep(200);
+
+    await cdpClient.clickSelector('[data-testid="workspace-tab-inbox"]');
+    await sleep(250);
+    await cdpClient.clickSelector(`[data-testid="inbox-item-board:${qMobile.id}"]`);
+    await sleep(250);
+    await assertViewportContainment(cdpClient, `mobile-${vw}x${vh}-inbox-qa`);
+    const mobileInboxQA = await cdpClient.evalJS(`
+      (() => {
+        const detail = document.querySelector('[data-testid="inbox-detail-pane"]');
+        const scroller = detail ? detail.querySelector('.overflow-y-auto') : null;
+        if (scroller) scroller.scrollTop = scroller.scrollHeight;
+        const bar = document.querySelector('[data-testid="inbox-action-bar"]');
+        const barRect = bar ? bar.getBoundingClientRect() : null;
+        const backBtn = document.querySelector('[data-testid="inbox-mobile-back-btn"]');
+        const backRect = backBtn ? backBtn.getBoundingClientRect() : null;
+        const inputEl = document.querySelector('[data-testid="inbox-answer-input"]');
+        const inputFont = inputEl ? parseFloat(getComputedStyle(inputEl).fontSize) : 0;
+        const btns = bar ? Array.from(bar.querySelectorAll("button")) : [];
+        const undersized = btns
+          .map((b) => {
+            const r = b.getBoundingClientRect();
+            return { text: b.textContent?.trim(), w: r.width, h: r.height };
+          })
+          .filter((b) => b.w > 0 && b.h > 0 && (b.w < 43.5 || b.h < 43.5));
+        return {
+          hasDetail: Boolean(detail),
+          barRect: barRect ? { top: barRect.top, bottom: barRect.bottom, width: barRect.width, height: barRect.height } : null,
+          backRect: backRect ? { w: backRect.width, h: backRect.height } : null,
+          innerHeight: window.innerHeight,
+          inputFont,
+          undersized
+        };
+      })()
+    `);
+    if (
+      !mobileInboxQA.hasDetail ||
+      !mobileInboxQA.barRect ||
+      mobileInboxQA.barRect.height <= 0 ||
+      mobileInboxQA.barRect.top < 0 ||
+      mobileInboxQA.barRect.bottom > mobileInboxQA.innerHeight + 1 ||
+      mobileInboxQA.barRect.bottom < mobileInboxQA.innerHeight - 24 ||
+      !mobileInboxQA.backRect ||
+      mobileInboxQA.backRect.w < 43.5 ||
+      mobileInboxQA.backRect.h < 43.5 ||
+      !(mobileInboxQA.inputFont >= 16) ||
+      mobileInboxQA.undersized.length > 0
+    ) {
+      throw new Error(`Mobile ${vw}x${vh} Inbox sticky Q&A check failed: ${JSON.stringify(mobileInboxQA)}`);
+    }
+    await cdpClient.clickSelector('[data-testid="inbox-mobile-back-btn"]');
+    await sleep(200);
+  }
+
+  // Deep link routing check: /?workspace=inbox&source=board&id=<msgId>
+  await cdpClient.setViewport(1440, 900, false);
+  await cdpClient.send("Page.navigate", { url: `${hubUrl}/?workspace=inbox&source=board&id=${qMobile.id}` });
+  let deepLinkOK = false;
+  for (let i = 0; i < 40; i++) {
+    const dl = await cdpClient.evalJS(`({
+      mode: window.__AHUB_EVAL__?.getState()?.workspaceMode,
+      detailText: document.querySelector('[data-testid="inbox-detail-pane"]')?.textContent ?? ""
+    })`);
+    if (dl.mode === "inbox" && dl.detailText.includes("移动端吸底问答检查")) {
+      deepLinkOK = true;
+      break;
+    }
+    await sleep(200);
+  }
+  if (!deepLinkOK) {
+    throw new Error(`Deep link /?workspace=inbox&source=board&id=${qMobile.id} did not route to inbox detail`);
+  }
+
+  // Text draft + explicit submit button check (on a separate question, preserving qMobile open for Phase 5)
+  const qTextDraftRes = await apiJson(hubUrl, adminToken, `/api/v1/board/topics/${boardTop1.id}/messages`, {
+    method: "POST",
+    body: JSON.stringify({
+      kind: "question",
+      actor_profile: "agy-worker",
+      source_node: "macmini",
+      text_md: "自由文本答复输入框测试问题",
+      question_options: []
+    })
+  });
+  const qTextDraft = qTextDraftRes.message;
+  for (let i = 0; i < 30; i++) {
+    const hasDraftItem = await cdpClient.evalJS(`Boolean(document.querySelector('[data-testid="inbox-item-board:${qTextDraft.id}"]'))`);
+    if (hasDraftItem) break;
+    if (i === 29) throw new Error("qTextDraft did not appear in Inbox in time");
+    await sleep(150);
+  }
+  await cdpClient.clickSelector(`[data-testid="inbox-item-board:${qTextDraft.id}"]`);
+  await sleep(150);
+  const submitDisabledInitially = await cdpClient.evalJS(`Boolean(document.querySelector('[data-testid="inbox-answer-submit-btn"]')?.disabled)`);
+  if (!submitDisabledInitially) {
+    throw new Error("Expected inbox-answer-submit-btn to be disabled when draft is empty");
+  }
+  await cdpClient.fillInput('[data-testid="inbox-answer-input"]', "通过文本输入框提交的答复");
+  await sleep(100);
+  await cdpClient.clickSelector('[data-testid="inbox-answer-submit-btn"]');
+  for (let i = 0; i < 30; i++) {
+    const badgeVal = await cdpClient.evalJS(`document.querySelector('[data-testid="inbox-open-badge"]')?.textContent?.trim() ?? ""`);
+    const stillInInbox = await cdpClient.evalJS(`Boolean(document.querySelector('[data-testid="inbox-item-board:${qTextDraft.id}"]'))`);
+    if (badgeVal === "1" && !stillInInbox) break;
+    if (i === 29) throw new Error(`Text draft submit did not resolve qTextDraft (badge=${badgeVal}, stillInInbox=${stillInInbox})`);
+    await sleep(150);
+  }
+
+  // Phase 5: Verify client-scope Board + Runs isolation (prefix-scoped AND empty-prefix) with zero 403/console errors
   const forbiddenResponses = [];
   await cdpClient.send("Network.enable");
   cdpClient.onEvent("Network.responseReceived", (params) => {
@@ -2396,7 +3013,130 @@ try {
       forbiddenResponses.push({ status: st, url });
     }
   });
+  cdpClient.consoleErrors.length = 0;
 
+  // Test A: clientBoardKey with allowed_board_prefixes: ["proj/demo"]
+  await cdpClient.setViewport(1440, 900, false);
+  await cdpClient.send("Page.navigate", { url: `${hubUrl}/?token=${clientBoardKey.token}` });
+  let clientBoardState = null;
+  for (let i = 0; i < 40; i++) {
+    clientBoardState = await cdpClient.evalJS(`
+      (() => {
+        const s = window.__AHUB_EVAL__?.getState();
+        if (
+          !s ||
+          s.authStatus !== "authenticated" ||
+          s.authScope !== "client" ||
+          s.workspaceMode !== "board" ||
+          s.boardTopics.length < 1 ||
+          s.streamStatus !== "connected"
+        ) {
+          return null;
+        }
+        return s;
+      })()
+    `);
+    if (clientBoardState) break;
+    await sleep(200);
+  }
+  if (
+    !clientBoardState ||
+    clientBoardState.workspaceMode !== "board" ||
+    clientBoardState.boardPermissionDenied !== false ||
+    !clientBoardState.selectedBoardTopicId ||
+    clientBoardState.streamStatus !== "connected"
+  ) {
+    const latest = clientBoardState ?? (await cdpClient.evalJS(`window.__AHUB_EVAL__?.getState() ?? null`));
+    throw new Error(`clientBoardKey login state invalid: ${JSON.stringify(latest)}`);
+  }
+  if (
+    !clientBoardState.boardTopics.some((t) => t.channel === "proj/demo") ||
+    clientBoardState.boardTopics.some((t) => t.channel === "ops/fleet") ||
+    clientBoardState.boardChannels.some((c) => c.channel === "ops/fleet")
+  ) {
+    throw new Error(`clientBoardKey leaked unauthorized channel: ${JSON.stringify(clientBoardState)}`);
+  }
+
+  await cdpClient.clickSelector(`[data-testid="board-topic-item-${boardTop1.id}"]`);
+  let clientBoardReadOnly = null;
+  for (let i = 0; i < 30; i++) {
+    clientBoardReadOnly = await cdpClient.evalJS(`({
+      text: document.querySelector('[data-testid="board-topic-timeline"]')?.textContent ?? "",
+      hasReadonlyBanner: Boolean(document.querySelector('[data-testid="board-client-readonly-banner"]')),
+      hasAnswerSubmit: Boolean(document.querySelector('[data-testid^="board-answer-submit-btn-"]:not([disabled]), [data-testid="board-mobile-answer-submit-btn"]:not([disabled])'))
+    })`);
+    if (
+      clientBoardReadOnly.hasReadonlyBanner &&
+      clientBoardReadOnly.text.includes("仅管理员可答复协同板阻塞提问")
+    ) {
+      break;
+    }
+    await sleep(100);
+  }
+  if (
+    !clientBoardReadOnly.text.includes("仅管理员可答复协同板阻塞提问") ||
+    !clientBoardReadOnly.hasReadonlyBanner ||
+    clientBoardReadOnly.hasAnswerSubmit
+  ) {
+    throw new Error(`Expected client scope Board question to render read-only notice without answer submit, got ${JSON.stringify(clientBoardReadOnly)}`);
+  }
+
+  await cdpClient.clickSelector('[data-testid="workspace-tab-inbox"]');
+  await sleep(200);
+  const clientInboxListCheck = await cdpClient.evalJS(`({
+    hasBoardQ: Boolean(document.querySelector('[data-testid="inbox-item-board:${qMobile.id}"]')),
+    nativeItemsCount: document.querySelectorAll('[data-testid^="inbox-item-native:"]').length
+  })`);
+  if (!clientInboxListCheck.hasBoardQ || clientInboxListCheck.nativeItemsCount !== 0) {
+    throw new Error(`clientBoardKey inbox check failed: ${JSON.stringify(clientInboxListCheck)}`);
+  }
+  await cdpClient.clickSelector(`[data-testid="inbox-item-board:${qMobile.id}"]`);
+  await sleep(200);
+  const clientInboxReadOnly = await cdpClient.evalJS(`({
+    hasReadonlyBanner: Boolean(document.querySelector('[data-testid="inbox-client-readonly-banner"]')),
+    detailText: document.querySelector('[data-testid="inbox-detail-pane"]')?.textContent ?? "",
+    hasEnabledAnswerSubmit: Boolean(document.querySelector('[data-testid="inbox-answer-submit-btn"]:not([disabled])')),
+    hasEnabledOptionBtn: Boolean(document.querySelector('[data-testid^="inbox-question-option-"]:not([disabled])'))
+  })`);
+  if (
+    !clientInboxReadOnly.hasReadonlyBanner ||
+    !clientInboxReadOnly.detailText.includes("仅管理员可答复协同板阻塞提问") ||
+    clientInboxReadOnly.hasEnabledAnswerSubmit ||
+    clientInboxReadOnly.hasEnabledOptionBtn
+  ) {
+    throw new Error(`Expected client scope Inbox question to render read-only without enabled answer controls, got ${JSON.stringify(clientInboxReadOnly)}`);
+  }
+
+  await cdpClient.clickSelector('[data-testid="workspace-tab-runs"]');
+  let runsState = null;
+  for (let i = 0; i < 20; i++) {
+    runsState = await cdpClient.evalJS(`window.__AHUB_EVAL__?.getState() ?? null`);
+    if (runsState && runsState.workspaceMode === "runs" && runsState.streamStatus === "disconnected") break;
+    await sleep(100);
+  }
+  if (!runsState || runsState.workspaceMode !== "runs" || runsState.streamStatus !== "disconnected") {
+    throw new Error(`Expected clientBoardKey runs workspace to disconnect topic stream, got ${JSON.stringify(runsState)}`);
+  }
+  await cdpClient.clickSelector('[data-testid="inspector-pane"] [role="tab"]:nth-of-type(4)');
+  await sleep(200);
+  const clientBoardInspectorCheck = await cdpClient.evalJS(`({
+    hasNotifySelect: Boolean(document.querySelector('[data-testid="node-default-notify-select"]')),
+    hasFleetNativeTab: Boolean(document.querySelector('[data-testid="fleet-tab-native"]')),
+    hasBrowserNotifyBtn: Boolean(document.querySelector('[data-testid="open-browser-notify-btn"]')),
+    hasInteractionsPill: Boolean(document.querySelector('[data-testid="open-interactions-pill"]')),
+    hasDeliveriesTab: Boolean(document.querySelector('[data-testid="inspector-tab-deliveries"]'))
+  })`);
+  if (
+    clientBoardInspectorCheck.hasNotifySelect ||
+    clientBoardInspectorCheck.hasFleetNativeTab ||
+    clientBoardInspectorCheck.hasBrowserNotifyBtn ||
+    clientBoardInspectorCheck.hasInteractionsPill ||
+    clientBoardInspectorCheck.hasDeliveriesTab
+  ) {
+    throw new Error(`clientBoardKey leaked admin controls in runs workspace: ${JSON.stringify(clientBoardInspectorCheck)}`);
+  }
+
+  // Test B: clientScopeKey with default allowed_board_prefixes: []
   const clientScopeKey = await apiJson(hubUrl, adminToken, "/api/v1/keys", {
     method: "POST",
     body: JSON.stringify({ name: "cdp-client-scope", scope: "client", allowed_nodes: [] })
@@ -2408,16 +3148,23 @@ try {
     clientState = await cdpClient.evalJS(`
       (() => {
         const s = window.__AHUB_EVAL__?.getState();
-        if (!s || s.authStatus !== "authenticated" || s.authScope !== "client" || s.nodes.length < 2) return null;
+        if (!s || s.authStatus !== "authenticated" || s.authScope !== "client" || s.nodes.length < 2 || !s.boardPermissionDenied) return null;
         return s;
       })()
     `);
     if (clientState) break;
     await sleep(200);
   }
-  if (!clientState || clientState.streamStatus !== "disconnected") {
-    throw new Error(`Client-scoped token login did not hydrate cleanly with disconnected global stream: ${JSON.stringify(clientState)}`);
+  if (!clientState || clientState.boardPermissionDenied !== true || clientState.streamStatus !== "disconnected") {
+    const latest = clientState ?? (await cdpClient.evalJS(`window.__AHUB_EVAL__?.getState() ?? null`));
+    throw new Error(`Client-scoped token login did not hydrate cleanly with boardPermissionDenied & disconnected global stream: ${JSON.stringify(latest)}`);
   }
+  const emptyPrefixText = await cdpClient.evalJS(`document.querySelector('[data-testid="board-workspace"]')?.textContent ?? ""`);
+  if (!emptyPrefixText.includes("当前凭证尚未分配协同板频道前缀权限")) {
+    throw new Error(`Expected empty-prefix board guidance for clientScopeKey, got: ${emptyPrefixText.slice(0, 200)}`);
+  }
+  await cdpClient.clickSelector('[data-testid="workspace-tab-runs"]');
+  await sleep(200);
   await cdpClient.clickSelector('[data-testid="inspector-pane"] [role="tab"]:nth-of-type(4)');
   await sleep(200);
   const clientInspectorCheck = await cdpClient.evalJS(`({
@@ -2445,7 +3192,7 @@ try {
     throw new Error(`Expected zero console errors in client-scoped UI, got ${JSON.stringify(cdpClient.consoleErrors)}`);
   }
 
-  // Zero-token Cloudflare Access cookie login verification in real Chromium
+  // Phase 6: Zero-token Cloudflare Access cookie login verification in real Chromium (defaults to board)
   await cdpClient.setViewport(1440, 900, false);
   await cdpClient.evalJS(`localStorage.removeItem("ahub-token")`);
   await cdpClient.send("Network.enable");
@@ -2475,7 +3222,13 @@ try {
     if (cookieState) break;
     await sleep(250);
   }
-  if (!cookieState || cookieState.storedToken !== null || cookieState.nodes.length < 2) {
+  if (
+    !cookieState ||
+    cookieState.storedToken !== null ||
+    cookieState.nodes.length < 2 ||
+    cookieState.workspaceMode !== "board" ||
+    cookieState.boardTopics.length < 2
+  ) {
     throw new Error(`Zero-token Cloudflare Access cookie flow failed: ${JSON.stringify(cookieState)}`);
   }
 

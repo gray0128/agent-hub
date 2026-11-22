@@ -3,6 +3,7 @@ import type { StreamFrame } from "@/types";
 export interface StreamCallbacks {
   onStatusChange: (status: "connecting" | "connected" | "disconnected") => void;
   onFrame: (frame: StreamFrame) => void;
+  getPath?: () => string;
 }
 
 export class HubStreamClient {
@@ -69,7 +70,8 @@ export class HubStreamClient {
   private connect(): void {
     if (this.stopped) return;
     const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const wsUrl = `${proto}//${window.location.host}/ws/stream`;
+    const path = this.callbacks.getPath ? this.callbacks.getPath() : "/ws/stream";
+    const wsUrl = `${proto}//${window.location.host}${path}`;
     this.callbacks.onStatusChange("connecting");
 
     const trimmed = this.token.trim();

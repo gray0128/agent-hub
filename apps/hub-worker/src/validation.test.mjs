@@ -303,7 +303,12 @@ test("M3 admin query, ack, redeliver, and push-subscription parsers enforce cont
   );
   assert.equal(sub.endpointHost, "fcm.googleapis.com");
   assert.deepEqual(sub.nodeFilter, ["macmini", "mbp"]);
-  assert.deepEqual(sub.eventFilter, ["run_needs_approval", "run_failed", "native_interaction_needed"]);
+  assert.deepEqual(sub.eventFilter, [
+    "run_needs_approval",
+    "run_failed",
+    "native_interaction_needed",
+    "board_question_opened"
+  ]);
 
   assert.throws(
     () =>

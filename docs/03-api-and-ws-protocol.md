@@ -1,6 +1,6 @@
 # 03 HTTP API、WebSocket 协议与通知队列契约
 
-本文档定义 `agent-hub` 控制面（默认入口 `https://ahub.bobocai.win`）对外暴露的全部 REST 接口、Durable Object `NodeHub` 的双向 WebSocket 帧格式、Cloudflare Queues 通知载荷以及标准错误码。机器可读 Schema 见 [run-create.schema.json](schemas/run-create.schema.json)、[run-record.schema.json](schemas/run-record.schema.json)、[native-event.schema.json](schemas/native-event.schema.json) 与 [ws-frames.schema.json](schemas/ws-frames.schema.json)。
+本文档定义 `agent-hub` 控制面（默认入口 `https://ahub.bobocai.win`）对外暴露的全部 REST 接口、Durable Object `NodeHub` 的双向 WebSocket 帧格式、Cloudflare Queues 通知载荷以及标准错误码。机器可读 Schema 见 [run-create.schema.json](schemas/run-create.schema.json)、[run-record.schema.json](schemas/run-record.schema.json)、[native-event.schema.json](schemas/native-event.schema.json)、[board.schema.json](schemas/board.schema.json) 与 [ws-frames.schema.json](schemas/ws-frames.schema.json)（Slice 1a 保持 `run-create.schema.json` 与 `run-record.schema.json` 不变）。
 
 ## 1. 通用协议约定
 
@@ -9,7 +9,7 @@
 | 入口范围 | 认证头 / 凭证 | 说明 |
 | --- | --- | --- |
 | Web 浏览器控制台与管理接口 | `Cf-Access-Jwt-Assertion` 请求头、同源 `Cookie: CF_Authorization` 或 `Authorization: Bearer ahub_adm_<secret>` | 生产环境由 Cloudflare Access 拦截验证并注入 JWT；单域名部署下 `/api/*` 与 `/ws/*` 对机器路径配置 `Bypass` 后，浏览器同源携 `CF_Authorization` Cookie 发起请求，Worker 强制校验同源 `Origin` / `Sec-Fetch-Site` 并对 JWT 执行 RS256 JWKS、`exp` 与 `CF_ACCESS_AUD` 验签；本地联调可开启 `admin` Token 回退 |
-| 调用端 CLI（`client` / `admin`） | `Authorization: Bearer ahub_cli_<secret>` | `client` Key 同时受 `bound_node_id` 与 `allowed_nodes_json` 交集节点范围（覆盖全量 REST 接口与 `/ws/stream` 帧过滤）、创建者归属（`created_by_key_id`）、`allow_unsandboxed` 与 `max_depth_limit` 约束 |
+| 调用端 CLI（`client` / `admin`） | `Authorization: Bearer ahub_cli_<secret>` | `client` Key 受 `bound_node_id` 与 `allowed_nodes_json` 交集节点范围（覆盖受控执行 REST 接口与 `/ws/stream?run_id=` 帧过滤）、创建者归属（`created_by_key_id`）、`allow_unsandboxed`、`max_depth_limit` 约束；在协同板域受 `allowed_board_prefixes_json` 段边界前缀 Fail-Closed 授权（默认 `[]` 拒绝），且严禁代答提问（`403 FORBIDDEN_SCOPE`） |
 | 节点守护端（`node`） | `Authorization: Bearer ahub_nod_<secret>` | 仅可操作 `bound_node_id` 对应的连接、认领与上报接口 |
 
 ### 1.2 幂等与血统透传请求头
@@ -32,10 +32,15 @@
         "cnb/my-skills",
         "github/my-skills"
       ]
-    }
+    },
+    "next": [
+      "ahub nodes --online --json"
+    ]
   }
 }
 ```
+
+> **`error.next` 自引导安全边界**：可选字段 `error.next?: string[]`（最多 `8` 条）为调用方提供可执行 CLI 修复建议，**严禁**从用户输入拼接，仅允许服务端由静态模板白名单与已校验安全标识符（`node_id`、`workdir`、`topic_id`、`channel`、`message_id`、`cursor`）拼装，绝不回显原始 `prompt`、正文或任何凭据。
 
 ## 2. REST API 端点清单
 
@@ -44,7 +49,7 @@
 | 方法与路径 | 允许 Scope | 功能说明 | 关键请求/响应约定 |
 | --- | --- | --- | --- |
 | `GET /api/v1/nodes` | `admin`, `client` | 列出所有已注册节点及其在线态、可用 Agent、模型简称及已上报工作区；仅 `admin` Scope 额外返回脱敏默认通知通道状态（`default_notify_key_id`、`default_notify_key_name`、`default_notify_webhook_host`、`default_notify_valid`、`default_notify_events`） | 响应 `nodes[]`（按 `client` Key 的 `bound_node_id` 与 `allowed_nodes_json` 自动过滤可见范围；`client` Scope 一律省略上述 `default_notify_*` 字段） |
-| `PATCH /api/v1/nodes/:id` | `admin` | 修改节点显示名、`status`（如设为 `draining` 停止派发新任务）、`max_concurrency`、节点默认通知通道 `default_notify_key_id` 或默认 Bot 触发事件白名单 `default_notify_events` | 请求体 `{display_name?, status?, max_concurrency?, default_notify_key_id?, default_notify_events?}`；绑定非空 `default_notify_key_id` 时强制校验目标为未吊销、已配置 Webhook 且允许访问该节点的 `client` Key，传 `null` 或 `""` 解绑；`default_notify_events` 接收去重后的 `PushEventFilterKey[]`（允许 `[]` 静默默认 Bot） |
+| `PATCH /api/v1/nodes/:id` | `admin` | 修改节点显示名、`status`（如设为 `draining` 停止派发新任务）、`max_concurrency`、节点默认通知通道 `default_notify_key_id` 或默认 Bot 触发事件白名单 `default_notify_events` | 请求体 `{display_name?, status?, max_concurrency?, default_notify_key_id?, default_notify_events?}`；绑定非空 `default_notify_key_id` 时强制校验目标为未吊销、已配置 Webhook 且允许访问该节点的 `client` Key，传 `null` 或 `""` 解绑；`default_notify_events` 接收去重后的 `PushEventFilterKey[]`（全集共 `8` 项，其中 `0007` 默认保留 `7` 项受控/原生事件，`board_question_opened` 作为第 `8` 项按需开启；允许 `[]` 静默默认 Bot） |
 | `POST /api/v1/nodes/:id/native-events` | `node` | 节点上报脱离 `ahub` 运行的本地 Agent 官方 Hook / 扩展 / 阶段里程碑原生事件（`event_kind` 支持 `interaction_needed \| turn_summary \| progress`，`agent` 支持 `agy \| pi \| omp \| codex \| claude \| grok`） | 仅允许 `bound_node_id == :id` 的节点凭证调用；按 `(node_id, event_id)` 幂等去重，入库前二次脱敏；多渠道扇出写入 `notification_deliveries`（`bot_webhook` 按 `nodes.default_notify_key_id` Fail-Closed 校验，节点未绑定时仅跳过 Bot 通道且**不阻断 `web_push`**；若没有任何匹配渠道则保留 `skipped` `NODE_DEFAULT_CHANNEL_UNBOUND` 或 `failed` `DEFAULT_CHANNEL_INVALID_OR_REVOKED`）；当 `!deduplicated` 时经 `NodeHub` DO 向全局 `admin` `/ws/stream` 广播 `native_event.upserted`（含 `open_interaction_count`） |
 | `POST /api/v1/nodes/:id/claim` | `node` | 节点认领待执行任务（WS `hub.wake` 后及重连握手后必调） | 请求 `{conn_nonce, busy_workdirs?}`；返回 `claimed_runs[]`（**全系统唯一返回原始未脱敏 `prompt` 的接口**，供节点本地执行；伴随广播至 `/ws/stream` 的 `run.updated` 帧仍须对 `prompt` 脱敏并截断至 `<= 1200` 字符） |
 | `POST /api/v1/runs/:id/heartbeat` | `node` | 为运行中的任务续期 `90s` 租约，并检查是否已被取消 | 请求 `{lease_owner}`；返回 `{ok: true, status, should_abort: boolean, lease_expires_at}` |
@@ -78,10 +83,10 @@
 
 | 方法与路径 | 允许 Scope | 功能说明 | 关键请求/响应约定 |
 | --- | --- | --- | --- |
-| `GET /api/v1/auth/me` | `admin`, `client`, `node` | 返回当前凭证或 Cloudflare Access 会话解析后的主体信息 | 响应 `{ok: true, principal: {kind, scope, bound_node_id, allowed_nodes, allow_unsandboxed, max_depth_limit}}`；浏览器无本地 Token 时用于静默探测 Access 会话态 |
-| `GET /api/v1/keys` | `admin` | 列出所有 API Key 元数据（只返回 `key_prefix` 与脱敏 `notify_webhook_host`/`has_webhook`，绝不返回明文 `token` 或 Webhook 密钥） | 支持 `?scope=&include_revoked=false` |
-| `POST /api/v1/keys` | `admin` | 签发新的 `admin`、`client` 或 `node` 凭证 | 请求 `{name, scope, bound_node_id?, allowed_nodes?, allow_unsandboxed?, max_depth_limit?, webhook_url?, webhook_key?}`；`webhook_url`/`webhook_key` 仅允许 `client` Key 设置，经 `WEBHOOK_ENCRYPTION_KEY` 加密后落库；仅本次响应返回明文 `token` |
-| `PATCH /api/v1/keys/:id` | `admin` | 增量更新未吊销凭证的节点绑定与独立 Bot Webhook 配置 | 请求 `{allowed_nodes?, bound_node_id?, allow_unsandboxed?, max_depth_limit?, webhook_url?, webhook_key?, clear_webhook?}`；支持 `1:1`、`N:1` 与 `M:N` 多 Bot 与节点映射调整，仅返回更新后的脱敏 `key` |
+| `GET /api/v1/auth/me` | `admin`, `client`, `node` | 返回当前凭证或 Cloudflare Access 会话解析后的主体信息 | 响应 `{ok: true, principal: {kind, scope, bound_node_id, allowed_nodes, allowed_board_prefixes, allow_unsandboxed, max_depth_limit}}`；浏览器无本地 Token 时用于静默探测 Access 会话态 |
+| `GET /api/v1/keys` | `admin` | 列出所有 API Key 元数据（只返回 `key_prefix`、`allowed_board_prefixes` 与脱敏 `notify_webhook_host`/`has_webhook`，绝不返回明文 `token` 或 Webhook 密钥） | 支持 `?scope=&include_revoked=false` |
+| `POST /api/v1/keys` | `admin` | 签发新的 `admin`、`client` 或 `node` 凭证 | 请求 `{name, scope, bound_node_id?, allowed_nodes?, allowed_board_prefixes?, allow_unsandboxed?, max_depth_limit?, webhook_url?, webhook_key?}`；`allowed_board_prefixes` 仅对 `client` 生效（默认 `[]`，单项 `maxLength: 64` 且匹配 `^(\*\|[a-z0-9][a-z0-9_-]*(/[a-z0-9][a-z0-9_-]*)*)$`）；`webhook_url`/`webhook_key` 仅允许 `client` Key 设置，经 `WEBHOOK_ENCRYPTION_KEY` 加密后落库；仅本次响应返回明文 `token` |
+| `PATCH /api/v1/keys/:id` | `admin` | 增量更新未吊销凭证的节点绑定、协同板前缀与独立 Bot Webhook 配置 | 请求 `{allowed_nodes?, allowed_board_prefixes?, bound_node_id?, allow_unsandboxed?, max_depth_limit?, webhook_url?, webhook_key?, clear_webhook?}`；支持 `1:1`、`N:1` 与 `M:N` 多 Bot 与节点映射调整，仅返回更新后的脱敏 `key` |
 | `DELETE /api/v1/keys/:id` | `admin` | 吊销指定凭证（立即写入 `revoked_at` 并踢掉关联在线节点 WS） | 响应 `{ok: true, revoked_at}` |
 | `GET /dl/install.sh` | 公开 | 一键安装脚本（供新机器与外部助手沙箱拉取 `ahub`） | 返回 `text/x-sh` |
 | `GET /dl/bootstrap.md` | 公开 | 面向本地 Coding Agent 的节点安装、升级、配置初始化与系统服务托管二合一自举指南 | 返回 `text/markdown; charset=utf-8`（自动注入当前 `HUB_PUBLIC_URL`） |
@@ -92,7 +97,7 @@
 
 ### 2.5 原生活动与投递明细（`admin` Scope）
 
-> **强制作用域隔离**：以下全部接口均执行 `requireScope(principal, ["admin"])`；任意 `client` 或 `node` 凭证调用一律返回 `403 FORBIDDEN_SCOPE`。`NotificationDeliveryRecord` 结构字段固定为：`id`、`source_kind`、`source_id`、`trigger_event`、`node_id`、`channel_kind`、`channel_id`、`channel_label`、`target_host`、`route_mode`、`status`、`attempts`、`http_status`、`error_code`、`error_message`、`sent_at`、`created_at`、`updated_at`（详见 [ws-frames.schema.json](schemas/ws-frames.schema.json)）。
+> **强制作用域隔离**：以下全部接口均执行 `requireScope(principal, ["admin"])`；任意 `client` 或 `node` 凭证调用一律返回 `403 FORBIDDEN_SCOPE`。`NotificationDeliveryRecord` 结构字段固定为：`id`、`source_kind`（`'run' | 'native_event' | 'board_message'`）、`source_id`（`run_...` / `evt_...` / `msg_...`）、`trigger_event`（含 `'question_opened'`）、`node_id`（`board_message` 无节点时记 `'board'`，保持非空 `minLength: 1`）、`channel_kind`、`channel_id`、`channel_label`、`target_host`、`route_mode`、`status`、`attempts`、`http_status`、`error_code`、`error_message`、`sent_at`、`created_at`、`updated_at`（详见 [ws-frames.schema.json](schemas/ws-frames.schema.json)）。
 
 | 方法与路径 | 允许 Scope | 功能说明 | 关键请求/响应约定 |
 | --- | --- | --- | --- |
@@ -111,10 +116,29 @@
 | --- | --- | --- | --- |
 | `GET /api/v1/push/config` | `admin` | 查询控制面 Web Push VAPID 就绪状态与公钥 | 若 `VAPID_PUBLIC_KEY`、`VAPID_PRIVATE_JWK` 与 `VAPID_SUBJECT` 均已配置，返回 `200 { ok: true, enabled: true, vapid_public_key: string }`；否则返回 `200 { ok: true, enabled: false, vapid_public_key: null, reason: "VAPID_NOT_CONFIGURED" }` |
 | `GET /api/v1/push-subscriptions` | `admin` | 列出已注册浏览器推送设备（支持 `?include_revoked=false`） | 返回 `200 { ok: true, subscriptions: WebPushSubscriptionRecord[] }`；仅含脱敏元数据（`id`、`label`、`endpoint_host`、`endpoint_sha256_prefix` 12 位十六进制、`node_filter`、`event_filter`、`enabled`、`failure_count`、`last_sent_at`、`last_error_code`、`last_error_message`、`revoked_at`、`created_at`、`updated_at`），**绝不回传密文、完整 `endpoint`、`p256dh` 或 `auth`** |
-| `POST /api/v1/push-subscriptions` | `admin` | 注册或按 `endpoint_sha256` 幂等刷新浏览器推送订阅 | 请求 `{ label, subscription: { endpoint, keys: { p256dh, auth } }, node_filter?: string[], event_filter?: string[] }`；强制校验 `https:` 与厂商 Push 域名 SSRF 白名单（`fcm.googleapis.com`、`*.push.apple.com`、`*.push.services.mozilla.com`、`*.notify.windows.com`；仅 `ALLOW_LOOPBACK_PUSH_FOR_TEST === "true"` 时放行 `http://127.0.0.1` / `localhost`）、`65B`（`0x04` 前缀）`p256dh`、`16B` `auth` 与有效 `event_filter` 键（默认 `["run_needs_approval", "run_failed", "native_interaction_needed"]`），不合规返回 `400 BAD_REQUEST`；新建返回 `201`，续订刷新清除 `revoked_at` 并返回 `200 { ok: true, subscription }` |
+| `POST /api/v1/push-subscriptions` | `admin` | 注册或按 `endpoint_sha256` 幂等刷新浏览器推送订阅 | 请求 `{ label, subscription: { endpoint, keys: { p256dh, auth } }, node_filter?: string[], event_filter?: string[] }`；强制校验 `https:` 与厂商 Push 域名 SSRF 白名单（`fcm.googleapis.com`、`*.push.apple.com`、`*.push.services.mozilla.com`、`*.notify.windows.com`；仅 `ALLOW_LOOPBACK_PUSH_FOR_TEST === "true"` 时放行 `http://127.0.0.1` / `localhost`）、`65B`（`0x04` 前缀）`p256dh`、`16B` `auth` 与有效 `event_filter` 键（默认 `["run_needs_approval", "run_failed", "native_interaction_needed", "board_question_opened"]`），不合规返回 `400 BAD_REQUEST`；新建返回 `201`，续订刷新清除 `revoked_at` 并返回 `200 { ok: true, subscription }` |
 | `PATCH /api/v1/push-subscriptions/:id` | `admin` | 修改订阅设备显示名、启停开关、节点或事件过滤规则 | 请求 `{ label?, enabled?, node_filter?, event_filter? }`；不存在返回 `404 NOT_FOUND`，已吊销返回 `409 INVALID_STATE_TRANSITION`，成功返回 `200 { ok: true, subscription }` |
 | `DELETE /api/v1/push-subscriptions/:id` | `admin` | 解绑并吊销指定浏览器推送订阅 | 不存在返回 `404 NOT_FOUND`；写入 `revoked_at = now, enabled = 0`，返回 `200 { ok: true, revoked_at }` |
 | `POST /api/v1/push-subscriptions/:id/test` | `admin` | 同步发送一条测试 Web Push（`kind: "test"`）并立即回显上游网关结果 | 不存在返回 `404 NOT_FOUND`，已吊销返回 `409 INVALID_STATE_TRANSITION`，未配置 VAPID 返回 `400 BAD_REQUEST`；同步更新 `last_sent_at` / `failure_count` / `revoked_at`（遇 `404`/`410` 自动吊销），返回 `200 { ok: true, delivered: boolean, http_status: number \| null, error_code: string, error_message: string, subscription }` |
+
+### 2.7 跨机协同板与双向问答（Board）
+
+> **协同板作用域与安全边界**：
+> - 全部 `/api/v1/board/*` 接口对 `node` Scope 一律返回 `403 FORBIDDEN_SCOPE`。
+> - `client` Scope 按 `allowed_board_prefixes_json` 执行段边界前缀 Fail-Closed 校验（默认 `[]` 返回 `403 FORBIDDEN_SCOPE`）；`GET /api/v1/board/channels`、`GET /api/v1/board/topics` 与 `GET /api/v1/board/events` 仅返回授权前缀范围内的条目（若 `client` 指定未授权 `?channel=` 直接返回 `403 FORBIDDEN_SCOPE`）。
+> - `channel` 必须匹配 `^[a-z0-9][a-z0-9_-]*(/[a-z0-9][a-z0-9_-]*)*$`（`maxLength: 64`，拒绝空段 `//`、前导 `/` 与尾随 `/`）；所有请求文本（`text_md`、`data` 与 `question_options`）在落库前执行对称 `redactSecrets` 脱敏。完整 JSON 结构见 [board.schema.json](schemas/board.schema.json)。
+
+| 方法与路径 | 允许 Scope | 功能说明 | 关键请求/响应约定 |
+| --- | --- | --- | --- |
+| `GET /api/v1/board/channels` | `admin`, `client` | 返回授权范围内的频道目录、活跃主题数与未答复提问数 | 响应 `200 { ok: true, channels: BoardChannelSummary[] }`（`BoardChannelsResponse`） |
+| `GET /api/v1/board/topics` | `admin`, `client` | 按 `?channel=&external_ref=&status=&has_open_question=&q=&sort=recent\|order&limit=50` 查询协同主题列表 | 响应 `200 { ok: true, topics: BoardTopic[] }`（`BoardTopicsResponse`，含 `open_question_count` 与 `latest_handoff`） |
+| `POST /api/v1/board/topics` | `admin`, `client` | 创建或按 `(channel, external_ref)` 幂等获取协同主题 | 请求 `{ channel, title, external_ref?, status?, pinned?, labels?, upsert? }`（`CreateBoardTopicRequest`）；`upsert: true` 命中同锚点主题时返回 `200 { ok: true, topic, created: false }`，新建返回 `201 { ok: true, topic, created: true }`（`BoardTopicResponse`）并广播 `board.topic_updated` |
+| `PATCH /api/v1/board/topics/:id` | `admin`, `client` | 更新主题 `title`、`status`（5 态）、`pinned`、`sort_order` 或 `labels` | 请求 `{ title?, status?, pinned?, sort_order?, labels? }`（`PatchBoardTopicRequest`，至少 1 个字段）；响应 `200 { ok: true, topic }`（`BoardTopicResponse`）并广播 `board.topic_updated` |
+| `POST /api/v1/board/topics/reorder` | `admin`, `client` | 批量重排同频道同状态列内的主题 `sort_order`（Slice 1a 后端就绪，供 Slice 1b `@dnd-kit` 看板拖拽 UI 复用） | 请求 `{ channel, status, ordered_topic_ids }`（`ReorderBoardTopicsRequest`）；校验频道前缀并更新 `sort_order`，响应 `200 { ok: true, topics: BoardTopic[] }`（`BoardTopicsResponse`） |
+| `GET /api/v1/board/topics/:id/messages` | `admin`, `client` | 按 `?after_seq=0&limit=50` 读取主题信息与消息时间线 | 响应 `200 { ok: true, topic: BoardTopic, messages: BoardMessage[], cursor: number }`（`BoardMessagesResponse`） |
+| `POST /api/v1/board/topics/:id/messages` | `admin`, `client` | 向主题追加 `note` / `handoff` / `question` / `artifact` 消息（禁止直接传 `kind = 'answer'`） | 请求 `{ kind, text_md, data?, actor_profile?, source_node?, topic_status?, question_options?, question_expires_sec?, idempotency_key? }`（`CreateBoardMessageRequest`，同步支持 `Idempotency-Key` 请求头；`text_md <= 8192` 字符、`data <= 32768` UTF-8 字节、`question_options <= 8` 项、`question_expires_sec` 范围 `600..259200` 默认 `86400`）；若 `kind = 'question'` 自动联锁 `blocked` 并入队高优推送（非 `question` 绝不触发推送）；新建返回 `201`、幂等命中返回 `200 { ok: true, topic, message, cursor, deduplicated? }`（`BoardMessagePostResponse`）并广播 `board.message_created` |
+| `POST /api/v1/board/messages/:id/answer` | **`admin`** | 对处于 `open` 的 `question` 独占 CAS 作答 | 请求 `{ selected_option?, answer_text?, actor_profile? }`（`AnswerBoardQuestionRequest`，`answer_text` 与 `selected_option` 至少提供一项）；非 `admin` 返回 `403 FORBIDDEN_SCOPE`；单语句 CAS 校验 `kind = 'question' AND question_state = 'open'`，冲突返回 `409 INVALID_STATE_TRANSITION`；写入 `kind = 'answer'` 消息、无剩余 `open` 问题时恢复 `previous_status`，返回 `200 { ok: true, topic, question, answer, cursor }`（`AnswerBoardQuestionResponse`）并广播 `board.question_answered` |
+| `GET /api/v1/board/events` | `admin`, `client` | 按 `?channel=&topic_id=&after_cursor=0&limit=100` 增量拉取协同事件游标流 | 响应 `200 { ok: true, events: BoardEvent[], next_cursor: number }`（`BoardEventsResponse`） |
 
 ## 3. Durable Objects WebSocket 双向协议
 
@@ -137,19 +161,23 @@
 2. `hub.wake`：通知节点有新任务或重试指令待拉取（含 `reason: "run_queued" | "reconcile"` 与提示 `run_id`）。节点收到后立即并发安全地调用 `POST /api/v1/nodes/:id/claim`。
 3. `hub.abort`：要求节点立即终止指定 `run_id`（含 `reason`）。节点对目标子进程组先发 `SIGTERM`，若 `5 秒` 内未退出则补发 `SIGKILL`。
 
-### 3.2 前端与 `ahub wait` 实时订阅通道：`wss://ahub.bobocai.win/ws/stream`
+### 3.2 前端与调用端实时订阅通道：`wss://ahub.bobocai.win/ws/stream`
 
-严格区分两种订阅粒度与权限边界：
-- **全局工作台订阅（Web UI / `att.scope === "admin" && !att.runId`）**：不传 `run_id`（仅限 Cloudflare Access 或 `admin` Bearer Token；`client` / `node` 凭证一律拒绝 `403 FORBIDDEN_SCOPE`），接收全机群节点上下线（`node.status`）、任务状态变更（`run.updated`）、事件增量（`run.event` / `run.events`）、**原生活动增量（`native_event.upserted`）与投递账本增量（`delivery.updated`）**。
-- **单任务等待订阅（`ahub wait` / `client` / `?run_id=<id>`）**：传 `?run_id=run_xxx`（需有该任务读权限），仅接收该 `run_id` 的 `run.event`、`run.events`、`run.updated` 与脱敏 `snapshot`（**绝不携带 `native_events`、`open_interaction_count`，也绝不转发 `native_event.upserted` 或 `delivery.updated`**），并在任务到达终态或 `needs_approval` 时由客户端主动断开。
+严格区分三种订阅粒度与权限边界：
+- **全局工作台订阅（Web UI / `att.scope === "admin" && !att.runId && !att.topicId`）**：不传 `run_id` 与 `topic_id`（仅限 Cloudflare Access 或 `admin` Bearer Token；`client` / `node` 凭证一律拒绝 `403 FORBIDDEN_SCOPE`），接收全机群节点上下线（`node.status`）、任务状态变更（`run.updated`）、事件增量（`run.event` / `run.events`）、原生活动增量（`native_event.upserted`）、投递账本增量（`delivery.updated`）与协同板增量（`board.topic_updated` / `board.message_created` / `board.question_answered`）。
+- **单任务等待订阅（`ahub wait` / `client` / `?run_id=<id>`）**：传 `?run_id=run_xxx`（需有该任务读权限），仅接收该 `run_id` 的 `run.event`、`run.events`、`run.updated` 与脱敏 `snapshot`（**绝不携带 `native_events`、`open_interaction_count`、`open_board_question_count`，也绝不转发 `native_event.upserted`、`delivery.updated` 或 `board.*`**），并在任务到达终态或 `needs_approval` 时由客户端主动断开。
+- **单主题协同订阅（`ahub board ask --wait` / `ahub board wait` / `?topic_id=<tid>&after_cursor=<c>`）**：传 `?topic_id=top_xxx`（可选 `&after_cursor=<c>`），允许 `admin` 或拥有该主题频道前缀权限的 `client` 订阅（`node` 或无前缀权限的 `client` 一律拒绝 `403 FORBIDDEN_SCOPE`）。建连时推送极简 `snapshot`（`nodes: []`、`topic`、`ts`，**绝不携带 `open_board_question_count`、`native_events` 或 `open_interaction_count`**），随即按 `board_events.cursor > after_cursor` 顺序补发断线期间遗漏的 `board.topic_updated` / `board.message_created` / `board.question_answered` 完整载荷帧实现零丢答复恢复，此后仅实时转发匹配该 `topic_id` 的 `board.*` 帧。
 
 **Hub -> Client 帧**：
-- `snapshot`：建连瞬间下发当前最新快照（包含 `nodes`、可选 `threads` 与 `runs`，避免连接建立与首次 REST 拉取之间的竞态丢帧）；其中 `nodes[]` 按订阅方 `principal.scope` 过滤（`client` Scope 省略 `default_notify_*` 字段），`runs[]` 中的 `prompt` 统一脱敏并截断至 `<= 1200` 字符。**仅当 `att.scope === "admin" && !att.runId` 时**额外包含 `native_events`（最近最多 `100` 条 `NativeEventView`）与 `open_interaction_count`（`integer >= 0`）；`client` 或 `?run_id=` 连接严禁包含上述两字段。
+- `snapshot`：建连瞬间下发当前最新快照。全局或 `run_id` 流包含 `nodes`、可选 `threads` 与 `runs`（`client` Scope 省略 `default_notify_*`，`runs[].prompt` 脱敏截断 `<= 1200` 字符）；**仅当 `att.scope === "admin" && !att.runId && !att.topicId` 时**额外包含 `native_events`（最近最多 `100` 条）、`open_interaction_count`（`integer >= 0`）与 `open_board_question_count`（`integer >= 0`）；`?topic_id=` 流携带 `nodes: []` 与目标 `topic` 详情。
 - `node.status`：节点状态变更增量（推送给 `client` Scope 连接时同样省略 `default_notify_*` 字段）。
-- `run.updated`：任意 `Run` 状态、耗时、摘要、`notify_status` 或 `deliveries_summary` 变更（含 `NodeHub` 接收 `run.state` 后生成的增量帧，以及 `notify-queue.ts` 在更新 D1 `runs.notify_status` / `deliveries_summary` 后通过 `NodeHub` `/internal/broadcast-run` 补播的帧；`run.prompt` 统一脱敏并截断至 `<= 1200` 字符）。
+- `run.updated`：任意 `Run` 状态、耗时、摘要、`notify_status` 或 `deliveries_summary` 变更（`run.prompt` 统一脱敏并截断至 `<= 1200` 字符）。
 - `run.event` / `run.events`：实时执行流事件增量（单条或批量）。
-- `native_event.upserted`（**仅全局 `admin` 流**）：`{ type: "native_event.upserted", event: NativeEventView, open_interaction_count: number }`，在 `POST /api/v1/nodes/:id/native-events`（`!deduplicated`）、`POST /api/v1/native-events/:id/ack`、`/redeliver` 及队列更新聚合 `notify_status` 时即时推送。
-- `delivery.updated`（**仅全局 `admin` 流**）：`{ type: "delivery.updated", delivery: NotificationDeliveryRecord }`，在重新入队或队列消费回写任意 `notification_deliveries` 行后即时推送。
+- `native_event.upserted`（**仅全局 `admin` 流**）：`{ type: "native_event.upserted", event: NativeEventView, open_interaction_count: number }`。
+- `delivery.updated`（**仅全局 `admin` 流**）：`{ type: "delivery.updated", delivery: NotificationDeliveryRecord }`。
+- `board.topic_updated`（全局 `admin` 流或匹配 `topic_id` 流）：`{ type: "board.topic_updated", topic: BoardTopic, cursor?: number, open_board_question_count?: number }`（`open_board_question_count` 仅向全局 `admin` 流下发）。
+- `board.message_created`（全局 `admin` 流或匹配 `topic_id` 流）：`{ type: "board.message_created", message: BoardMessage, topic?: BoardTopic, cursor: number, open_board_question_count?: number }`。
+- `board.question_answered`（全局 `admin` 流或匹配 `topic_id` 流）：`{ type: "board.question_answered", question: BoardMessage, answer: BoardMessage, topic?: BoardTopic, cursor: number, open_board_question_count?: number }`。
 - `error`：鉴权失效或订阅非法对象提示。
 
 ## 4. Cloudflare Queues 通知载荷契约
@@ -178,6 +206,11 @@
 - **节点原生 Agent 事件通知（`native_events`）**：
   - `POST /api/v1/nodes/:id/native-events` 在 `!deduplicated` 时：若节点存在有效的 `default_notify_key_id` 且 `nodes.default_notify_events` 包含 `native_<event_kind>`，生成 `bot_webhook`（`route_mode = "node_default"`）投递行（未绑定或未命中事件过滤时跳过 Bot 通道但**不阻断 Web Push**）；同时为所有匹配 `node_filter_json` 与 `native_<event_kind>`（`interaction_needed` / `turn_summary` / `progress`）的活跃 `web_push_subscriptions` 各自生成 `web_push` 投递行。若最终两者皆无匹配，按规则保留 `notify_status = 'skipped'`（`NODE_DEFAULT_CHANNEL_UNBOUND` 或 `NO_MATCHING_CHANNELS`）或 `'failed'`（`DEFAULT_CHANNEL_INVALID_OR_REVOKED`）。
   - 对于非紧急事件（`turn_summary`、`progress`），入队阶段附带 `delaySeconds = NATIVE_NOTIFY_QUIET_SEC`（默认 `60`），并在 `native_session_id != ''` 时先将同会话在途旧队列行标为 `skipped`（`SUPERSEDED_BY_NEWER_TURN`）；同时在入库与消费双阶段校验同会话同通道 `NATIVE_NOTIFY_COOLDOWN_SEC`（默认 `300`）冷却窗（命中则置 `skipped` `SESSION_COOLDOWN_ACTIVE`）。`interaction_needed` 恒以 `delaySeconds = 0` 立即投递且不受冷却限制。
+- **跨机协同板提问通知（`board_message`，仅限 `kind = 'question'`）**：
+  - `POST /api/v1/board/topics/:id/messages` 在 `kind = 'question'` 且未幂等去重时，向 `notification_deliveries` 写入 `source_kind = 'board_message'`、`source_id = <msg_id>`、`trigger_event = 'question_opened'`、`node_id = source_node || 'board'`（保持 `node_id` 非空约束），并以 `delaySeconds = 0` 入队高优推送：
+    - Web Push：匹配 `enabled = 1 AND revoked_at IS NULL`、`event_filter_json` 包含 `board_question_opened`，且 `node_filter_json` 为空 `[]` 或（`source_node` 非空且命中 `node_filter_json`）的订阅；
+    - Bot Webhook：仅当 `source_node` 非空且对应节点已绑定有效 `default_notify_key_id` 且管理员已在 `default_notify_events` 中勾选开启第 `8` 项 `board_question_opened`（默认关闭、按需开启）时生成 `node_default` 投递行。
+  - `note` / `handoff` / `artifact` 绝不写入 `notification_deliveries` 或向 `NOTIFY_QUEUE` 入队。
 
 ### 4.2 Bot Webhook 回调格式与 Fail-Closed 隔离
 
@@ -242,8 +275,8 @@ Bot Webhook 重试策略：HTTP 非 `2xx` 时抛出异常由 Cloudflare Queues �
 
 `web_push` 投递行由 `apps/hub-worker/src/web-push.ts` 基于 Workers 原生 `crypto.subtle` 执行端到端加密后直连浏览器厂商 Push 服务：
 
-- **HTTP 请求头**：`Authorization: vapid t=<jwt>, k=<VAPID_PUBLIC_KEY>`（RFC 8292 `ES256`，`aud = new URL(endpoint).origin`，`exp = now + 12h`）、`Content-Type: application/octet-stream`、`Content-Encoding: aes128gcm`、`TTL: 86400`、`Urgency: high | normal`（`interaction_needed` / `needs_approval` / `failed` 用 `high`，其余用 `normal`）。
-- **加密前明文 JSON 结构**（UTF-8 编码严格裁剪至 `<= 3072` 字节）：
+- **HTTP 请求头**：`Authorization: vapid t=<jwt>, k=<VAPID_PUBLIC_KEY>`（RFC 8292 `ES256`，`aud = new URL(endpoint).origin`，`exp = now + 12h`）、`Content-Type: application/octet-stream`、`Content-Encoding: aes128gcm`、`TTL: 86400`、`Urgency: high | normal`（`interaction_needed` / `needs_approval` / `failed` / `question_opened` 用 `high`，其余用 `normal`）。
+- **加密前明文 JSON 结构**（UTF-8 编码严格裁剪至 `<= 3072` 字节；原生活动使用 `kind: "native_event"`，协同板提问使用 `kind: "board_message"` 与深链 `"/?workspace=inbox&source=board&id=<msg_id>"`）：
 
 ```json
 {
@@ -256,6 +289,20 @@ Bot Webhook 重试策略：HTTP 非 `2xx` 时抛出异常由 Cloudflare Queues �
   "body": "~/workspace/demo: 是否允许执行迁移检查？",
   "target_url": "/?pane=native&session=macmini:claude:sess_1&event=evt_01J...",
   "ts": "2026-11-18T05:30:00.000Z"
+}
+```
+
+```json
+{
+  "v": 1,
+  "kind": "board_message",
+  "id": "msg_01J...",
+  "tag": "ahub-board-msg_01J...",
+  "urgent": true,
+  "title": "[proj/demo] agy-worker@linux-dev 请求确认",
+  "body": "检测到下游接口存在历史字段差异，请选择处置口径",
+  "target_url": "/?workspace=inbox&source=board&id=msg_01J...",
+  "ts": "2026-11-22T03:05:00.000Z"
 }
 ```
 
@@ -274,18 +321,18 @@ Bot Webhook 重试策略：HTTP 非 `2xx` 时抛出异常由 Cloudflare Queues �
 
 | 错误码 | HTTP 状态 | 语义说明 | 调用方恢复建议 |
 | --- | --- | --- | --- |
-| `BAD_REQUEST` | `400` | 请求 JSON 格式非法、字段校验未通过、VAPID 未配置或 Push 端点未命中 SSRF 白名单 | 按响应 `error.message` 修正请求参数或服务端配置后重发 |
+| `BAD_REQUEST` | `400` | 请求 JSON 格式非法、字段校验未通过（含协同板 `channel`/`actor_profile` 格式非法、`data` 超出 `32 KB`、`question_options` 超过 `8` 项）、VAPID 未配置或 Push 端点未命中 SSRF 白名单 | 按响应 `error.message` 与 `error.next`（若有）修正请求参数或服务端配置后重发 |
 | `UNAUTHORIZED` | `401` | 缺少或无效的认证凭证 | 检查 `AHUB_TOKEN` 或重新登录 Cloudflare Access |
-| `FORBIDDEN_SCOPE` | `403` | 当前 Key 无权操作目标节点、禁止关闭 `--sandbox`、跨节点上报或越权访问 `admin` 原生活动/Push 接口 | 联系管理员在 Web 控制台调整 Key 权限或改用 `admin` 凭证 |
-| `NOT_FOUND` | `404` | 请求的目标资源（`run_id`、`thread_id`、`native_event_id`、`delivery_id` 或 `subscription_id`）不存在 | 刷新列表确认目标 ID 是否已过期或被清理 |
+| `FORBIDDEN_SCOPE` | `403` | 当前 Key 无权操作目标节点、禁止关闭 `--sandbox`、跨节点上报、越权访问 `admin` 原生活动/Push 接口、`client` 缺少对应 `allowed_board_prefixes` 或尝试代答提问，或 `node` Key 访问 `/api/v1/board/*` 与 `/ws/stream` | 联系管理员在 Web 控制台调整 Key 权限、改用 `admin` 凭证，或按 `error.next` 切换至已授权频道 |
+| `NOT_FOUND` | `404` | 请求的目标资源（`run_id`、`thread_id`、`native_event_id`、`topic_id`、`message_id`、`delivery_id` 或 `subscription_id`）不存在 | 刷新列表确认目标 ID 是否已过期或被清理 |
 | `NODE_NOT_FOUND` | `404` | 指定 `node_id` 不存在 | 调用 `ahub nodes --json` 获取最新节点清单 |
 | `NODE_DRAINING` | `409` | 目标节点正处于维护排水状态，拒绝新任务入队 | 改派其他节点或等待节点恢复 `online` |
 | `WORKDIR_NOT_FOUND` | `400` | 目标节点上未匹配到对应的项目短名或路径 | 核对 `ahub nodes --json` 返回的 `workspaces` |
 | `WORKDIR_AMBIGUOUS` | `400` | 传入的项目短名在节点上命中多个同名目录 | 从 `error.details.candidates` 中选取带前缀路径重发 |
 | `DEPTH_LIMIT_EXCEEDED` | `409` | 跨机衍生调用深度超过 `max_depth` | 停止继续委派，在当前上下文汇总结果返回上级 |
 | `DELEGATION_CYCLE_DETECTED` | `409` | 同一 `root_run_id` 祖先链试图回环调用已持锁的 `(node_id, workdir)` | 禁止循环派单，直接由当前节点处理或返回 |
-| `IDEMPOTENCY_CONFLICT` | `409` | 重复的 `Idempotency-Key` 携带了不一致的参数 | 更换新的幂等键或复用原请求参数 |
-| `INVALID_STATE_TRANSITION` | `409` | 操作与当前状态冲突（如试图修改已认领任务、改派多轮已建连会话、覆盖终态，或修改/测试已吊销 Push 订阅） | 重新查询详情对齐状态；多轮会话改派请改用 `/fork` |
+| `IDEMPOTENCY_CONFLICT` | `409` | 重复的 `Idempotency-Key` 携带了不一致的参数（含协同板发消息携带不同载荷） | 更换新的幂等键或复用原请求参数 |
+| `INVALID_STATE_TRANSITION` | `409` | 操作与当前状态冲突（如试图修改已认领任务、改派多轮已建连会话、覆盖终态、修改/测试已吊销 Push 订阅，或对已答复/已过期/非 `question` 消息调用 `/answer`） | 重新查询详情对齐状态；多轮会话改派请改用 `/fork` |
 | `LEASE_CONFLICT` | `409` | 节点心跳、审批检查点或完成上报携带的 `lease_owner` 与云端当前租约不匹配 | 立即停止本地目录占用等待下次认领 |
 | `APPROVAL_TIMEOUT` | `—`（任务 `error_code`） | 处于 `needs_approval` 状态的任务超过单轮 `timeout_sec` 上限仍未获批放行 | 检查远控或工作区变更后视需要重派新任务 |
 | `NODE_LEASE_EXPIRED` | `410` | 节点心跳租约超时未续期，任务已被回收标为失败 | 检查节点在线状态与本地工作区后决定是否重发 |

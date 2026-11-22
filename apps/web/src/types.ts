@@ -3,7 +3,7 @@ export type NativeEventAgentName = AgentName | "grok";
 export type NativeEventKind = "interaction_needed" | "turn_summary" | "progress";
 export type NativeEventNotifyStatus = "none" | "queued" | "sent" | "partial" | "failed" | "skipped";
 export type AttentionState = "open" | "acked" | "superseded" | "stale";
-export type DeliverySourceKind = "run" | "native_event";
+export type DeliverySourceKind = "run" | "native_event" | "board_message";
 export type DeliveryChannelKind = "bot_webhook" | "web_push" | "legacy_webhook";
 export type DeliveryStatus = "queued" | "sent" | "failed" | "skipped";
 export type NotifyRouteMode = "key" | "node_default" | "web_push" | "global_legacy";
@@ -14,7 +14,8 @@ export type DeliveryTriggerEvent =
   | "cancelled"
   | "interaction_needed"
   | "turn_summary"
-  | "progress";
+  | "progress"
+  | "question_opened";
 export type PushEventFilterKey =
   | "run_needs_approval"
   | "run_failed"
@@ -22,7 +23,8 @@ export type PushEventFilterKey =
   | "run_cancelled"
   | "native_interaction_needed"
   | "native_turn_summary"
-  | "native_progress";
+  | "native_progress"
+  | "board_question_opened";
 
 export interface DeliveriesSummary {
   total: number;
@@ -244,6 +246,7 @@ export interface ApiKeyRecord {
   scope: "admin" | "client" | "node";
   bound_node_id: string | null;
   allowed_nodes: string[];
+  allowed_board_prefixes: string[];
   allow_unsandboxed: boolean;
   max_depth_limit: number;
   notify_webhook_host: string;
@@ -251,6 +254,142 @@ export interface ApiKeyRecord {
   last_used_at: string | null;
   revoked_at: string | null;
   created_at: string;
+}
+
+export interface AuthPrincipal {
+  kind: string;
+  scope: "admin" | "client" | "node";
+  bound_node_id?: string | null;
+  allowed_nodes?: string[];
+  allowed_board_prefixes?: string[];
+  allow_unsandboxed?: boolean;
+  max_depth_limit?: number;
+}
+
+export type BoardTopicStatus = "todo" | "in_progress" | "blocked" | "done" | "archived";
+export type BoardTopicPreviousStatus = "" | "todo" | "in_progress";
+export type BoardMessageKind = "note" | "handoff" | "question" | "answer" | "artifact";
+export type BoardQuestionState = "" | "open" | "answered" | "expired" | "cancelled";
+export type BoardActorScope = "admin" | "client";
+export type BoardEventType =
+  | "topic.created"
+  | "topic.updated"
+  | "message.posted"
+  | "question.opened"
+  | "question.answered"
+  | "question.expired"
+  | "question.cancelled";
+
+export interface BoardHandoffSnapshot {
+  id: string;
+  actor_profile: string;
+  source_node: string;
+  text_md: string;
+  data: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface BoardChannelSummary {
+  channel: string;
+  active_topic_count: number;
+  open_question_count: number;
+  total_topic_count?: number;
+  updated_at?: string | null;
+}
+
+export interface BoardTopic {
+  id: string;
+  channel: string;
+  title: string;
+  external_ref: string;
+  status: BoardTopicStatus;
+  previous_status: BoardTopicPreviousStatus;
+  pinned: boolean;
+  sort_order: number;
+  labels: Record<string, string>;
+  created_by_key_id: string | null;
+  last_message_id: string;
+  last_handoff_message_id: string;
+  last_event_cursor: number;
+  open_question_count?: number;
+  message_count?: number;
+  latest_handoff?: BoardHandoffSnapshot | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface BoardMessage {
+  id: string;
+  topic_id: string;
+  channel: string;
+  seq: number;
+  kind: BoardMessageKind;
+  reply_to_id: string | null;
+  actor_scope: BoardActorScope;
+  actor_key_id: string | null;
+  actor_profile: string;
+  source_node: string;
+  text_md: string;
+  data: Record<string, unknown>;
+  question_state: BoardQuestionState;
+  question_options: string[];
+  question_expires_at: string | null;
+  answered_message_id: string | null;
+  answered_at: string | null;
+  deliveries_summary?: DeliveriesSummary;
+  created_at: string;
+}
+
+export interface BoardEvent {
+  cursor: number;
+  channel: string;
+  topic_id: string;
+  message_id: string | null;
+  event_type: BoardEventType;
+  actor_profile: string;
+  created_at: string;
+}
+
+export interface CreateBoardTopicPayload {
+  channel: string;
+  title: string;
+  external_ref?: string;
+  status?: BoardTopicStatus;
+  pinned?: boolean;
+  labels?: Record<string, string>;
+  upsert?: boolean;
+}
+
+export interface PatchBoardTopicPayload {
+  title?: string;
+  status?: BoardTopicStatus;
+  pinned?: boolean;
+  sort_order?: number;
+  labels?: Record<string, string>;
+}
+
+export interface ReorderBoardTopicsPayload {
+  channel: string;
+  status: BoardTopicStatus;
+  ordered_topic_ids: string[];
+}
+
+export interface CreateBoardMessagePayload {
+  kind: "note" | "handoff" | "question" | "artifact";
+  text_md: string;
+  data?: Record<string, unknown>;
+  actor_profile?: string;
+  source_node?: string;
+  topic_status?: BoardTopicStatus;
+  question_options?: string[];
+  question_expires_sec?: number;
+  idempotency_key?: string;
+}
+
+export interface AnswerBoardQuestionPayload {
+  selected_option?: string;
+  answer_text?: string;
+  actor_profile?: string;
 }
 
 export interface CreateRunPayload {
@@ -274,6 +413,8 @@ export type StreamFrame =
       runs: RunRecord[];
       native_events?: NativeEventView[];
       open_interaction_count?: number;
+      open_board_question_count?: number;
+      topic?: BoardTopic;
       ts: string;
     }
   | {
@@ -305,4 +446,25 @@ export type StreamFrame =
   | {
       type: "delivery.updated";
       delivery: NotificationDeliveryRecord;
+    }
+  | {
+      type: "board.topic_updated";
+      topic: BoardTopic;
+      cursor?: number;
+      open_board_question_count?: number;
+    }
+  | {
+      type: "board.message_created";
+      message: BoardMessage;
+      topic?: BoardTopic;
+      cursor: number;
+      open_board_question_count?: number;
+    }
+  | {
+      type: "board.question_answered";
+      question: BoardMessage;
+      answer: BoardMessage;
+      topic?: BoardTopic;
+      cursor: number;
+      open_board_question_count?: number;
     };

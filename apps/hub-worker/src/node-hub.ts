@@ -1,5 +1,10 @@
 import { DurableObject } from "cloudflare:workers";
 import {
+  countOpenBoardQuestions,
+  getBoardTopicById,
+  listMissedTopicStreamFrames
+} from "./board";
+import {
   appendRunEvents,
   applyRunStateFrame,
   countOpenNativeInteractions,
@@ -20,6 +25,8 @@ import {
 import {
   type ApiScope,
   type AuthPrincipal,
+  type BoardMessage,
+  type BoardTopic,
   type Env,
   HubError,
   type NativeEventRecord,
@@ -40,10 +47,12 @@ interface NodeWsAttachment {
 interface StreamWsAttachment {
   role: "stream";
   runId: string | null;
+  topicId: string | null;
   scope: ApiScope;
   keyId: string | null;
   boundNodeId: string | null;
   allowedNodes: string[];
+  allowedBoardPrefixes?: string[];
 }
 
 type WsAttachment = NodeWsAttachment | StreamWsAttachment;
@@ -58,14 +67,26 @@ const TERMINAL_OR_PAUSE = new Set(["done", "failed", "cancelled", "needs_approva
 export async function buildStreamSnapshotPayload(
   db: D1Database,
   principal: AuthPrincipal,
-  runId: string | null
+  runId: string | null,
+  topicId: string | null = null
 ): Promise<Record<string, unknown>> {
+  if (topicId) {
+    const topic = await getBoardTopicById(db, principal, topicId);
+    return {
+      type: "snapshot",
+      nodes: [],
+      topic,
+      ts: nowIso()
+    };
+  }
+
   const isGlobalAdminStream = principal.scope === "admin" && !runId;
-  const [nodes, threads, runs, nativeSnapshot] = await Promise.all([
+  const [nodes, threads, runs, nativeSnapshot, openBoardQuestionCount] = await Promise.all([
     listNodes(db, principal),
     runId ? Promise.resolve([]) : listThreads(db, principal, { limit: 100 }),
     listRuns(db, principal, { limit: 100 }),
-    isGlobalAdminStream ? listNativeEvents(db, { limit: 100 }) : Promise.resolve(null)
+    isGlobalAdminStream ? listNativeEvents(db, { limit: 100 }) : Promise.resolve(null),
+    isGlobalAdminStream ? countOpenBoardQuestions(db) : Promise.resolve(null)
   ]);
   const filteredRuns = runId ? runs.filter((r) => r.id === runId) : runs;
 
@@ -79,6 +100,9 @@ export async function buildStreamSnapshotPayload(
           native_events: nativeSnapshot.events,
           open_interaction_count: nativeSnapshot.openInteractionCount
         }
+      : {}),
+    ...(openBoardQuestionCount !== null
+      ? { open_board_question_count: openBoardQuestionCount }
       : {}),
     ts: nowIso()
   };
@@ -130,16 +154,58 @@ export class NodeHub extends DurableObject<Env> {
 
   private broadcastToStream(
     payload: { type: string; node?: NodeRecord } & Record<string, unknown>,
-    filter?: { runId?: string; nodeId?: string }
+    filter?: { runId?: string; nodeId?: string; topicId?: string }
   ): void {
     const adminEncoded = JSON.stringify(payload);
     const adminGlobalOnly =
       payload.type === "native_event.upserted" || payload.type === "delivery.updated";
+    const isBoardFrame = payload.type.startsWith("board.");
     let clientEncoded: string | null = null;
+    let topicBoardEncoded: string | null = null;
+
     for (const ws of this.ctx.getWebSockets("stream")) {
       const att = ws.deserializeAttachment() as StreamWsAttachment | null;
       if (!att) continue;
-      if (adminGlobalOnly && (att.scope !== "admin" || Boolean(att.runId))) {
+      if (adminGlobalOnly && (att.scope !== "admin" || Boolean(att.runId) || Boolean(att.topicId))) {
+        continue;
+      }
+
+      if (isBoardFrame) {
+        if (att.runId) {
+          continue;
+        }
+        if (att.topicId) {
+          if (!filter?.topicId || att.topicId !== filter.topicId) {
+            continue;
+          }
+          if (topicBoardEncoded === null) {
+            if ("open_board_question_count" in payload) {
+              const { open_board_question_count: _ignored, ...rest } = payload;
+              topicBoardEncoded = JSON.stringify(rest);
+            } else {
+              topicBoardEncoded = adminEncoded;
+            }
+          }
+          try {
+            ws.send(topicBoardEncoded);
+          } catch {
+            // ignore broken socket
+          }
+          continue;
+        }
+        if (att.scope !== "admin") {
+          continue;
+        }
+        try {
+          ws.send(adminEncoded);
+        } catch {
+          // ignore broken socket
+        }
+        continue;
+      }
+
+      // Non-board frames must never be sent to single-topic subscribers
+      if (att.topicId) {
         continue;
       }
       if (att.runId && filter?.runId && att.runId !== filter.runId) {
@@ -194,6 +260,12 @@ export class NodeHub extends DurableObject<Env> {
 
     if (url.pathname === "/internal/ws/stream") {
       const runId = url.searchParams.get("run_id") || null;
+      const topicId = url.searchParams.get("topic_id") || null;
+      const afterCursorRaw = url.searchParams.get("after_cursor");
+      const afterCursor =
+        afterCursorRaw !== null && /^\d+$/.test(afterCursorRaw)
+          ? Number.parseInt(afterCursorRaw, 10)
+          : null;
       const scope = (request.headers.get("x-ahub-scope") || "admin") as ApiScope;
       const keyId = request.headers.get("x-ahub-key-id") || null;
       const boundNodeId = request.headers.get("x-ahub-bound-node-id") || null;
@@ -205,6 +277,16 @@ export class NodeHub extends DurableObject<Env> {
       } catch {
         allowedNodes = [];
       }
+      const allowedBoardPrefixesRaw = request.headers.get("x-ahub-allowed-board-prefixes") || "[]";
+      let allowedBoardPrefixes: string[] = [];
+      try {
+        const parsed = JSON.parse(allowedBoardPrefixesRaw);
+        if (Array.isArray(parsed)) {
+          allowedBoardPrefixes = parsed.filter((x): x is string => typeof x === "string");
+        }
+      } catch {
+        allowedBoardPrefixes = [];
+      }
 
       const principal: AuthPrincipal = {
         kind: "api_key",
@@ -212,6 +294,7 @@ export class NodeHub extends DurableObject<Env> {
         scope,
         boundNodeId,
         allowedNodes,
+        allowedBoardPrefixes,
         allowUnsandboxed: true,
         maxDepthLimit: 3
       };
@@ -221,19 +304,29 @@ export class NodeHub extends DurableObject<Env> {
       const tags = ["stream"];
       if (keyId) tags.push(`key:${keyId}`);
       if (runId) tags.push(`run:${runId}`);
+      if (topicId) tags.push(`topic:${topicId}`);
       this.ctx.acceptWebSocket(server, tags);
       const attachment: StreamWsAttachment = {
         role: "stream",
         runId,
+        topicId,
         scope,
         keyId,
         boundNodeId,
-        allowedNodes
+        allowedNodes,
+        allowedBoardPrefixes
       };
       server.serializeAttachment(attachment);
 
-      const snapshot = await buildStreamSnapshotPayload(this.env.DB, principal, runId);
+      const snapshot = await buildStreamSnapshotPayload(this.env.DB, principal, runId, topicId);
       this.sendJson(server, snapshot);
+
+      if (topicId && afterCursor !== null && Number.isSafeInteger(afterCursor)) {
+        const missedFrames = await listMissedTopicStreamFrames(this.env.DB, topicId, afterCursor);
+        for (const frame of missedFrames) {
+          this.sendJson(server, frame);
+        }
+      }
 
       const responseHeaders = new Headers();
       const proto = request.headers.get("Sec-WebSocket-Protocol");
@@ -319,6 +412,78 @@ export class NodeHub extends DurableObject<Env> {
         type: "delivery.updated",
         delivery: body.delivery
       });
+      return Response.json({ ok: true });
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal/broadcast-board-topic") {
+      const body = (await request.json()) as {
+        topic: BoardTopic;
+        cursor?: number;
+        open_board_question_count?: number;
+      };
+      const openBoardQuestionCount =
+        typeof body.open_board_question_count === "number"
+          ? body.open_board_question_count
+          : await countOpenBoardQuestions(this.env.DB);
+      this.broadcastToStream(
+        {
+          type: "board.topic_updated",
+          topic: body.topic,
+          ...(typeof body.cursor === "number" && body.cursor >= 1 ? { cursor: body.cursor } : {}),
+          open_board_question_count: openBoardQuestionCount
+        },
+        { topicId: body.topic.id }
+      );
+      return Response.json({ ok: true });
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal/broadcast-board-message") {
+      const body = (await request.json()) as {
+        message: BoardMessage;
+        topic?: BoardTopic;
+        cursor: number;
+        open_board_question_count?: number;
+      };
+      const openBoardQuestionCount =
+        typeof body.open_board_question_count === "number"
+          ? body.open_board_question_count
+          : await countOpenBoardQuestions(this.env.DB);
+      this.broadcastToStream(
+        {
+          type: "board.message_created",
+          message: body.message,
+          ...(body.topic ? { topic: body.topic } : {}),
+          cursor: body.cursor,
+          open_board_question_count: openBoardQuestionCount
+        },
+        { topicId: body.message.topic_id }
+      );
+      return Response.json({ ok: true });
+    }
+
+    if (request.method === "POST" && url.pathname === "/internal/broadcast-board-answer") {
+      const body = (await request.json()) as {
+        question: BoardMessage;
+        answer: BoardMessage;
+        topic?: BoardTopic;
+        cursor: number;
+        open_board_question_count?: number;
+      };
+      const openBoardQuestionCount =
+        typeof body.open_board_question_count === "number"
+          ? body.open_board_question_count
+          : await countOpenBoardQuestions(this.env.DB);
+      this.broadcastToStream(
+        {
+          type: "board.question_answered",
+          question: body.question,
+          answer: body.answer,
+          ...(body.topic ? { topic: body.topic } : {}),
+          cursor: body.cursor,
+          open_board_question_count: openBoardQuestionCount
+        },
+        { topicId: body.question.topic_id }
+      );
       return Response.json({ ok: true });
     }
 

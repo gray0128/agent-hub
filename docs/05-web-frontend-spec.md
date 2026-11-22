@@ -19,8 +19,8 @@
 | **图标体系** | `lucide-react` | 按需具名导入，统一线宽 `strokeWidth={1.75}` | `@radix-ui/react-icons`、`@heroicons/*`、`react-icons`、`@tabler/icons-react` |
 | **动效引擎** | `motion` | 统一从 `"motion/react"` 导入 `motion`、`AnimatePresence`、`MotionConfig` | `framer-motion`（旧包名）、`gsap`、`react-spring`、`@formkit/auto-animate` |
 | **分栏布局** | `react-resizable-panels`（v4） | 用于桌面端三栏控制台布局与尺寸持久化 | `allotment`、`react-split`、手写 `mousedown` 拖拽分割条 |
-| **拖拽交互** | `@dnd-kit/core`、`@dnd-kit/sortable`、`@dnd-kit/utilities`、`@dnd-kit/modifiers` | 仅用于三处受控列表/队列编排 | `react-beautiful-dnd`、`@hello-pangea/dnd`、`react-dnd`、`sortablejs` |
-| **状态管理** | `zustand` | 拆分 `fleet`、`task`、`workbench`、`native-activity` 四个 Store；浏览器推送协调器 `apps/web/src/lib/browser-notify.ts` 与 `public/sw.js` 仅使用浏览器原生 Push / Notification / `navigator.locks` / `BroadcastChannel` API，**零新增第三方依赖** | `redux`、`@reduxjs/toolkit`、`jotai`、`recoil`、`mobx`、`valtio` |
+| **拖拽交互** | `@dnd-kit/core`、`@dnd-kit/sortable`、`@dnd-kit/utilities`、`@dnd-kit/modifiers` | Slice 1a 仅用于既有三处受控列表/队列编排；协同板 4 列看板拖拽（消费 `POST /api/v1/board/topics/reorder`）延后至 **Slice 1b** | `react-beautiful-dnd`、`@hello-pangea/dnd`、`react-dnd`、`sortablejs` |
+| **状态管理** | `zustand` | 拆分 `fleet`、`task`、`workbench`、`native-activity`、`board` 五个 Store；浏览器推送协调器 `apps/web/src/lib/browser-notify.ts` 与 `public/sw.js` 仅使用浏览器原生 Push / Notification / `navigator.locks` / `BroadcastChannel` API，**零新增第三方依赖** | `redux`、`@reduxjs/toolkit`、`jotai`、`recoil`、`mobx`、`valtio` |
 | **Markdown 与代码** | `react-markdown` + `remark-gfm` | 渲染任务输出 `output_md` 与行内代码 | 不引入重型富文本编辑器 |
 
 ## 2. 视觉语言与设计工程细节（`radix-nova` 控制台美学）
@@ -42,15 +42,15 @@
 | 结构分割线 `--border` | `oklch(1 0 0 / 0.09)` | `oklch(0 0 0 / 0.09)` | 分栏分隔条、列表项边界、选中态边框 |
 | 状态 `online` / `done` | `oklch(0.72 0.17 155)` | `oklch(0.55 0.16 155)` | 在线圆点、任务完成标识 |
 | 状态 `running` / `claimed` | `oklch(0.68 0.16 245)` | `oklch(0.54 0.18 245)` | 执行中脉冲指示与活动进度 |
-| 状态 `needs_approval` | `oklch(0.78 0.16 75)` | `oklch(0.62 0.17 65)` | 人工审批横幅、待放行提示、待处理原生互动（`attention_state === "open"`）与部分送达态（`partial`）；`acked` / `superseded` / `stale` 降级为中性/次级文本 |
+| 状态 `needs_approval` | `oklch(0.78 0.16 75)` | `oklch(0.62 0.17 65)` | 人工审批横幅、待放行提示、待处理原生互动（`attention_state === "open"`）、协同板 `blocked` 状态与 `open` 提问标识，以及部分送达态（`partial`）；`acked` / `superseded` / `stale` 降级为中性/次级文本 |
 | 状态 `failed` | `oklch(0.64 0.21 25)` | `oklch(0.55 0.21 25)` | 失败徽标与危险操作按钮 |
 | 状态 `queued` / `offline` / `cancelled` | `oklch(0.62 0.01 260)` | `oklch(0.52 0.01 260)` | 排队中、离线与已取消态 |
 
 ### 2.3 排版与微交互规范
 
-- **字体平滑与等宽对齐**：根节点设置 `-webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;`。所有动态更新数字（运行耗时、队列计数、字节大小、时间戳、租约倒计时，以及新增 `NativeActivityPane.tsx`、`BrowserNotifyDialog.tsx`、`InspectorPane`「投递明细」与顶栏「互动」计数徽标）统一施加 `tabular-nums`（`font-variant-numeric: tabular-nums`），防止数字刷新时引发横向抖动。
+- **字体平滑与等宽对齐**：根节点设置 `-webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;`。所有动态更新数字（运行耗时、队列计数、字节大小、时间戳、租约倒计时，以及 `NativeActivityPane.tsx`、`BrowserNotifyDialog.tsx`、`BoardWorkspace.tsx`、`PendingInbox.tsx`、`BoardTopicTimeline.tsx`、`InspectorPane`「投递明细」与顶栏「待决 / 互动」计数徽标）统一施加 `tabular-nums`（`font-variant-numeric: tabular-nums`），防止数字刷新时引发横向抖动。
 - **网络调用与 Service Worker 边界（L1/L2 门禁）**：全仓前端仅允许 `apps/web/src/lib/api-client.ts` 调用 `fetch(`，任何组件、Store 或 `public/sw.js` 均严禁直接发起裸 `fetch`（`sw.js` 严禁请求 `/api/`，保持零回源）。
-- **移动端触控与零溢出约束**：`<head>` 须声明 `<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content" />`；在 `:root` 中定义 `--safe-top`/`--safe-right`/`--safe-bottom`/`--safe-left`（绑定 `env(safe-area-inset-*, 0px)`），供顶栏、底栏、左右抽屉与居中弹窗避让刘海屏与底部手势条。移动端（`< 640px`）所有 `Input` 与 `Textarea` 表单控件计算字号须保持 `>= 16px`（`text-base sm:text-xs`），防止 iOS Safari / Standalone PWA 聚焦时强制放大视口；节点 ID、目录、Token、模型 ID、Webhook URL 与搜索框等标识符输入字段须显式关闭自动纠错与首字母大写（`autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false}`）。在 `< 768px`（含 `360×780`、`390×844` 视口）下，顶栏、抽屉标签页与筛选/操作按钮均须保持 `>= 44×44px` 触控热区（如 `min-h-11` / `h-11 w-11`），页面横向与纵向溢出始终为 `0`（`document.documentElement.scrollWidth <= document.documentElement.clientWidth`）。
+- **移动端触控与零溢出约束**：`<head>` 须声明 `<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content" />`；在 `:root` 中定义 `--safe-top`/`--safe-right`/`--safe-bottom`/`--safe-left`（绑定 `env(safe-area-inset-*, 0px)`），供顶栏、底栏、左右抽屉与居中弹窗避让刘海屏与底部手势条。移动端（`< 640px`）所有 `Input` 与 `Textarea` 表单控件计算字号须保持 `>= 16px`（`text-base sm:text-xs`），防止 iOS Safari / Standalone PWA 聚焦时强制放大视口；节点 ID、目录、Token、模型 ID、Webhook URL 与搜索框等标识符输入字段须显式关闭自动纠错与首字母大写（`autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false}`）。在 `< 768px`（含 `360×780`、`390×844` 视口）下，顶栏、抽屉标签页与筛选/操作按钮均须保持 `>= 44×44px` 触控热区（如 `min-h-11` / `h-11 w-11`），进入待决问答或含 `open` 提问的协同主题详情时，选项按钮与回复提交栏**吸底固定在 `--safe-bottom` 安全区**，页面横向与纵向溢出始终为 `0`（`document.documentElement.scrollWidth <= document.documentElement.clientWidth`）。
 - **标题与正文折行**：标题设置 `text-wrap: balance`，长段提示文案设置 `text-wrap: pretty`。节点 ID、工作区路径、`run_id`、模型名称与事件日志流统一使用等宽字体（`font-mono`）。Markdown 表格须包裹于可键盘聚焦的局部横向滚动容器（`.ahub-table-scroll`，`role="region"`、`tabIndex={0}`、`aria-label="数据表格"`），确保多列表格在窄屏不被挤压成单字竖排且不撑宽页面。
 - **同心圆角法则**：所有嵌套容器遵循 `outer_radius = inner_radius + padding`（例如外框 `rounded-lg` `8px` 配 `p-1` `4px` 时，内按钮用 `rounded-sm` `4px`）。
 - **克制的 `motion/react` 动效**：
@@ -61,11 +61,45 @@
   - 状态图标切换（如复制成功、状态变化）采用 `opacity: 0 -> 1`、`scale: 0.25 -> 1`、`filter: blur(4px) -> blur(0px)` 交叠过渡。
   - **禁用 CSS `transition: all`**，所有样式过渡必须明确指定属性（如 `transition-[color,background-color,border-color]`）。
 
-## 3. 三栏可调信息架构与移动端降级
+## 3. 三工作区 Board-First 信息架构与移动端降级
 
-### 3.1 桌面端三栏布局（`>= 768px`）
+### 3.1 顶栏三工作区切换与桌面端布局（`>= 768px`）
 
-使用 `react-resizable-panels` 的 `PanelGroup`（`direction="horizontal"`，`autoSaveId="ahub-workbench-layout"`）构建工作台：
+顶栏（`44px`）紧邻 `BrandMark` 提供一级三工作区切换器：
+
+1. **「协同板」（`board`，Slice 1a 新默认主视角）**：跨机、跨会话、跨 Harness 共享的工作主题与交接协同台。
+2. **「待决收件箱」（`inbox`，带全局合并 `tabular-nums` 琥珀角标）**：聚合全部需要人工拍板的待处理事项——协同板 `open` 提问数 + 受控任务 `needs_approval` 数 +（仅 `admin`）原生活动 `interaction_needed (open)` 数。
+3. **「执行台」（`runs`）**：**100% 兼容保留**既有的三栏可调布局（`autoSaveId="ahub-workbench-layout"`）、`FleetThreadsPane` / `ConversationPane` / `NativeActivityPane` / `InspectorPane` 全部 `data-testid` 选择器及右栏 5-Tab 严格 DOM 顺序（`events` -> `queue` -> `lineage` -> `control` -> `deliveries`）。
+
+#### 协同板（`board`）桌面端三栏布局（`>= 768px`，`autoSaveId="ahub-board-layout"`）
+
+```text
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│ 顶栏 (44px): BrandMark | [协同板 | 待决 N | 执行台] | 在线 X/Y | 通知渠道 | 接入 | 主题 │
+├──────────────────┬───────────────────────────────────────────────┬─────────────────────┤
+│ 左栏 (18% ~ 24%) │ 中栏 (48% ~ 58%)                              │ 右栏 (22% ~ 28%)    │
+│ 频道与视图导航   │ [主题列表 / 话题详情时间线]    [搜索 / 筛选]  │ 主题上下文检视器    │
+│                  │ --------------------------------------------- │                     │
+│ 全部活跃         │ - 顶部置顶 open 提问横幅（admin 一键选答）    │ 1. 状态与锚点       │
+│ 待我确认         │ - 混合时间线：                                │   5 态切换 / 置顶   │
+│                  │   note / handoff / question / answer / artifact│   external_ref      │
+│ 频道树 Channels  │   明确显示 actor_scope / actor_profile / node │   参与节点与角色    │
+│ + 新建主题       │ - 底部统一 Composer（发备注/交接/提问/产物）  │ 2. 最新交接快照     │
+│                  │                                               │   branch/SHA/PR/复制│
+└──────────────────┴───────────────────────────────────────────────┴─────────────────────┘
+```
+
+- **左栏（频道与视图导航）**：提供「全部活跃」与「待我确认」快速筛选（`近期动态 Recent Topics` 跨频道总览属 **Slice 1b** 延后项）、路径式 `Channels` 树（展示各频道活跃主题数与未答复提问数，`tabular-nums`）与「`+ 新建主题`」弹窗触发器。
+- **中栏（列表与话题时间线 `BoardWorkspace.tsx` / `BoardTopicTimeline.tsx`）**：展示当前频道/筛选条件下的主题列表与选中主题时间线。主题内存在 `open` 提问时在顶部置顶待答复横幅（`admin` 可直接点选建议选项或输入答复提交；`client` 仅展示只读状态提示）。时间线混合呈现 `note`、`handoff`、`question`、`answer` 与 `artifact`，显式标示每条消息的 `actor_scope`、`actor_profile` 与 `source_node`；底部提供统一 Composer 提交新备注/交接/提问/产物（`note`/`handoff`/`artifact` 明确提示不触发外发推送）。（注：4 列 `@dnd-kit` 看板拖拽视角与 `J`/`K`/`1`–`4` 快捷键延后至 **Slice 1b**。）
+- **右栏（主题上下文检视器）**：支持 5 态切换（`todo` / `in_progress` / `blocked` / `done` / `archived`）、置顶开关、`external_ref` 锚点展示、参与节点/角色摘要，以及**最新 `handoff` 交接快照**（提取 `data` 中的 `repo` / `branch` / `commit_sha` / `pr_url` / `next_action` 与一键复制 `ahub board read` 命令）。
+
+#### 待决收件箱（`inbox`）桌面端 Master-Detail 双栏布局（`PendingInbox.tsx`）
+
+- 左栏列出全部跨三域待决条目（按紧急度与时间排序，标明来源域 `board` / `runs` / `native`、频道/节点与角色署名），右栏展开完整上下文并支持就地答复协同板提问（仅 `admin`）、打开远控/标记放行 `needs_approval` 任务，或标记原生互动已处理。（注：`J`/`K`/`1`–`4`/`Enter`/`Esc` 键盘快捷流延后至 **Slice 1b**。）
+
+#### 执行台（`runs`）桌面端三栏布局（`>= 768px`，`autoSaveId="ahub-workbench-layout"`）
+
+使用 `react-resizable-panels` 的 `PanelGroup`（`direction="horizontal"`，`autoSaveId="ahub-workbench-layout"`）完整保留既有执行台工作区：
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
@@ -105,14 +139,18 @@
    - **Tab 1（`events` / `:nth-of-type(1)`）过程事件**：订阅当前选中 `Run` 的 `run_events`，以等宽时间线展示 `status`、`tool_use`、`turn_end`、`stderr_warn`，并实时计算 `lease_expires_at` 剩余秒数。
    - **Tab 2（`queue` / `:nth-of-type(2)`）待跑队列**：按节点与 `workdir` 分组展示待执行的 `queued` 任务与当前持锁占用目录，支持直接拖拽排序或跨节点改派。
    - **Tab 3（`lineage` / `:nth-of-type(3)`）委派拓扑**：展示当前 `Run` 所属 `root_run_id` 的父子委派树与深度。
-   - **Tab 4（`control` / `:nth-of-type(4)`）节点控制**：展示节点在线态、并发上限调整、排空开关、**默认 Bot 通知通道绑定与事件过滤**（**仅当 `authScope === "admin"` 时**展示 `<Select>` 绑定/解绑任意有效且允许该节点的 `client` Key，并实时提示「通道失效/已吊销」徽标；已绑定默认通道时同步展示 7 类触发事件勾选按钮以持久化 `default_notify_events`；`client` Scope 登录后隐藏该绑定控件且不请求 `GET /api/v1/keys`，服务端同步省略 `default_notify_*` 字段），以及已上报工作区筛选、路径复制与一键派发。
+   - **Tab 4（`control` / `:nth-of-type(4)`）节点控制**：展示节点在线态、并发上限调整、排空开关、**默认 Bot 通知通道绑定与事件过滤**（**仅当 `authScope === "admin"` 时**展示 `<Select>` 绑定/解绑任意有效且允许该节点的 `client` Key，并实时提示「通道失效/已吊销」徽标；已绑定默认通道时同步展示 8 类触发事件勾选按钮以持久化 `default_notify_events`（其中 `0007` 的 7 项受控/原生事件默认开启，第 8 项 `board_question_opened` 默认关闭、按需开启，启用后附带该 `source_node` 的协同板提问同步路由至该节点默认 Bot 通道）；`client` Scope 登录后隐藏该绑定控件且不请求 `GET /api/v1/keys`，服务端同步省略 `default_notify_*` 字段），以及已上报工作区筛选、路径复制与一键派发。
    - **Tab 5（`deliveries` / `:nth-of-type(5)`，必须为第 5 个标签页）投递明细**：依据当前聚焦对象（受控 `Run` 调 `GET /api/v1/runs/:id/deliveries`，或原生事件调 `GET /api/v1/native-events/:id`；**仅限 `authScope === "admin"` 请求**）展示 `deliveries_summary`（`tabular-nums`）与逐渠道 `NotificationDeliveryRecord` 明细行（`channel_label`、`channel_kind`、脱敏 `target_host`、`route_mode`、`status`、`http_status`、`attempts`、`error_code`、`error_message`、`sent_at`），对 `status === "skipped"` 明细以中性灰字展示跳过原因（如 `SUPERSEDED_BY_NEWER_TURN`、`SESSION_COOLDOWN_ACTIVE`），并对 `status === "failed"`（「重推此通道」）与 `status === "skipped"`（「立即推送此通道」）的行提供单通道推送按钮（分别调用 `POST /api/v1/native-events/:id/redeliver` 或 `POST /api/v1/runs/:id/redeliver`，仅传入 `{ delivery_id }`）。
-   - **顶栏「通知渠道」弹窗（`BrowserNotifyDialog.tsx`）**：由顶栏按钮（`data-testid="open-browser-notify-btn"`，紧邻 `互动 N` 胶囊；`authScope !== "admin"` 时隐藏）触发，展示当前浏览器三态健康度（`Web Push 已激活（离线可达）` / `仅页内提醒（未配置 VAPID 或 iOS 未添加主屏幕）` / `浏览器权限已拒绝（附恢复指引）`）；支持仅在用户点击手势内发起 `Notification.requestPermission()` -> `navigator.serviceWorker.register('/sw.js')` -> `pushManager.subscribe()` -> `POST /api/v1/push-subscriptions`（经 `apiClient`），新订阅默认勾选 `["run_needs_approval", "run_failed", "native_interaction_needed"]`，并提供按设备勾选 `native_turn_summary`、`native_progress`、`run_done`、`run_cancelled` 与 `node_filter`，以及全部已注册设备列表（`enabled` 开关、重命名、「发送测试通知」回显 HTTP 状态码、解绑吊销）。
-   - **顶栏「凭证与接入」弹窗（`KeysDialog` / `OnboardingDialog`）**：仅当当前用户具备 `admin` 权限（`authScope === "admin"`）时才调用 `GET /api/v1/keys` 并支持签发与编辑 `api_keys`（选 `client`、`node` 或 `admin` Scope）；其中 `client` Key 支持多选或留空设置「允许调度节点（`allowed_nodes`）」以及配置该 Bot 专属的「Webhook URL」与「Webhook Key」（支持 `1 Node <-> 1 Bot`、`N Nodes -> 1 Bot` 与 `M Bots <-> N Nodes` 组合映射，列表中脱敏展示已绑定节点列表及 `Webhook: <host>` 徽标并支持在线编辑）；弹窗同时提供「节点接入（`node`）」与「Bot / 纯调用端接入（`client`）」自举提示词（后者要求 Bot 仅作只读转达 `ahub_native_event` 的 `event_kind`、`title`、`summary` 与 `action_required: "notify_user_only"`，严禁将原生事件视为自动审批放行或自动回复指令）；任何已保存 Key 视图与弹窗提示词均**严禁**暴露 Webhook URL 路径或 Bearer Key 原文。
+   - **顶栏「通知渠道」弹窗（`BrowserNotifyDialog.tsx`）**：由顶栏按钮（`data-testid="open-browser-notify-btn"`，紧邻 `互动 N` 胶囊；`authScope !== "admin"` 时隐藏）触发，展示当前浏览器三态健康度（`Web Push 已激活（离线可达）` / `仅页内提醒（未配置 VAPID 或 iOS 未添加主屏幕）` / `浏览器权限已拒绝（附恢复指引）`）；支持仅在用户点击手势内发起 `Notification.requestPermission()` -> `navigator.serviceWorker.register('/sw.js')` -> `pushManager.subscribe()` -> `POST /api/v1/push-subscriptions`（经 `apiClient`），新订阅默认勾选 `["run_needs_approval", "run_failed", "native_interaction_needed", "board_question_opened"]`（其中 `board_question_opened` 显示为「协同板阻塞提问」），并提供按设备勾选 `native_turn_summary`、`native_progress`、`run_done`、`run_cancelled` 与 `node_filter`，以及全部已注册设备列表（`enabled` 开关、重命名、「发送测试通知」回显 HTTP 状态码、解绑吊销）。
+   - **顶栏「凭证与接入」弹窗（`KeysDialog` / `OnboardingDialog`）**：仅当当前用户具备 `admin` 权限（`authScope === "admin"`）时才调用 `GET /api/v1/keys` 并支持签发与编辑 `api_keys`（选 `client`、`node` 或 `admin` Scope）；其中 `client` Key 支持多选或留空设置「允许调度节点（`allowed_nodes`）」、设置「允许访问的协同板频道前缀（`allowed_board_prefixes`，默认空数组拒绝协同板读写）」以及配置该 Bot 专属的「Webhook URL」与「Webhook Key」（支持 `1 Node <-> 1 Bot`、`N Nodes -> 1 Bot` 与 `M Bots <-> N Nodes` 组合映射，列表中脱敏展示已绑定节点列表、频道前缀与 `Webhook: <host>` 徽标并支持在线编辑）；弹窗同时提供「节点接入（`node`）」与「Bot / 纯调用端接入（`client`）」自举提示词（后者要求 Bot 仅作只读转达 `ahub_native_event` 的 `event_kind`、`title`、`summary` 与 `action_required: "notify_user_only"`，严禁将原生事件视为自动审批放行或自动回复指令）；任何已保存 Key 视图与弹窗提示词均**严禁**暴露 Webhook URL 路径或 Bearer Key 原文。
 
 ### 3.2 移动端响应式降级（`< 768px`）
 
-- 隐藏三栏分割线，主屏幕专注渲染中栏「当前会话消息流 + 底部紧贴派发台」（或「原生活动详情流」）。
+- **协同板与待决收件箱（`< 768px` 单列栈式 + 吸底安全区问答条）**：
+  - 「`协同板`」在 `< 768px` 下隐藏三栏分割线，频道树收敛入左侧响应式 `Sheet` 抽屉、主题检视器收敛入右侧 `Sheet` 抽屉；主屏单列栈式展示主题列表或选中主题时间线（顶部提供返回列表按钮），选定频道或主题后自动收起左抽屉。
+  - 「`待决收件箱`」在 `< 768px` 下切换为单列 Master-Detail 栈式视图（列表项点击进入详情页并提供返回按钮）。
+  - 进入任意待决问答或包含 `open` 提问的主题详情时，选项按钮与答复提交栏**吸底固定在 `--safe-bottom` 安全区**，保障单手拇指即可完成选答与发送，且所有交互按钮维持 `>= 44×44px` 触控热区、输入框 `>= 16px`、`360×780` 与 `390×844` 视口下横向溢出严格为 `0`。
+- **执行台（`< 768px`）**：隐藏三栏分割线，主屏幕专注渲染中栏「当前会话消息流 + 底部紧贴派发台」（或「原生活动详情流」）。
 - **顶部导航条**：
   - 保留左抽屉触发器（存在 `openInteractionCount > 0` 时展示琥珀色 `tabular-nums` 角标）、内嵌实时 `streamStatus` 状态核心的品牌几何图标（`BrandMark`，保留 `data-testid="brand-stream-dot"`）、`sm:hidden` 在线节点计数摘要、通知渠道直达按钮（保障移动端单次点击手势兼容 Safari Web Push 订阅）、以及右抽屉触发器（存在 `approval > 0` 时展示琥珀色待审批角标，否则存在 `running + queued > 0` 时展示蓝色活跃角标）。
   - 在 `< 640px` 窄屏下，将「接入节点」「API Keys」「主题切换」三个低频管理/外观入口收拢进顶栏右侧「更多」菜单（`DropdownMenu`，触发按钮与菜单项均满足 `>= 44px` 高度），避免窄屏顶栏拥挤；`>= 640px` 维持既有独立按钮展示。
@@ -130,14 +168,14 @@
 - **零回源 Service Worker（`apps/web/public/sw.js`）**：
   - `push` 事件仅调用 `event.data?.json()` 本地解析随帧下发的 RFC 8291 加密载荷（**严禁调用 `fetch('/api/...')`**），避免 Cloudflare Access Cookie 过期时后台唤醒回源失败。
   - 每次 `push` 事件**必须无条件调用** `event.waitUntil(self.registration.showNotification(title, { body, tag, icon: "/icons/icon-192.png", badge: "/icons/badge-96.png", data: { target_url, kind, id } }))`，其中 `badge` 使用透明背景纯白单色剪影（`96×96`）以适配移动端状态栏 Alpha 遮罩，满足 Safari / APNs 对可见通知的强制要求，防止推送权限被吊销。
-  - `notificationclick` 事件优先查找并聚焦同源已有客户端窗口（如通过 `client.focus()` + `navigate(target_url)` 或消息定位），无可用窗口时调用 `clients.openWindow(target_url)` 深链定位（`/?pane=native&session=...&event=...` 或 `/?thread=...&run=...`）。
+  - `notificationclick` 事件优先查找并聚焦同源已有客户端窗口（如通过 `client.focus()` + `navigate(target_url)` 或消息定位），无可用窗口时调用 `clients.openWindow(target_url)` 深链定位（`/?workspace=inbox&source=board&id=<msg_id>`、`/?pane=native&session=...&event=...` 或 `/?thread=...&run=...`），由 `App.tsx` 消费并自动切至对应工作区与目标条目。
 - **双模式浏览器通知协调器（`apps/web/src/lib/browser-notify.ts`）**：
   - 当当前设备已启用且激活 Web Push 主通道时，自动抑制同源页内 `window.Notification` 重复弹窗（由 Web Push + `tag` 唯一负责系统级提示）。
   - 当尚未配置 VAPID、未订阅 Web Push 或处于仅页内提醒降级模式时，利用 `navigator.locks.request("ahub-notify-" + eventKey, { ifAvailable: true }, ...)` 与 `BroadcastChannel("ahub-notify-dedup")` 协调多标签页，确保同一事件在多开标签页中至多弹出一次页内系统通知。
 
-## 4. `@dnd-kit` 三处高价值拖拽交互规格
+## 4. `@dnd-kit` 三处高价值拖拽交互规格（Slice 1a 保留）
 
-仅在能直接减少多步点击表单操作的场景使用 `@dnd-kit`：
+Slice 1a 仅在以下三处保留既有的高价值 `@dnd-kit` 拖拽（协同板 4 列看板拖拽交互延后至 **Slice 1b**）：
 
 1. **待执行队列优先级重排**
    - 作用域：右栏「节点排队甲板」中状态为 `queued` 的任务列表（`SortableContext` + `verticalListSortingStrategy`）。
@@ -157,7 +195,7 @@
 
 ## 5. `zustand` 状态切片契约
 
-前端状态强制拆分为四个职责单一的 Store，避免单一大对象引发全局重渲染：
+前端状态强制拆分为五个职责单一的 Store，避免单一大对象引发全局重渲染：
 
 ```ts
 // 1. 机群与节点目录切片 (apps/web/src/stores/fleet-store.ts)
@@ -189,6 +227,7 @@ export interface TaskState {
 }
 
 // 3. 工作台视图、鉴权与草稿切片 (apps/web/src/stores/workbench-store.ts)
+export type WorkspaceMode = "board" | "inbox" | "runs";
 export type InspectorTab = "events" | "queue" | "lineage" | "control" | "deliveries";
 export type LeftRailTab = "threads" | "native" | "nodes";
 
@@ -199,6 +238,7 @@ export interface WorkbenchState {
   authKind: string | null;
   authScope: "admin" | "client" | "node" | null;
   streamStatus: "connecting" | "connected" | "disconnected";
+  workspaceMode: WorkspaceMode; // 默认 "board"
   leftTab: LeftRailTab;
   activeTab: InspectorTab;
   threadQuery: string;
@@ -218,6 +258,7 @@ export interface WorkbenchState {
     authScope?: WorkbenchState["authScope"]
   ) => void;
   setStreamStatus: (status: WorkbenchState["streamStatus"]) => void;
+  setWorkspaceMode: (mode: WorkspaceMode) => void;
   setLeftTab: (tab: LeftRailTab) => void;
   setActiveTab: (tab: InspectorTab) => void;
   setThreadQuery: (q: string) => void;
@@ -256,6 +297,40 @@ export interface NativeActivityState {
   setOnlySelectedNode: (only: boolean) => void;
   setSearchQuery: (q: string) => void;
 }
+
+// 5. 跨机协同板与待决提问切片 (apps/web/src/stores/board-store.ts)
+export interface BoardState {
+  channels: BoardChannelSummary[];
+  topics: BoardTopic[];
+  messagesByTopicId: Record<string, BoardMessage[]>;
+  eventsCursor: number;
+  openBoardQuestionCount: number;
+  selectedChannel: string | null;
+  selectedTopicId: string | null;
+  topicFilter: "active" | "open_questions";
+  searchQuery: string;
+  hydrateBoard: (payload: {
+    channels: BoardChannelSummary[];
+    topics: BoardTopic[];
+    eventsCursor?: number;
+    openQuestionCount?: number;
+  }) => void;
+  setOpenBoardQuestionCount: (count: number) => void;
+  upsertTopic: (topic: BoardTopic) => void;
+  setTopicMessages: (topicId: string, messages: BoardMessage[], cursor?: number) => void;
+  appendMessage: (topicId: string, message: BoardMessage, cursor?: number) => void;
+  applyQuestionAnswered: (payload: {
+    question: BoardMessage;
+    answer: BoardMessage;
+    topic?: BoardTopic;
+    cursor?: number;
+    openQuestionCount?: number;
+  }) => void;
+  selectChannel: (channel: string | null) => void;
+  selectTopic: (topicId: string | null) => void;
+  setTopicFilter: (filter: BoardState["topicFilter"]) => void;
+  setSearchQuery: (q: string) => void;
+}
 ```
 
 > 纯推导辅助函数 `deriveNativeAttentionState(event, allEvents, nowMs)` 与后端 `02-data-and-state-contracts.md` §5.1 保持逐字一致：当 `event_kind === "interaction_needed"` 时按 `acked` (`ack_at !== null`) -> `superseded` (`native_session_id !== ""` 且同 `(node_id, agent, native_session_id)` 存在更大 `(created_at, id)`) -> `stale` (`> 24h`) -> `open` 顺序推导，前端在收到新事件或 `ack` 后可即时重算无幽灵红点。
@@ -263,13 +338,14 @@ export interface NativeActivityState {
 ### 无本地 Token 时的 Cloudflare Access 会话探测与 `client` Scope 隔离
 
 - 页面加载时即使 `localStorage` 中不存在 `ahub-token`，工作台也必须主动发起同源会话探测（`GET /api/v1/auth/me` 配合初始 REST 拉取，`credentials: "same-origin"`），以无缝激活 Cloudflare Access 登录态（同源 `CF_Authorization` Cookie）并建立 `/ws/stream` 连接；`GET /api/v1/auth/me` 同时回填 `authKind` 与 `authScope`（`principal.scope`）。
-- **严格 `admin` Scope 门禁**：仅当 `authScope === "admin"` 时连接全局 `/ws/stream` 并发起 `GET /api/v1/keys`、`GET /api/v1/native-events`、`GET /api/v1/push/config`、`GET /api/v1/push-subscriptions` 与 `GET /api/v1/runs/:id/deliveries`；当 `authScope === "client"` 时，前端保持 `streamStatus === "disconnected"`、隐藏原生活动与通知渠道入口，且**零触发上述管理员请求（控制台与网络层零 `403` / 零报错）**。
+- **严格 `admin` Scope 门禁**：仅当 `authScope === "admin"` 时连接全局无参 `/ws/stream` 并发起 `GET /api/v1/keys`、`GET /api/v1/native-events`、`GET /api/v1/push/config`、`GET /api/v1/push-subscriptions` 与 `GET /api/v1/runs/:id/deliveries`；当 `authScope === "client"` 时，前端保持不建立全局 `/ws/stream`（仅在订阅单主题或单任务时按需使用 `?topic_id=` / `?run_id=`）、正常加载授权前缀内的协同板与 `runs` 待审批收件箱、隐藏原生活动与通知渠道入口，且**零触发上述管理员请求（控制台与网络层零 `403` / 零报错）**。
 - 仅当后端明确返回 `401 UNAUTHORIZED` 时，将 `authStatus` 置为 `"unauthenticated"`、停止 WebSocket 自动重连循环，并提示用户在「接入节点 -> Token 登录」配置访问 Token。
 
 ### 增量同步与断线补偿规则
 
-- WebSocket `/ws/stream` 收到 `snapshot` 帧时调用 `setNodes`、`setThreads`、`setRuns` 与 `hydrateNativeEvents(frame.native_events ?? [], frame.open_interaction_count)` 全量对齐；每次重连成功后重新拉取并校准一次，避免断网期间遗漏终态或原生活动变更。
+- WebSocket `/ws/stream` 收到 `snapshot` 帧时调用 `setNodes`、`setThreads`、`setRuns`、`hydrateNativeEvents(frame.native_events ?? [], frame.open_interaction_count)`，并在携带 `open_board_question_count` 时调用 `setOpenBoardQuestionCount(frame.open_board_question_count)`；每次重连成功后重新拉取 REST 快照并校准一次，避免断网期间遗漏终态、原生活动或协同板变更。
 - 收到 `native_event.upserted` 时调用 `upsertNativeEvent(frame.event, frame.open_interaction_count)`；收到 `delivery.updated` 时调用 `upsertDelivery(frame.delivery)` 同步更新投递明细；收到 `run.updated` 时调用 `upsertRun(frame.run)` 同步刷新 `notify_status` 与 `deliveries_summary`。
+- 收到 `board.topic_updated` 时调用 `upsertTopic(frame.topic)`（并更新 `openBoardQuestionCount`）；收到 `board.message_created` 时调用 `appendMessage(frame.message.topic_id, frame.message, frame.cursor)` 及按需更新主题与未答复计数；收到 `board.question_answered` 时调用 `applyQuestionAnswered(...)` 同步更新提问状态、答复消息与恢复后的主题状态。
 - `appendEvents` 依据 `event.seq` 进行严格去重与单调排序，超过 `500` 条时从头部裁掉早期日志并保留「已归档更早事件，点击加载」提示。
 
 ## 6. 受控界面文案规范
@@ -287,4 +363,9 @@ export interface NativeActivityState {
 | 权限受限提示 | 「当前凭证无权查看系统密钥管理。请使用管理员账号通过 Cloudflare Access 登录。」 |
 | 危险操作：取消运行中任务 | 「确认取消任务？系统将立即向目标节点发送进程组终止信号（SIGTERM），已产生的本地文件改动不会自动回滚。」 |
 | 危险操作：级联取消任务树 | 「确认级联取消整棵任务树？此操作将同步终止该主任务及其衍生出的全部排队与运行中子任务。」 |
+| 空状态：协同板首次使用 | 「暂无协同主题。点击新建主题或通过 `ahub board post` 发起跨机协作。」 |
+| 空状态：`client` 无频道前缀授权 | 「当前凭证尚未分配协同板频道前缀权限（`allowed_board_prefixes`）。请联系管理员在凭证管理中授权后再访问。」 |
+| 协同板非 `admin` 提问只读提示 | 「仅管理员可答复协同板阻塞提问。请使用管理员账号登录后在收件箱或当前主题作答。」 |
+| 空状态：待决收件箱全清空 | 「当前没有待确认或待审批的阻塞事项。」 |
+| 移动端吸底问答确认提示 | 「提交答复后将立即唤醒等待中的本地或远端会话。」 |
 | 危险操作：吊销凭证 | 「确认吊销此凭证？吊销立即生效；若该凭证属于在线节点，对应节点连接将被立即断开。」 |

@@ -1,0 +1,15 @@
+{
+  "id": "E-10",
+  "name": "阻塞问答超时续等与远程唤醒",
+  "task_prompt": "在 proj/demo 频道针对工单 cnb:org/demo#456 以 linux-dev 的 agy-worker 身份发起带两个候选方案的阻塞决策提问并短时等待；若等待超时不要取消或重发提问，改用增量等待接管直到远程管理员选定方案后继续。",
+  "theoretical_min_calls": 2,
+  "max_wasted_calls": 0,
+  "assertions": {
+    "first_exit_code": 24,
+    "must_stay_open_on_timeout": true,
+    "must_not_reask": true,
+    "forbid_sleep_or_poll": true,
+    "final_exit_code": 0,
+    "expected_answer_text": "Option A"
+  }
+}

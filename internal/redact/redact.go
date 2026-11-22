@@ -1,6 +1,7 @@
 package redact
 
 import (
+	"encoding/json"
 	"regexp"
 	"strings"
 	"unicode/utf8"
@@ -19,7 +20,8 @@ var (
 	curlLineRe         = regexp.MustCompile(`(?m)^[^\r\n]*\bcurl\b[^\r\n]*$`)
 	curlUserFlagRe     = regexp.MustCompile(`((?:^|[\s;|&(])(?:-[A-Za-z]*u|--user|--proxy-user)(?:=|[ \t]+))(\\"(?:[^"\\\r\n]|\\[^"\r\n])*\\"|"(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*'|[^\s'"` + "`" + `;|&]+)`)
 	cliFlagSecretRe    = regexp.MustCompile(`(?i)((?:^|[\s;|&(])--(?:[a-z0-9-]+-)?(?:token|password|passwd|secret|api-key|apikey|webhook-key)(?:\s*=\s*|[ \t]+))(\\"(?:[^"\\\r\n]|\\[^"\r\n])*\\"|"(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*'|[^\s'"` + "`" + `;|&)]+)`)
-	jsonSecretRe       = regexp.MustCompile(`(?i)("(?:[a-z0-9_]*_)?(?:password|passwd|token|secret|api_?key|webhook_?key|access_?token|auth_?token|private_?key|encryption_?key)"\s*:\s*")((?:[^"\\\r\n]|\\.)*)(")`)
+	jsonSecretRe        = regexp.MustCompile(`(?i)("(?:[a-z0-9_]*_)?(?:password|passwd|token|secret|api_?key|webhook_?key|access_?token|auth_?token|private_?key|encryption_?key)"\s*:\s*")((?:[^"\\\r\n]|\\.)*)(")`)
+	secretJSONKeyNameRe = regexp.MustCompile(`(?i)^(?:[a-z0-9_]*_)?(?:password|passwd|token|secret|api_?key|webhook_?key|access_?token|auth_?token|private_?key|encryption_?key)$`)
 	kvSecretRe         = regexp.MustCompile(`(?i)\b([A-Za-z0-9_]*(?:PASSWORD|PASSWD|TOKEN|SECRET|API_?KEY|WEBHOOK_?KEY|PRIVATE_?KEY|ENCRYPTION_?KEY)\s*[:=]\s*)(\\"(?:[^"\\\r\n]|\\[^"\r\n])*\\"|"(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*'|[^\s'"` + "`" + `;|&]+)`)
 	isoDateRe          = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}`)
 	lettersOnlyRe      = regexp.MustCompile(`^[A-Za-z]+$`)
@@ -235,6 +237,77 @@ func Text(input string) string {
 		out = maskPrefixVal(out, kvSecretRe, false, false, true)
 	}
 	return out
+}
+
+// Value recursively redacts string leaves and sensitive map keys in decoded JSON values
+// while preserving placeholders ($VAR, <PLACEHOLDER>), has_token, json.Number, bools, and numbers.
+func Value(v interface{}) interface{} {
+	switch val := v.(type) {
+	case nil:
+		return nil
+	case string:
+		return Text(val)
+	case map[string]interface{}:
+		return Map(val)
+	case map[string]string:
+		if val == nil {
+			return nil
+		}
+		out := make(map[string]string, len(val))
+		for k, s := range val {
+			out[k] = redactNamedString(k, s)
+		}
+		return out
+	case []interface{}:
+		if val == nil {
+			return nil
+		}
+		out := make([]interface{}, len(val))
+		for i, item := range val {
+			out[i] = Value(item)
+		}
+		return out
+	case []string:
+		if val == nil {
+			return nil
+		}
+		out := make([]string, len(val))
+		for i, item := range val {
+			out[i] = Text(item)
+		}
+		return out
+	case json.Number:
+		return val
+	default:
+		return val
+	}
+}
+
+// Map recursively redacts a JSON object map's string leaves and sensitive key names.
+func Map(m map[string]interface{}) map[string]interface{} {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]interface{}, len(m))
+	for k, v := range m {
+		if s, ok := v.(string); ok {
+			out[k] = redactNamedString(k, s)
+			continue
+		}
+		out[k] = Value(v)
+	}
+	return out
+}
+
+func redactNamedString(key, val string) string {
+	redacted := Text(val)
+	if !strings.EqualFold(key, "has_token") &&
+		secretJSONKeyNameRe.MatchString(key) &&
+		redacted != "" &&
+		!isPlaceholderValue(redacted) {
+		return "[REDACTED]"
+	}
+	return redacted
 }
 
 // TruncateUTF8 bounds s to at most maxBytes on a valid UTF-8 rune boundary.

@@ -21,6 +21,7 @@ const allDeps = {
 
 const bannedExact = new Set([
   "antd",
+  "daisyui",
   "framer-motion",
   "gsap",
   "react-spring",
@@ -39,14 +40,56 @@ const bannedExact = new Set([
   "valtio",
   "@radix-ui/react-icons",
   "react-icons",
-  "@tabler/icons-react"
+  "@tabler/icons-react",
+  "react-router",
+  "react-router-dom",
+  "@tanstack/react-router",
+  "quill",
+  "tiptap",
+  "@tiptap/react"
 ]);
 
 const bannedPrefixes = ["@mui/", "@chakra-ui/", "@mantine/", "@heroicons/"];
 
+const allowedDeps = new Set([
+  "@dnd-kit/core",
+  "@dnd-kit/modifiers",
+  "@dnd-kit/sortable",
+  "@dnd-kit/utilities",
+  "@radix-ui/react-dialog",
+  "@radix-ui/react-dropdown-menu",
+  "@radix-ui/react-scroll-area",
+  "@radix-ui/react-select",
+  "@radix-ui/react-separator",
+  "@radix-ui/react-slot",
+  "@radix-ui/react-switch",
+  "@radix-ui/react-tabs",
+  "@radix-ui/react-tooltip",
+  "@tailwindcss/vite",
+  "class-variance-authority",
+  "clsx",
+  "lucide-react",
+  "motion",
+  "react",
+  "react-dom",
+  "react-markdown",
+  "react-resizable-panels",
+  "remark-gfm",
+  "tailwind-merge",
+  "tailwindcss",
+  "zustand",
+  "@types/react",
+  "@types/react-dom",
+  "@vitejs/plugin-react",
+  "typescript",
+  "vite"
+]);
+
 for (const dep of Object.keys(allDeps)) {
   if (bannedExact.has(dep) || bannedPrefixes.some((p) => dep.startsWith(p))) {
     fail("dependency-allowlist", `禁止引入依赖: ${dep}`);
+  } else if (!allowedDeps.has(dep)) {
+    fail("dependency-allowlist", `未批准的第三方依赖（Slice 1a 零新增依赖约束）: ${dep}`);
   }
 }
 
@@ -69,45 +112,298 @@ function collectSourceFiles(dir) {
   return out;
 }
 
-const emojiRegex = /\p{Extended_Pictographic}/u;
+const emojiRegex = /\p{Extended_Pictographic}/gu;
+const nonEmojiSymbols = new Set(["©", "®", "™", "↗", "↘", "↔"]);
 const neonRegex = /\b(from|via|to)-(purple|violet|fuchsia|indigo)-(400|500|600)\b/i;
+
+function stripCommentsPreserveLines(src) {
+  let out = "";
+  let i = 0;
+  let lastSig = "";
+  let lastWord = "";
+  const regexPrevTokens = new Set(["", "(", ",", "=", ":", "[", "!", "&", "|", "?", ";", "{", "}", "~", "^", "+", "-", "*", "%", ">"]);
+  const regexPrevWords = new Set(["return", "case", "throw", "typeof", "void", "delete", "in", "of", "else", "new", "await", "yield"]);
+
+  while (i < src.length) {
+    const ch = src[i];
+    const next = src[i + 1];
+
+    // String literals
+    if (ch === '"' || ch === "'" || ch === "`") {
+      const quote = ch;
+      out += ch;
+      i += 1;
+      while (i < src.length) {
+        const c = src[i];
+        out += c;
+        if (c === "\\" && i + 1 < src.length) {
+          i += 1;
+          out += src[i];
+          i += 1;
+          continue;
+        }
+        i += 1;
+        if (c === quote) break;
+      }
+      lastSig = quote;
+      lastWord = "";
+      continue;
+    }
+
+    // Line comment
+    if (ch === "/" && next === "/") {
+      i += 2;
+      while (i < src.length && src[i] !== "\n") {
+        i += 1;
+      }
+      continue;
+    }
+
+    // Block comment (covers /* ... */ and {/* ... */})
+    if (ch === "/" && next === "*") {
+      i += 2;
+      while (i < src.length && !(src[i] === "*" && src[i + 1] === "/")) {
+        if (src[i] === "\n") out += "\n";
+        i += 1;
+      }
+      i += 2;
+      continue;
+    }
+
+    // Regex literal heuristic to avoid misparsing quotes or // inside /.../
+    if (ch === "/" && (regexPrevTokens.has(lastSig) || regexPrevWords.has(lastWord))) {
+      out += ch;
+      i += 1;
+      let inClass = false;
+      while (i < src.length) {
+        const c = src[i];
+        out += c;
+        if (c === "\\" && i + 1 < src.length) {
+          i += 1;
+          out += src[i];
+          i += 1;
+          continue;
+        }
+        if (c === "[") inClass = true;
+        else if (c === "]") inClass = false;
+        else if (c === "/" && !inClass) {
+          i += 1;
+          break;
+        } else if (c === "\n") {
+          i += 1;
+          break;
+        }
+        i += 1;
+      }
+      lastSig = "/";
+      lastWord = "";
+      continue;
+    }
+
+    out += ch;
+    if (/[A-Za-z0-9_$]/.test(ch)) {
+      lastWord = /[A-Za-z0-9_$]/.test(lastSig) ? lastWord + ch : ch;
+      lastSig = ch;
+    } else if (!/\s/.test(ch)) {
+      lastSig = ch;
+      lastWord = "";
+    }
+    i += 1;
+  }
+  return out;
+}
+
+function hasApiPollingInSetInterval(stripped) {
+  const re = /\bsetInterval\s*\(/g;
+  let m;
+  while ((m = re.exec(stripped)) !== null) {
+    let i = m.index + m[0].length;
+    let depth = 1;
+    const start = i;
+    while (i < stripped.length && depth > 0) {
+      const ch = stripped[i];
+      if (ch === '"' || ch === "'" || ch === "`") {
+        const quote = ch;
+        i += 1;
+        while (i < stripped.length) {
+          if (stripped[i] === "\\") {
+            i += 2;
+            continue;
+          }
+          if (stripped[i] === quote) {
+            i += 1;
+            break;
+          }
+          i += 1;
+        }
+        continue;
+      }
+      if (ch === "(") depth += 1;
+      else if (ch === ")") depth -= 1;
+      i += 1;
+    }
+    const callBody = stripped.slice(start, Math.max(start, i - 1));
+    if (/(?:\/api\/|\bapiClient\.)/.test(callBody)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function hasNestedCardTag(stripped) {
+  let depth = 0;
+  let i = 0;
+  while (i < stripped.length) {
+    const ch = stripped[i];
+    if (ch === '"' || ch === "'" || ch === "`") {
+      const quote = ch;
+      i += 1;
+      while (i < stripped.length) {
+        if (stripped[i] === "\\") {
+          i += 2;
+          continue;
+        }
+        if (stripped[i] === quote) {
+          i += 1;
+          break;
+        }
+        i += 1;
+      }
+      continue;
+    }
+    if (stripped.startsWith("</Card", i) && /^[\s>]/.test(stripped[i + 6] ?? "")) {
+      depth = Math.max(0, depth - 1);
+      i += 6;
+      continue;
+    }
+    if (stripped.startsWith("<Card", i) && /^[\s>/]/.test(stripped[i + 5] ?? "")) {
+      if (depth >= 1) {
+        return true;
+      }
+      // Advance to closing '>' of <Card ...> respecting strings and {...}
+      let j = i + 5;
+      let braceDepth = 0;
+      let selfClosing = false;
+      let lastNonWs = "";
+      while (j < stripped.length) {
+        const c = stripped[j];
+        if (c === '"' || c === "'" || c === "`") {
+          const quote = c;
+          j += 1;
+          while (j < stripped.length) {
+            if (stripped[j] === "\\") {
+              j += 2;
+              continue;
+            }
+            if (stripped[j] === quote) {
+              j += 1;
+              break;
+            }
+            j += 1;
+          }
+          lastNonWs = quote;
+          continue;
+        }
+        if (c === "{") {
+          braceDepth += 1;
+        } else if (c === "}") {
+          braceDepth = Math.max(0, braceDepth - 1);
+        } else if (c === ">" && braceDepth === 0) {
+          selfClosing = lastNonWs === "/";
+          j += 1;
+          break;
+        }
+        if (!/\s/.test(c)) {
+          lastNonWs = c;
+        }
+        j += 1;
+      }
+      if (!selfClosing) {
+        depth += 1;
+      }
+      i = j;
+      continue;
+    }
+    i += 1;
+  }
+  return false;
+}
 
 const sourceFiles = collectSourceFiles(srcDir);
 for (const file of sourceFiles) {
   const rel = path.relative(repoRoot, file);
   const content = fs.readFileSync(file, "utf8");
+  const stripped = stripCommentsPreserveLines(content);
   const lines = content.split("\n");
+  const strippedLines = stripped.split("\n");
 
   lines.forEach((line, idx) => {
     const lineNo = idx + 1;
+    const strippedLine = strippedLines[idx] ?? "";
     if (/\btransition-all\b/.test(line) || /transition\s*:\s*all\b/i.test(line)) {
       fail("no-transition-all", `${rel}:${lineNo} 出现禁止的 transition-all`);
     }
     if (/from\s+["']framer-motion["']/.test(line)) {
       fail("motion-import", `${rel}:${lineNo} 必须从 motion/react 导入`);
     }
-    if (emojiRegex.test(line) && !line.trim().startsWith("//")) {
+    const emojiMatches = strippedLine.match(emojiRegex) ?? [];
+    if (emojiMatches.some((ch) => !nonEmojiSymbols.has(ch))) {
       fail("no-decorative-emoji", `${rel}:${lineNo} 包含装饰性 emoji`);
     }
     if (neonRegex.test(line)) {
       fail("no-neon-gradient", `${rel}:${lineNo} 包含禁止的紫蓝霓虹渐变`);
     }
-    if (/\bfetch\s*\(/.test(line) && rel !== "apps/web/src/lib/api-client.ts") {
+    if (/(?<![.\w$])fetch\s*\(/.test(strippedLine) && rel !== "apps/web/src/lib/api-client.ts") {
       fail("single-api-client", `${rel}:${lineNo} 禁止绕过 api-client.ts 直接调用 fetch()`);
     }
   });
 
-  if (/setInterval\s*\([\s\S]*?\/api\//.test(content)) {
-    fail("no-api-polling", `${rel} 存在面向 /api/ 的 setInterval 轮询`);
+  if (rel !== "apps/web/src/lib/ws-client.ts" && hasApiPollingInSetInterval(stripped)) {
+    fail("no-api-polling", `${rel} 存在面向 /api/ 或 apiClient 的 setInterval 轮询`);
   }
 
-  if (/<Card[\s>]/.test(content) && /<Card[\s>][\s\S]*<Card[\s>]/.test(content)) {
+  if (hasNestedCardTag(stripped)) {
     fail("no-card-in-card", `${rel} 疑似存在卡片嵌套卡片 (<Card> 嵌套)`);
   }
 }
 
-// Verify tabular-nums discipline across the main workbench panes and dialogs
+// Verify Slice 1a board-store.ts (zustand) and --safe-bottom CSS token
+const boardStorePath = path.join(srcDir, "stores", "board-store.ts");
+if (!fs.existsSync(boardStorePath)) {
+  fail("board-store", "缺少 apps/web/src/stores/board-store.ts");
+} else {
+  const boardStoreContent = fs.readFileSync(boardStorePath, "utf8");
+  if (!/from\s+["']zustand["']/.test(boardStoreContent)) {
+    fail("board-store", "apps/web/src/stores/board-store.ts 必须使用 zustand");
+  }
+}
+
+const indexCssPath = path.join(srcDir, "index.css");
+if (!fs.existsSync(indexCssPath) || !fs.readFileSync(indexCssPath, "utf8").includes("--safe-bottom")) {
+  fail("safe-area-css", "apps/web/src/index.css 必须定义 --safe-bottom 安全区变量");
+}
+
+function findFilesByBasename(dir, targetNames) {
+  const found = new Map();
+  if (!fs.existsSync(dir)) return found;
+  const stack = [dir];
+  while (stack.length > 0) {
+    const cur = stack.pop();
+    for (const entry of fs.readdirSync(cur, { withFileTypes: true })) {
+      const full = path.join(cur, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(full);
+      } else if (targetNames.has(entry.name)) {
+        found.set(entry.name, full);
+      }
+    }
+  }
+  return found;
+}
+
+// Verify tabular-nums discipline across the main workbench panes, topbar, board, and inbox
 for (const pane of [
+  "apps/web/src/App.tsx",
   "apps/web/src/components/workbench/FleetThreadsPane.tsx",
   "apps/web/src/components/workbench/ConversationPane.tsx",
   "apps/web/src/components/workbench/InspectorPane.tsx",
@@ -117,6 +413,24 @@ for (const pane of [
   const paneContent = fs.readFileSync(path.join(repoRoot, pane), "utf8");
   if (!paneContent.includes("tabular-nums")) {
     fail("tabular-nums", `${pane} 未对动态数字/时间戳启用 tabular-nums`);
+  }
+}
+
+const slice1aTabularTargets = new Set([
+  "BoardWorkspace.tsx",
+  "BoardTopicTimeline.tsx",
+  "PendingInbox.tsx"
+]);
+const foundSlice1aFiles = findFilesByBasename(path.join(srcDir, "components"), slice1aTabularTargets);
+for (const fileName of slice1aTabularTargets) {
+  const resolved = foundSlice1aFiles.get(fileName);
+  if (!resolved) {
+    fail("tabular-nums-missing-file", `缺少 Slice 1a 组件文件: apps/web/src/components/**/${fileName}`);
+  } else {
+    const rel = path.relative(repoRoot, resolved);
+    if (!fs.readFileSync(resolved, "utf8").includes("tabular-nums")) {
+      fail("tabular-nums", `${rel} 未对动态数字/计数/游标启用 tabular-nums`);
+    }
   }
 }
 

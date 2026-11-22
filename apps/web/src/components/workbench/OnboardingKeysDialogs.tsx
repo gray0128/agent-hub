@@ -30,6 +30,7 @@ export interface OnboardingDialogProps {
   token: string;
   authenticated?: boolean;
   authKind?: string | null;
+  authScope?: "admin" | "client" | "node" | null;
   onApplyToken: (token: string) => void;
 }
 
@@ -123,9 +124,11 @@ export function OnboardingDialog({
   token,
   authenticated = false,
   authKind = null,
+  authScope = null,
   onApplyToken
 }: OnboardingDialogProps) {
   const hasSession = Boolean(authenticated || token);
+  const canIssueKeys = !authScope || authScope === "admin";
   const [nodeName, setNodeName] = useState("macmini");
   const [issuedToken, setIssuedToken] = useState("");
   const [tokenInput, setTokenInput] = useState(token);
@@ -148,8 +151,8 @@ export function OnboardingDialog({
   const skillCmd = `mkdir -p ~/.agents/skills/ahub && curl -fsSL ${hubOrigin}/skill/SKILL.md -o ~/.agents/skills/ahub/SKILL.md`;
 
   async function handleIssueNodeKey() {
-    if (!hasSession) {
-      setIssueError("请先通过 Cloudflare Access 登录，或在「Token 登录」标签页输入管理员 Token。");
+    if (!hasSession || !canIssueKeys) {
+      setIssueError("请先通过管理员账号（Cloudflare Access 或 admin Token）登录后再签发节点密钥。");
       return;
     }
     setIssuing(true);
@@ -218,7 +221,7 @@ export function OnboardingDialog({
                 type="button"
                 variant="outline"
                 onClick={handleIssueNodeKey}
-                disabled={issuing}
+                disabled={issuing || !canIssueKeys}
                 className="min-h-11 sm:min-h-0 sm:h-8"
               >
                 <KeyRound className="h-3.5 w-3.5" strokeWidth={1.75} />
@@ -347,6 +350,7 @@ export interface KeysDialogProps {
   token: string;
   authenticated?: boolean;
   authKind?: string | null;
+  authScope?: "admin" | "client" | "node" | null;
 }
 
 function parseNodeList(raw: string): string[] {
@@ -354,6 +358,19 @@ function parseNodeList(raw: string): string[] {
   const seen = new Set<string>();
   for (const part of raw.split(",")) {
     const clean = part.trim();
+    if (clean && !seen.has(clean)) {
+      seen.add(clean);
+      out.push(clean);
+    }
+  }
+  return out;
+}
+
+function parseBoardPrefixList(raw: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const part of raw.split(",")) {
+    const clean = part.trim().replace(/^\/+|\/+$/g, "");
     if (clean && !seen.has(clean)) {
       seen.add(clean);
       out.push(clean);
@@ -380,9 +397,11 @@ export function KeysDialog({
   open,
   onOpenChange,
   token,
-  authenticated = false
+  authenticated = false,
+  authScope = null
 }: KeysDialogProps) {
   const hasSession = Boolean(authenticated || token);
+  const isAdmin = authScope === "admin";
   const fleetNodes = useFleetStore((s) => s.nodes);
   const nodeIds = fleetNodes.map((n) => n.id);
   const hubOrigin = resolveHubOrigin();
@@ -392,6 +411,7 @@ export function KeysDialog({
   const [scope, setScope] = useState<"client" | "node" | "admin">("client");
   const [boundNodeId, setBoundNodeId] = useState("");
   const [allowedNodesText, setAllowedNodesText] = useState("");
+  const [allowedBoardPrefixesText, setAllowedBoardPrefixesText] = useState("");
   const [webhookUrl, setWebhookUrl] = useState("");
   const [webhookKey, setWebhookKey] = useState("");
   const [freshCreated, setFreshCreated] = useState<FreshCreatedKey | null>(null);
@@ -400,13 +420,14 @@ export function KeysDialog({
 
   const [editingKeyId, setEditingKeyId] = useState<string | null>(null);
   const [editAllowedNodesText, setEditAllowedNodesText] = useState("");
+  const [editAllowedBoardPrefixesText, setEditAllowedBoardPrefixesText] = useState("");
   const [editWebhookUrl, setEditWebhookUrl] = useState("");
   const [editWebhookKey, setEditWebhookKey] = useState("");
   const [editClearWebhook, setEditClearWebhook] = useState(false);
   const [savingEdit, setSavingEdit] = useState(false);
 
   async function loadKeys() {
-    if (!hasSession) return;
+    if (!hasSession || !isAdmin) return;
     setLoading(true);
     setError(null);
     try {
@@ -424,12 +445,16 @@ export function KeysDialog({
       setFreshCreated(null);
       setEditingKeyId(null);
       setConfirmRevokeId(null);
-      void loadKeys();
+      if (isAdmin) {
+        void loadKeys();
+      } else {
+        setKeys([]);
+      }
     }
-  }, [open, token, authenticated]);
+  }, [open, token, authenticated, isAdmin]);
 
   async function handleCreate() {
-    if (!hasSession || !name.trim()) return;
+    if (!hasSession || !isAdmin || !name.trim()) return;
     if (scope === "node" && !boundNodeId.trim()) {
       setError("签发 node 角色密钥必须填写目标节点 ID");
       return;
@@ -447,6 +472,10 @@ export function KeysDialog({
         if (nodes.length > 0) {
           payload.allowed_nodes = nodes;
         }
+        const prefixes = parseBoardPrefixList(allowedBoardPrefixesText);
+        if (prefixes.length > 0) {
+          payload.allowed_board_prefixes = prefixes;
+        }
         if (webhookUrl.trim()) {
           payload.webhook_url = webhookUrl.trim();
         }
@@ -463,6 +492,7 @@ export function KeysDialog({
       setName("");
       setBoundNodeId("");
       setAllowedNodesText("");
+      setAllowedBoardPrefixesText("");
       setWebhookUrl("");
       setWebhookKey("");
       await loadKeys();
@@ -474,6 +504,7 @@ export function KeysDialog({
   function startEdit(item: ApiKeyRecord) {
     setEditingKeyId(item.id);
     setEditAllowedNodesText(item.allowed_nodes.join(", "));
+    setEditAllowedBoardPrefixesText((item.allowed_board_prefixes ?? []).join(", "));
     setEditWebhookUrl("");
     setEditWebhookKey("");
     setEditClearWebhook(false);
@@ -481,12 +512,13 @@ export function KeysDialog({
   }
 
   async function handleSaveEdit(keyId: string) {
-    if (!hasSession) return;
+    if (!hasSession || !isAdmin) return;
     setSavingEdit(true);
     setError(null);
     try {
       const body: Parameters<typeof apiClient.patchKey>[2] = {
-        allowed_nodes: parseNodeList(editAllowedNodesText)
+        allowed_nodes: parseNodeList(editAllowedNodesText),
+        allowed_board_prefixes: parseBoardPrefixList(editAllowedBoardPrefixesText)
       };
       if (editClearWebhook) {
         body.clear_webhook = true;
@@ -540,6 +572,14 @@ export function KeysDialog({
           </DialogDescription>
         </DialogHeader>
 
+        {!isAdmin ? (
+          <div
+            data-testid="keys-forbidden-notice"
+            className="rounded-[6px] border border-border bg-muted/30 px-3 py-4 text-xs text-muted-foreground text-pretty"
+          >
+            当前凭证无权查看系统密钥管理。请使用管理员账号通过 Cloudflare Access 登录。
+          </div>
+        ) : (
         <div className="space-y-3">
           <div className="space-y-2 rounded-[6px] border border-border bg-muted/20 p-2.5">
             <div className="grid grid-cols-1 gap-2 sm:grid-cols-[1fr_112px_auto]">
@@ -628,6 +668,17 @@ export function KeysDialog({
                   autoCapitalize="none"
                   spellCheck={false}
                   data-testid="key-allowed-nodes-input"
+                />
+                <Input
+                  value={allowedBoardPrefixesText}
+                  onChange={(e) => setAllowedBoardPrefixesText(e.target.value)}
+                  placeholder="允许访问协同板频道前缀（逗号分隔，如 proj, ops/fleet 或 *；留空禁止访问协同板）"
+                  aria-label="允许访问协同板频道前缀"
+                  autoComplete="off"
+                  autoCorrect="off"
+                  autoCapitalize="none"
+                  spellCheck={false}
+                  data-testid="key-allowed-board-prefixes-input"
                 />
                 <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
                   <Input
@@ -751,6 +802,17 @@ export function KeysDialog({
                             <Badge variant="outline" className="font-mono text-[10px]">
                               {nodeLabel}
                             </Badge>
+                            {item.scope === "client" && (
+                              <Badge
+                                variant="outline"
+                                data-testid={`key-board-prefixes-badge-${item.id}`}
+                                className="font-mono text-[10px]"
+                              >
+                                {(item.allowed_board_prefixes ?? []).length > 0
+                                  ? `协同板: ${item.allowed_board_prefixes.join(", ")}`
+                                  : "协同板: 无权限"}
+                              </Badge>
+                            )}
                             {item.has_webhook && (
                               <Badge
                                 variant="outline"
@@ -868,6 +930,17 @@ export function KeysDialog({
                             spellCheck={false}
                             data-testid={`edit-allowed-nodes-${item.id}`}
                           />
+                          <Input
+                            value={editAllowedBoardPrefixesText}
+                            onChange={(e) => setEditAllowedBoardPrefixesText(e.target.value)}
+                            placeholder="允许协同板频道前缀（逗号分隔，如 proj, ops 或 *；留空禁止协同板访问）"
+                            aria-label="编辑允许协同板频道前缀"
+                            autoComplete="off"
+                            autoCorrect="off"
+                            autoCapitalize="none"
+                            spellCheck={false}
+                            data-testid={`edit-allowed-board-prefixes-${item.id}`}
+                          />
                           <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
                             <Input
                               value={editWebhookUrl}
@@ -955,6 +1028,7 @@ export function KeysDialog({
             )}
           </div>
         </div>
+        )}
       </DialogContent>
     </Dialog>
   );

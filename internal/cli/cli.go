@@ -83,6 +83,8 @@ func Execute(args []string, version string) int {
 		return runThreads(g, subArgs)
 	case "activity":
 		return runActivity(g, subArgs)
+	case "board":
+		return runBoard(g, subArgs)
 	case "cancel":
 		return runCancel(g, subArgs)
 	case "resolve":
@@ -1348,6 +1350,14 @@ func failErr(asJSON bool, err error) int {
 		}
 	} else {
 		fmt.Fprintln(os.Stderr, err.Error())
+		var apiErr *api.APIError
+		if errors.As(err, &apiErr) {
+			for _, nextCmd := range apiErr.Body.Next {
+				if trimmed := strings.TrimSpace(nextCmd); trimmed != "" {
+					fmt.Fprintf(os.Stderr, "Next: %s\n", trimmed)
+				}
+			}
+		}
 	}
 	return code
 }
@@ -1383,6 +1393,7 @@ Commands:
   runs            List recent runs
   threads         List threads
   activity        Inspect read-only native agent activity across nodes (admin only)
+  board           Post, read, ask, or wait on cross-machine coordination board
   cancel          Cancel a run (or entire tree with --cascade)
   resolve         Mark a needs_approval run resolved and release locks
   native-emit     Emit an official hook or CLI native Agent event for node default Bot notify

@@ -5,6 +5,7 @@ import {
   hasRecentNonUrgentSessionDelivery,
   mapRunRow,
   parseNotifyPolicy,
+  parseStringArray,
   recomputeSourceNotifyStatus,
   type RunRow
 } from "./db";
@@ -71,6 +72,24 @@ interface NativeEventWebhookRow {
   source: string;
   notify_key_id: string | null;
   created_at: string;
+  node_default_key_id: string | null;
+  node_key_scope: ApiScope | null;
+  node_key_revoked_at: string | null;
+  node_key_allowed_nodes_json: string | null;
+  node_key_webhook_ciphertext: string | null;
+}
+
+interface BoardMessageWebhookRow {
+  id: string;
+  topic_id: string;
+  channel: string;
+  actor_profile: string;
+  source_node: string;
+  text_md: string;
+  question_options_json: string;
+  question_expires_at: string | null;
+  created_at: string;
+  topic_title: string;
   node_default_key_id: string | null;
   node_key_scope: ApiScope | null;
   node_key_revoked_at: string | null;
@@ -298,6 +317,24 @@ function buildNativeEventWebhookPayload(row: NativeEventWebhookRow, env: Env): R
   };
 }
 
+function buildBoardQuestionWebhookPayload(row: BoardMessageWebhookRow, env: Env): Record<string, unknown> {
+  return {
+    event: "ahub_board_question",
+    hub_url: env.HUB_PUBLIC_URL || "https://ahub.bobocai.win",
+    topic_id: row.topic_id,
+    topic_title: redactSecrets(row.topic_title),
+    channel: row.channel,
+    message_id: row.id,
+    actor_profile: row.actor_profile,
+    source_node: row.source_node,
+    text_md: redactSecrets(row.text_md),
+    question_options: parseStringArray(row.question_options_json).map((opt) => redactSecrets(opt)),
+    question_expires_at: row.question_expires_at,
+    action_required: "answer_board_question",
+    created_at: row.created_at
+  };
+}
+
 async function doBroadcast(env: Env, path: string, payload: unknown): Promise<void> {
   if (!env.NODE_HUB) return;
   try {
@@ -344,9 +381,11 @@ async function broadcastDeliveryAndParent(
     return;
   }
 
-  const freshEvent = await getNativeEventById(env.DB, sourceId);
-  if (freshEvent) {
-    await doBroadcast(env, "/internal/broadcast-native-event", { event: freshEvent });
+  if (sourceKind === "native_event") {
+    const freshEvent = await getNativeEventById(env.DB, sourceId);
+    if (freshEvent) {
+      await doBroadcast(env, "/internal/broadcast-native-event", { event: freshEvent });
+    }
   }
 }
 
@@ -397,6 +436,31 @@ async function loadNativeEventWebhookRow(
     )
     .bind(nativeEventId)
     .first<NativeEventWebhookRow>();
+}
+
+async function loadBoardMessageWebhookRow(
+  db: D1Database,
+  messageId: string
+): Promise<BoardMessageWebhookRow | null> {
+  return db
+    .prepare(
+      `SELECT m.id, m.topic_id, m.channel, m.actor_profile, m.source_node, m.text_md,
+              m.question_options_json, m.question_expires_at, m.created_at,
+              t.title AS topic_title,
+              n.default_notify_key_id AS node_default_key_id,
+              nk.scope AS node_key_scope,
+              nk.revoked_at AS node_key_revoked_at,
+              nk.allowed_nodes_json AS node_key_allowed_nodes_json,
+              nk.notify_webhook_ciphertext AS node_key_webhook_ciphertext
+       FROM board_messages m
+       JOIN board_topics t ON t.id = m.topic_id
+       LEFT JOIN nodes n ON n.id = m.source_node
+       LEFT JOIN api_keys nk ON nk.id = n.default_notify_key_id
+       WHERE m.id = ?1
+       LIMIT 1`
+    )
+    .bind(messageId)
+    .first<BoardMessageWebhookRow>();
 }
 
 async function markDeliveryFailedAndAck(
@@ -472,6 +536,26 @@ async function processDeliveryWebhook(
       resolved = resolveGlobalLegacyWebhook(target, env);
     }
     payload = buildRunWebhookPayload(row, env);
+  } else if (delivery.source_kind === "board_message") {
+    const row = await loadBoardMessageWebhookRow(env.DB, delivery.source_id);
+    if (!row) {
+      message.ack();
+      return;
+    }
+    if (row.source_node) {
+      resolved = await resolveNodeDefaultWebhook(
+        `board_message=${row.id}`,
+        row.source_node,
+        delivery.channel_id,
+        row.node_default_key_id ?? null,
+        row.node_key_scope ?? null,
+        row.node_key_revoked_at ?? null,
+        row.node_key_allowed_nodes_json ?? null,
+        row.node_key_webhook_ciphertext ?? null,
+        env
+      );
+    }
+    payload = buildBoardQuestionWebhookPayload(row, env);
   } else {
     const row = await loadNativeEventWebhookRow(env.DB, delivery.source_id);
     if (!row) {
@@ -665,6 +749,46 @@ async function processDeliveryWebPush(
       body: bodyText,
       target_url: `/?pane=native&session=${encodeURIComponent(sessionKey)}&event=${encodeURIComponent(ev.id)}`,
       ts: ev.created_at
+    };
+  } else if (delivery.source_kind === "board_message") {
+    const msg = await env.DB.prepare(
+      `SELECT m.id, m.topic_id, m.channel, m.actor_profile, m.source_node, m.text_md, m.created_at,
+              t.title AS topic_title
+       FROM board_messages m
+       JOIN board_topics t ON t.id = m.topic_id
+       WHERE m.id = ?1
+       LIMIT 1`
+    )
+      .bind(delivery.source_id)
+      .first<{
+        id: string;
+        topic_id: string;
+        channel: string;
+        actor_profile: string;
+        source_node: string;
+        text_md: string;
+        created_at: string;
+        topic_title: string;
+      }>();
+    if (!msg) {
+      message.ack();
+      return;
+    }
+    const actorBase = msg.actor_profile || msg.source_node || "agent";
+    const actorDisplay =
+      msg.source_node && !actorBase.includes("@") ? `${actorBase}@${msg.source_node}` : actorBase;
+    const title = `[${msg.channel}] ${actorDisplay} 请求确认`;
+    const bodyText = redactSecrets(msg.text_md).trim() || redactSecrets(msg.topic_title);
+    pushPayload = {
+      v: 1,
+      kind: "board_message",
+      id: msg.id,
+      tag: `ahub-board-${msg.id}`,
+      urgent: true,
+      title,
+      body: bodyText,
+      target_url: `/?workspace=inbox&source=board&id=${encodeURIComponent(msg.id)}`,
+      ts: msg.created_at
     };
   } else {
     const run = await env.DB.prepare(`SELECT * FROM runs WHERE id = ?1 LIMIT 1`)
