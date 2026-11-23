@@ -46,6 +46,7 @@ import {
   formatBytes,
   formatDurationMs,
   formatNotifyBadgeMeta,
+  formatShortDateTime,
   formatShortTime
 } from "@/lib/utils";
 import type { ComposerDraft } from "@/stores/workbench-store";
@@ -449,21 +450,21 @@ export function ConversationPane({
                     : "pl-4 hover:bg-surface-elevated/40"
                 )}
               >
-                <div className="flex min-h-7 flex-wrap items-center justify-between gap-x-2 gap-y-1 sm:h-7 sm:flex-nowrap">
-                  <div className="flex min-w-0 flex-wrap items-center gap-1.5 overflow-hidden sm:flex-nowrap">
+                <div className="flex min-h-7 flex-wrap items-center justify-between gap-x-2 gap-y-1">
+                  <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">
                     <RunStatusBadge status={run.status} blockedReason={run.blocked_reason} />
-                    <span className="min-w-0 truncate text-xs font-mono text-foreground">{run.id}</span>
+                    <span className="min-w-0 max-w-full truncate text-xs font-mono text-foreground">{run.id}</span>
                     {run.plan_key || run.plan_id ? (
                       <Badge
                         variant="outline"
-                        className="shrink-0 font-mono text-[10px]"
+                        className="shrink-0 whitespace-nowrap font-mono text-[10px]"
                         title={run.plan_id ? `Plan ${run.plan_id}` : undefined}
                       >
                         {run.plan_key ? `plan:${run.plan_key}` : run.plan_id}
                       </Badge>
                     ) : null}
                     {run.actor_profile ? (
-                      <Badge variant="secondary" className="shrink-0 font-mono text-[10px]">
+                      <Badge variant="secondary" className="shrink-0 whitespace-nowrap font-mono text-[10px]">
                         {run.actor_profile}
                       </Badge>
                     ) : null}
@@ -476,13 +477,13 @@ export function ConversationPane({
                             e.stopPropagation();
                             onOpenBoardTopic(run.board_topic_id!);
                           }}
-                          className="inline-flex min-h-11 px-2 md:min-h-6 md:px-1.5 items-center gap-1 rounded-[5px] border border-border bg-card font-mono text-[11px] md:text-[10px] text-[var(--status-running)] hover:bg-accent cursor-pointer shrink-0"
+                          className="inline-flex min-h-11 px-2 md:min-h-6 md:px-1.5 items-center gap-1 rounded-[5px] border border-border bg-card font-mono text-[11px] md:text-[10px] text-[var(--status-running)] hover:bg-accent cursor-pointer shrink-0 whitespace-nowrap"
                         >
                           <span>{run.board_topic_id}</span>
                           <ExternalLink className="h-2.5 w-2.5 shrink-0" strokeWidth={1.75} aria-hidden="true" />
                         </button>
                       ) : (
-                        <Badge variant="outline" className="shrink-0 font-mono text-[10px]">
+                        <Badge variant="outline" className="shrink-0 whitespace-nowrap font-mono text-[10px]">
                           {run.board_topic_id}
                         </Badge>
                       )
@@ -495,19 +496,19 @@ export function ConversationPane({
                           e.stopPropagation();
                           jumpToRun(run.retry_of_run_id!);
                         }}
-                        className="inline-flex min-h-11 px-2 md:min-h-6 md:px-1.5 items-center gap-1 rounded-[5px] border border-border bg-card font-mono text-[11px] md:text-[10px] text-muted-foreground hover:text-foreground hover:bg-accent cursor-pointer shrink-0"
+                        className="inline-flex min-h-11 px-2 md:min-h-6 md:px-1.5 items-center gap-1 rounded-[5px] border border-border bg-card font-mono text-[11px] md:text-[10px] text-muted-foreground hover:text-foreground hover:bg-accent cursor-pointer shrink-0 whitespace-nowrap"
                       >
                         <RotateCcw className="h-2.5 w-2.5 shrink-0" strokeWidth={1.75} aria-hidden="true" />
                         <span>重试自 {run.retry_of_run_id}</span>
                       </button>
                     ) : null}
                     {run.depth > 0 ? (
-                      <Badge variant="outline" className="shrink-0 font-mono text-[10px]">
+                      <Badge variant="outline" className="shrink-0 whitespace-nowrap font-mono text-[10px]">
                         depth={run.depth}
                       </Badge>
                     ) : null}
                     {!run.sandbox ? (
-                      <Badge variant="approval" className="shrink-0 text-[10px]">
+                      <Badge variant="approval" className="shrink-0 whitespace-nowrap text-[10px]">
                         非沙箱
                       </Badge>
                     ) : null}
@@ -520,9 +521,9 @@ export function ConversationPane({
                             e.stopPropagation();
                             onOpenRunDeliveries(run.id);
                           }}
-                          className="inline-flex min-h-11 px-2.5 md:min-h-6 md:px-1.5 items-center gap-1 rounded-[5px] border border-border bg-card text-[11px] md:text-[10px] font-medium text-foreground hover:bg-accent cursor-pointer tabular-nums"
+                          className="inline-flex min-h-11 px-2.5 md:min-h-6 md:px-1.5 items-center gap-1 rounded-[5px] border border-border bg-card text-[11px] md:text-[10px] font-medium text-foreground hover:bg-accent cursor-pointer tabular-nums shrink-0 whitespace-nowrap"
                         >
-                          <Bell className="h-2.5 w-2.5" strokeWidth={1.75} aria-hidden="true" />
+                          <Bell className="h-2.5 w-2.5 shrink-0" strokeWidth={1.75} aria-hidden="true" />
                           <span>{notifyMeta.label}</span>
                           {run.deliveries_summary && run.deliveries_summary.total > 0 ? (
                             <span className="font-mono text-muted-foreground">
@@ -531,8 +532,11 @@ export function ConversationPane({
                           ) : null}
                         </button>
                       ) : (
-                        <Badge variant={notifyMeta.tone === "neutral" ? "outline" : notifyMeta.tone} className="shrink-0 text-[10px]">
-                          <Bell className="h-2.5 w-2.5" strokeWidth={1.75} aria-hidden="true" />
+                        <Badge
+                          variant={notifyMeta.tone === "neutral" ? "outline" : notifyMeta.tone}
+                          className="shrink-0 whitespace-nowrap text-[10px]"
+                        >
+                          <Bell className="h-2.5 w-2.5 shrink-0" strokeWidth={1.75} aria-hidden="true" />
                           {notifyMeta.label}
                         </Badge>
                       )
@@ -738,7 +742,7 @@ export function ConversationPane({
                         <Clock className="h-3 w-3 shrink-0" strokeWidth={1.75} aria-hidden="true" />
                         <span>定时唤醒：</span>
                         <span className="text-foreground" title={run.scheduled_at}>
-                          {formatShortTime(run.scheduled_at)}
+                          {formatShortDateTime(run.scheduled_at)}
                         </span>
                       </div>
                     ) : null}

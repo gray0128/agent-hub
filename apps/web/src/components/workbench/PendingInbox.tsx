@@ -19,7 +19,7 @@ import {
   shouldIgnoreActivationShortcut,
   shouldIgnoreGlobalShortcut
 } from "@/lib/keyboard";
-import { cn, formatShortTime } from "@/lib/utils";
+import { cn, formatShortDateTime, formatShortTime } from "@/lib/utils";
 import type { AuthScope } from "@/stores/workbench-store";
 import type {
   AnswerBoardQuestionPayload,
@@ -702,7 +702,9 @@ export function PendingInbox({
                   <span>#{message.seq}</span>
                   <span>{formatShortTime(message.created_at)}</span>
                   {message.question_expires_at ? (
-                    <span>截止 {formatShortTime(message.question_expires_at)}</span>
+                    <span title={message.question_expires_at}>
+                      截止 {formatShortDateTime(message.question_expires_at)}
+                    </span>
                   ) : null}
                 </div>
 

@@ -25,7 +25,7 @@ import {
   SelectValue
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import { cn, formatShortTime } from "@/lib/utils";
+import { cn, formatShortDateTime, formatShortTime } from "@/lib/utils";
 import {
   type BoardTopicFilter,
   type BoardViewMode,
@@ -398,8 +398,11 @@ export function BoardTopicTimeline({
             </span>
           </div>
           {q.question_expires_at ? (
-            <span className="shrink-0 font-mono text-[10px] text-muted-foreground tabular-nums">
-              截止 {formatShortTime(q.question_expires_at)}
+            <span
+              className="shrink-0 font-mono text-[10px] text-muted-foreground tabular-nums"
+              title={q.question_expires_at}
+            >
+              截止 {formatShortDateTime(q.question_expires_at)}
             </span>
           ) : null}
         </div>

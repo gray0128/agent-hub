@@ -32,6 +32,7 @@ import {
   type EventTone,
   formatBlockedReason,
   formatLeaseRemainingSec,
+  formatShortDateTime,
   formatShortTime,
   summarizeRunEvent
 } from "@/lib/utils";
@@ -554,7 +555,7 @@ export function InspectorPane({
                       className="font-mono text-foreground"
                       title={selectedRun.scheduled_at}
                     >
-                      {formatShortTime(selectedRun.scheduled_at)} ({selectedRun.scheduled_at})
+                      {formatShortDateTime(selectedRun.scheduled_at)} ({selectedRun.scheduled_at})
                     </span>
                   </div>
                 ) : null}

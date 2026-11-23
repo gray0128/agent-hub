@@ -1366,11 +1366,14 @@ try {
   const boardDetailCheck = await cdpClient.evalJS(`
     (() => {
       const tlText = document.querySelector('[data-testid="board-topic-timeline"]')?.textContent ?? "";
+      const qBannerText = document.querySelector('[data-testid="board-open-question-banner-${boardQ1.id}"]')?.textContent ?? "";
       const snapText = document.querySelector('[data-testid="board-latest-handoff"]')?.textContent ?? "";
       const inspText = document.querySelector('[data-testid="board-topic-inspector"]')?.textContent ?? "";
       return {
         hasReviewer: tlText.includes("codex-reviewer") && tlText.includes("mbp"),
         hasWorker: tlText.includes("agy-worker") && tlText.includes("macmini"),
+        hasQuestionExpiryDate: /截止\\s+\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}/.test(qBannerText),
+        qBannerText: qBannerText.slice(0, 120),
         hasBranch: snapText.includes("feat/rfc-0001") && snapText.includes("a1b2c3d"),
         hasNextAction: snapText.includes("请在 macmini 执行端到端验证"),
         hasReadCmd: snapText.includes("ahub board read"),
@@ -1381,6 +1384,7 @@ try {
   if (
     !boardDetailCheck.hasReviewer ||
     !boardDetailCheck.hasWorker ||
+    !boardDetailCheck.hasQuestionExpiryDate ||
     !boardDetailCheck.hasBranch ||
     !boardDetailCheck.hasNextAction ||
     !boardDetailCheck.hasReadCmd ||
@@ -1487,9 +1491,16 @@ try {
   await sleep(150);
   const beforeFilterCheck = await cdpClient.evalJS(`({
     hasOptionBtn: Boolean(document.querySelector('[data-testid="inbox-question-option-0"]')),
-    detailText: document.querySelector('[data-testid="inbox-detail-pane"]')?.textContent ?? ""
+    detailText: document.querySelector('[data-testid="inbox-detail-pane"]')?.textContent ?? "",
+    hasExpiryDate: /截止\\s+\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}/.test(
+      document.querySelector('[data-testid="inbox-detail-pane"]')?.textContent ?? ""
+    )
   })`);
-  if (!beforeFilterCheck.hasOptionBtn || !beforeFilterCheck.detailText.includes("检测到下游字段差异，是否按方案 A 合入？")) {
+  if (
+    !beforeFilterCheck.hasOptionBtn ||
+    !beforeFilterCheck.hasExpiryDate ||
+    !beforeFilterCheck.detailText.includes("检测到下游字段差异，是否按方案 A 合入？")
+  ) {
     throw new Error(`Phase 2 inbox board selection failed before filter check: ${JSON.stringify(beforeFilterCheck)}`);
   }
 
@@ -4338,6 +4349,46 @@ try {
     await sleep(150);
   }
 
+  // Regression guard: Run header metadata badges/buttons (including board_topic_id + actor_profile + notify button) must stay single-line and unclipped inside header row
+  const s2aHeaderLayout = await cdpClient.evalJS(`
+    (() => {
+      const row = document.querySelector('[data-testid="run-row-${s2a.id}"]');
+      const header = row?.firstElementChild;
+      if (!row || !header) return { ok: false, reason: "missing row/header" };
+      const headerRect = header.getBoundingClientRect();
+      const chips = Array.from(header.querySelectorAll('button, [data-run-status], [data-testid^="open-run-deliveries-"], [data-testid^="run-open-board-"]'));
+      const deliveriesBtn = row.querySelector('[data-testid="open-run-deliveries-${s2a.id}"]');
+      const issues = [];
+      for (const el of chips) {
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 && r.height === 0) continue;
+        if (r.height > 32) {
+          issues.push({ text: (el.textContent || "").trim(), height: Math.round(r.height), kind: "wrapped-tall" });
+        }
+        if (r.right > headerRect.right + 1 || r.bottom > headerRect.bottom + 1) {
+          issues.push({
+            text: (el.textContent || "").trim(),
+            elRight: Math.round(r.right),
+            headerRight: Math.round(headerRect.right),
+            elBottom: Math.round(r.bottom),
+            headerBottom: Math.round(headerRect.bottom),
+            kind: "clipped-or-overflow"
+          });
+        }
+      }
+      return {
+        ok: issues.length === 0,
+        chipCount: chips.length,
+        hasDeliveriesBtn: Boolean(deliveriesBtn),
+        deliveriesHeight: deliveriesBtn ? Math.round(deliveriesBtn.getBoundingClientRect().height) : null,
+        issues
+      };
+    })()
+  `);
+  if (!s2aHeaderLayout?.ok || !s2aHeaderLayout.hasDeliveriesBtn) {
+    throw new Error(`Run header metadata badge/notify layout regression on s2a (${s2a.id}): ${JSON.stringify(s2aHeaderLayout)}`);
+  }
+
   // Switch to s2b thread -> verify waiting StatusBadge, exact docs/05 UPSTREAM_FAILED copy & Inspector 5-Tab DOM order + Tab 3 lineage
   await cdpClient.clickSelector('[data-testid="fleet-tab-threads"]');
   await sleep(150);
@@ -4422,20 +4473,24 @@ try {
         return {
           waitingBadge,
           hasScheduledCopy: rowText.includes("等待定时时间到达后自动唤醒。"),
+          rowHasScheduledDate: /定时唤醒：\\s*\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}/.test(rowText),
           tabularCount: tabularEls.length,
           activeTab,
           inspHasScheduledLabel: inspText.includes("定时唤醒"),
-          inspHasScheduledAtTabular: Boolean(inspSchedEl)
+          inspHasScheduledAtTabular: Boolean(inspSchedEl),
+          inspHasScheduledDate: /\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}\\s*\\(/.test(inspSchedEl?.textContent ?? "")
         };
       })()
     `);
     if (
       s2SchedUiCheck?.waitingBadge &&
       s2SchedUiCheck.hasScheduledCopy &&
+      s2SchedUiCheck.rowHasScheduledDate &&
       s2SchedUiCheck.tabularCount > 0 &&
       s2SchedUiCheck.activeTab === "lineage" &&
       s2SchedUiCheck.inspHasScheduledLabel &&
-      s2SchedUiCheck.inspHasScheduledAtTabular
+      s2SchedUiCheck.inspHasScheduledAtTabular &&
+      s2SchedUiCheck.inspHasScheduledDate
     ) {
       break;
     }

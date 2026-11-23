@@ -37,6 +37,14 @@ export function formatShortTime(iso?: string | null): string {
   });
 }
 
+export function formatShortDateTime(iso?: string | null): string {
+  if (!iso) return "--";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "--";
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
 function splitModelAndEffort(rawModel: string, rawEffort: string): { model: string; effort: string } {
   let model = rawModel.trim();
   let effort = rawEffort.trim();
