@@ -5047,6 +5047,117 @@ try {
     body: JSON.stringify({ cascade: false, reason: "cleanup T5-05" })
   });
 
+  // T5-06: BoardTopicInspector (+ 派发任务) & App (执行台派发) auto-match workspace & online node from topic channel / latest_handoff.data.repo
+  const betaTopicRes = await apiJson(hubUrl, adminToken, "/api/v1/board/topics", {
+    method: "POST",
+    body: JSON.stringify({
+      channel: "proj/repo-beta",
+      title: "T5-06 同节点次位目录自动匹配",
+      status: "todo"
+    })
+  });
+  const betaTopic = betaTopicRes.topic;
+  const webTopicRes = await apiJson(hubUrl, adminToken, "/api/v1/board/topics", {
+    method: "POST",
+    body: JSON.stringify({
+      channel: "proj/repo-web",
+      title: "T5-06 跨节点同名项目自动匹配",
+      status: "todo"
+    })
+  });
+  const webTopic = webTopicRes.topic;
+
+  await cdpClient.clickSelector('[data-testid="board-filter-active"]');
+  await sleep(200);
+  for (let i = 0; i < 25; i++) {
+    const ready = await cdpClient.evalJS(
+      `Boolean(document.querySelector('[data-testid="board-topic-item-${betaTopic.id}"]')) && Boolean(document.querySelector('[data-testid="board-topic-item-${webTopic.id}"]'))`
+    );
+    if (ready) break;
+    if (i === 24) throw new Error("T5-06 topics did not appear in board list");
+    await sleep(150);
+  }
+
+  // Case 1: proj/repo-beta -> macmini + repo-beta (2nd workspace, not default 1st repo-alpha)
+  await cdpClient.clickSelector(`[data-testid="board-topic-item-${betaTopic.id}"]`);
+  await sleep(200);
+  const betaQuickOpen = await cdpClient.evalJS(`Boolean(document.querySelector('[data-testid="board-quick-dispatch-form"]'))`);
+  if (!betaQuickOpen) {
+    await cdpClient.clickSelector('[data-testid="board-quick-dispatch-toggle"]');
+    await sleep(200);
+  }
+  const betaQuickCheck = await cdpClient.evalJS(`({
+    nodeText: document.querySelector('[data-testid="board-quick-dispatch-node"]')?.textContent?.trim() ?? "",
+    workdirText: document.querySelector('[data-testid="board-quick-dispatch-workdir"]')?.textContent?.trim() ?? ""
+  })`);
+  if (!betaQuickCheck.nodeText.includes("macmini") || betaQuickCheck.workdirText !== "repo-beta") {
+    throw new Error(`T5-06 quick dispatch did not auto-match repo-beta on macmini: ${JSON.stringify(betaQuickCheck)}`);
+  }
+
+  await cdpClient.clickSelector('[data-testid="board-open-composer-btn"]');
+  await sleep(250);
+  const betaComposerCheck = await cdpClient.evalJS(`({
+    workspaceMode: window.__AHUB_EVAL__?.getState()?.workspaceMode,
+    nodeId: window.__AHUB_EVAL__?.getState()?.composer?.nodeId,
+    workdir: window.__AHUB_EVAL__?.getState()?.composer?.workdir,
+    boardTopicId: window.__AHUB_EVAL__?.getState()?.composer?.boardTopicId
+  })`);
+  if (
+    betaComposerCheck.workspaceMode !== "runs" ||
+    betaComposerCheck.nodeId !== "macmini" ||
+    betaComposerCheck.workdir !== wsBeta ||
+    betaComposerCheck.boardTopicId !== betaTopic.id
+  ) {
+    throw new Error(`T5-06 执行台派发 did not auto-match wsBeta: ${JSON.stringify(betaComposerCheck)} expected=${wsBeta}`);
+  }
+
+  // Case 2: proj/repo-web -> cross-node match mbp + repo-web
+  await cdpClient.clickSelector('[data-testid="workspace-tab-board"]');
+  await sleep(200);
+  await cdpClient.clickSelector(`[data-testid="board-topic-item-${webTopic.id}"]`);
+  await sleep(200);
+  const webQuickOpen = await cdpClient.evalJS(`Boolean(document.querySelector('[data-testid="board-quick-dispatch-form"]'))`);
+  if (!webQuickOpen) {
+    await cdpClient.clickSelector('[data-testid="board-quick-dispatch-toggle"]');
+    await sleep(200);
+  }
+  const webQuickCheck = await cdpClient.evalJS(`({
+    nodeText: document.querySelector('[data-testid="board-quick-dispatch-node"]')?.textContent?.trim() ?? "",
+    workdirText: document.querySelector('[data-testid="board-quick-dispatch-workdir"]')?.textContent?.trim() ?? ""
+  })`);
+  if (!webQuickCheck.nodeText.includes("mbp") || webQuickCheck.workdirText !== "repo-web") {
+    throw new Error(`T5-06 quick dispatch did not cross-node auto-match repo-web on mbp: ${JSON.stringify(webQuickCheck)}`);
+  }
+
+  await cdpClient.clickSelector('[data-testid="board-open-composer-btn"]');
+  await sleep(250);
+  const webComposerCheck = await cdpClient.evalJS(`({
+    workspaceMode: window.__AHUB_EVAL__?.getState()?.workspaceMode,
+    nodeId: window.__AHUB_EVAL__?.getState()?.composer?.nodeId,
+    workdir: window.__AHUB_EVAL__?.getState()?.composer?.workdir,
+    boardTopicId: window.__AHUB_EVAL__?.getState()?.composer?.boardTopicId
+  })`);
+  if (
+    webComposerCheck.workspaceMode !== "runs" ||
+    webComposerCheck.nodeId !== "mbp" ||
+    webComposerCheck.workdir !== wsMbp ||
+    webComposerCheck.boardTopicId !== webTopic.id
+  ) {
+    throw new Error(`T5-06 执行台派发 did not cross-node auto-match wsMbp: ${JSON.stringify(webComposerCheck)} expected=${wsMbp}`);
+  }
+
+  // Cleanup T5-06 temporary topics and return to s2Topic
+  for (const tid of [betaTopic.id, webTopic.id]) {
+    await apiJson(hubUrl, adminToken, `/api/v1/board/topics/${tid}`, {
+      method: "PATCH",
+      body: JSON.stringify({ status: "archived" })
+    });
+  }
+  await cdpClient.clickSelector('[data-testid="workspace-tab-board"]');
+  await sleep(200);
+  await cdpClient.clickSelector(`[data-testid="board-topic-item-${s2Topic.id}"]`);
+  await sleep(200);
+
   const s2ModeAfterDispatch = await cdpClient.evalJS(`window.__AHUB_EVAL__.getState().workspaceMode`);
   if (s2ModeAfterDispatch !== "board") {
     await cdpClient.clickSelector('[data-testid="workspace-tab-board"]');

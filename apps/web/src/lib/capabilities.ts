@@ -1,5 +1,12 @@
 import type { ComposerDraft } from "@/stores/workbench-store";
-import type { AgentCapability, AgentName, EffortLevel, ModelCapability, NodeRecord } from "@/types";
+import type {
+  AgentCapability,
+  AgentName,
+  BoardTopic,
+  EffortLevel,
+  ModelCapability,
+  NodeRecord
+} from "@/types";
 
 export const ALL_AGENTS: AgentName[] = ["agy", "pi", "omp", "codex", "claude"];
 export const DEFAULT_AGY_MODEL = "gemini-4-hydrogen";
@@ -201,4 +208,136 @@ export function reconcileComposerDraft(
   if (nextEffort !== composer.effort) patch.effort = nextEffort;
 
   return Object.keys(patch).length > 0 ? patch : null;
+}
+
+const GENERIC_CHANNEL_SEGMENTS = new Set([
+  "proj",
+  "project",
+  "projects",
+  "repo",
+  "repos",
+  "ops",
+  "team",
+  "teams",
+  "general",
+  "default",
+  "misc"
+]);
+
+export function extractBoardTopicWorkspaceCandidates(
+  topic: Pick<BoardTopic, "channel" | "latest_handoff"> | null | undefined
+): string[] {
+  if (!topic) return [];
+  const out: string[] = [];
+  const push = (raw?: string | null) => {
+    const trimmed = (raw ?? "").trim().replace(/^\/+|\/+$/g, "");
+    if (!trimmed) return;
+    const lower = trimmed.toLowerCase();
+    if (!GENERIC_CHANNEL_SEGMENTS.has(lower) && !out.includes(lower)) {
+      out.push(lower);
+    }
+  };
+
+  const repoRaw = topic.latest_handoff?.data?.repo;
+  if (typeof repoRaw === "string" && repoRaw.trim()) {
+    const repoClean = repoRaw.trim().replace(/\.git$/i, "").replace(/^\/+|\/+$/g, "");
+    const parts = repoClean.split("/").filter(Boolean);
+    if (parts.length > 0) {
+      push(parts[parts.length - 1]);
+    }
+    push(repoClean);
+  }
+
+  const channelParts = (topic.channel || "")
+    .split("/")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  for (let i = channelParts.length - 1; i >= 0; i -= 1) {
+    push(channelParts[i]);
+  }
+  return out;
+}
+
+export function matchWorkspacePathForTopic(
+  node: NodeRecord | null | undefined,
+  topic: Pick<BoardTopic, "channel" | "latest_handoff"> | null | undefined
+): string | null {
+  if (!node || !node.workspaces || node.workspaces.length === 0) return null;
+  const candidates = extractBoardTopicWorkspaceCandidates(topic);
+  if (candidates.length === 0) return null;
+
+  const normalized = node.workspaces.map((ws) => {
+    const cleanPath = ws.path.replace(/[\\/]+$/, "");
+    const segs = cleanPath.split(/[\\/]/).filter(Boolean);
+    return {
+      path: ws.path,
+      key: (ws.key || "").trim().toLowerCase(),
+      basename: (segs[segs.length - 1] ?? "").toLowerCase(),
+      lowerPath: cleanPath.replace(/\\/g, "/").toLowerCase()
+    };
+  });
+
+  for (const cand of candidates) {
+    const exact = normalized.find((ws) => ws.key === cand || ws.basename === cand);
+    if (exact) return exact.path;
+  }
+
+  for (const cand of candidates) {
+    if (!cand.includes("/")) continue;
+    const suffix = `/${cand}`;
+    const bySuffix = normalized.find((ws) => ws.lowerPath.endsWith(suffix));
+    if (bySuffix) return bySuffix.path;
+  }
+
+  return null;
+}
+
+export function resolveBoardTopicDispatchTarget(
+  nodes: NodeRecord[],
+  topic: Pick<BoardTopic, "channel" | "latest_handoff"> | null | undefined,
+  preferredNodeId?: string | null
+): { node: NodeRecord | null; workdir: string; matchedWorkspace: boolean } {
+  if (nodes.length === 0) {
+    return { node: null, workdir: "", matchedWorkspace: false };
+  }
+  const onlineNodes = nodes.filter((n) => n.status === "online");
+  const pool = onlineNodes.length > 0 ? onlineNodes : nodes;
+
+  const preferredNode = preferredNodeId
+    ? nodes.find((n) => n.id === preferredNodeId) ?? null
+    : null;
+  const handoffNode = topic?.latest_handoff?.source_node
+    ? nodes.find((n) => n.id === topic.latest_handoff?.source_node) ?? null
+    : null;
+
+  const orderedNodes: NodeRecord[] = [];
+  for (const n of [preferredNode, handoffNode, ...pool, ...nodes]) {
+    if (n && !orderedNodes.some((x) => x.id === n.id)) {
+      orderedNodes.push(n);
+    }
+  }
+
+  for (const n of orderedNodes) {
+    if (onlineNodes.length > 0 && n.status !== "online") continue;
+    const matched = matchWorkspacePathForTopic(n, topic);
+    if (matched) {
+      return { node: n, workdir: matched, matchedWorkspace: true };
+    }
+  }
+
+  const fallbackNode =
+    (preferredNode && (onlineNodes.length === 0 || preferredNode.status === "online")
+      ? preferredNode
+      : null) ??
+    (handoffNode && (onlineNodes.length === 0 || handoffNode.status === "online")
+      ? handoffNode
+      : null) ??
+    pool[0] ??
+    null;
+
+  return {
+    node: fallbackNode,
+    workdir: fallbackNode?.workspaces[0]?.path ?? "",
+    matchedWorkspace: false
+  };
 }

@@ -62,7 +62,11 @@ import {
   readInPageFallbackPref,
   writeInPageFallbackPref
 } from "@/lib/browser-notify";
-import { getAvailableAgents, resolveInitialComposerModelAndEffort } from "@/lib/capabilities";
+import {
+  getAvailableAgents,
+  resolveBoardTopicDispatchTarget,
+  resolveInitialComposerModelAndEffort
+} from "@/lib/capabilities";
 import { AUTO_FULL_OUTPUT_MAX_BYTES, cn } from "@/lib/utils";
 import { HubStreamClient } from "@/lib/ws-client";
 import {
@@ -2296,10 +2300,20 @@ export function App() {
   }
 
   function handlePrefillRunComposerFromTopic(topic: BoardTopic) {
-    const targetNode =
-      nodes.find((n) => n.id === (composer.nodeId || selectedNodeId)) ??
-      nodes.find((n) => n.status === "online") ??
-      nodes[0];
+    const resolved = resolveBoardTopicDispatchTarget(
+      nodes,
+      topic,
+      composer.nodeId || selectedNodeId
+    );
+    const targetNode = resolved.node;
+    const sameNodeCurrentWorkdir =
+      !resolved.matchedWorkspace &&
+      targetNode &&
+      composer.nodeId === targetNode.id &&
+      composer.workdir &&
+      targetNode.workspaces.some((ws) => ws.path === composer.workdir)
+        ? composer.workdir
+        : "";
     selectThread(null);
     setWorkspaceMode("runs");
     setLeftTab("threads");
@@ -2311,7 +2325,7 @@ export function App() {
     patchComposer({
       mode: "new",
       nodeId: targetNode?.id ?? composer.nodeId,
-      workdir: composer.workdir || targetNode?.workspaces?.[0]?.path || "",
+      workdir: sameNodeCurrentWorkdir || resolved.workdir,
       boardTopicId: topic.id
     });
     window.requestAnimationFrame(() => {

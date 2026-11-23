@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { ExternalLink, GitBranch, Pin, PinOff, Plus, Send, Terminal } from "lucide-react";
@@ -12,7 +12,11 @@ import {
   SelectValue
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import { getAvailableAgents } from "@/lib/capabilities";
+import {
+  getAvailableAgents,
+  matchWorkspacePathForTopic,
+  resolveBoardTopicDispatchTarget
+} from "@/lib/capabilities";
 import { formatBlockedReason, formatShortTime } from "@/lib/utils";
 import type {
   AgentName,
@@ -96,21 +100,47 @@ export function BoardTopicInspector({
     [nodes]
   );
 
+  const topicMatchKey = topic
+    ? `${topic.id}|${topic.channel}|${topic.latest_handoff?.id ?? ""}|${
+        typeof topic.latest_handoff?.data?.repo === "string"
+          ? topic.latest_handoff.data.repo
+          : ""
+      }`
+    : "";
+  const appliedTopicMatchKeyRef = useRef<string>("");
+
   useEffect(() => {
     if (nodes.length === 0) return;
+
+    if (appliedTopicMatchKeyRef.current !== topicMatchKey) {
+      const resolved = resolveBoardTopicDispatchTarget(nodes, topic, dispatchNodeId || null);
+      if (resolved.node) {
+        appliedTopicMatchKeyRef.current = topicMatchKey;
+        const avail = getAvailableAgents(resolved.node);
+        setDispatchNodeId(resolved.node.id);
+        setDispatchWorkdir(resolved.workdir);
+        setDispatchAgent((prev) => (avail.includes(prev) ? prev : (avail[0] ?? "agy")));
+      }
+      return;
+    }
+
     const activeNode = nodes.find((n) => n.id === dispatchNodeId) ?? preferredNode;
     if (!activeNode) return;
     if (dispatchNodeId !== activeNode.id) {
       const avail = getAvailableAgents(activeNode);
       setDispatchNodeId(activeNode.id);
-      setDispatchWorkdir(activeNode.workspaces[0]?.path ?? "");
-      setDispatchAgent(avail[0] ?? "agy");
+      setDispatchWorkdir(
+        matchWorkspacePathForTopic(activeNode, topic) ?? activeNode.workspaces[0]?.path ?? ""
+      );
+      setDispatchAgent((prev) => (avail.includes(prev) ? prev : (avail[0] ?? "agy")));
       return;
     }
     if (!dispatchWorkdir && activeNode.workspaces.length > 0) {
-      setDispatchWorkdir(activeNode.workspaces[0].path);
+      setDispatchWorkdir(
+        matchWorkspacePathForTopic(activeNode, topic) ?? activeNode.workspaces[0].path
+      );
     }
-  }, [dispatchNodeId, dispatchWorkdir, nodes, preferredNode]);
+  }, [dispatchNodeId, dispatchWorkdir, nodes, preferredNode, topic, topicMatchKey]);
 
   const selectedDispatchNode = useMemo(
     () => nodes.find((n) => n.id === dispatchNodeId) ?? preferredNode,
@@ -490,7 +520,11 @@ export function BoardTopicInspector({
                           const nextNode = nodes.find((n) => n.id === v) ?? null;
                           const nextAgents = getAvailableAgents(nextNode);
                           setDispatchNodeId(v);
-                          setDispatchWorkdir(nextNode?.workspaces[0]?.path ?? "");
+                          setDispatchWorkdir(
+                            matchWorkspacePathForTopic(nextNode, topic) ??
+                              nextNode?.workspaces[0]?.path ??
+                              ""
+                          );
                           setDispatchAgent(
                             nextAgents.includes(dispatchAgent)
                               ? dispatchAgent
